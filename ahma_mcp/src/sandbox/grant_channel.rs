@@ -635,6 +635,9 @@ pub async fn notify_stderr_denial(
 
 /// Variant of [`notify_stderr_denial`] that resolves relative candidate paths
 /// against the command's actual working directory.
+///
+/// Waits for the human's answer. A command's own failure path must not: it
+/// uses [`raise_stderr_denial_question`], which asks without waiting.
 pub async fn notify_stderr_denial_in_dir(
     sandbox: &super::Sandbox,
     notifier: Option<&Arc<dyn ScopeGrantNotifier>>,
@@ -645,11 +648,76 @@ pub async fn notify_stderr_denial_in_dir(
     op_id: Option<&str>,
 ) {
     let Some(n) = notifier else { return };
-    // stdout too: a merged pipeline (`… 2>&1 | tail`) leaves stderr empty, and a
-    // denial that disappears when a caller adds `2>&1` is a trap, not a feature.
-    let Some(hit) = super::denial_scan::scan_denial_streams(stderr, stdout) else {
+    let Some(question) = stderr_denial_question(sandbox, stderr, stdout, tool, working_dir, op_id)
+    else {
         return;
     };
+    question.ask(n.as_ref()).await;
+}
+
+/// Raise the grant question for a failed command's out-of-scope denial, and
+/// return without waiting for the answer.
+///
+/// A question is not a wait (SPEC R2.7.1, R-PERM.3): the command has already
+/// failed, its result belongs to the agent now, and the workspace belongs to
+/// whoever is next. Waiting here held both for as long as a dialog nobody was
+/// looking at stayed open. An approval still applies live to the next command.
+pub fn raise_stderr_denial_question(
+    sandbox: &super::Sandbox,
+    notifier: Option<&Arc<dyn ScopeGrantNotifier>>,
+    stderr: &str,
+    stdout: &str,
+    tool: &str,
+    working_dir: Option<&Path>,
+    op_id: Option<&str>,
+) {
+    let Some(n) = notifier else { return };
+    let Some(question) = stderr_denial_question(sandbox, stderr, stdout, tool, working_dir, op_id)
+    else {
+        return;
+    };
+    let n = Arc::clone(n);
+    tokio::spawn(async move { question.ask(n.as_ref()).await });
+}
+
+/// One grant question, worked out from a failed command's output and ready to
+/// ask: everything that needs the live sandbox is resolved up front, so asking
+/// can happen after the command's result has gone back.
+struct StderrDenialQuestion {
+    target: PathBuf,
+    access: ScopeAccess,
+    tool: String,
+    context: GrantContext,
+}
+
+impl StderrDenialQuestion {
+    async fn ask(self, notifier: &dyn ScopeGrantNotifier) {
+        let _ = notifier
+            .notify_violation_with(
+                &self.target,
+                self.access,
+                GrantReason::StderrHeuristic,
+                Some(self.tool),
+                self.context,
+            )
+            .await;
+    }
+}
+
+/// The grant question a failed command's output calls for, if any: a denial
+/// on a path outside the scope. A denial for a path already in scope (e.g. a
+/// root-owned file inside the workspace) is unrelated to the sandbox.
+fn stderr_denial_question(
+    sandbox: &super::Sandbox,
+    stderr: &str,
+    stdout: &str,
+    tool: &str,
+    working_dir: Option<&Path>,
+    op_id: Option<&str>,
+) -> Option<StderrDenialQuestion> {
+    // stdout too: a merged pipeline (`… 2>&1 | tail`) leaves stderr empty, and a
+    // denial that disappears when a caller adds `2>&1` is a trap, not a feature.
+    let hit = super::denial_scan::scan_denial_streams(stderr, stdout)?;
     let evidence = GrantEvidence {
         raw_path: Some(hit.path.clone()),
         pattern: Some(hit.pattern.to_string()),
@@ -671,7 +739,7 @@ pub async fn notify_stderr_denial_in_dir(
         (in_scope, target)
     };
     if in_scope {
-        return;
+        return None;
     }
     // The denial usually names a single cache file; offer its parent directory so
     // one grant covers the whole cache rather than re-prompting per file (P1c).
@@ -686,15 +754,12 @@ pub async fn notify_stderr_denial_in_dir(
         None,
         hit.access.is_write(),
     );
-    let _ = n
-        .notify_violation_with(
-            &target,
-            hit.access,
-            GrantReason::StderrHeuristic,
-            Some(tool.to_string()),
-            context,
-        )
-        .await;
+    Some(StderrDenialQuestion {
+        target,
+        access: hit.access,
+        tool: tool.to_string(),
+        context,
+    })
 }
 
 /// Resolve the candidate path from a denial into the directory that should actually

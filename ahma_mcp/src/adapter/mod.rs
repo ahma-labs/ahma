@@ -942,7 +942,7 @@ impl Adapter {
         safe_wd: &std::path::Path,
         result: Result<String, anyhow::Error>,
     ) -> SyncRun {
-        sandbox::grant_channel::notify_stderr_denial_in_dir(
+        sandbox::grant_channel::raise_stderr_denial_question(
             &self.sandbox,
             self.scope_grant_notifier.as_ref(),
             stderr,
@@ -950,8 +950,7 @@ impl Adapter {
             command,
             Some(safe_wd),
             Some(op_id),
-        )
-        .await;
+        );
         // When the failure was a kernel denial on an out-of-scope path, return
         // it as a typed error so the MCP boundary attaches a structured
         // `sandbox_denial` payload (path + grant->restart->retry remediation)
@@ -2534,7 +2533,9 @@ async fn record_failure_diagnostics(
     stderr_str: &str,
     working_dir: Option<&Path>,
 ) {
-    sandbox::grant_channel::notify_stderr_denial_in_dir(
+    // Asked, not awaited (SPEC R-PERM.3.9): the caller still holds the
+    // workspace and the operation is not yet finished.
+    sandbox::grant_channel::raise_stderr_denial_question(
         sandbox,
         scope_grant_notifier,
         stderr_str,
@@ -2542,8 +2543,7 @@ async fn record_failure_diagnostics(
         tool,
         working_dir,
         Some(op_id),
-    )
-    .await;
+    );
 
     // An out-of-scope runtime denial cannot be returned as a typed McpError on
     // the async path (the result is delivered later as text), so attach the
@@ -3158,6 +3158,95 @@ mod tests {
         let notices = notices.lock();
         assert_eq!(notices.len(), 1, "one notice per wait: {notices:?}");
         assert!(notices[0].contains("op_holder"), "{notices:?}");
+    }
+
+    /// A grant question that waits on a human never answers.
+    #[derive(Debug, Default)]
+    struct NeverAnswers {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl sandbox::ScopeGrantNotifier for NeverAnswers {
+        async fn notify_violation_with(
+            &self,
+            _path: &std::path::Path,
+            _access: ahma_common::config::ScopeAccess,
+            _reason: ahma_common::scope_grant::GrantReason,
+            _tool: Option<String>,
+            _context: ahma_common::scope_grant::GrantContext,
+        ) -> Option<ahma_common::scope_grant::ScopeGrantRequest> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+
+        fn budget_exhausted(&self) -> bool {
+            false
+        }
+
+        fn status(&self, _decision_id: &str) -> ahma_common::scope_grant::GrantStatus {
+            ahma_common::scope_grant::GrantStatus::Pending
+        }
+    }
+
+    /// SPEC R2.7.1, R-PERM.3: a grant question raised by a failed command is a
+    /// question, not a wait. The command's result comes back, and the workspace
+    /// is handed on, while the human has not answered yet — or a dialog nobody
+    /// is looking at would stall every writer in the workspace.
+    #[tokio::test]
+    async fn a_grant_question_does_not_hold_the_result_or_the_workspace() {
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let notifier = Arc::new(NeverAnswers::default());
+        let adapter = adapter
+            .with_workspace_queue(workspace_queue::WorkspaceQueue::with_lock_dir(
+                true,
+                Some(td.path().join("locks")),
+            ))
+            .with_scope_grant_notifier(notifier.clone());
+        let outside = crate::test_utils::path_helpers::test_out_of_scope_path();
+        let line = format!("echo \"{}: Permission denied\"; exit 3", outside.display());
+        let config = crate::AhmaMcpService::build_shell_subcommand_config(
+            Some(30),
+            &ExecutionMode::Synchronous,
+        );
+
+        let quick =
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
+        let wd = td.path().to_string_lossy().into_owned();
+        let run = adapter.execute_sync_in_dir(
+            crate::shell_pool::platform_shell_program(),
+            Some(shell_args(&line)),
+            &wd,
+            Some(30),
+            Some(&config),
+        );
+        let result = tokio::time::timeout(quick, run)
+            .await
+            .expect("the failed command's result must not wait for the human's answer");
+        assert!(result.is_err(), "the command failed: {result:?}");
+
+        crate::test_utils::concurrency::wait_with_backoff(
+            "the grant question is raised",
+            quick,
+            || async { notifier.asked.load(std::sync::atomic::Ordering::SeqCst) > 0 },
+        )
+        .await
+        .expect("the question is still asked");
+
+        let key = adapter.workspace_key_for(td.path());
+        let never_cancelled = tokio_util::sync::CancellationToken::new();
+        let next = adapter
+            .workspace_queue()
+            .enqueue(
+                &key,
+                workspace_queue::HolderInfo::new("op_next", "cargo build"),
+            )
+            .unwrap()
+            .acquire(&never_cancelled, &|_| {});
+        tokio::time::timeout(quick, next)
+            .await
+            .expect("the next writer gets the workspace while the question is open")
+            .unwrap();
     }
 
     #[test]
