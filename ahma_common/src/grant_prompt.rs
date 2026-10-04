@@ -169,6 +169,9 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         GrantReason::StderrHeuristic => {
             blocked.push_str("\nread from the command's error output: double-check the path")
         }
+        GrantReason::KernelRecord => blocked.push_str(
+            "\nthe path and the access are exact: the kernel's own record of the refusal",
+        ),
         GrantReason::StartupFlag => blocked.push_str(
             "\nthe path is exact: this machine's temp directory, shared by every program you \
              run, and part of no project",

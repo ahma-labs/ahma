@@ -104,9 +104,13 @@ impl Sandbox {
         let signal_rules = super::signals::seatbelt_signal_rule();
         // SPEC R6.2.7: the GPU is a capability, denied unless `[sandbox] allow_gpu`.
         let gpu_rules = super::gpu::seatbelt_gpu_rules();
+        // Every denial the default rule causes is recorded with this
+        // command's tag, so its records can be read back (SPEC R-DENY.1).
+        let tag = super::kernel_denials::new_tag();
+        let prefix = super::kernel_denials::TAG_PREFIX;
         let profile = format!(
             r#"(version 1)
-(deny default)
+(deny default (with message "{prefix}{tag}"))
 (allow process*)
 {signal_rules}{gpu_rules}(allow sysctl-read)
 (allow process-info*)

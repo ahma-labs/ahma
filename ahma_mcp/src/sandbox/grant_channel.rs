@@ -729,6 +729,118 @@ pub fn raise_stderr_denial_question(
     tokio::spawn(async move { question.ask(n.as_ref()).await });
 }
 
+/// What the kernel recorded for a failed command (SPEC R-DENY): the lines its
+/// result carries, and the first path a human may grant with the access the
+/// kernel refused, after asking about it without waiting (R-PERM.3.9).
+///
+/// Asked only when the output suggests a refusal, so other failures cost
+/// nothing. A record may arrive late, and under heavy load macOS drops some
+/// altogether, so an empty answer is asked once more and is never taken to
+/// mean the sandbox refused nothing (R-DENY.3): `None` then, and the caller
+/// judges from the output as before. `None` when the records cannot be read
+/// here; the caller then scans the output as before. `Some(vec![])` means the
+/// kernel refused nothing: the failure was not the sandbox's, and nothing is
+/// suggested (R-DENY.3).
+pub async fn kernel_denial_lines(
+    sandbox: &super::Sandbox,
+    notifier: Option<&Arc<dyn ScopeGrantNotifier>>,
+    output: (&str, &str),
+    tag: Option<&str>,
+    within: std::time::Duration,
+    tool: &str,
+    op_id: Option<&str>,
+) -> Option<KernelReport> {
+    use super::kernel_denials::{DenialClass, classify, one_line, read_records};
+    let tag = tag?;
+    if super::denial_scan::scan_denial_streams(output.0, output.1).is_none()
+        && !looks_refused(output.0)
+        && !looks_refused(output.1)
+    {
+        return None;
+    }
+    let mut records = Vec::new();
+    for wait_ms in [0u64, 300] {
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        records = read_records(tag, within + std::time::Duration::from_millis(wait_ms)).await?;
+        if !records.is_empty() {
+            break;
+        }
+    }
+    if records.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut grant = None;
+    let mut asked = false;
+    for denial in &records {
+        let class = classify(denial);
+        let line = one_line(denial, &class);
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+        if let DenialClass::Grant { path, access } = &class
+            && grant.is_none()
+        {
+            grant = Some((path.clone(), *access));
+        }
+        if let (DenialClass::Grant { path, access }, false, Some(n)) = (&class, asked, notifier) {
+            asked = true;
+            let target = resolve_grant_target(path, None, sandbox);
+            let context = build_context(
+                sandbox,
+                &target,
+                Some(GrantEvidence {
+                    raw_path: Some(path.clone()),
+                    pattern: Some(denial.operation.clone()),
+                    line: Some(format!(
+                        "Sandbox: {}({}) deny {} {}",
+                        denial.process, denial.pid, denial.operation, denial.target
+                    )),
+                }),
+                Some(tool),
+                op_id,
+                None,
+                access.is_write(),
+            );
+            let (n, access, tool) = (Arc::clone(n), *access, tool.to_string());
+            tokio::spawn(async move {
+                let _ = n
+                    .notify_violation_with(
+                        &target,
+                        access,
+                        GrantReason::KernelRecord,
+                        Some(tool),
+                        context,
+                    )
+                    .await;
+            });
+        }
+    }
+    Some(KernelReport { lines, grant })
+}
+
+/// Whether output mentions a refusal at all, path or not.
+fn looks_refused(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "not permitted",
+        "permission denied",
+        "read-only file system",
+        "sandbox",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+/// What [`kernel_denial_lines`] found.
+#[derive(Debug, Clone, Default)]
+pub struct KernelReport {
+    /// One line per distinct denial, for the command's result.
+    pub lines: Vec<String>,
+    /// The first path a human may grant, and the access the kernel refused.
+    pub grant: Option<(PathBuf, ScopeAccess)>,
+}
+
 /// One grant question, worked out from a failed command's output and ready to
 /// ask: everything that needs the live sandbox is resolved up front, so asking
 /// can happen after the command's result has gone back.

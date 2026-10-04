@@ -14,6 +14,80 @@ use std::path::{Path, PathBuf};
 
 use ahma_common::config::ScopeAccess;
 
+/// What a profile's default deny says in each record it causes, followed by
+/// the command's own tag: `(deny default (with message "ahma-denial:<tag>"))`
+/// puts it on the record's second line, so a command's denials are found by
+/// its tag alone, even after its processes are gone.
+pub const TAG_PREFIX: &str = "ahma-denial:";
+
+/// A fresh tag for one command's profile.
+pub fn new_tag() -> String {
+    (0..16)
+        .map(|_| format!("{:x}", rand::random::<u8>() & 0xf))
+        .collect()
+}
+
+/// The tag in a built command's arguments (its Seatbelt profile), if any.
+pub fn tag_of<'a>(args: impl Iterator<Item = &'a std::ffi::OsStr>) -> Option<String> {
+    args.filter_map(|a| a.to_str()).find_map(|a| {
+        let at = a.find(TAG_PREFIX)? + TAG_PREFIX.len();
+        let tag: String = a[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        (!tag.is_empty()).then_some(tag)
+    })
+}
+
+/// Tags of operations running in the background, by operation id: the async
+/// path spawns in one place and reads the records in another.
+static OPERATION_TAGS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Remember operation `op_id`'s tag as it spawns.
+pub fn remember_tag(op_id: &str, tag: String) {
+    OPERATION_TAGS
+        .lock()
+        .insert(op_id.to_string(), (tag, std::time::Instant::now()));
+}
+
+/// Take operation `op_id`'s tag back as it ends, with how long it ran.
+pub fn take_tag(op_id: &str) -> Option<(String, std::time::Duration)> {
+    OPERATION_TAGS
+        .lock()
+        .remove(op_id)
+        .map(|(tag, at)| (tag, at.elapsed()))
+}
+
+/// The kernel's records for the command tagged `tag`, from the last
+/// `within` (SPEC R-DENY.1): read by this process, which the sandbox does not
+/// confine. `None` when they cannot be read here — not macOS, no `log`, or
+/// it failed or took too long — and then the caller falls back to scanning
+/// the output. `Some(vec![])` means the kernel refused nothing it recorded.
+pub async fn read_records(tag: &str, within: std::time::Duration) -> Option<Vec<KernelDenial>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let secs = within.as_secs().max(1) + 2;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("/usr/bin/log")
+            .args(["show", "--last", &format!("{secs}s"), "--style", "compact"])
+            .arg("--predicate")
+            .arg(format!("eventMessage CONTAINS \"{TAG_PREFIX}{tag}\""))
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(denials_of(&text, &|_| true))
+}
+
 /// One denial as the kernel recorded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelDenial {
