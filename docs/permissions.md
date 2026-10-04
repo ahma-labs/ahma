@@ -181,15 +181,16 @@ on_redirect_to_new_domain = "prompt"   # or "policy" (default), "block"
 
 ## Git authentication (SSH and HTTPS)
 
-In terminal hooks, `git push` over SSH goes through ahma's [SSH key broker](ssh-agent-broker.md): it signs for a server once you allow that key for it (`ssh-sign` grants: the Claude Code dialog for a session, `ahma permissions grant ssh-sign` for good), with no key in your agent needed. MCP commands use it too; a refused one says so in an alert, and you grant with `ahma permissions grant ssh-sign`. The rest of this section is about keys the broker does not sign with itself.
+`git push` over SSH goes through ahma's [SSH key broker](ssh-agent-broker.md): it signs for a server once you allow that key for it (`ssh-sign` grants: the Claude Code dialog for a session, `ahma permissions grant ssh-sign` for good). An unencrypted ed25519 key in `~/.ssh` needs nothing else. MCP commands use it too; a refused one says so in an alert, and you grant with `ahma permissions grant ssh-sign`.
 
 The sandbox denies reads of your private keys (all of `~/.ssh` except `config`,
-`known_hosts` and public keys) and forwards the SSH
-agent socket instead, so a sandboxed `git fetch` or `git push` over SSH can
-authenticate only through the agent. On the host, ssh reads the key file directly,
-so an **empty agent is invisible until the first sandboxed push** fails with
+`known_hosts` and public keys), and the broker signs with any other key —
+passphrase-protected, RSA, ECDSA, security keys — only through your SSH agent.
+On the host, ssh reads the key file directly, so for such a key an **empty agent
+is invisible until the first sandboxed push** fails with
 `Permission denied (publickey)`. One thing to do: `ssh-add --apple-use-keychain
-~/.ssh/id_ed25519` (macOS) or `ssh-add ~/.ssh/id_ed25519`.
+~/.ssh/id_rsa` (macOS) or `ssh-add ~/.ssh/id_rsa`. `ahma doctor` says which of
+your keys need it.
 
 HTTPS is the more common transport and ahma does not block it: the login keychain
 is allowed (`[sandbox] allow_keychain`, on by default), so `osxkeychain` and `gh`
@@ -228,7 +229,7 @@ the AI, or a confirmed prompt:
   the enclosing git repository root of a worktree or subdirectory workspace is allowed)
 - credential directories and everything inside them: `~/.ssh`, `~/.aws`, `~/.gnupg`,
   `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/gcloud` (a key file is refused
-  like the directory that holds it; git and ssh still work through your SSH agent)
+  like the directory that holds it; ssh signs through the [SSH key broker](ssh-agent-broker.md) instead)
 - `~/.ahma` itself and everything in it — the ledger cannot authorize access to the ledger
 - OS system directories
 - a grant for any of these that is already in `settings.toml` (written by hand, or by an
@@ -357,7 +358,7 @@ log — detection, not prevention.
 See [`docs/security-sandbox.md`](security-sandbox.md#writable-but-not-everything-trust-handoff)
 and SPEC R-HANDOFF.
 
-**SSH credentials and agent authentication**: Sandboxed commands cannot read private keys: `~/.ssh` is denied as a whole, except `config`, `config.d/`, `known_hosts*`, public keys and `allowed_signers`. Ahma forwards `$SSH_AUTH_SOCK` into the sandbox, so SSH operations (such as `git fetch` or `git push` over SSH) authenticate seamlessly via the SSH agent. If a command fails with `Permission denied (publickey)`, run `ssh-add` on the host to load your key into the agent (e.g. `ssh-add ~/.ssh/id_ed25519`).
+**SSH credentials and agent authentication**: Sandboxed commands cannot read private keys: `~/.ssh` is denied as a whole, except `config`, `config.d/`, `known_hosts*`, public keys and `allowed_signers`. A sandboxed command's `$SSH_AUTH_SOCK` is ahma's [SSH key broker](ssh-agent-broker.md), so SSH operations (such as `git fetch` or `git push` over SSH) sign once a human allows that key for that server: with an unencrypted ed25519 key file itself, and with any other key through your SSH agent. If a command fails with `Permission denied (publickey)` and its key has a passphrase or is RSA, ECDSA or a security key, run `ssh-add` on the host to load it into the agent (e.g. `ssh-add ~/.ssh/id_rsa`).
 
 ## Command reference
 

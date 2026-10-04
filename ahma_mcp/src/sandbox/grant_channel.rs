@@ -1227,7 +1227,7 @@ mod context_tests {
                 );
             }
             assert!(
-                t.contains("ssh-add"),
+                t.contains(ahma_common::scope_grant::SSH_KEY_USE),
                 "says how ssh can still use the key: {t}"
             );
             assert!(

@@ -1,6 +1,6 @@
 # SSH key broker — `git push` over SSH from inside the sandbox
 
-**Status:** Experimental (v0.22.3). Terminal hooks (Claude Code's Bash tool and other hooked
+**Status:** Experimental (v0.22.3). macOS and Linux (on Windows ssh still uses only your own agent). Terminal hooks (Claude Code's Bash tool and other hooked
 shells) and commands run through MCP `run_terminal_command`. An MCP command that is refused
 says so in an alert while it runs; there is no mid-command question yet, so a human grants
 with `ahma permissions grant ssh-sign`. SPEC: [R-CRED](../SPEC.md).
@@ -49,7 +49,8 @@ The key never enters the sandbox.
 
 ## Quickstart
 
-Nothing to set up for an unencrypted ed25519 key in `~/.ssh` (the `ssh-keygen` default).
+Nothing to set up for an unencrypted ed25519 key in `~/.ssh` (`ssh-keygen -t ed25519`,
+leaving the passphrase empty).
 Push; when the broker refuses, push again and answer the dialog that comes first (once
 per session).
 
@@ -71,7 +72,7 @@ ahma permissions revoke ssh-sign "SHA256:<key> for host:SHA256:<host key>" --yes
 Passphrase-protected, RSA, ECDSA and security keys (`sk-*`) are used through your own SSH
 agent: load them once per login with `ssh-add <key>` (on macOS, `ssh-add
 --apple-use-keychain <key>` keeps the passphrase in the keychain). The broker still asks
-before the agent signs.
+before the agent signs. `ahma doctor` says which of your keys need this.
 
 ## What is refused, always
 
