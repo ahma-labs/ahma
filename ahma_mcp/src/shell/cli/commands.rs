@@ -901,7 +901,93 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
             global,
             yes,
         } => revoke_permission(&file, load()?, &kind, &subject, workspace, global, yes),
+        PermissionsCommand::Grant {
+            kind,
+            subject,
+            workspace,
+            lease,
+            yes,
+        } => grant_permission(&file, &kind, &subject, workspace, lease.as_deref(), yes),
     }
+}
+
+/// `ahma permissions grant`: today the `ssh-sign` kind (SPEC R-CRED.3).
+/// Previews the settings line, writes it only with `--yes`, and audits it.
+fn grant_permission(
+    file: &std::path::Path,
+    kind: &str,
+    subject: &str,
+    workspace: Option<PathBuf>,
+    lease: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    let kind = parse_kind(kind)?;
+    if kind != GrantKind::SshSign {
+        anyhow::bail!(
+            "`ahma permissions grant` grants `ssh-sign`; use `ahma sandbox grant` for a \
+             directory, `ahma network allow` for a host and `ahma web allow` for a domain."
+        );
+    }
+    let Some((key, destination)) = subject.split_once(" for ") else {
+        anyhow::bail!(
+            "an ssh-sign grant is named `<key> for <destination>`, as ahma's refusal printed \
+             it, e.g. \"SHA256:abc… for host:SHA256:def…\""
+        );
+    };
+    let (key, destination) = (key.trim(), destination.trim());
+    if !key.starts_with("SHA256:")
+        || !(destination.starts_with(ahma_common::ssh_sign::HOST_PREFIX)
+            || destination.starts_with(ahma_common::ssh_sign::SSHSIG_PREFIX))
+    {
+        anyhow::bail!(
+            "the key is a `SHA256:` fingerprint and the destination `host:SHA256:…` or \
+             `sshsig:<namespace>`, as ahma's refusal printed them"
+        );
+    }
+    let workspace = match workspace {
+        Some(w) => workspace_key(&ahma_common::config::expand_home(&w)),
+        None => workspace_key(&std::env::current_dir()?),
+    };
+    let now = ahma_common::config::unix_now();
+    let expires_at = lease
+        .map(parse_lease_arg)
+        .transpose()?
+        .map(|secs| now + secs);
+    let grant = ahma_common::ssh_sign::SshSignGrant {
+        key: key.to_string(),
+        destination: destination.to_string(),
+        label: String::new(),
+        workspace: workspace.clone(),
+        granted_at: now,
+        expires_at,
+        granted_by: Some("cli".into()),
+        owner_pid: None,
+    };
+    let line = format!(
+        "[[sandbox.ssh_sign]] key = {key}, destination = {destination}, workspace = {}{}",
+        workspace.display(),
+        expires_at
+            .map(|t| format!(", expires {}", ahma_common::config::fmt_utc_datetime(t)))
+            .unwrap_or_default()
+    );
+    if !yes {
+        println!("Would add: {line}");
+        println!();
+        println!("File: {}", file.display());
+        println!();
+        println!("Nothing was changed. Re-run with --yes to apply.");
+        return Ok(());
+    }
+    ahma_common::ssh_sign::persist(file, grant, "cli")?;
+    println!("✓ Granted: {line}");
+    println!();
+    println!(
+        "Nothing more to do: commands in {} may sign with this key for this destination \
+         from their next run. Revoke with: ahma permissions revoke ssh-sign \"{key} for \
+         {destination}\" --yes",
+        workspace.display()
+    );
+    Ok(())
 }
 
 /// Parse a kind filter/selector, naming the valid options on failure rather than
@@ -913,9 +999,10 @@ fn parse_kind(s: &str) -> Result<GrantKind> {
         "net-host" | "net" | "network" | "host" => Ok(GrantKind::NetHost),
         "tool" => Ok(GrantKind::Tool),
         "log-target" | "log" | "logs" => Ok(GrantKind::LogTarget),
+        "ssh-sign" | "ssh" => Ok(GrantKind::SshSign),
         other => anyhow::bail!(
-            "unknown permission kind '{other}' (expected: fs-scope, web-domain, net-host, \
-             tool, or log-target)"
+            "unknown permission kind '{other}' (expected: fs-scope, ssh-sign, web-domain, \
+             net-host, tool, or log-target)"
         ),
     }
 }
@@ -1365,6 +1452,37 @@ fn preview_revoke_log_target(
     ))
 }
 
+/// Preview an ssh-sign revoke. `subject` is a row as `ahma permissions list`
+/// prints it, `<key> for <destination>`, and the revoke removes that key's
+/// grant for that destination in every workspace.
+fn preview_revoke_ssh_sign(
+    settings: &ahma_common::config::AhmaSettings,
+    subject: &str,
+) -> Option<(String, RevokeFn)> {
+    let Some((key, destination)) = subject.split_once(" for ") else {
+        println!(
+            "An ssh-sign grant is named `<key> for <destination>`, as `ahma permissions list \
+             --kind ssh-sign` prints it."
+        );
+        return None;
+    };
+    let (key, destination) = (key.trim().to_string(), destination.trim().to_string());
+    let matches =
+        move |g: &ahma_common::ssh_sign::SshSignGrant| g.key == key && g.destination == destination;
+    if !settings.sandbox.ssh_sign.iter().any(&matches) {
+        println!("No ssh-sign grant for {subject}.");
+        return None;
+    }
+    Some((
+        format!("remove the ssh-sign grant for {subject}"),
+        Box::new(move |s: &mut ahma_common::config::AhmaSettings| {
+            let before = s.sandbox.ssh_sign.len();
+            s.sandbox.ssh_sign.retain(|g| !matches(g));
+            s.sandbox.ssh_sign.len() != before
+        }),
+    ))
+}
+
 fn revoke_permission(
     file: &std::path::Path,
     mut settings: ahma_common::config::AhmaSettings,
@@ -1388,6 +1506,7 @@ fn revoke_permission(
         GrantKind::NetHost => preview_revoke_net_host(&settings, subject),
         GrantKind::Tool => preview_revoke_tool(&settings, subject, workspace),
         GrantKind::LogTarget => preview_revoke_log_target(&settings, subject, workspace),
+        GrantKind::SshSign => preview_revoke_ssh_sign(&settings, subject),
         GrantKind::HookUnsandboxed => anyhow::bail!(
             "hook consent is session-scoped and never persisted; revoke it with \
                  `ahma hooks revoke`"
@@ -3208,6 +3327,73 @@ mod tests {
             !ledger(home.path()).exists(),
             "a refused grant must write nothing at all"
         );
+    }
+
+    /// SPEC R-CRED.3: `ahma permissions grant ssh-sign` previews, writes with
+    /// `--yes`, is listed, and is revoked by the same subject.
+    #[test]
+    fn an_ssh_sign_grant_previews_writes_lists_and_revokes() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let ws = home.path().join("repo");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let subject = "SHA256:key for host:SHA256:host";
+        let grant = |yes: bool| {
+            run_permissions_command(PermissionsArgs {
+                command: PermissionsCommand::Grant {
+                    kind: "ssh-sign".into(),
+                    subject: subject.into(),
+                    workspace: Some(ws.clone()),
+                    lease: Some("8h".into()),
+                    yes,
+                },
+            })
+        };
+        grant(false).unwrap();
+        assert!(!ledger(home.path()).exists(), "a preview writes nothing");
+        grant(true).unwrap();
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        let g = &settings.sandbox.ssh_sign[0];
+        assert_eq!(
+            (g.key.as_str(), g.destination.as_str()),
+            ("SHA256:key", "host:SHA256:host")
+        );
+        assert_eq!(g.workspace, dunce::canonicalize(&ws).unwrap());
+        assert!(g.expires_at.is_some(), "a lease");
+        let rows = ahma_common::permissions::records(&settings);
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == GrantKind::SshSign && r.subject == subject)
+        );
+
+        assert!(
+            run_permissions_command(PermissionsArgs {
+                command: PermissionsCommand::Grant {
+                    kind: "ssh-sign".into(),
+                    subject: "id_ed25519 for github.com".into(),
+                    workspace: Some(ws.clone()),
+                    lease: None,
+                    yes: true,
+                },
+            })
+            .is_err(),
+            "names are fingerprints, never file or host names"
+        );
+
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "ssh-sign".into(),
+                subject: subject.into(),
+                workspace: None,
+                global: false,
+                yes: true,
+            },
+        })
+        .unwrap();
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        assert!(settings.sandbox.ssh_sign.is_empty());
     }
 
     #[test]

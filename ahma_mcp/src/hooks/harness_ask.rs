@@ -87,7 +87,7 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
     }
 }
 
-/// The question to put to the human before the next command in `cwd`, in
+/// The question to put to the human before `command` runs again in `cwd`, in
 /// harness session `session_id`, with the token that approves it. Recording
 /// the question is what makes it the only time it is asked this session.
 pub(super) fn next_ask(
@@ -176,6 +176,70 @@ pub(super) fn ask_reason(question: &Question) -> String {
     )
 }
 
+/// The SSH signature to ask about before `command` runs in `cwd`, with the
+/// token that approves it (SPEC R-CRED.3, R-PERM.10): a signature the broker
+/// refused an earlier command here, that no grant covers now, not yet asked
+/// in this harness session.
+pub(super) fn next_ssh_ask(
+    cwd: &Path,
+    session_id: &str,
+    command: &str,
+    settings_file: Option<&Path>,
+) -> Option<(harness_asks::SshRefusal, String)> {
+    let dir = harness_asks::default_dir()?;
+    let workspace = workspace_for(cwd);
+    let now = ahma_common::session_grants::now_secs();
+    let asks = harness_asks::load(&dir, &workspace, now);
+    if asks.ssh_refusals.is_empty() {
+        return None;
+    }
+    let mut grants = settings_file
+        .and_then(|f| ahma_common::config::AhmaSettings::load_from_result(f).ok())
+        .map(|s| s.sandbox.ssh_sign)
+        .unwrap_or_default();
+    if let Some(sessions) = ahma_common::ssh_sign::session_dir() {
+        grants.extend(ahma_common::ssh_sign::active_sessions(
+            &sessions,
+            now,
+            &crate::sandbox::pid_alive,
+        ));
+    }
+    let covered = |r: &harness_asks::SshRefusal| {
+        ahma_common::ssh_sign::allowed(&grants, &r.key, &r.destination, &workspace, now)
+    };
+    let refusal = harness_asks::next_ssh_question(&asks, session_id, command, &covered)?;
+    let pid = harness_pid().or(refusal.harness_pid)?;
+    let token = harness_asks::mark_ssh_asked(
+        &dir,
+        &workspace,
+        session_id,
+        &refusal,
+        command,
+        Some(pid),
+        now,
+    )
+    .ok()?;
+    Some((refusal, token))
+}
+
+/// The dialog text for a refused SSH signature: which key, for which server,
+/// what a yes allows and for how long, and how to make it permanent.
+pub(super) fn ssh_ask_reason(refusal: &harness_asks::SshRefusal) -> String {
+    let key = if refusal.key_comment.is_empty() {
+        refusal.key.clone()
+    } else {
+        format!("{} ({})", refusal.key, refusal.key_comment)
+    };
+    format!(
+        "ahma: when this command last ran it asked to use your SSH key {key} for {} ({}); the \
+         key itself never enters the sandbox. Approve to let commands in this workspace sign \
+         with it for {} for this session, then run this command. Deny and ahma will not ask \
+         about it again this session. To allow it always: `ahma permissions grant ssh-sign \
+         \"{} for {}\"`.",
+        refusal.label, refusal.destination, refusal.label, refusal.key, refusal.destination,
+    )
+}
+
 /// Spend an approval `token` for `command` in `cwd`: apply the session grant
 /// the human approved in the harness dialog, and say so in one line. `None`
 /// when the token is unknown, spent, expired, for another command, or the
@@ -185,6 +249,10 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<S
     let workspace = workspace_for(cwd);
     let now = ahma_common::session_grants::now_secs();
     let Some(asked) = harness_asks::take_approved(&dir, &workspace, token, command, now) else {
+        if let Some(asked) = harness_asks::take_ssh_approved(&dir, &workspace, token, command, now)
+        {
+            return Some(apply_ssh_approval(&asked, &workspace, now));
+        }
         return Some(
             "ahma: the approval this command carries is unknown, already used or expired; it \
              runs without a new grant."
@@ -211,6 +279,46 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<S
         "ahma: approved — commands in this workspace may {verb} {} for this session.",
         q.dir.display()
     ))
+}
+
+/// Record the session grant a yes to an SSH-signature question gives.
+fn apply_ssh_approval(asked: &harness_asks::AskedSsh, workspace: &Path, now: u64) -> String {
+    let r = &asked.refusal;
+    let recorded = asked.harness_pid.and_then(|owner| {
+        let dir = ahma_common::ssh_sign::session_dir()?;
+        let grant = ahma_common::ssh_sign::SshSignGrant {
+            key: r.key.clone(),
+            destination: r.destination.clone(),
+            label: r.label.clone(),
+            workspace: workspace.to_path_buf(),
+            granted_at: now,
+            expires_at: None,
+            granted_by: Some("harness dialog".into()),
+            owner_pid: Some(owner),
+        };
+        ahma_common::ssh_sign::record_session(&dir, &grant).ok()
+    });
+    match recorded {
+        Some(_) => {
+            ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
+                ahma_common::config::fmt_utc_datetime(now),
+                ahma_common::permissions::AuditAction::Grant,
+                ahma_common::permissions::GrantKind::SshSign,
+                format!("{} for {}", r.key, r.destination),
+                None,
+                ahma_common::permissions::GrantTier::Session,
+                Some("harness dialog".into()),
+            ));
+            format!(
+                "ahma: approved — commands in this workspace may sign with {} for {} for this \
+                 session.",
+                r.key, r.label
+            )
+        }
+        None => {
+            "ahma: the approval could not be recorded; the command runs without it.".to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +349,56 @@ mod tests {
             "another command is not held for it"
         );
         assert!(next_ask(&ws, "s1", "make heavy", &[]).is_some());
+    }
+
+    /// SPEC R-CRED.3 through R-PERM.10, the whole loop at the hook: the
+    /// broker refuses a signature no grant allows and remembers it; before
+    /// the next command the dialog asks; the approved command's token records
+    /// a session grant; the same signature is then allowed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_signature_is_asked_about_and_a_yes_lets_it_sign() {
+        use crate::credentials::ssh_agent::broker::{
+            Decision, Destination, SignConsent, SignRequest,
+        };
+        use crate::credentials::ssh_agent::consent::RecordedConsent;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let workspace = workspace_for(&ws);
+        // SAFETY: getpid has no preconditions; this process is the owner.
+        let owner = std::process::id();
+        let consent =
+            RecordedConsent::new(workspace.clone(), None, Some(owner)).for_command("git push");
+        let request = SignRequest {
+            key_fingerprint: "SHA256:key".into(),
+            key_comment: "me@laptop".into(),
+            destination: Destination::Host {
+                host_key_fingerprint: "SHA256:host".into(),
+                names: vec!["github.com".into()],
+            },
+        };
+        assert!(matches!(consent.decide(&request).await, Decision::Deny(_)));
+
+        assert!(
+            next_ssh_ask(&ws, "session-1", "cargo build", None).is_none(),
+            "an unrelated command is not held for it (R-PERM.10)"
+        );
+        let (refusal, token) =
+            next_ssh_ask(&ws, "session-1", "git push", None).expect("the dialog asks");
+        let reason = ssh_ask_reason(&refusal);
+        assert!(
+            reason.contains("github.com") && reason.contains("never enters the sandbox"),
+            "{reason}"
+        );
+        assert!(
+            next_ssh_ask(&ws, "session-1", "git push", None).is_none(),
+            "once per harness session"
+        );
+        let line = apply_approval(&token, &ws, "git push").expect("a line");
+        assert!(line.contains("approved"), "{line}");
+        assert_eq!(consent.decide(&request).await, Decision::Allow);
     }
 
     /// The whole R-PERM.10 loop at the hook: a refusal is recorded; the next

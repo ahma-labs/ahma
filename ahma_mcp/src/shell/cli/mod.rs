@@ -1560,12 +1560,30 @@ pub enum PermissionsCommand {
     /// Show every permission currently granted, with its kind, tier, and
     /// provenance, and name the file that holds them.
     List {
-        /// Show only one kind: `fs-scope`, `web-domain`, `net-host`, `tool`, or `log-target` (a file outside the workspace that a `.ahma/logs/*.log` symlink may point at, approved with `logs_approve`).
+        /// Show only one kind: `fs-scope`, `ssh-sign` (a key the SSH key broker may sign with for one destination), `web-domain`, `net-host`, `tool`, or `log-target` (a file outside the workspace that a `.ahma/logs/*.log` symlink may point at, approved with `logs_approve`).
         #[arg(long = "kind", value_name = "KIND")]
         kind: Option<String>,
         /// Show only leases that end within this long (`12h`, `2d`): what to renew before a long unattended run.
         #[arg(long = "expiring", value_name = "DURATION")]
         expiring: Option<String>,
+    },
+    /// Grant a permission by kind and subject. Today: `ssh-sign`, which lets the SSH key broker sign with one key for one destination in one workspace (SPEC R-CRED.3); other kinds have their own commands (`ahma sandbox grant`, `ahma network allow`, `ahma web allow`). Previews the exact settings line and requires `--yes` to write. Example: `ahma permissions grant ssh-sign "SHA256:abc… for host:SHA256:def…" --yes`, as a refusal names it.
+    Grant {
+        /// Kind of permission: `ssh-sign`.
+        #[arg(value_name = "KIND")]
+        kind: String,
+        /// For `ssh-sign`: `<key fingerprint> for <destination>`, the destination being `host:<host key fingerprint>` or `sshsig:<namespace>`.
+        #[arg(value_name = "SUBJECT")]
+        subject: String,
+        /// The workspace whose commands may use it. Defaults to the git repository enclosing the current directory.
+        #[arg(long = "workspace", value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Grant it for this long (`8h`, `7d`) instead of until revoked.
+        #[arg(long = "for", value_name = "DURATION")]
+        lease: Option<String>,
+        /// Write the previewed change (without this, nothing is written).
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
     },
     /// Revoke a permission by kind and subject.
     ///
@@ -1575,7 +1593,7 @@ pub enum PermissionsCommand {
     ///   ahma permissions revoke tool cargo_build --workspace ~/code/proj
     ///   ahma permissions revoke log-target /var/log/app.log --workspace ~/code/proj
     Revoke {
-        /// Kind of permission: `fs-scope`, `web-domain`, `net-host`, `tool`, or `log-target`.
+        /// Kind of permission: `fs-scope`, `ssh-sign`, `web-domain`, `net-host`, `tool`, or `log-target`.
         #[arg(value_name = "KIND")]
         kind: String,
         /// The path, domain pattern, host, or tool name to revoke.

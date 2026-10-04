@@ -233,6 +233,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Feature area | Stable doc | SPEC.md section |
 |---|---|---|
 | Kernel sandbox | [docs/security-sandbox.md](docs/security-sandbox.md) | R5, R6 |
+| SSH key broker | [docs/ssh-agent-broker.md](docs/ssh-agent-broker.md) | R-CRED |
 | Connection modes | [docs/connection-modes.md](docs/connection-modes.md) | §6 |
 | Custom tools / MTDF | [docs/custom-tools.md](docs/custom-tools.md) | §5 |
 | Live log monitoring | [docs/live-log-monitoring.md](docs/live-log-monitoring.md) | §5.5 |

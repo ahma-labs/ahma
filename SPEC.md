@@ -162,7 +162,7 @@ may change.
 | Nested sandbox detection and deferral (R7) | tests-pass | Hooks and MCP server apply ahma's own sandbox; defer only on kernel proof (R7.6) |
 | Trust-handoff hardening (R-HANDOFF) | in-progress | Kernel-enforced on macOS; elsewhere ahma's file tools refuse and shell-command writes are detected after the fact (R6.1.7) |
 | Execution audit log | tests-pass | `<log dir>/audit.jsonl` on every execution path (R-HANDOFF.10) |
-| SSH key broker (R-CRED) | in-progress | Protocol, keys, session binding and `known_hosts` as a library (R-CRED.4, R-CRED.8); serving sandboxed commands open |
+| SSH key broker (R-CRED) | in-progress | Terminal hooks: broker, consent, Claude Code dialog, `ahma permissions grant ssh-sign`; MCP path open (§11) |
 | Unified permissions and doctor | tests-pass | One ledger under `~/.ahma`; `ahma doctor [--fix]` (R-PERM, R-DOCTOR) |
 | Grant prompts | tests-pass | One body on every surface, `grant_prompt::render` (R-PERM.3.4); per-session budget (R-PERM.4.5) |
 | Grant advisor and decision habits | tests-pass | R-PERM.8, R-DOCTOR.8 |
@@ -819,7 +819,7 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
 - **R-CRED.9**: **The broker runs outside every Landlock domain.** On Linux it runs on a thread started before any `restrict_self`, so a restricted worker can still reach the key it signs with and nothing else changes.
 - **R-CRED.10**: **Every use is audited and every refusal says what to do**, in one line (R-PERM.9), from the broker's own record of what it refused, not scraped from the command's output.
 
-Status: R-CRED.4 and R-CRED.8 are implemented as a library (`ahma_mcp::credentials::ssh_agent`: protocol, keys, purposes, session binding, `known_hosts`); the broker that serves sandboxed commands (R-CRED.1–3, 5–7, 9, 10) is open: §11.
+Status: implemented for terminal hooks (`ahma hooks run-shell`): the broker, consent from recorded grants with the Claude Code dialog before the refused command runs again (R-PERM.10: a refused signature is recorded with the command digest like a refused path, so no other command is held for it), `ahma permissions grant|list|revoke ssh-sign`, and one-line refusals. Open (§11): commands run through MCP (`run_terminal_command`) and asking at the MCP client or the TUI while a command waits; R-CRED.7's session-option and platform-agent discovery (the hook uses its own `SSH_AUTH_SOCK`); denying direct connects to the human's agent socket.
 
 ### R-DENY: Denials Read From the Kernel
 
@@ -2001,6 +2001,6 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **Windows filesystem boundary** (R6.3.3, R6.3.9, R-HANDOFF.4): AppContainer spawn isolation holds both ways on `windows-latest` but is disabled: ordinary tools need `NUL` (denied to application packages; fixing it needs an administrator) and the scope's ancestors (traverse and stat denied). Enabling it needs a design for granting both.
 - **Linux trust-handoff deny tier** (R6.1.7): prevention exists but is opt-in (`linux_deny_tier = "namespace"`) and falls back to detection where unprivileged user namespaces are denied (stock Ubuntu 23.10+, Docker, a nested ahma). Still open: prevention by default (or an `ahma setup` AppArmor `userns` profile), paths created during a command, and Landlock's no-inherit rule once a kernel ships it.
 - **Developer-ID signing and notarization** (R-SIGN.1): wired in the release workflow and activates when the maintainer adds the six Apple secrets (docs/release-signing.md); until then releases are ad-hoc signed. `scripts/install.sh` and `ahma update` keep a valid Developer ID signature with the hardened runtime and re-sign anything else ad hoc (docs/release-signing.md).
-- **SSH key broker** (R-CRED.1–3, R-CRED.5–7, R-CRED.9, R-CRED.10): the protocol, signing and binding library exists; serving it to sandboxed commands, asking for consent on every surface, recording `ssh-sign` grants, discovering the human's agent and denying direct connects to it are not built yet. Until then `git push` over SSH works inside the sandbox only with the key already in the human's agent.
+- **SSH key broker on the MCP path** (R-CRED.1, R-CRED.3, R-CRED.7): terminal hooks serve it; MCP `run_terminal_command` does not yet, nor do the elicitation and TUI questions while a command waits, discovery of the human's agent from the client's environment, or denying a sandboxed command a direct connect to that agent socket.
 - **Kernel denial records** (R-DENY.1, R-DENY.3): the parser and classifier exist; reading macOS's records for a command and routing them through the classifier is not wired, so refusals still come from text scanning.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

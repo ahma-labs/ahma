@@ -1360,6 +1360,13 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub persistent_scopes: Vec<PersistentScope>,
+    /// What the SSH key broker may sign without asking (SPEC R-CRED.3): a
+    /// key, a destination (a server's host key, or an `ssh-keygen -Y`
+    /// namespace) and the workspace whose commands may ask. Written by ahma
+    /// when a human answers `always` or a lease, or by `ahma permissions`.
+    /// Default: empty list
+    #[serde(default)]
+    pub ssh_sign: Vec<crate::ssh_sign::SshSignGrant>,
     /// Environment-variable names to **preserve** in tool subprocess
     /// environments even though they match a built-in secret pattern
     /// (`*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*PASSWORD*`, …).
@@ -1592,6 +1599,7 @@ impl Default for SandboxSettings {
             scratch_directory: None,
             use_scratch_directory: false,
             persistent_scopes: Vec::new(),
+            ssh_sign: Vec::new(),
             env_allow: Vec::new(),
             allow_keychain: true,
             signal_other_processes: false,
@@ -2593,6 +2601,12 @@ impl AhmaSettings {
             toml_persistent_scopes(&d.sandbox.persistent_scopes),
         );
         w.setting(
+            "Keys the SSH key broker may sign with, per destination and workspace (manage via `ahma permissions`).",
+            "ssh_sign",
+            toml_ssh_sign(&self.sandbox.ssh_sign),
+            toml_ssh_sign(&d.sandbox.ssh_sign),
+        );
+        w.setting(
             "Env var names preserved in tool subprocesses despite matching a secret pattern (e.g. GITHUB_TOKEN). Everything else secret-looking is scrubbed.",
             "env_allow",
             toml_str_list(&self.sandbox.env_allow),
@@ -2979,6 +2993,34 @@ fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
             push_opt_str_field(&mut parts, "note", &ps.note);
             if let Some(at) = ps.expires_at {
                 parts.push(format!("expires_at = {at}"));
+            }
+            format!("{{ {} }}", parts.join(", "))
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render ssh-sign grants as an inline TOML array of inline tables, omitting
+/// the optional fields that are unset (matching serde's `skip_serializing_if`).
+fn toml_ssh_sign(v: &[crate::ssh_sign::SshSignGrant]) -> String {
+    let items: Vec<String> = v
+        .iter()
+        .map(|g| {
+            let mut parts = vec![
+                format!("key = {}", toml_str(&g.key)),
+                format!("destination = {}", toml_str(&g.destination)),
+            ];
+            if !g.label.is_empty() {
+                parts.push(format!("label = {}", toml_str(&g.label)));
+            }
+            parts.push(format!("workspace = {}", toml_path(&g.workspace)));
+            parts.push(format!("granted_at = {}", g.granted_at));
+            if let Some(at) = g.expires_at {
+                parts.push(format!("expires_at = {at}"));
+            }
+            push_opt_str_field(&mut parts, "granted_by", &g.granted_by);
+            if let Some(pid) = g.owner_pid {
+                parts.push(format!("owner_pid = {pid}"));
             }
             format!("{{ {} }}", parts.join(", "))
         })
@@ -3452,6 +3494,7 @@ mod tests {
                 container_root: Some(PathBuf::from("/projects")),
                 scratch_directory: Some(PathBuf::from("/scratch")),
                 use_scratch_directory: true,
+                ssh_sign: Vec::new(),
                 persistent_scopes: vec![PersistentScope {
                     path: PathBuf::from("~/Library/Caches/x.sccache"),
                     access: ScopeAccess::Ro,

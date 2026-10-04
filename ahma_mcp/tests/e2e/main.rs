@@ -51,6 +51,7 @@ mod proxy_client_integration_test;
 mod sandbox_lifecycle_notification_test;
 mod sandbox_security_red_team_test;
 mod shell_list_tools_integration_test;
+mod ssh_broker_e2e_test;
 mod stdio_handshake_test;
 mod test_launched_server_orphan_test;
 mod test_utils_coverage_test;

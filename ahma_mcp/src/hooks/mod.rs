@@ -1541,6 +1541,9 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
 }
 
 async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
+    // Before anything restricts this process (SPEC R-CRED.9).
+    #[cfg(unix)]
+    crate::credentials::ssh_agent::host::start();
     let approval = args.approve_grant.clone();
     let payload = args.resolve_payload()?;
     // A grant the human just approved in the harness dialog applies before
@@ -1580,7 +1583,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // Sandbox the command in the discovered hook scopes (enclosing git repo
         // or worktree root, plus cwd). This ensures intra-repo builds, target dirs,
         // and shared worktree dependencies do not hit false sandbox denials (SPEC R5.2.1).
-        sandbox_scopes: hook_scopes,
+        sandbox_scopes: hook_scopes.clone(),
         persistent_scopes,
         use_scratch_dir: false,
         ..cfg
@@ -1657,21 +1660,37 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // operation (SPEC R2.7): a harness's own Bash tool, rewritten through this
     // hook, waits its turn behind an ahma `cargo nextest run` instead of
     // racing it.
-    let adapter = std::sync::Arc::new(
-        crate::adapter::Adapter::new_with_registry(
-            operation_monitor,
-            shell_pool_manager,
-            sandbox,
-            mutex_registry,
-        )?
-        .with_workspace_queue(
-            crate::adapter::workspace_queue::WorkspaceQueue::new(cfg.workspace_queue)
-                .with_source_readers(cfg.source_readers.clone()),
-        )
-        // The harness shows this command's stderr to the model: a wait for
-        // the workspace is explained there, not left as a silent hang.
-        .with_queue_wait_notice(std::sync::Arc::new(|line: &str| eprintln!("{line}"))),
-    );
+    let adapter = crate::adapter::Adapter::new_with_registry(
+        operation_monitor,
+        shell_pool_manager,
+        sandbox,
+        mutex_registry,
+    )?
+    .with_workspace_queue(
+        crate::adapter::workspace_queue::WorkspaceQueue::new(cfg.workspace_queue)
+            .with_source_readers(cfg.source_readers.clone()),
+    )
+    // The harness shows this command's stderr to the model: a wait for
+    // the workspace is explained there, not left as a silent hang.
+    .with_queue_wait_notice(std::sync::Arc::new(|line: &str| eprintln!("{line}")));
+    // The command signs with SSH keys through a broker, never with the key
+    // files (SPEC R-CRED.1). Its own agent socket is the broker's upstream.
+    #[cfg(unix)]
+    let adapter = match ahma_common::config::ahma_home_dir() {
+        Some(home) => adapter.with_credential_brokers(std::sync::Arc::new(
+            crate::credentials::ssh_agent::consent::RecordedBrokers::new(
+                home,
+                std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+                cfg.settings_origin.user_settings_file(),
+                harness_ask::harness_pid(),
+                hook_scopes.clone(),
+            )
+            .for_workspace(harness_ask::workspace_for(Path::new(&payload.cwd)))
+            .for_command(&payload.command),
+        )),
+        None => adapter,
+    };
+    let adapter = std::sync::Arc::new(adapter);
 
     let mut adapter_args = serde_json::Map::new();
     adapter_args.insert(
@@ -1752,7 +1771,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             // applies to `write_exec_output` a few hundred lines up.
             crate::utils::stdio::emit_stdout_text(&format!("{output}\n"))?;
             // A refusal the command shrugged off is said once, in one line,
-            // and remembered so the next command here can ask (R-PERM.10).
+            // and remembered so a re-run of this command can ask (R-PERM.10).
             if let Some((path, access)) =
                 crate::sandbox::grant_channel::hook_side_refusal(&output, &requester)
             {
@@ -1832,7 +1851,7 @@ fn report_shell_execution_error(
     let Some(sandbox_err) = e.downcast_ref::<crate::sandbox::SandboxError>() else {
         return Err(e);
     };
-    // Remembered so the next command here can ask first (R-PERM.10).
+    // Remembered so a re-run of this command can ask first (R-PERM.10).
     // A path no grant can open is never asked about (R-PERM.4.3).
     if let crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } = sandbox_err
         && ahma_common::scope_grant::refusal_reason(path).is_none()
@@ -2035,13 +2054,23 @@ fn ask_first_if_refused_before(
     let Ok(cwd) = extract_command_cwd(input, &tool.tool_input) else {
         return decision;
     };
-    let Some((question, token)) = harness_ask::next_ask(
+    let (reason, token) = match harness_ask::next_ask(
         Path::new(&cwd),
         session_id,
         &tool.command,
         &cfg.persistent_scopes,
-    ) else {
-        return decision;
+    ) {
+        Some((question, token)) => (harness_ask::ask_reason(&question), token),
+        // A signature the SSH key broker refused (SPEC R-CRED.3).
+        None => match harness_ask::next_ssh_ask(
+            Path::new(&cwd),
+            session_id,
+            &tool.command,
+            cfg.settings_origin.user_settings_file().as_deref(),
+        ) {
+            Some((refusal, token)) => (harness_ask::ssh_ask_reason(&refusal), token),
+            None => return decision,
+        },
     };
     match build_wrapped_shell_command(
         args.scope,
@@ -2053,7 +2082,7 @@ fn ask_first_if_refused_before(
     ) {
         Ok(wrapped) => HooksDecision::AskGrant {
             updated_input: updated_tool_input(&tool.tool_input, wrapped, &tool.arg_key),
-            reason: harness_ask::ask_reason(&question),
+            reason,
         },
         Err(_) => decision,
     }
