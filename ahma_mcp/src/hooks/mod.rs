@@ -1828,7 +1828,10 @@ fn report_shell_execution_error(
         return Err(e);
     };
     // Remembered so the next command here can ask first (R-PERM.10).
-    if let crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } = sandbox_err {
+    // A path no grant can open is never asked about (R-PERM.4.3).
+    if let crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } = sandbox_err
+        && ahma_common::scope_grant::refusal_reason(path).is_none()
+    {
         harness_ask::record_refusal(cwd, path, *access);
     }
     let remediation = match sandbox_err {

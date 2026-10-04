@@ -907,10 +907,9 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
             .find(|dir| path.starts_with(dir))
     {
         let hint = if dir.ends_with(".ssh") {
-            " Git and ssh still work inside the sandbox through your SSH agent, which \
-                 ahma forwards; add a new host key by connecting once from your own terminal."
+            format!(" {SSH_KEY_USE}")
         } else {
-            ""
+            String::new()
         };
         return GrantRisk::Refused(format!(
             "'{}' is inside {}, which holds credentials/secrets (or ahma's own settings) and \
@@ -1692,6 +1691,14 @@ mod refused_path_gate_tests {
     }
 }
 
+/// How ssh uses a key the sandbox will never let a command read: through the
+/// SSH agent, which signs without handing the key over. One statement, shared
+/// by the grant refusal and the `Permission denied (publickey)` diagnostic, so
+/// the two never tell different stories about the same failure.
+pub const SSH_KEY_USE: &str = "ssh can still use your key without reading it, through your \
+SSH agent: load it on the host with `ssh-add <key>` (once per login), and sandboxed git and ssh \
+sign through the agent. A new host key is added by connecting once from your own terminal.";
+
 /// Why `path` can never be granted, if the hard denylist refuses it
 /// (SPEC R-PERM.4.3): a filesystem root, `$HOME`, a credential directory,
 /// ahma's own settings directory, or an OS system directory. `None` for a path
@@ -1708,6 +1715,17 @@ pub fn refusal_reason(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod request_context_tests {
     use super::*;
+
+    /// The refusal for a key under `~/.ssh` says what works, not what may not:
+    /// "git and ssh still work through your SSH agent" was false whenever the
+    /// agent held no key, which on macOS is every fresh login.
+    #[test]
+    fn the_ssh_refusal_says_how_to_make_ssh_work() {
+        let home = crate::config::ahma_home_dir().expect("home");
+        let why = refusal_reason(&home.join(".ssh").join("id_ed25519")).expect("refused");
+        assert!(why.contains("ssh-add"), "{why}");
+        assert!(!why.contains("still work"), "{why}");
+    }
     use crate::grant_prompt::{PromptBody, render};
 
     fn full_request() -> ScopeGrantRequest {

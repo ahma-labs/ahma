@@ -142,7 +142,7 @@ pub fn diagnose_streams(stderr: &str, stdout: &str) -> Option<ContaminationHint>
         if looks_like_ssh_publickey_failure(line) {
             return Some(ContaminationHint {
                 kind: ContaminationKind::SshPublicKeyAuth,
-                remediation: SSH_PUBLICKEY_REMEDIATION.to_string(),
+                remediation: SSH_PUBLICKEY_REMEDIATION.clone(),
             });
         }
         if looks_like_https_auth_failure(line) {
@@ -238,13 +238,16 @@ One thing for the human to do, on the host: `gh auth login` then `gh auth setup-
 `ahma doctor` reports which helper git uses (`git config --get-all credential.helper`) and whether a \
 sandbox setting blocks it.";
 
-const SSH_PUBLICKEY_REMEDIATION: &str = "SSH authentication failed (`Permission denied (publickey)`): \
-ahma's sandbox keeps the private keys in `~/.ssh/` unreadable, by design. The simplest way through, which \
-works inside the sandbox, is HTTPS with the GitHub CLI's credentials (kept in the keychain): the human runs \
-`gh auth setup-git` once, and `git remote set-url origin https://github.com/<owner>/<repo>.git` in each \
-repository. Alternatively, with the key loaded into the SSH agent on the host (`ssh-add \
---apple-use-keychain ~/.ssh/id_ed25519` on macOS), sandboxed git signs through the forwarded \
-`$SSH_AUTH_SOCK`. No directory grant can help.";
+/// The refusal and this diagnostic share [`ahma_common::scope_grant::SSH_KEY_USE`],
+/// so one failure never gets two stories.
+static SSH_PUBLICKEY_REMEDIATION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SSH authentication failed (`Permission denied (publickey)`): ahma's sandbox keeps \
+         private keys under `~/.ssh` unreadable, by design, and no directory grant changes \
+         that. {}",
+        ahma_common::scope_grant::SSH_KEY_USE
+    )
+});
 
 #[cfg(test)]
 mod tests {
@@ -376,14 +379,13 @@ mod tests {
             fatal: Could not read from remote repository.";
         let hit = diagnose_streams("", stdout).expect("ssh publickey failure should match");
         assert_eq!(hit.kind, ContaminationKind::SshPublicKeyAuth);
-        // HTTPS through gh works inside the sandbox today (verified against
-        // a private repository); it leads, and the agent route follows.
+        // The same statement the grant refusal makes for a key file.
         assert!(
-            hit.remediation.contains("gh auth setup-git"),
+            hit.remediation
+                .contains(ahma_common::scope_grant::SSH_KEY_USE),
             "{}",
             hit.remediation
         );
-        assert!(hit.remediation.contains("git remote set-url"));
         assert!(hit.remediation.contains("ssh-add"));
     }
 }
