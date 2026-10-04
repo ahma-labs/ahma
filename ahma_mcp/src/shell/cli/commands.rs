@@ -1208,7 +1208,7 @@ fn print_profile_entry(
 /// The variables one profile sets, as `ahma permissions list` shows them for
 /// the workspace it runs in, each with its reason (SPEC R-PERM.5.5).
 fn profile_env_lines(profile: &str, workspace: &std::path::Path) -> Vec<String> {
-    crate::sandbox::profiles::profile_env(&[profile.to_string()], workspace)
+    crate::sandbox::profiles::resolved_profile_env(&[profile.to_string()], workspace)
         .into_iter()
         .map(|e| {
             format!(

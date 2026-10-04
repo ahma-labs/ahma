@@ -1031,6 +1031,12 @@ mod tests {
             std::env::set_var("SCCACHE_DIR", "/mine");
         }
         let td = tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join(".cargo")).unwrap();
+        std::fs::write(
+            td.path().join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper = \"sccache\"\n",
+        )
+        .unwrap();
         let sandbox = make_test_sandbox(td.path());
         let cmd = sandbox.base_command("env", &[], td.path());
         let set: std::collections::HashMap<String, String> = cmd
@@ -1062,12 +1068,40 @@ mod tests {
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::remove_var("SCCACHE_DIR") };
         let td = tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join(".cargo")).unwrap();
+        std::fs::write(
+            td.path().join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper = \"sccache\"\n",
+        )
+        .unwrap();
         let sandbox = make_test_sandbox(td.path());
         let _cmd = sandbox.base_command("env", &[], td.path());
         let ws = sandbox.scopes().first().unwrap().clone();
         let ignore = ws.join(".sccache").join(".gitignore");
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
         assert!(ws.join(".sccache").join("CACHEDIR.TAG").exists());
+    }
+
+    /// Where a tool is not in use, its profile variables do not apply and
+    /// ahma does not create its cache directory in the project (R-PERM.5.5).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_profile_cache_directory_is_not_created_when_tool_not_in_use() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("RUSTC_WRAPPER");
+            std::env::remove_var("CARGO_BUILD_RUSTC_WRAPPER");
+            std::env::remove_var("SCCACHE_DIR");
+            std::env::set_var("CARGO_HOME", "/nonexistent");
+        };
+        let td = tempdir().unwrap();
+        let sandbox = make_test_sandbox(td.path());
+        let _cmd = sandbox.base_command("env", &[], td.path());
+        let ws = sandbox.scopes().first().unwrap().clone();
+        assert!(
+            !ws.join(".sccache").exists(),
+            "an unused toolchain cache directory is not created"
+        );
     }
 
     /// A tool subprocess must not inherit a secret-looking env var.
