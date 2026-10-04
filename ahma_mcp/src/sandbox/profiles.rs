@@ -812,7 +812,10 @@ mod tests {
             file: Some(f.into()),
             contains: c.into(),
         };
-        assert!(profile(vec![], vec![]).env_applies(ws.path()), "no condition: always");
+        assert!(
+            profile(vec![], vec![]).env_applies(ws.path()),
+            "no condition: always"
+        );
         let config = "${WORKSPACE}/.cargo/config.toml";
         let in_use = profile(vec![file(config, "sccache")], vec![]);
         assert!(!in_use.env_applies(ws.path()), "not configured here");
@@ -848,7 +851,10 @@ mod tests {
         };
         let absent = home.path().join(".gradle").join("caches");
         precreate(&rule(absent.clone(), RuleKind::Dir));
-        assert!(!home.path().join(".gradle").exists(), "no toolchain, no home");
+        assert!(
+            !home.path().join(".gradle").exists(),
+            "no toolchain, no home"
+        );
 
         std::fs::create_dir(home.path().join(".gradle")).unwrap();
         precreate(&rule(absent.clone(), RuleKind::Dir));
