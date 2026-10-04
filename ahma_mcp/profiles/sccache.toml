@@ -33,19 +33,10 @@ contains = "sccache"
 file = "${CARGO_HOME:-~/.cargo}/config.toml"
 contains = "sccache"
 
-# Never over sccache's own configuration: a cache location you chose there (or
-# a config file you point at) wins, as a variable you set yourself does.
-[[unless]]
-env = "SCCACHE_CONF"
-contains = ""
-
-[[unless]]
-file = "~/.config/sccache/config"
-contains = "[cache"
-
-[[unless]]
-file = "~/Library/Application Support/Mozilla.sccache/config"
-contains = "[cache"
+# A cache location set in sccache's own config file is overridden on purpose:
+# a server started inside the sandbox can write only the workspace, so a cache
+# anywhere else would fail every sandboxed build. A variable you set yourself
+# still wins (SPEC R-PERM.5.5).
 
 [[env]]
 name = "SCCACHE_DIR"
