@@ -1756,7 +1756,12 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             if let Some((path, access)) =
                 crate::sandbox::grant_channel::hook_side_refusal(&output, &requester)
             {
-                harness_ask::record_refusal(Path::new(&payload.cwd), &path, access);
+                harness_ask::record_refusal(
+                    Path::new(&payload.cwd),
+                    &path,
+                    access,
+                    &payload.command,
+                );
                 let note = crate::sandbox::grant_channel::refusal_note(&path, access);
                 crate::utils::stdio::emit_stdout_text(&format!("{note}\n"))?;
             }
@@ -1832,7 +1837,7 @@ fn report_shell_execution_error(
     if let crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } = sandbox_err
         && ahma_common::scope_grant::refusal_reason(path).is_none()
     {
-        harness_ask::record_refusal(cwd, path, *access);
+        harness_ask::record_refusal(cwd, path, *access, who.command.as_deref().unwrap_or(""));
     }
     let remediation = match sandbox_err {
         crate::sandbox::SandboxError::RuntimeDenial {

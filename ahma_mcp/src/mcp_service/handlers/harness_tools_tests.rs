@@ -845,7 +845,7 @@ async fn approve_web_egress_tui_hub_send_success_denies_with_hint() {
     )
     .await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    svc.set_web_approval_sender(tx);
+    svc.set_web_approval_sender(tx, Arc::new(std::sync::atomic::AtomicUsize::new(1)));
 
     let action = svc
         .approve_web_egress("tui.example", "https://tui.example/x")
@@ -864,6 +864,37 @@ async fn approve_web_egress_tui_hub_send_success_denies_with_hint() {
     assert_eq!(received.domain, "tui.example");
 }
 
+/// SPEC R-PERM.3.6 for web questions: with no TUI watching, the hub channel
+/// is not a surface. The question was sent anyway, the fetch told "a prompt
+/// was raised in the ahma TUI", and the decision stayed pending, so every
+/// retry for the domain was denied by the dedup for the rest of the session.
+#[tokio::test]
+async fn approve_web_egress_with_no_tui_watching_asks_nobody_and_leaves_nothing_pending() {
+    let svc = make_service_with(
+        Arc::new(MockFileOpsProvider::default()),
+        Arc::new(MockWebPageFetcher::default()),
+    )
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    svc.set_web_approval_sender(tx, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    for _ in 0..2 {
+        match svc
+            .approve_web_egress("nobody.example", "https://nobody.example/x")
+            .await
+        {
+            FetchAction::Deny(msg) => {
+                assert!(!msg.contains("ahma TUI"), "no TUI was asked: {msg}");
+                assert!(msg.contains("ahma web allow nobody.example"), "{msg}");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing was sent to a TUI nobody watches"
+    );
+}
+
 #[tokio::test]
 async fn approve_web_egress_tui_hub_send_failure_falls_back_to_cancel_and_deny() {
     let svc = make_service_with(
@@ -873,7 +904,7 @@ async fn approve_web_egress_tui_hub_send_failure_falls_back_to_cancel_and_deny()
     .await;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     drop(rx); // No live receiver: tx.send(..) returns Err, exercising the fallback.
-    svc.set_web_approval_sender(tx);
+    svc.set_web_approval_sender(tx, Arc::new(std::sync::atomic::AtomicUsize::new(1)));
 
     let action = svc
         .approve_web_egress("tuidown.example", "https://tuidown.example/x")
@@ -1144,7 +1175,7 @@ async fn approve_web_egress_elicitation_unsupported_falls_back_to_tui_hub() {
     )
     .await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    svc.set_web_approval_sender(tx);
+    svc.set_web_approval_sender(tx, Arc::new(std::sync::atomic::AtomicUsize::new(1)));
 
     let action = svc
         .approve_web_egress("nocap.example", "https://nocap.example/x")

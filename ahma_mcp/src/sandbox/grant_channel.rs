@@ -662,7 +662,7 @@ pub fn refusal_note(path: &Path, access: ahma_common::config::ScopeAccess) -> St
         "ahma: the sandbox refused a {verb} outside the workspace ({}) and the command went on \
          without it; if it needs that, a human can run `ahma sandbox grant {}{ro}` (add \
          `--session` for this terminal session only); in Claude Code, ahma asks in its \
-         dialog before the next command here.",
+         dialog when the command is run again.",
         path.display(),
         target.display()
     )

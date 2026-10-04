@@ -323,6 +323,7 @@ mod tests {
                 access: ScopeAccess::Rw,
                 at: 100,
                 harness_pid: Some(std::process::id()),
+                command_digest: None,
             },
         )
         .unwrap();
