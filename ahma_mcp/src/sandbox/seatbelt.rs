@@ -97,6 +97,8 @@ impl Sandbox {
             XCRUN_CACHE_RULE.to_string()
         };
         let network_rules = self.get_macos_network_rules();
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
+        let socket_connect_denies = container_socket_connect_denies(Path::new(&home_dir));
         let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
 
         // SPEC R6.2.6: signals stay inside this command's own sandbox unless
@@ -124,7 +126,7 @@ impl Sandbox {
 (allow pseudo-tty)
 (allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
 (allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
-{exec_config_deny_rules}{network_rules}(allow mach-lookup)
+{exec_config_deny_rules}{network_rules}{socket_connect_denies}(allow mach-lookup)
 (allow ipc-posix-shm*)
 {broker_rules}"#,
             working_dir = wd_str,
@@ -141,6 +143,7 @@ impl Sandbox {
             temp_rules = temp_rules,
             exec_config_deny_rules = exec_config_deny_rules,
             network_rules = network_rules,
+            socket_connect_denies = socket_connect_denies,
             broker_rules = broker_rules(),
         );
 
@@ -225,12 +228,11 @@ impl Sandbox {
     /// host bind mount and a root process entirely outside this profile does the
     /// write — and can trivially exfiltrate from there. Blanket-denying unix
     /// sockets would break too much (mDNSResponder, `securityd`, editor IPC), so
-    /// the real defence is per-socket and lives in
-    /// [`Self::get_macos_exec_config_deny_rules`], which denies `file-read*` and
-    /// `file-write*` on the known container sockets. That file-level deny is what
-    /// actually stops it: on macOS `connect(2)` to a unix socket is classified as
-    /// a *network* operation, so `(allow network*)` here would otherwise let the
-    /// connection through no matter what the network rules said.
+    /// the real defence is per-socket: [`container_socket_connect_denies`], a
+    /// `network-outbound` unix-socket deny on each known container socket,
+    /// emitted after these rules. On macOS `connect(2)` to a unix socket is a
+    /// *network* operation: a `file-read*`/`file-write*` deny on the socket does
+    /// not stop it (measured; the profile relied on one and was open).
     fn get_macos_network_rules(&self) -> String {
         match *self.egress_proxy_addr.read() {
             None => "(allow network*)\n".to_string(),
@@ -353,32 +355,13 @@ impl Sandbox {
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
         let home = std::path::Path::new(&home_dir);
 
-        // Each socket gets both spellings. Canonicalizing the socket *node*
-        // fails outright when the daemon isn't running — `/var/run/docker.sock`
-        // would then be emitted raw, and never match, because `/var` is a
-        // symlink to `/private/var` and the kernel matches the canonical vnode.
-        // Canonicalizing the *parent directory* (which does exist) and rejoining
-        // the file name yields a rule that fires the moment the hub starts,
-        // while keeping the raw spelling for the case where the parent itself is
-        // absent. A socket deny that only works when the socket already exists
-        // is a deny that fails open exactly when it matters.
-        let mut emitted: Vec<std::path::PathBuf> = Vec::new();
-        for sock in super::credential_reads::container_socket_denies(home) {
-            let via_parent = sock.parent().and_then(|p| dunce::canonicalize(p).ok());
-            let candidates = [
-                Some(sock.clone()),
-                via_parent.and_then(|p| sock.file_name().map(|f| p.join(f))),
-            ];
-            for candidate in candidates.into_iter().flatten() {
-                if emitted.contains(&candidate) {
-                    continue;
-                }
-                rules.push_str(&format!(
-                    "(deny file-read* file-write* (literal \"{}\"))\n",
-                    candidate.display()
-                ));
-                emitted.push(candidate);
-            }
+        // Reading or writing a container socket as a file. This does not stop
+        // a connect: see [`container_socket_connect_denies`].
+        for sock in container_socket_spellings(home) {
+            rules.push_str(&format!(
+                "(deny file-read* file-write* (literal \"{}\"))\n",
+                sock.display()
+            ));
         }
         for re in super::credential_reads::container_socket_deny_regexes(home) {
             rules.push_str(&format!(
@@ -500,6 +483,54 @@ impl Sandbox {
     }
 }
 
+/// Each container socket under both spellings. Canonicalizing the socket
+/// *node* fails outright when the daemon isn't running — `/var/run/docker.sock`
+/// would then be emitted raw, and never match, because `/var` is a symlink to
+/// `/private/var` and the kernel matches the canonical path. Canonicalizing the
+/// *parent directory* (which does exist) and rejoining the file name yields a
+/// rule that fires the moment the daemon starts, while the raw spelling covers
+/// a parent that is itself absent. A socket deny that only works when the
+/// socket already exists fails open exactly when it matters.
+fn container_socket_spellings(home: &Path) -> Vec<PathBuf> {
+    let mut spellings: Vec<PathBuf> = Vec::new();
+    for sock in super::credential_reads::container_socket_denies(home) {
+        let via_parent = sock.parent().and_then(|p| dunce::canonicalize(p).ok());
+        let candidates = [
+            Some(sock.clone()),
+            via_parent.and_then(|p| sock.file_name().map(|f| p.join(f))),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if !spellings.contains(&candidate) {
+                spellings.push(candidate);
+            }
+        }
+    }
+    spellings
+}
+
+/// What actually keeps a command from asking a container daemon to write
+/// outside its sandbox (SPEC R-HANDOFF.6): a `connect(2)` to a unix socket is
+/// a `network-outbound` operation, which `(allow network*)` permits and a
+/// `file-read*`/`file-write*` deny on the socket does not touch. Emitted after
+/// the network rules (SBPL is last-match-wins). The rule matches the
+/// canonical path the connect resolves to, so a symlink to the socket is
+/// refused too.
+fn container_socket_connect_denies(home: &Path) -> String {
+    let mut rules = String::new();
+    for sock in container_socket_spellings(home) {
+        rules.push_str(&format!(
+            "(deny network-outbound (remote unix-socket (path-literal \"{}\")))\n",
+            sock.display()
+        ));
+    }
+    for re in super::credential_reads::container_socket_deny_regexes(home) {
+        rules.push_str(&format!(
+            "(deny network-outbound (remote unix-socket (path-regex #\"{re}\")))\n"
+        ));
+    }
+    rules
+}
+
 /// The SSH key broker's sockets (SPEC R-CRED.1): a command may reach a
 /// socket in the agent directory and do nothing else there — read it and
 /// write data to it, never create, remove or rename an entry. Emitted last,
@@ -541,12 +572,13 @@ mod tests {
         )
         .unwrap();
 
-        // No proxy → blanket allow, no deny rule.
+        // No proxy → blanket allow, no IP deny rule (the container-socket
+        // connect denies are unix-socket rules, R-HANDOFF.6).
         let p = sb.generate_seatbelt_profile_test(dir.path());
         assert!(p.contains("(allow network*)"), "default keeps network open");
         assert!(
-            !p.contains("(deny network-outbound"),
-            "no deny rule without restrict-network"
+            !p.contains("(deny network-outbound (remote ip"),
+            "no IP deny rule without restrict-network"
         );
 
         // Proxy set → deny all outbound IP, re-allow only the proxy address.
@@ -565,7 +597,7 @@ mod tests {
         sb.set_egress_proxy_addr(None);
         let p = sb.generate_seatbelt_profile_test(dir.path());
         assert!(p.contains("(allow network*)"));
-        assert!(!p.contains("(deny network-outbound"));
+        assert!(!p.contains("(deny network-outbound (remote ip"));
     }
 
     /// The read-only lane may write xcrun's cache file and nothing else under
@@ -852,9 +884,10 @@ mod tests {
         assert!(profile.contains(&ahma_deny));
     }
 
-    /// Container daemon sockets are denied at the *file* level. A network rule
-    /// cannot do this job: macOS classifies `connect(2)` to a unix socket as a
-    /// network operation, so `(allow network*)` would let it through.
+    /// Container daemon sockets are denied as files and, what actually stops a
+    /// command using them, for `connect(2)`: a `network-outbound` unix-socket
+    /// deny placed after `(allow network*)` (SPEC R-HANDOFF.6). The kernel test
+    /// is `test_container_daemon_sockets_refuse_a_sandboxed_connect`.
     #[test]
     fn container_daemon_sockets_are_denied_for_read_and_write() {
         let dir = tempdir().unwrap();
@@ -902,6 +935,24 @@ mod tests {
         assert!(
             profile.contains(r"/\.lima/.*/sock$"),
             "lima socket regex missing:\n{profile}"
+        );
+        let network_allow = profile.find("(allow network*)").expect("network allow");
+        for sock in ["/var/run/docker.sock", "/run/podman/podman.sock"] {
+            let rule =
+                format!("(deny network-outbound (remote unix-socket (path-literal \"{sock}\")))");
+            let at = profile
+                .find(&rule)
+                .unwrap_or_else(|| panic!("{rule} missing:\n{profile}"));
+            assert!(
+                at > network_allow,
+                "{sock}: the connect deny must follow the network allow"
+            );
+        }
+        assert!(
+            profile.lines().any(|l| l
+                .starts_with("(deny network-outbound (remote unix-socket (path-regex")
+                && l.contains(r"/\.colima/.*/docker\.sock$")),
+            "colima connect deny missing:\n{profile}"
         );
     }
 

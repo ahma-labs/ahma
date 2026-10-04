@@ -369,7 +369,8 @@ disclosed loudly when written. That deny tier is kernel-enforced on macOS,
 `run_terminal_command` can still write those paths), and unenforced on Windows.
 Where the kernel does not hold it, ahma compares those paths before and after every
 command and reports a change as `TRUST-HANDOFF WRITE` in the result and the audit
-log — detection, not prevention.
+log — detection, not prevention. Using a container socket changes no file, so on
+Linux it is neither prevented nor detected yet.
 See [`docs/security-sandbox.md`](security-sandbox.md#writable-but-not-everything-trust-handoff)
 and SPEC R-HANDOFF.
 
