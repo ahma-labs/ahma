@@ -372,7 +372,7 @@ mod tests {
         ] {
             assert!(allow.is_match(ok), "{ok}");
         }
-        for secret in [
+        for key_path in [
             "/home/u/.ssh/id_ed25519",
             "/home/u/.ssh/github_ed25519",
             "/home/u/.ssh/deploy_key",
@@ -380,7 +380,7 @@ mod tests {
             "/home/u/.ssh/sub/known_hosts",
             "/home/uX/.ssh/config",
         ] {
-            assert!(!allow.is_match(secret), "{secret}");
+            assert!(!allow.is_match(key_path), "{key_path}");
         }
         assert_eq!(
             ssh_client_readable_dirs(home),
