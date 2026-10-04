@@ -6,9 +6,11 @@
 //! a restricted thread could not read the key it signs with.
 //!
 //! Each sandboxed command gets its own socket in [`agent_dir`], named at
-//! random, and the broker answers only connections from that command's own
-//! process group (SPEC R-CRED.1): the kernel tells it who connected, so one
-//! command cannot borrow another's consent.
+//! random, and the broker answers only a connection from a process group led
+//! by a command this ahma process spawned (SPEC R-CRED.1): every command ahma
+//! runs leads its own group, and the kernel says who connected. A command of
+//! another session, another ahma process or anything else on the machine is
+//! refused, so no one borrows another session's consent.
 
 use super::broker::{Broker, BrokerEvent};
 use std::path::{Path, PathBuf};
@@ -63,8 +65,6 @@ const SUN_PATH_MAX: usize = 103;
 pub struct BrokerLease {
     socket: PathBuf,
     broker: Arc<Broker>,
-    /// The process group allowed to connect; set once the command is spawned.
-    group: Arc<OnceLock<u32>>,
     cancel: CancellationToken,
 }
 
@@ -72,7 +72,6 @@ impl std::fmt::Debug for BrokerLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrokerLease")
             .field("socket", &self.socket)
-            .field("group", &self.group.get())
             .finish_non_exhaustive()
     }
 }
@@ -98,16 +97,10 @@ impl BrokerLease {
             tokio::net::UnixListener::from_std(std_listener)?
         };
         let cancel = CancellationToken::new();
-        let group: Arc<OnceLock<u32>> = Arc::default();
-        runtime.spawn(Arc::clone(&broker).serve_filtered(
-            listener,
-            cancel.clone(),
-            Arc::clone(&group),
-        ));
+        runtime.spawn(Arc::clone(&broker).serve_filtered(listener, cancel.clone()));
         Ok(Self {
             socket,
             broker,
-            group,
             cancel,
         })
     }
@@ -115,12 +108,6 @@ impl BrokerLease {
     /// The socket to hand the command as `SSH_AUTH_SOCK`.
     pub fn socket(&self) -> &Path {
         &self.socket
-    }
-
-    /// Admit connections from the process group led by `pid` — the command
-    /// just spawned, which `base_command` makes a group leader.
-    pub fn admit_group(&self, pid: u32) {
-        let _ = self.group.set(pid);
     }
 
     /// What the broker did for this command.
@@ -136,9 +123,10 @@ impl Drop for BrokerLease {
     }
 }
 
-/// Whether the peer of `stream` may use a broker whose command leads process
-/// group `group`: the same user as this process, in that group.
-pub(super) fn admitted(stream: &tokio::net::UnixStream, group: Option<u32>) -> bool {
+/// Whether the peer of `stream` may use this process's brokers: the same
+/// user, in a process group led by a direct child of this process — a
+/// command ahma spawned, which `base_command` makes a group leader.
+pub(super) fn admitted(stream: &tokio::net::UnixStream) -> bool {
     let Ok(cred) = stream.peer_cred() else {
         return false;
     };
@@ -146,12 +134,21 @@ pub(super) fn admitted(stream: &tokio::net::UnixStream, group: Option<u32>) -> b
     if cred.uid() != unsafe { libc::geteuid() } {
         return false;
     }
-    let (Some(group), Some(pid)) = (group, cred.pid()) else {
+    let Some(pid) = cred.pid() else {
         return false;
     };
     // SAFETY: `getpgid` has no preconditions; a vanished pid returns -1.
-    let peer_group = unsafe { libc::getpgid(pid) };
-    peer_group >= 0 && peer_group as u32 == group
+    let group = unsafe { libc::getpgid(pid) };
+    if group <= 0 {
+        return false;
+    }
+    let leader = sysinfo::Pid::from_u32(group as u32);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[leader]), true);
+    system
+        .process(leader)
+        .and_then(|p| p.parent())
+        .is_some_and(|parent| parent.as_u32() == std::process::id())
 }
 
 #[cfg(test)]
@@ -181,23 +178,47 @@ mod tests {
         proto::read_message(&mut s).await.ok()?
     }
 
-    /// Only the command's own process group is answered: this test process
-    /// leads no admitted group until it is admitted.
+    /// A process ahma did not spawn is refused: this test process is no
+    /// child of itself. A command it spawns into its own process group — as
+    /// ahma spawns every command — is answered.
     #[tokio::test]
-    async fn only_the_admitted_process_group_is_served() {
+    async fn only_a_command_this_process_spawned_is_served() {
         let dir = tempfile::tempdir().unwrap();
         let lease = lease(dir.path());
-        assert_eq!(list(lease.socket()).await, None, "nobody admitted yet");
-
-        // SAFETY: `getpgrp` has no preconditions.
-        let own_group = unsafe { libc::getpgrp() } as u32;
-        lease.admit_group(own_group);
-        let answer = list(lease.socket()).await.expect("admitted");
-        assert_eq!(proto::parse_identities_answer(&answer), Some(vec![]));
+        assert_eq!(list(lease.socket()).await, None, "not a spawned command");
         assert!(matches!(
             lease.events().as_slice(),
-            [BrokerEvent::RefusedOperation(why)] if why.contains("process group")
+            [BrokerEvent::RefusedOperation(why)] if why.contains("ahma did not spawn")
         ));
+
+        if std::process::Command::new("ssh-add")
+            .arg("-h")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped the spawned half: ssh-add is not installed");
+            return;
+        }
+        let socket = lease.socket().to_path_buf();
+        let out = tokio::task::spawn_blocking(move || {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("ssh-add")
+                .arg("-l")
+                .env("SSH_AUTH_SOCK", &socket)
+                .process_group(0)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        // An empty agent: "The agent has no identities", exit status 1.
+        // Refused, ssh-add would say it cannot connect (exit status 2).
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     #[tokio::test]

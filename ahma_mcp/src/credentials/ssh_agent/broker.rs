@@ -138,22 +138,21 @@ impl Broker {
     }
 
     /// Serve connections on `listener` until `cancel` fires, answering only
-    /// peers in the process group `group` holds (SPEC R-CRED.1). A
-    /// connection from anywhere else is closed unanswered and recorded.
+    /// commands this process spawned (SPEC R-CRED.1). A connection from
+    /// anywhere else is closed unanswered and recorded.
     pub(super) async fn serve_filtered(
         self: Arc<Self>,
         listener: UnixListener,
         cancel: CancellationToken,
-        group: Arc<std::sync::OnceLock<u32>>,
     ) {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
-                        if !super::host::admitted(&stream, group.get().copied()) {
+                        if !super::host::admitted(&stream) {
                             self.record(BrokerEvent::RefusedOperation(
-                                "a connection from outside the command's process group".into(),
+                                "a connection from a process ahma did not spawn".into(),
                             ));
                             continue;
                         }

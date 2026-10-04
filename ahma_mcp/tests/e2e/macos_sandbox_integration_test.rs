@@ -561,9 +561,6 @@ UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
     std::fs::write(home.path().join(".ssh/id_ed25519"), KEY).unwrap();
     let broker = Broker::new(KeySources::for_home(home.path(), None), Arc::new(Deny));
     let lease = BrokerLease::start(broker, &agent_dir().expect("agent dir")).expect("lease");
-    // SAFETY: `getpgrp` has no preconditions. The sandboxed child below
-    // inherits this test's process group.
-    lease.admit_group(unsafe { libc::getpgrp() } as u32);
 
     let scope = TempDir::new().expect("scope");
     let sandbox = Sandbox::new(
@@ -577,7 +574,11 @@ UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     let socket = lease.socket().to_path_buf();
     let out = tokio::task::spawn_blocking(move || {
+        use std::os::unix::process::CommandExt;
+        // In a process group of its own, led by a child of this process: how
+        // ahma spawns every command, and what the broker admits.
         Command::new("sandbox-exec")
+            .process_group(0)
             .args(["-p", &profile, "/usr/bin/ssh-add", "-l"])
             .env("SSH_AUTH_SOCK", &socket)
             .current_dir(scope.path())
