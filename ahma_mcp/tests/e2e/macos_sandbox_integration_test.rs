@@ -525,6 +525,81 @@ fn test_ssh_keys_are_unreadable_whatever_their_name() {
     }
 }
 
+/// Kernel test for SPEC R-HANDOFF.6: a sandboxed command cannot connect to a
+/// container daemon's socket, which would let it have the daemon write
+/// anywhere on the host. A `file-read*`/`file-write*` deny on the socket does
+/// not stop `connect(2)` — only a `network-outbound` unix-socket rule does —
+/// and the profile used to rely on the file deny alone. An ordinary socket in
+/// the workspace stays reachable.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_container_daemon_sockets_refuse_a_sandboxed_connect() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    use std::os::unix::net::UnixListener;
+
+    let scope = TempDir::new().expect("scope dir");
+    let home = TempDir::new().expect("home dir");
+    let h = dunce::canonicalize(home.path()).expect("canonical home");
+    let scope_dir = dunce::canonicalize(scope.path()).expect("canonical scope");
+    let sockets = [
+        (h.join(".docker/run/docker.sock"), false),
+        (h.join(".colima/default/docker.sock"), false),
+        (scope_dir.join("app.sock"), true),
+    ];
+    // Each listener accepts and drops connections, so a client that gets in
+    // exits 0.
+    let mut listeners = Vec::new();
+    for (sock, _) in &sockets {
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(sock).expect("bind test socket");
+        let accepting = listener.try_clone().unwrap();
+        std::thread::spawn(move || for _ in accepting.incoming() {});
+        listeners.push(listener);
+    }
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("HOME", &h) };
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        true,  // no_temp_files: the fake home lives under /var/folders
+        false, // livelog
+        false, // tmp_access
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+
+    let connects = |sandboxed: bool, sock: &Path| -> bool {
+        let mut cmd = if sandboxed {
+            let mut c = Command::new("sandbox-exec");
+            c.args(["-p", &profile, "/usr/bin/nc"]);
+            c
+        } else {
+            Command::new("/usr/bin/nc")
+        };
+        cmd.args(["-U", &sock.to_string_lossy()])
+            .current_dir(scope.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run nc")
+            .status
+            .success()
+    };
+    for (sock, reachable) in &sockets {
+        assert!(
+            connects(false, sock),
+            "{}: the control connect failed",
+            sock.display()
+        );
+        assert_eq!(
+            connects(true, sock),
+            *reachable,
+            "{}: sandboxed connect expected reachable={reachable}\n{profile}",
+            sock.display()
+        );
+    }
+}
+
 /// Kernel test for the SSH key broker's socket (SPEC R-CRED.1): a sandboxed
 /// command reaches a broker socket in ahma's agent directory — inside the
 /// runtime directory the profile otherwise denies — and lists the key the
