@@ -568,12 +568,12 @@ impl SandboxProfile {
 /// runs and ahma versions) and the environment, as rule paths do.
 ///
 /// Order follows [`builtin_profiles`], as [`profile_hosts`] does.
-pub fn profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
+pub fn resolved_profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
     let ws = workspace.to_string_lossy();
     let port = workspace_port(workspace).to_string();
     let mut out = Vec::new();
     for profile in builtin_profiles() {
-        if !enabled.iter().any(|n| n == &profile.name) || !profile.env_applies(workspace) {
+        if !enabled.iter().any(|n| n == &profile.name) {
             continue;
         }
         for raw in &profile.env {
@@ -591,6 +591,29 @@ pub fn profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
         }
     }
     out
+}
+
+/// The profile variables that actually apply to a command in `workspace`
+/// (SPEC R-PERM.5.5): [`resolved_profile_env`] filtered to the profiles whose
+/// tool is in use (`when`/`unless` conditions).
+pub fn applicable_profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
+    let profiles = builtin_profiles();
+    resolved_profile_env(enabled, workspace)
+        .into_iter()
+        .filter(|env| {
+            profiles
+                .iter()
+                .find(|p| p.name == env.profile)
+                .is_some_and(|p| p.env_applies(workspace))
+        })
+        .collect()
+}
+
+/// The profile variables that apply in `workspace` (SPEC R-PERM.5.5).
+///
+/// Alias for [`applicable_profile_env`].
+pub fn profile_env(enabled: &[String], workspace: &Path) -> Vec<ProfileEnv> {
+    applicable_profile_env(enabled, workspace)
 }
 
 /// Create a cache directory a profile variable names (`cache_dir = true`)
@@ -902,7 +925,7 @@ mod tests {
     #[test]
     fn the_sccache_cache_is_a_hidden_directory_that_ignores_itself() {
         let ws = tempfile::tempdir().unwrap();
-        let env = profile_env(&["sccache".to_string()], ws.path());
+        let env = resolved_profile_env(&["sccache".to_string()], ws.path());
         let dir = env
             .iter()
             .find(|e| e.name == "SCCACHE_DIR")
@@ -943,6 +966,30 @@ mod tests {
     }
 
     #[test]
+    fn applicable_profile_env_respects_when_conditions() {
+        let ws = tempfile::tempdir().unwrap();
+        let enabled = vec!["sccache".to_string()];
+        // In an empty workspace without sccache in env or config, sccache env does not apply.
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("RUSTC_WRAPPER");
+            std::env::remove_var("CARGO_BUILD_RUSTC_WRAPPER");
+            std::env::set_var("CARGO_HOME", "/nonexistent");
+        }
+        assert!(applicable_profile_env(&enabled, ws.path()).is_empty());
+
+        // When configured in workspace .cargo/config.toml, sccache env applies.
+        std::fs::create_dir_all(ws.path().join(".cargo")).unwrap();
+        std::fs::write(
+            ws.path().join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper = \"sccache\"\n",
+        )
+        .unwrap();
+        let applied = applicable_profile_env(&enabled, ws.path());
+        assert!(applied.iter().any(|e| e.name == "SCCACHE_DIR"));
+    }
+
+    #[test]
     fn every_builtin_profile_parses() {
         // A malformed shipped profile is a build-time bug that would silently
         // shrink the sandbox's usable surface for everyone.
@@ -979,7 +1026,7 @@ mod tests {
         let enabled = vec!["sccache".to_string()];
         let a = Path::new("/work/alpha");
         let b = Path::new("/work/beta");
-        let env_a = profile_env(&enabled, a);
+        let env_a = resolved_profile_env(&enabled, a);
         let get = |env: &[ProfileEnv], name: &str| {
             env.iter()
                 .find(|e| e.name == name)
@@ -990,16 +1037,16 @@ mod tests {
         let port_a: u16 = get(&env_a, "SCCACHE_SERVER_PORT").parse().unwrap();
         assert!((20_000..60_000).contains(&port_a), "{port_a}");
         assert_eq!(
-            get(&profile_env(&enabled, a), "SCCACHE_SERVER_PORT"),
+            get(&resolved_profile_env(&enabled, a), "SCCACHE_SERVER_PORT"),
             port_a.to_string()
         );
         assert_ne!(
-            get(&profile_env(&enabled, b), "SCCACHE_SERVER_PORT"),
+            get(&resolved_profile_env(&enabled, b), "SCCACHE_SERVER_PORT"),
             port_a.to_string()
         );
         assert!(env_a.iter().all(|e| e.profile == "sccache"));
         assert!(
-            profile_env(&[], a).is_empty(),
+            resolved_profile_env(&[], a).is_empty(),
             "a disabled profile sets nothing"
         );
     }
