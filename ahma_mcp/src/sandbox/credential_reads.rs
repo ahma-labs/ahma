@@ -108,6 +108,15 @@ pub fn ssh_client_readable_regex(home: &Path) -> String {
     )
 }
 
+/// Whether a file directly in `~/.ssh` named `name` is one ssh reads that
+/// holds no secret — the same set [`ssh_client_readable_regex`] lets through.
+fn is_ssh_client_file(name: &str) -> bool {
+    name == "config"
+        || name == "allowed_signers"
+        || name.starts_with("known_hosts")
+        || name.ends_with(".pub")
+}
+
 /// Directories under `~/.ssh` that hold no secret: `config.d` (included
 /// configuration) and `agent` (where OpenSSH keeps agent sockets).
 pub fn ssh_client_readable_dirs(home: &Path) -> Vec<PathBuf> {
@@ -121,7 +130,6 @@ pub fn ssh_client_readable_dirs(home: &Path) -> Vec<PathBuf> {
 /// git ran with no identity and no credential helper, and ssh without
 /// `known_hosts`.
 pub fn client_config_read_paths(home: &Path) -> Vec<PathBuf> {
-    let readable = regex::Regex::new(&ssh_client_readable_regex(home)).ok();
     let mut out: Vec<PathBuf> = std::fs::read_dir(ssh_dir(home))
         .into_iter()
         .flatten()
@@ -129,9 +137,9 @@ pub fn client_config_read_paths(home: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .filter(|p| {
-            readable
-                .as_ref()
-                .is_some_and(|re| re.is_match(&p.to_string_lossy()))
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_ssh_client_file)
         })
         .collect();
     out.extend(
@@ -415,7 +423,7 @@ mod tests {
             ".config/git",
         ]
         .iter()
-        .map(|f| h.join(f))
+        .map(|f| f.split('/').fold(h.to_path_buf(), |p, c| p.join(c)))
         .collect();
         want.sort();
         assert_eq!(got, want);
