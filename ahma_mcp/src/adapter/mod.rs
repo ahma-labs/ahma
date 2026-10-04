@@ -1459,6 +1459,12 @@ impl Adapter {
                 broker_socket.as_deref(),
             )
             .await;
+            #[cfg(unix)]
+            if let Some(broker) = broker.as_ref() {
+                for refusal in broker_refusal_lines(broker) {
+                    monitor.append_alert_unique(&op_id_task, refusal).await;
+                }
+            }
             // The PTY path publishes its own result, so a deny-tier write here
             // reaches the log and the audit trail, not the result text.
             if let Some(watch) = handoff {
@@ -1719,7 +1725,7 @@ fn alert_broker_refusals(
     broker.observe(Arc::new(move |event| {
         if let crate::credentials::ssh_agent::broker::BrokerEvent::Refused { why, .. } = event {
             let (monitor, op_id, why) = (monitor.clone(), op_id.clone(), why.clone());
-            runtime.spawn(async move { monitor.append_alert(&op_id, why).await });
+            runtime.spawn(async move { monitor.append_alert_unique(&op_id, why).await });
         }
     }));
 }
@@ -1858,7 +1864,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // alert on this operation while it still runs (R-CRED.10). Held until the
     // command has finished.
     #[cfg(unix)]
-    let _broker = credential_brokers
+    let broker = credential_brokers
         .as_ref()
         .and_then(|f| f.lease(&wd_path))
         .inspect(|broker| {
@@ -1908,6 +1914,8 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         drift.as_ref(),
         &mut handoff,
         &mut lease,
+        #[cfg(unix)]
+        broker.as_ref(),
     )
     .await;
     // Normally compared inside, where the alert can lead the result. Still
@@ -1990,9 +1998,9 @@ impl std::fmt::Debug for QueueWaitNotice {
 /// A wait shorter than this is not worth a line in the result.
 const QUEUE_WAIT_WORTH_REPORTING: Duration = Duration::from_millis(500);
 
-/// The lines a broker's refusals leave in a command's result, once each.
+/// The unique refusal lines a broker recorded for this command (SPEC R-CRED.10).
 #[cfg(unix)]
-fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> Option<String> {
+fn broker_refusal_lines(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> Vec<String> {
     use crate::credentials::ssh_agent::broker::BrokerEvent;
     let mut lines: Vec<String> = Vec::new();
     for event in lease.events() {
@@ -2002,6 +2010,13 @@ fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> 
             lines.push(why);
         }
     }
+    lines
+}
+
+/// The lines a broker's refusals leave in a command's result, once each.
+#[cfg(unix)]
+fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> Option<String> {
+    let lines = broker_refusal_lines(lease);
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
@@ -2444,6 +2459,7 @@ async fn execute_with_streaming(
     drift: Option<&DriftProbe>,
     handoff: &mut Option<HandoffWatch>,
     lease: &mut Option<workspace_queue::Lease>,
+    #[cfg(unix)] broker: Option<&crate::credentials::ssh_agent::host::BrokerLease>,
 ) -> (audit::Outcome, Option<i32>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -2677,6 +2693,8 @@ async fn execute_with_streaming(
         drift,
         handoff,
         lease,
+        #[cfg(unix)]
+        broker,
     )
     .await
 }
@@ -2880,6 +2898,7 @@ async fn finalize_streaming_operation(
     drift: Option<&DriftProbe>,
     handoff: &mut Option<HandoffWatch>,
     lease: &mut Option<workspace_queue::Lease>,
+    #[cfg(unix)] broker: Option<&crate::credentials::ssh_agent::host::BrokerLease>,
 ) -> (audit::Outcome, Option<i32>) {
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -2948,6 +2967,15 @@ async fn finalize_streaming_operation(
         // Before the terminal transition, while the operation is still active:
         // the `Alert` event is what the hub and the TUI show.
         op_monitor.append_alert(op_id, alert).await;
+    }
+    // What the SSH key broker refused this command, one line each (SPEC R-CRED.10):
+    // appended before the terminal transition so a waiter (or fast exit) observes it
+    // deterministically without racing the broker thread's background alert.
+    #[cfg(unix)]
+    if let Some(broker) = broker {
+        for refusal in broker_refusal_lines(broker) {
+            op_monitor.append_alert_unique(op_id, refusal).await;
+        }
     }
     // The process tree is gone and the drift probe has looked: hand the
     // workspace on *before* anyone can observe this operation as finished, so
