@@ -771,9 +771,11 @@ pub async fn kernel_denial_lines(
     }
     let mut lines: Vec<String> = Vec::new();
     let mut grant = None;
+    let mut unfixable = false;
     let mut asked = false;
     for denial in &records {
         let class = classify(denial);
+        unfixable |= matches!(class, DenialClass::Unfixable { .. });
         let line = one_line(denial, &class);
         if !lines.contains(&line) {
             lines.push(line);
@@ -816,7 +818,11 @@ pub async fn kernel_denial_lines(
             });
         }
     }
-    Some(KernelReport { lines, grant })
+    Some(KernelReport {
+        lines,
+        grant,
+        unfixable,
+    })
 }
 
 /// Whether output mentions a refusal at all, path or not.
@@ -839,6 +845,8 @@ pub struct KernelReport {
     pub lines: Vec<String>,
     /// The first path a human may grant, and the access the kernel refused.
     pub grant: Option<(PathBuf, ScopeAccess)>,
+    /// Whether a refusal was something no grant or setting allows.
+    pub unfixable: bool,
 }
 
 /// One grant question, worked out from a failed command's output and ready to

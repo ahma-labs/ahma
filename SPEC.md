@@ -831,6 +831,16 @@ Status: implemented for terminal hooks and for MCP commands (`run_terminal_comma
 
 Status: implemented on macOS for MCP commands and terminal hooks, sync and async: the default deny carries a per-command tag, a failed command's records are read back and routed through the classifier, and a grantable one is asked about with `GrantReason::KernelRecord`. Text scanning (`denial_scan`) remains for Linux and Windows, for the explicit denies (untagged), where `log` cannot be read, and where no record arrives in time. Measured on a macOS 15 CI runner (2026-10): an unprivileged `log show --last 1m --predicate 'eventMessage CONTAINS "<tag>"'` returns a command's records in under a second, immediately after it exits; a rule written `(deny … (with message "<tag>"))` puts the tag on the record's second line, which attributes a denial to its command exactly; records name the rule's operation (`file-write*`), and every process also records `/dev/dtracehelper`, which is noise. The runner's user is an administrator; a user who is not may read no records, and then text scanning stays.
 
+### R-ESCAPE: One Run Outside the Sandbox, Approved by a Human
+
+**Problem this family solves.** Some refusals no grant or setting can change: opening an app (LaunchServices runs it outside any sandbox), a setuid program, an operation the sandbox withholds. The only way past was the human's own terminal or the TUI's `!`, which the agent's harness dialog could not offer.
+
+- **R-ESCAPE.1**: **Offered only for what nothing else fixes, on the kernel's word.** A command whose kernel records (R-DENY) show a refusal classed unfixable, and no grantable one, is recorded per workspace with a digest of the exact command. Nothing is offered for a path a grant can open, a credential, a capability a setting enables, or a host.
+- **R-ESCAPE.2**: **Asked when that exact command runs again, in the harness's own dialog, deny by default.** The dialog says what was refused, that a yes runs this exact command once outside ahma's sandbox with its writes unconfined, and that the run is recorded. Once per harness session, whatever the answer.
+- **R-ESCAPE.3**: **A yes runs it once.** The approved command carries a one-use token bound to its digest and valid for an hour; the hook spends it, says on stderr before the run that the command runs outside the sandbox, records `unsandboxed-once-approved` in the execution audit log, and runs it in the platform shell. A token the agent wrote itself is refused (R-PERM.10(d)).
+
+Status: terminal hooks in Claude Code. Open (§11): offering it at the MCP client and in the TUI.
+
 ### R-PERM: Unified Permissions Model
 
 **Problem this family solves.** When the sandbox blocks something the user legitimately wants, the user can grant an exception. Kernel denial detection (R5.4.7), persistent grants (R5.4.4–R5.4.8), elicitation prompts (R5.3.1), the TUI modal (R-WEB.6) and the dedup coordinator (R-WEB.7) converge on one ledger (R-PERM.1), one record shape (R-PERM.2) and one question ladder (R-PERM.3), so that a hook denial has a path to a user decision (R-PERM.6) and toolchain carve-outs are data, not code (R-PERM.5).
@@ -2003,4 +2013,5 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **Developer-ID signing and notarization** (R-SIGN.1): wired in the release workflow and activates when the maintainer adds the six Apple secrets (docs/release-signing.md); until then releases are ad-hoc signed. `scripts/install.sh` and `ahma update` keep a valid Developer ID signature with the hardened runtime and re-sign anything else ad hoc (docs/release-signing.md).
 - **SSH key broker, remaining** (R-CRED.3, R-CRED.7): asking at the MCP client (elicitation) or the TUI while a command waits — today an MCP command is refused with the line and the human grants with `ahma permissions grant ssh-sign`; forwarding the client's `SSH_AUTH_SOCK` as a session option; the PTY path; denying a sandboxed command a direct connect to the human's agent socket.
 - **Kernel denial records off macOS** (R-DENY.1): Linux and Windows still judge refusals from text; Landlock's audit records need privileges an ordinary user rarely has.
+- **One run outside the sandbox from MCP and the TUI** (R-ESCAPE): offered in Claude Code's dialog for hooked commands only.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

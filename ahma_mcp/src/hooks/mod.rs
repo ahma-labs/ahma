@@ -1548,6 +1548,14 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let payload = args.resolve_payload()?;
     // A grant the human just approved in the harness dialog applies before
     // the scopes are read, so this very command runs with it (R-PERM.10).
+    // A human's yes to running this exact command once outside the sandbox
+    // (SPEC R-ESCAPE): disclosed, audited, and spent.
+    if let Some(token) = &approval
+        && let Some(refusal) =
+            harness_ask::take_escape(token, Path::new(&payload.cwd), &payload.command)
+    {
+        return run_command_once_unsandboxed(&payload, &refusal.why).await;
+    }
     if let Some(token) = approval
         && let Some(line) =
             harness_ask::apply_approval(&token, Path::new(&payload.cwd), &payload.command)
@@ -1867,6 +1875,21 @@ fn report_shell_execution_error(
         } => Some(crate::sandbox::grant_channel::hook_denial_text(
             path, *access, details, who,
         )),
+        crate::sandbox::SandboxError::Unfixable { details } => {
+            // Offered as one run outside the sandbox when this exact command
+            // is run again (SPEC R-ESCAPE.1).
+            if let Some(command) = who.command.as_deref() {
+                let why = details
+                    .lines()
+                    .find(|l| l.starts_with("Blocked: "))
+                    .unwrap_or("an operation the sandbox does not allow");
+                harness_ask::record_escape(cwd, command, why);
+            }
+            Some(format!(
+                "{details}\n\nIn Claude Code, run the same command again and ahma will ask whether \
+                 to run it once outside the sandbox."
+            ))
+        }
         crate::sandbox::SandboxError::PathOutsideSandbox { path, .. } => {
             Some(crate::sandbox::grant_channel::hook_denial_text(
                 path,
@@ -1888,6 +1911,46 @@ fn report_shell_execution_error(
     // Returned, not also printed: the caller prints the error, and printing it
     // here too showed the whole panel twice.
     Err(anyhow!("{e}\n\n{remediation}"))
+}
+
+/// Run `payload.command` once outside ahma's sandbox, because a human
+/// approved exactly that in the harness dialog after the kernel refused it
+/// something no grant or setting allows (SPEC R-ESCAPE). Disclosed on stderr
+/// before it runs and recorded in the execution audit log.
+async fn run_command_once_unsandboxed(payload: &WrappedShellPayload, why: &str) -> Result<()> {
+    eprintln!(
+        "\n⚠️  ahma: running this command ONCE OUTSIDE the sandbox, as approved in the dialog \
+         ({why}). Its writes are not confined to the workspace.\n"
+    );
+    crate::adapter::audit::record_hook_decision(
+        "unsandboxed-once-approved",
+        Some(&payload.cwd),
+        &payload.command,
+        payload.session_id.as_deref(),
+        "claude",
+    )
+    .await;
+    let shell = crate::shell_pool::platform_shell_program();
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.current_dir(&payload.cwd).kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &payload.command,
+    ]);
+    #[cfg(not(target_os = "windows"))]
+    cmd.args(["-c", &payload.command]);
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("Failed to spawn '{shell}'"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        std::process::exit(status.code().unwrap_or(1))
+    }
 }
 
 /// Fallback path when ahma's own execution cannot sandbox the command (SPEC
@@ -2069,7 +2132,14 @@ fn ask_first_if_refused_before(
             cfg.settings_origin.user_settings_file().as_deref(),
         ) {
             Some((refusal, token)) => (harness_ask::ssh_ask_reason(&refusal), token),
-            None => return decision,
+            // This exact command was refused what nothing allows: offer one
+            // run outside the sandbox (SPEC R-ESCAPE).
+            None => {
+                match harness_ask::next_escape_ask(Path::new(&cwd), session_id, &tool.command) {
+                    Some((refusal, token)) => (harness_ask::escape_ask_reason(&refusal), token),
+                    None => return decision,
+                }
+            }
         },
     };
     match build_wrapped_shell_command(
