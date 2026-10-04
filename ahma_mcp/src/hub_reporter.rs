@@ -486,6 +486,61 @@ fn next_backoff_secs(current: u64) -> u64 {
     (current * 2).min(30)
 }
 
+/// The questions this instance has put to the hub (rung 2), oldest first.
+///
+/// The hub cannot tell a dropped connection from an exit, so it takes an
+/// instance's questions off every TUI when the connection goes, and a
+/// restarted hub never had them. Every registration therefore asks again
+/// whatever is still unanswered. Without it a re-register (R-HUB.6) — which
+/// every applied grant triggers, so answering one question took the others
+/// off every TUI — left the question in flight with no surface showing it,
+/// and the coordinator's dedup kept the same path from being asked again for
+/// the rest of the session (SPEC R-PERM.3.7).
+struct AskedAtHub {
+    grant: Option<Arc<GrantCoordinator>>,
+    web: Option<Arc<WebApprovalCoordinator>>,
+    relays: Vec<HubRelay>,
+}
+
+impl AskedAtHub {
+    fn new(grant: Option<Arc<GrantCoordinator>>, web: Option<Arc<WebApprovalCoordinator>>) -> Self {
+        Self {
+            grant,
+            web,
+            relays: Vec::new(),
+        }
+    }
+
+    /// Note a question about to be sent. Noted before the send, so one lost
+    /// with the connection is asked on the next.
+    fn record(&mut self, relay: HubRelay) {
+        self.prune();
+        self.relays.push(relay);
+    }
+
+    /// The questions still waiting for an answer.
+    fn waiting(&mut self) -> Vec<HubRelay> {
+        self.prune();
+        self.relays.clone()
+    }
+
+    /// Forget what has been answered or withdrawn. Only a question its
+    /// coordinator still holds is re-sent: one closed meanwhile would be a
+    /// modal whose answer reaches nothing.
+    fn prune(&mut self) {
+        let (grant, web) = (self.grant.as_deref(), self.web.as_deref());
+        self.relays.retain(|relay| match relay {
+            HubRelay::ScopeGrantRequested { request } => {
+                grant.is_some_and(|c| c.is_in_flight(&request.decision_id))
+            }
+            HubRelay::WebApprovalRequested { request } => {
+                web.is_some_and(|c| c.is_in_flight(&request.decision_id))
+            }
+            _ => false,
+        });
+    }
+}
+
 /// Main reporter loop.  Runs until the process exits.
 #[allow(clippy::too_many_arguments)]
 async fn run_reporter_loop(
@@ -511,6 +566,7 @@ async fn run_reporter_loop(
     // Same split for the web-approval plumbing.
     let web_coordinator = web.as_ref().map(|w| w.coordinator.clone());
     let mut web_req_rx = web.map(|w| w.req_rx);
+    let mut asked = AskedAtHub::new(grant_coordinator.clone(), web_coordinator.clone());
     // Watch the client identity: learned after registration (the MCP
     // `initialize` handshake), a change makes us reconnect and re-register.
     let mut identity_rx = INSTANCE_IDENTITY.subscribe();
@@ -591,6 +647,22 @@ async fn run_reporter_loop(
         if !replay_active_operations(&mut writer, &active_ops, &scope, &origin).await {
             continue;
         }
+        // ── Ask again what is still waiting (SPEC R-PERM.3.7) ────────────────
+        // The hub dismissed these when the last connection went; a TUI that
+        // still shows one ignores the repeat.
+        let mut resent = true;
+        for relay in asked.waiting() {
+            if send_msg(&mut writer, &ClientMsg::Relay(relay))
+                .await
+                .is_err()
+            {
+                resent = false;
+                break;
+            }
+        }
+        if !resent {
+            continue;
+        }
 
         // ── Event loop: forward the unified operation event stream ───────────
         let mut closed = false;
@@ -645,8 +717,10 @@ async fn run_reporter_loop(
                 // 2b. Fresh scope-grant requests to forward to the hub.
                 maybe_req = recv_optional_grant(grant_req_rx.as_mut()) => {
                     match maybe_req {
-                        Some(req) => {
-                            if send_msg(&mut writer, &ClientMsg::Relay(HubRelay::ScopeGrantRequested { request: req })).await.is_err() {
+                        Some(request) => {
+                            let relay = HubRelay::ScopeGrantRequested { request };
+                            asked.record(relay.clone());
+                            if send_msg(&mut writer, &ClientMsg::Relay(relay)).await.is_err() {
                                 debug!("hub_reporter: send ScopeGrantRequested failed, reconnecting");
                                 closed = true;
                             }
@@ -660,7 +734,9 @@ async fn run_reporter_loop(
                 maybe_web = recv_optional_web(web_req_rx.as_mut()) => {
                     match maybe_web {
                         Some(request) => {
-                            if send_msg(&mut writer, &ClientMsg::Relay(HubRelay::WebApprovalRequested { request })).await.is_err() {
+                            let relay = HubRelay::WebApprovalRequested { request };
+                            asked.record(relay.clone());
+                            if send_msg(&mut writer, &ClientMsg::Relay(relay)).await.is_err() {
                                 debug!("hub_reporter: send WebApprovalRequested failed, reconnecting");
                                 closed = true;
                             }
@@ -693,6 +769,7 @@ async fn run_reporter_loop(
                         grant_sandbox.as_ref(),
                         web_coordinator.as_ref(),
                         tui_viewers.as_ref(),
+                        &mut asked,
                     ).await;
                 }
             }
@@ -791,6 +868,7 @@ async fn handle_incoming(
     grant_sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
     tui_viewers: Option<&Arc<std::sync::atomic::AtomicUsize>>,
+    asked: &mut AskedAtHub,
 ) -> bool {
     let msg = match incoming {
         Ok(msg) => msg,
@@ -845,7 +923,7 @@ async fn handle_incoming(
             .await
         }
         HubMsg::ReRaiseScopeGrant { path, access } => {
-            re_raise_scope_grant(&path, access, writer, grant_coordinator).await
+            re_raise_scope_grant(&path, access, writer, grant_coordinator, asked).await
         }
         HubMsg::SubmitWebApproval {
             decision_id,
@@ -1058,6 +1136,7 @@ async fn re_raise_scope_grant(
     access: ahma_common::config::ScopeAccess,
     writer: &mut tokio::io::WriteHalf<HubStream>,
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
+    asked: &mut AskedAtHub,
 ) {
     debug!(
         "hub_reporter: received ReRaiseScopeGrant path={path} access={}",
@@ -1073,11 +1152,9 @@ async fn re_raise_scope_grant(
         Some("re-raised from the TUI".to_string()),
     ) {
         Some(request) => {
-            let _ = send_msg(
-                writer,
-                &ClientMsg::Relay(HubRelay::ScopeGrantRequested { request }),
-            )
-            .await;
+            let relay = HubRelay::ScopeGrantRequested { request };
+            asked.record(relay.clone());
+            let _ = send_msg(writer, &ClientMsg::Relay(relay)).await;
         }
         // Already in flight — the modal the user wants is on screen already.
         None => debug!("hub_reporter: re-raise skipped, question already in flight"),
@@ -2694,6 +2771,127 @@ mod tests {
         reporter.abort();
         let _ = std::fs::remove_file(&sock);
         // _env_guard restores AHMA_HUB_SOCK; _lock releases the serialization.
+    }
+
+    /// The hub dismisses an instance's questions when its connection drops —
+    /// it cannot tell a reconnect from an exit — and a restarted hub never had
+    /// them. Whatever is still unanswered is asked again, oldest first, on the
+    /// next registration; what was answered meanwhile is not (SPEC R-PERM.3.7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn questions_still_waiting_are_asked_again_after_a_reconnect() {
+        use crate::operation_monitor::MonitorConfig;
+        use ahma_common::config::ScopeAccess;
+        use ahma_common::scope_grant::{GrantCoordinator, GrantDecision, GrantReason};
+
+        let _lock = HUB_SOCK_MUTEX.lock();
+        let unique = HUB_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join(format!("resend_{unique}.sock"));
+        let prev = std::env::var_os("AHMA_HUB_SOCK");
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", &sock) };
+        let _env_guard = EnvGuard { prev };
+        let listener = LocalListener::bind(&sock).expect("bind temp hub socket");
+
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::scale_secs(60),
+        )));
+        let coord = Arc::new(GrantCoordinator::new());
+        let web = Arc::new(WebApprovalCoordinator::new());
+        let (grant_tx, grant_rx) = mpsc::unbounded_channel::<ScopeGrantRequest>();
+        let (web_tx, web_rx) = mpsc::unbounded_channel::<WebApprovalRequest>();
+        let reporter = tokio::spawn(run_reporter_loop(
+            monitor,
+            "stdio".to_string(),
+            "ws-scope".to_string(),
+            "VSCode".to_string(),
+            Some(GrantReporting {
+                coordinator: coord.clone(),
+                req_rx: grant_rx,
+                sandbox: None,
+                tui_viewers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Some(WebApprovalReporting {
+                coordinator: web.clone(),
+                req_rx: web_rx,
+            }),
+            tokio::sync::watch::channel(None).0,
+        ));
+
+        let (mut r1, w1, _reg) = accept_register(&listener).await;
+
+        // Three questions reach the hub the way the broker and the web gate
+        // send them: begun in the coordinator, then handed to the reporter.
+        let paths = tempfile::tempdir().unwrap();
+        let ask = |name: &str| {
+            coord
+                .begin(
+                    &paths.path().join(name),
+                    ScopeAccess::Rw,
+                    GrantReason::StderrHeuristic,
+                    Some("cargo".into()),
+                )
+                .expect("a fresh question")
+        };
+        let waiting = ask("waiting");
+        let answered = ask("answered");
+        let web_req = web
+            .begin(
+                "example.com",
+                "https://example.com/",
+                Some("fetch_webpage".into()),
+            )
+            .expect("a fresh web question");
+        grant_tx.send(waiting.clone()).unwrap();
+        grant_tx.send(answered.clone()).unwrap();
+        web_tx.send(web_req.clone()).unwrap();
+        let mut sent = Vec::new();
+        while sent.len() < 3 {
+            match read_client_msg(&mut r1).await {
+                ClientMsg::Relay(HubRelay::ScopeGrantRequested { request }) => {
+                    sent.push(request.decision_id)
+                }
+                ClientMsg::Relay(HubRelay::WebApprovalRequested { request }) => {
+                    sent.push(request.decision_id)
+                }
+                _ => {}
+            }
+        }
+
+        // One is answered at another surface, then the hub goes.
+        assert!(matches!(
+            coord.resolve(&answered.decision_id, GrantDecision::Deny),
+            ahma_common::scope_grant::GrantResolveOutcome::Denied { .. }
+        ));
+        drop(w1);
+        drop(r1);
+
+        let (mut r2, mut w2, reg) = accept_register(&listener).await;
+        assert!(matches!(reg, ClientMsg::Register { .. }), "got {reg:?}");
+        // The event loop answers this only after everything sent on
+        // registration, so whatever precedes the Pong is the whole re-send.
+        send_msg(&mut w2, &HubMsg::Ping { seq: 1 }).await.unwrap();
+        let mut again = Vec::new();
+        loop {
+            match read_client_msg(&mut r2).await {
+                ClientMsg::Relay(HubRelay::ScopeGrantRequested { request }) => {
+                    again.push(request.decision_id)
+                }
+                ClientMsg::Relay(HubRelay::WebApprovalRequested { request }) => {
+                    again.push(request.decision_id)
+                }
+                ClientMsg::Pong { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            again,
+            vec![waiting.decision_id.clone(), web_req.decision_id.clone()],
+            "the unanswered questions are asked again, oldest first, and the \
+             answered one is not"
+        );
+
+        reporter.abort();
     }
 
     #[test]
