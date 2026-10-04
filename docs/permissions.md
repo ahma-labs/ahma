@@ -88,16 +88,18 @@ A few deliberate details:
   trying it for the session and tells you where the question went instead. But a
   *decline* is an answer, not a failure — declining doesn't cost you the prompt.
 
-## Three ways to say yes
+## Four ways to say yes
 
-| Tier | Lives | Use it when |
-|---|---|---|
-| **once** | The next command only. Never written down. | You're not sure yet. |
-| **session** | Until the session that approved it ends (your MCP server, or the terminal you ran `ahma sandbox grant --session` in), at most 12 hours. Never written to the file; terminal hooks and the edit guard honour it too. | A one-off task. |
-| **always** | `~/.ahma/settings.toml`, until you revoke it. | A cache your builds always need. |
+| Tier | Lives | TUI keys (read-only / read-write) | Use it when |
+|---|---|---|---|
+| **once** | The next command that may write. Never written down. | `o` / `w` | You're not sure yet. |
+| **session** | Until the session that approved it ends (your MCP server, or the terminal you ran `ahma sandbox grant --session` in); for terminal hooks, at most 12 hours. Never written to the file; terminal hooks and the edit guard honour it too. | `r` / `y` | A one-off task. |
+| **24 hours** (a lease) | `~/.ahma/settings.toml`, ending on its own; `ahma sandbox renew` extends it. | `l` / `L` | A long unattended run. |
+| **always** | `~/.ahma/settings.toml`, until you revoke it. | `R` / `Y` | A cache your builds always need. |
 
-Only **always** touches disk, and only after you've seen the exact file and the
-exact line.
+`n`, Enter and Esc deny. Only the 24-hour and always tiers touch disk, and only after
+you've seen the exact file and the exact line. A grant made or revoked in the file
+applies to a running server from its next command.
 
 ## When nothing can allow it: one run outside the sandbox
 
@@ -138,7 +140,7 @@ next session; see
   see it. `--global` is the explicit opt-out, and `ahma doctor` flags grants that
   have no workspace.
 - **Tier**: at a prompt you can answer for this session only (`read-write-session`
-  / `read-only-session`, or `[s]` / `[o]` in the TUI): applied now, audited, never
+  / `read-only-session`, or `y` / `r` in the TUI): applied now, audited, never
   written to the file. The answer is also recorded for terminal hooks and the edit
   guard in the same workspace (under ahma's runtime directory, ending with the
   session or after 12 hours), so a hooked command gets the same session tier an
