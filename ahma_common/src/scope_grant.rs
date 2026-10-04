@@ -53,6 +53,10 @@ pub enum GrantReason {
     /// from which a candidate path was extracted. The path is a *suggestion* — only
     /// the human's explicit approval persists anything.
     StderrHeuristic,
+    /// A sandboxed command was refused this path, and the kernel's own record
+    /// of the denial says so (SPEC R-DENY): the path and the access are exact,
+    /// not read from the command's output.
+    KernelRecord,
     /// Nothing was blocked: the server was started with `--tmp` (or
     /// `[sandbox] tmp_access = true`), which *asks* for the system temp
     /// directory. Asking it is a scope downgrade (SPEC R5.2.5, R5.3), so the
@@ -102,6 +106,7 @@ impl GrantReason {
         match self {
             GrantReason::PreExecViolation
             | GrantReason::StderrHeuristic
+            | GrantReason::KernelRecord
             | GrantReason::LogTarget
             | GrantReason::HarnessRefusal => true,
             GrantReason::StartupFlag | GrantReason::Unknown => false,

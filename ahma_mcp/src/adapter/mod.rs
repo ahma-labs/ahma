@@ -880,6 +880,10 @@ impl Adapter {
         stamp_lease(&mut cmd, lease);
         #[cfg(unix)]
         let broker = self.lease_credential_broker(&mut cmd, safe_wd);
+        // The tag the kernel's records of this command's denials carry
+        // (SPEC R-DENY.1).
+        let denial_tag = sandbox::kernel_denials::tag_of(cmd.as_std().get_args());
+        let spawned_at = Instant::now();
 
         // Spawn manually (rather than `cmd.output()`) so a timeout can take down
         // the whole process group — `cmd.output()` drops the future on timeout,
@@ -978,7 +982,17 @@ impl Adapter {
         };
         if result.is_err() {
             return self
-                .finalize_sync_denial(command, op_id, exit_code, &stdout, &stderr, safe_wd, result)
+                .finalize_sync_denial(
+                    command,
+                    op_id,
+                    exit_code,
+                    &stdout,
+                    &stderr,
+                    safe_wd,
+                    result,
+                    denial_tag.as_deref(),
+                    spawned_at.elapsed(),
+                )
                 .await;
         }
         SyncRun {
@@ -1003,7 +1017,27 @@ impl Adapter {
         stderr: &str,
         safe_wd: &std::path::Path,
         result: Result<String, anyhow::Error>,
+        denial_tag: Option<&str>,
+        ran_for: Duration,
     ) -> SyncRun {
+        // The kernel's own record decides where it can be read (SPEC R-DENY).
+        if let Some(report) = sandbox::grant_channel::kernel_denial_lines(
+            &self.sandbox,
+            self.scope_grant_notifier.as_ref(),
+            (stderr, stdout),
+            denial_tag,
+            ran_for,
+            command,
+            Some(op_id),
+        )
+        .await
+        {
+            return SyncRun {
+                outcome: audit::Outcome::Failed,
+                exit_code,
+                result: kernel_report_result(&self.sandbox, report, result, op_id, command).await,
+            };
+        }
         sandbox::grant_channel::raise_stderr_denial_question(
             &self.sandbox,
             self.scope_grant_notifier.as_ref(),
@@ -1805,6 +1839,11 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
                 }
             }));
         });
+    // The tag the kernel's records of this operation's denials carry
+    // (SPEC R-DENY.1), for the failure path to read them back.
+    if let Some(tag) = sandbox::kernel_denials::tag_of(proc_cmd.as_std().get_args()) {
+        sandbox::kernel_denials::remember_tag(&op_id, tag);
+    }
 
     let timeout_ms = timeout_secs
         .map(|t| t * 1000)
@@ -1942,6 +1981,41 @@ fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> 
 
 /// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
 /// command itself starts does not wait for the lease its ancestor holds.
+/// A failed command's result, as the kernel's records describe it (SPEC
+/// R-DENY): a grantable denial is the typed [`sandbox::SandboxError::RuntimeDenial`]
+/// the MCP boundary turns into a structured `sandbox_denial` payload, with
+/// every record's line in its details; other denials are their lines; no
+/// records leave the failure as it was, with nothing suggested (R-DENY.3).
+async fn kernel_report_result(
+    sandbox: &sandbox::Sandbox,
+    report: sandbox::grant_channel::KernelReport,
+    result: Result<String, anyhow::Error>,
+    op_id: &str,
+    command: &str,
+) -> Result<String, anyhow::Error> {
+    if report.lines.is_empty() {
+        return result;
+    }
+    let lines = report.lines.join("\n");
+    match report.grant {
+        Some((path, access)) => {
+            audit::record_sandbox_denial(Some(op_id), &path, access.label(), command).await;
+            let details = result.err().map(|e| e.to_string()).unwrap_or_default();
+            Err(sandbox::SandboxError::RuntimeDenial {
+                path,
+                access,
+                scopes: sandbox.scopes().to_vec(),
+                details: format!("{details}\n\n{lines}"),
+            }
+            .into())
+        }
+        None => match result {
+            Ok(out) => Ok(format!("{out}\n\n{lines}")),
+            Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
+        },
+    }
+}
+
 fn stamp_lease(cmd: &mut tokio::process::Command, lease: Option<&workspace_queue::Lease>) {
     if let Some(lease) = lease {
         cmd.env(
@@ -2642,6 +2716,35 @@ async fn record_failure_diagnostics(
     stderr_str: &str,
     working_dir: Option<&Path>,
 ) {
+    // The kernel's own record decides where it can be read (SPEC R-DENY):
+    // its lines are the alerts; no record means the failure was not the
+    // sandbox's, and no path is guessed (R-DENY.3).
+    let (tag, ran) = match sandbox::kernel_denials::take_tag(op_id) {
+        Some((tag, ran)) => (Some(tag), ran),
+        None => (None, Duration::default()),
+    };
+    if let Some(report) = sandbox::grant_channel::kernel_denial_lines(
+        sandbox,
+        scope_grant_notifier,
+        (stderr_str, stdout_str),
+        tag.as_deref(),
+        ran,
+        tool,
+        Some(op_id),
+    )
+    .await
+    {
+        if let Some((path, access)) = &report.grant {
+            audit::record_sandbox_denial(Some(op_id), path, access.label(), tool).await;
+        }
+        for line in report.lines {
+            op_monitor.append_alert(op_id, line).await;
+        }
+        if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
+            op_monitor.append_alert(op_id, hint.remediation).await;
+        }
+        return;
+    }
     // Asked, not awaited (SPEC R-PERM.3.9): the caller still holds the
     // workspace and the operation is not yet finished.
     sandbox::grant_channel::raise_stderr_denial_question(
@@ -2754,6 +2857,10 @@ async fn finalize_streaming_operation(
         .and_then(|s| s.code())
         .unwrap_or(-1);
     let success = exit_status.as_ref().is_ok_and(|s| s.success());
+    if success {
+        // Nothing to read back for an operation that succeeded.
+        let _ = sandbox::kernel_denials::take_tag(op_id);
+    }
 
     let stdout_str = collected_stdout.rendered_output();
     let stderr_str = collected_stderr.rendered_output();

@@ -597,6 +597,108 @@ UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
     );
 }
 
+/// SPEC R-DENY: a command refused a write outside its scope is reported from
+/// the kernel's own record — operation and exact path — not from its output,
+/// and a command that fails for its own reasons is not blamed on the sandbox.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn test_a_refusal_is_reported_from_the_kernels_record() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::adapter::Adapter;
+    use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
+    use std::sync::Arc;
+
+    // Outside the temp directory, which the profile leaves writable: in
+    // `target/`, which git ignores (R-TEST-PATH: resolved by the helper).
+    let base = ahma_mcp::test_utils::cli::get_binary_path("ahma_bin", "ahma")
+        .parent()
+        .expect("target/<profile>")
+        .to_path_buf();
+    let dir_in_target = |prefix: &str| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(&base)
+            .expect("a directory in target/")
+    };
+    let scope = dir_in_target("ahma-kernel-record-scope-");
+    let outside = dir_in_target("ahma-kernel-record-outside-");
+    let target = dunce::canonicalize(outside.path()).unwrap().join("x.lock");
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![scope.path().to_path_buf()],
+            SandboxMode::Strict,
+            true,
+            false,
+            false,
+        )
+        .expect("sandbox"),
+    );
+    let adapter = Adapter::new(
+        Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            std::time::Duration::from_secs(30),
+        ))),
+        Arc::new(ShellPoolManager::new(ShellPoolConfig::default())),
+        sandbox,
+    )
+    .unwrap();
+    let wd = scope.path().to_string_lossy().into_owned();
+    let shell = ahma_mcp::AhmaMcpService::build_shell_subcommand_config(
+        Some(30),
+        &ahma_mcp::adapter::ExecutionMode::Synchronous,
+    );
+    // `true >file` writes through the shell itself: no tool's own message.
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "command".into(),
+        serde_json::json!(format!("true > '{}'", target.display())),
+    );
+    args.insert("c_flag".into(), serde_json::json!(true));
+    let err = adapter
+        .execute_sync_in_dir("bash", Some(args), &wd, Some(30), Some(&shell))
+        .await
+        .expect_err("the write is refused");
+    // From the kernel's record when it arrives; macOS drops some under load
+    // and throttles bursts, and the refusal is then judged from the output
+    // (R-DENY.3). Either way it is the typed denial for the refused path.
+    let text = err.to_string();
+    match err.downcast_ref::<ahma_mcp::sandbox::SandboxError>() {
+        Some(ahma_mcp::sandbox::SandboxError::RuntimeDenial { path, access, .. }) => {
+            assert!(
+                path == &target || Some(path.as_path()) == target.parent(),
+                "the refused path: {} ({text})",
+                path.display()
+            );
+            assert!(access.is_write(), "a write was refused: {text}");
+        }
+        other => panic!("a typed runtime denial, got {other:?}: {text}"),
+    }
+    if text.contains("ahma's kernel sandbox refused") {
+        assert!(
+            text.contains("refused `file-write") && text.contains(&target.display().to_string()),
+            "the record's operation and path: {text}"
+        );
+    } else {
+        eprintln!("no kernel record arrived; judged from the output");
+    }
+
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "command".into(),
+        serde_json::json!("echo 'Permission denied' >&2; exit 3"),
+    );
+    args.insert("c_flag".into(), serde_json::json!(true));
+    let err = adapter
+        .execute_sync_in_dir("bash", Some(args), &wd, Some(30), Some(&shell))
+        .await
+        .expect_err("it fails");
+    assert!(
+        !err.to_string().contains("sandbox grant"),
+        "no record, no suggestion: {err}"
+    );
+}
+
 /// Verify that real git operations inside a git worktree succeed under macOS Seatbelt,
 /// while writes to .git/hooks in the common repository remain strictly blocked by the kernel.
 #[cfg(target_os = "macos")]
