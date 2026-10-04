@@ -33,21 +33,24 @@ The key never enters the sandbox.
 
    ```text
    Blocked until a human approves: ahma's SSH key broker did not sign for github.com with
-   key SHA256:… (you@laptop) in this workspace. In Claude Code, ahma asks before the next
-   command here; elsewhere a human runs `ahma permissions grant ssh-sign "SHA256:… for
-   host:SHA256:…"` (add `--for 24h` for a lease). Then re-run.
+   key SHA256:… (you@laptop) in this workspace. In Claude Code, re-run this command and
+   ahma asks first; elsewhere a human runs `ahma permissions grant ssh-sign "SHA256:… for
+   host:SHA256:…"` (add `--for 24h` for a lease), then re-run.
    ```
 
-5. In Claude Code, the next command is held for Claude Code's own permission dialog:
-   *ahma: an earlier command here asked to use your SSH key SHA256:… for github.com …
+5. In Claude Code, re-running that command (and only that command) brings up Claude Code's
+   own permission dialog first:
+   *ahma: when this command last ran it asked to use your SSH key SHA256:… for github.com …
    Approve to let commands in this workspace sign with it for github.com for this
    session.* A yes records a session grant (it ends with that Claude Code session, and
-   after 12 hours at most) and the command runs; the agent's retried push signs.
+   after 12 hours at most) and the retried push runs and signs. Other commands are never
+   held for the question.
 
 ## Quickstart
 
 Nothing to set up for an unencrypted ed25519 key in `~/.ssh` (the `ssh-keygen` default).
-Push, answer the dialog once per session, and push again.
+Push; when the broker refuses, push again and answer the dialog that comes first (once
+per session).
 
 To allow a key for a server permanently, or for a while, from any terminal:
 

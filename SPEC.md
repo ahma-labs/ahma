@@ -819,7 +819,7 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
 - **R-CRED.9**: **The broker runs outside every Landlock domain.** On Linux it runs on a thread started before any `restrict_self`, so a restricted worker can still reach the key it signs with and nothing else changes.
 - **R-CRED.10**: **Every use is audited and every refusal says what to do**, in one line (R-PERM.9), from the broker's own record of what it refused, not scraped from the command's output.
 
-Status: implemented for terminal hooks (`ahma hooks run-shell`): the broker, consent from recorded grants with the Claude Code dialog between commands (R-PERM.10), `ahma permissions grant|list|revoke ssh-sign`, and one-line refusals. Open (§11): commands run through MCP (`run_terminal_command`) and asking at the MCP client or the TUI while a command waits; R-CRED.7's session-option and platform-agent discovery (the hook uses its own `SSH_AUTH_SOCK`); denying direct connects to the human's agent socket.
+Status: implemented for terminal hooks (`ahma hooks run-shell`): the broker, consent from recorded grants with the Claude Code dialog before the refused command runs again (R-PERM.10: a refused signature is recorded with the command digest like a refused path, so no other command is held for it), `ahma permissions grant|list|revoke ssh-sign`, and one-line refusals. Open (§11): commands run through MCP (`run_terminal_command`) and asking at the MCP client or the TUI while a command waits; R-CRED.7's session-option and platform-agent discovery (the hook uses its own `SSH_AUTH_SOCK`); denying direct connects to the human's agent socket.
 
 ### R-DENY: Denials Read From the Kernel
 

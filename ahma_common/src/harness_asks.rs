@@ -167,7 +167,7 @@ pub struct WorkspaceAsks {
 }
 
 /// One signature the SSH key broker refused a hooked command because no grant
-/// allowed it (SPEC R-CRED.3): asked about before the next command.
+/// allowed it (SPEC R-CRED.3): asked about when that command runs again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshRefusal {
     /// The key, `SHA256:…`.
@@ -186,6 +186,10 @@ pub struct SshRefusal {
     /// The harness process whose life bounds a session grant for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_pid: Option<u32>,
+    /// Digest of the command that was refused: the dialog asks when that
+    /// command is run again, never before an unrelated one (SPEC R-PERM.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_digest: Option<String>,
 }
 
 impl SshRefusal {
@@ -381,17 +385,19 @@ pub fn record_ssh_refusal(dir: &Path, workspace: &Path, refusal: SshRefusal) -> 
     })
 }
 
-/// The SSH signature to ask about next in harness session `session_id`: one
-/// no grant covers (`covered`) and not yet asked in this session, whatever
+/// The SSH signature to ask about before `command` runs in harness session
+/// `session_id`: one refused when `command` last ran ([`refused_for`]), that
+/// no grant covers (`covered`), and not yet asked in this session, whatever
 /// the answer was.
 pub fn next_ssh_question(
     asks: &WorkspaceAsks,
     session_id: &str,
+    command: &str,
     covered: &dyn Fn(&SshRefusal) -> bool,
 ) -> Option<SshRefusal> {
     asks.ssh_refusals
         .iter()
-        .filter(|r| !covered(r))
+        .filter(|r| refused_for(r.command_digest.as_deref(), command) && !covered(r))
         .find(|r| {
             !asks
                 .ssh_asked
@@ -674,6 +680,7 @@ mod tests {
             label: "github.com".into(),
             at: 100,
             harness_pid: Some(7),
+            command_digest: Some(crate::digest::sha256_hex(b"git push")),
         };
         record_ssh_refusal(dir.path(), ws, refusal.clone()).unwrap();
         record_ssh_refusal(
@@ -688,20 +695,24 @@ mod tests {
         let asks = load(dir.path(), ws, 102);
         assert_eq!(asks.ssh_refusals.len(), 1, "one subject, one refusal");
         let never = |_: &SshRefusal| false;
-        let q = next_ssh_question(&asks, "s1", &never).expect("asked");
+        assert!(
+            next_ssh_question(&asks, "s1", "cargo build", &never).is_none(),
+            "an unrelated command is not held for it"
+        );
+        let q = next_ssh_question(&asks, "s1", "git push", &never).expect("asked");
         assert_eq!(q.label, "github.com");
         let token = mark_ssh_asked(dir.path(), ws, "s1", &q, "git push", Some(7), 103).unwrap();
         let asks = load(dir.path(), ws, 104);
         assert!(
-            next_ssh_question(&asks, "s1", &never).is_none(),
+            next_ssh_question(&asks, "s1", "git push", &never).is_none(),
             "once per session"
         );
         assert!(
-            next_ssh_question(&asks, "s2", &never).is_some(),
+            next_ssh_question(&asks, "s2", "git push", &never).is_some(),
             "another session asks"
         );
         assert!(
-            next_ssh_question(&asks, "s2", &|_| true).is_none(),
+            next_ssh_question(&asks, "s2", "git push", &|_| true).is_none(),
             "a grant that covers it asks nothing"
         );
         assert!(take_ssh_approved(dir.path(), ws, &token, "git pull", 105).is_none());

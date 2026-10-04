@@ -87,7 +87,7 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
     }
 }
 
-/// The question to put to the human before the next command in `cwd`, in
+/// The question to put to the human before `command` runs again in `cwd`, in
 /// harness session `session_id`, with the token that approves it. Recording
 /// the question is what makes it the only time it is asked this session.
 pub(super) fn next_ask(
@@ -207,7 +207,7 @@ pub(super) fn next_ssh_ask(
     let covered = |r: &harness_asks::SshRefusal| {
         ahma_common::ssh_sign::allowed(&grants, &r.key, &r.destination, &workspace, now)
     };
-    let refusal = harness_asks::next_ssh_question(&asks, session_id, &covered)?;
+    let refusal = harness_asks::next_ssh_question(&asks, session_id, command, &covered)?;
     let pid = harness_pid().or(refusal.harness_pid)?;
     let token = harness_asks::mark_ssh_asked(
         &dir,
@@ -231,7 +231,7 @@ pub(super) fn ssh_ask_reason(refusal: &harness_asks::SshRefusal) -> String {
         format!("{} ({})", refusal.key, refusal.key_comment)
     };
     format!(
-        "ahma: an earlier command here asked to use your SSH key {key} for {} ({}); the \
+        "ahma: when this command last ran it asked to use your SSH key {key} for {} ({}); the \
          key itself never enters the sandbox. Approve to let commands in this workspace sign \
          with it for {} for this session, then run this command. Deny and ahma will not ask \
          about it again this session. To allow it always: `ahma permissions grant ssh-sign \
@@ -369,7 +369,8 @@ mod tests {
         let workspace = workspace_for(&ws);
         // SAFETY: getpid has no preconditions; this process is the owner.
         let owner = std::process::id();
-        let consent = RecordedConsent::new(workspace.clone(), None, Some(owner));
+        let consent =
+            RecordedConsent::new(workspace.clone(), None, Some(owner)).for_command("git push");
         let request = SignRequest {
             key_fingerprint: "SHA256:key".into(),
             key_comment: "me@laptop".into(),
@@ -380,6 +381,10 @@ mod tests {
         };
         assert!(matches!(consent.decide(&request).await, Decision::Deny(_)));
 
+        assert!(
+            next_ssh_ask(&ws, "session-1", "cargo build", None).is_none(),
+            "an unrelated command is not held for it (R-PERM.10)"
+        );
         let (refusal, token) =
             next_ssh_ask(&ws, "session-1", "git push", None).expect("the dialog asks");
         let reason = ssh_ask_reason(&refusal);

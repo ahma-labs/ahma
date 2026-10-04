@@ -4,7 +4,7 @@
 //! session grant from a dialog, or an `always`/lease grant in the settings
 //! file (SPEC R-CRED.3). Anything else is refused at once, with one line
 //! saying how to allow it (R-CRED.10), and remembered so the harness's own
-//! dialog asks before the next command (R-PERM.10). A command never waits on
+//! dialog asks when that command runs again (R-PERM.10). A command never waits on
 //! a human mid-handshake here; the dialog comes between commands.
 
 use super::broker::{Broker, Decision, Destination, KeySources, SignConsent, SignRequest};
@@ -50,9 +50,9 @@ pub fn refusal_line(request: &SignRequest) -> String {
     match destination_key(&request.destination) {
         Some((destination, label)) => format!(
             "Blocked until a human approves: ahma's SSH key broker did not sign for {label} \
-             with key {key} in this workspace. In Claude Code, ahma asks before the next \
-             command here; elsewhere a human runs `ahma permissions grant ssh-sign \"{} for \
-             {destination}\"` (add `--for 24h` for a lease). Then re-run.",
+             with key {key} in this workspace. In Claude Code, re-run this \
+             command and ahma asks first; elsewhere a human runs `ahma permissions grant \
+             ssh-sign \"{} for {destination}\"` (add `--for 24h` for a lease), then re-run.",
             request.key_fingerprint
         ),
         None => match &request.destination {
@@ -83,6 +83,9 @@ pub struct RecordedConsent {
     workspace: PathBuf,
     settings_file: Option<PathBuf>,
     harness_pid: Option<u32>,
+    /// Digest of the command this consent answers for, when one is known: the
+    /// dialog asks about its refusals only when it runs again (R-PERM.10).
+    command_digest: Option<String>,
 }
 
 impl RecordedConsent {
@@ -95,7 +98,14 @@ impl RecordedConsent {
             workspace,
             settings_file,
             harness_pid,
+            command_digest: None,
         }
+    }
+
+    /// Answer for `command`: a refusal is asked about when it runs again.
+    pub fn for_command(mut self, command: &str) -> Self {
+        self.command_digest = Some(ahma_common::digest::sha256_hex(command.as_bytes()));
+        self
     }
 
     fn grants(&self, now: u64) -> Vec<ssh_sign::SshSignGrant> {
@@ -140,6 +150,7 @@ impl SignConsent for RecordedConsent {
                 label,
                 at: now,
                 harness_pid: self.harness_pid,
+                command_digest: self.command_digest.clone(),
             };
             if let Err(e) = harness_asks::record_ssh_refusal(&dir, &self.workspace, refusal) {
                 tracing::debug!("ssh refusal not recorded: {e:#}");
@@ -161,9 +172,19 @@ pub struct RecordedBrokers {
     /// The workspace grants and questions are keyed on, when the caller
     /// already knows it (the terminal hook's); else each command's own.
     workspace: Option<PathBuf>,
+    /// The one command every lease is for, when the caller knows it (the
+    /// terminal hook runs one).
+    command: Option<String>,
 }
 
 impl RecordedBrokers {
+    /// Every lease is for `command` (SPEC R-PERM.10: its refusals are asked
+    /// about when it runs again).
+    pub fn for_command(mut self, command: &str) -> Self {
+        self.command = Some(command.to_string());
+        self
+    }
+
     /// Key every command's grants and questions on `workspace`.
     pub fn for_workspace(mut self, workspace: PathBuf) -> Self {
         self.workspace = Some(workspace);
@@ -186,6 +207,7 @@ impl RecordedBrokers {
             harness_pid,
             scopes,
             workspace: None,
+            command: None,
         }
     }
 }
@@ -200,11 +222,12 @@ impl BrokerFactory for RecordedBrokers {
         let workspace = self.workspace.clone().unwrap_or_else(|| {
             crate::adapter::workspace_queue::workspace_key(working_dir, &self.scopes)
         });
-        let consent = Arc::new(RecordedConsent::new(
-            workspace,
-            self.settings_file.clone(),
-            self.harness_pid,
-        ));
+        let mut consent =
+            RecordedConsent::new(workspace, self.settings_file.clone(), self.harness_pid);
+        if let Some(command) = &self.command {
+            consent = consent.for_command(command);
+        }
+        let consent = Arc::new(consent);
         let broker = Broker::new(
             KeySources::for_home(&self.home, self.upstream.clone()),
             consent,
