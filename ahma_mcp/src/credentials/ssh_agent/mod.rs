@@ -4,6 +4,10 @@
 //! it asks the broker, outside the sandbox, to sign — and only for a
 //! destination a human allowed.
 
+#[cfg(unix)]
+pub mod broker;
+#[cfg(unix)]
+pub mod host;
 pub mod keys;
 pub mod known_hosts;
 pub mod proto;
