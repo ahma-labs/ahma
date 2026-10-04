@@ -69,7 +69,17 @@ const MULTILINE_LOOKBACK: usize = 5;
 /// stderr wins when both carry a signature: it is the stream the denial was
 /// actually written to when the command did not merge them.
 pub fn scan_denial_streams(stderr: &str, stdout: &str) -> Option<DenialHit> {
-    scan_denial(stderr).or_else(|| scan_denial(stdout))
+    let mut hit = scan_denial(stderr).or_else(|| scan_denial(stdout))?;
+    // macOS says "Operation not permitted" for a refused read as well as a
+    // refused write. Reads are refused only on the credential set, so there
+    // the refusal was a read; the text alone cannot tell.
+    if hit.access.is_write()
+        && !hit.pattern.starts_with("seatbelt")
+        && super::credential_reads::is_read_denied(&hit.path)
+    {
+        hit.access = ScopeAccess::Ro;
+    }
+    Some(hit)
 }
 
 /// Scan one stream for the first kernel-denial signature and extract its path.
@@ -401,6 +411,23 @@ pub fn scan_signal_denial(output: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS reports a refused *read* as "Operation not permitted" too. Reads
+    /// are refused only on the credential set, so a refusal there is a read:
+    /// reporting it as a write said "read-only would not fix it" about a key
+    /// file the command had only tried to read.
+    #[test]
+    fn a_refusal_on_a_credential_file_is_a_read() {
+        let home = ahma_common::config::ahma_home_dir().expect("home");
+        let key = home.join(".ssh").join("id_ed25519");
+        let line = format!("head: {}: Operation not permitted", key.display());
+        let hit = scan_denial_streams(&line, "").expect("a refusal");
+        assert_eq!(hit.path, key);
+        assert_eq!(hit.access, ScopeAccess::Ro, "{hit:?}");
+        // Anywhere else a refused write is still a write.
+        let hit = scan_denial_streams("cp: /opt/x/y: Operation not permitted", "").unwrap();
+        assert_eq!(hit.access, ScopeAccess::Rw);
+    }
 
     #[test]
     fn kill_eperm_names_the_pid() {

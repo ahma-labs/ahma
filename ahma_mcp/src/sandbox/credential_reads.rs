@@ -202,6 +202,28 @@ pub fn credential_read_denies() -> Vec<PathBuf> {
     CREDENTIAL_READ_DENIES.read().clone()
 }
 
+/// Whether the sandbox refuses a *read* of `path`: inside the installed
+/// credential set, or an SSH private key. Everything else is readable on
+/// macOS, which is what lets a refusal there be told apart: "Operation not
+/// permitted" on a path reads are refused for was a read; anywhere else it
+/// was a write.
+pub fn is_read_denied(path: &Path) -> bool {
+    if credential_read_denies()
+        .iter()
+        .any(|deny| path.starts_with(deny))
+    {
+        return true;
+    }
+    let Some(home) = ahma_common::config::ahma_home_dir() else {
+        return false;
+    };
+    path.parent() == Some(home.join(".ssh").as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("id_") && !name.ends_with(".pub"))
+}
+
 /// Install whether sandboxed tools may access the macOS keychain (called once at
 /// startup with the resolved `[sandbox] allow_keychain` value). See
 /// `KEYCHAIN_ACCESS_ALLOWED`.

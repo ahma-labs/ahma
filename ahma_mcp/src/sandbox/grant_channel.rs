@@ -63,6 +63,21 @@ pub(crate) fn grant_dir_for(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// What every surface says about a refusal no grant can change (SPEC
+/// R-PERM.4.3, R-PERM.9): one first line saying so, and why. Never grant
+/// commands, a tier to pick or an `always` line: the hard denylist refuses
+/// them, and offering them anyway was a question whose answer is always no.
+/// `None` for a path a human may be asked about.
+pub fn never_grantable_text(path: &Path, access: ScopeAccess) -> Option<String> {
+    let why = ahma_common::scope_grant::refusal_reason(path)?;
+    let verb = if access.is_write() { "write" } else { "read" };
+    Some(format!(
+        "Blocked, and no grant can change it: ahma's kernel sandbox refused a {verb} of '{}'. \
+         {why}",
+        path.display()
+    ))
+}
+
 /// Agent-facing remediation for a *runtime* sandbox denial (a sandboxed command
 /// exited non-zero because the kernel blocked an out-of-scope access). Describes
 /// the supported grant -> restart -> retry loop using the MCP tools, so the sync
@@ -72,6 +87,9 @@ pub(crate) fn grant_dir_for(path: &Path) -> PathBuf {
 /// approval prompt offers (a file's parent directory, so one grant covers the
 /// whole cache rather than re-prompting per file).
 pub fn runtime_denial_remediation(path: &Path, access: ScopeAccess) -> String {
+    if let Some(text) = never_grantable_text(path, access) {
+        return text;
+    }
     let target = grant_dir_for(path);
     let access_str = if access.is_write() { "rw" } else { "ro" };
     let verb = if access.is_write() { "write" } else { "read" };
@@ -94,6 +112,9 @@ pub fn runtime_denial_remediation(path: &Path, access: ScopeAccess) -> String {
 /// MCP `sandbox_grant`/`restart` tools are not in play — notably the shell hook
 /// running in the editor's *native* terminal. Points at `ahma sandbox grant`.
 pub fn runtime_denial_remediation_cli(path: &Path, access: ScopeAccess) -> String {
+    if let Some(text) = never_grantable_text(path, access) {
+        return text;
+    }
     let target = grant_dir_for(path);
     let ro_flag = if access.is_write() {
         ""
@@ -501,6 +522,9 @@ pub fn hook_denial_text(
     details: &str,
     who: &HookRequester,
 ) -> String {
+    if let Some(text) = never_grantable_text(path, access) {
+        return text;
+    }
     let target = grant_dir_for(path);
     let body = ahma_common::grant_prompt::render_for_hook(
         &target,
@@ -582,12 +606,24 @@ pub fn hook_side_refusal(
     let refused_here = output.lines().any(|l| {
         let lower = l.to_ascii_lowercase();
         l.contains(&shown)
+            && !is_listed_text(l)
             && (lower.contains("operation not permitted")
                 || lower.contains("permission denied")
                 || lower.contains("read-only file system"))
             && !lower.contains("(publickey)")
     });
     if !refused_here {
+        return None;
+    }
+    // A refused access happens on this machine: its directory exists. A path
+    // whose directory does not is text that mentions a refusal (a fixture, a
+    // log from elsewhere), not one.
+    if !path.parent().is_some_and(Path::exists) {
+        return None;
+    }
+    // Nothing to offer for a path no grant can open, and a command that
+    // succeeded did not need it.
+    if ahma_common::scope_grant::refusal_reason(path).is_some() {
         return None;
     }
     let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -599,6 +635,20 @@ pub fn hook_side_refusal(
         return None;
     }
     Some((path.clone(), hit.access))
+}
+
+/// Whether `line` is listed text rather than a tool's own diagnostic: `grep -n`
+/// and compiler-style output begin `file:line:`, and what follows is quoted
+/// content, not something that just happened.
+fn is_listed_text(line: &str) -> bool {
+    let mut parts = line.splitn(3, ':');
+    let (Some(file), Some(num), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !file.is_empty()
+        && !file.contains(char::is_whitespace)
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit())
 }
 
 /// The one-line note for a refusal a hooked command shrugged off.
@@ -738,7 +788,8 @@ fn stderr_denial_question(
         };
         (in_scope, target)
     };
-    if in_scope {
+    // A path no grant can open is never asked about (R-PERM.4.3).
+    if in_scope || ahma_common::scope_grant::refusal_reason(&target).is_some() {
         return None;
     }
     // The denial usually names a single cache file; offer its parent directory so
@@ -1069,15 +1120,17 @@ mod context_tests {
             scopes: vec![ws.path().to_path_buf()],
             command: None,
         };
-        let out = "heavy: line 1: /opt/cache/neubit/heavy.lock.holder: Operation not permitted\nBUILD SUCCESSFUL";
-        let note = hook_side_refusal_note(out, &who).expect("a note");
-        assert_eq!(note.lines().count(), 1, "{note}");
-        assert!(
-            note.contains("/opt/cache/neubit/heavy.lock.holder"),
-            "{note}"
+        let cache = tempfile::tempdir().unwrap();
+        let holder = cache.path().join("heavy.lock.holder");
+        let out = format!(
+            "heavy: line 1: {}: Operation not permitted\nBUILD SUCCESSFUL",
+            holder.display()
         );
+        let note = hook_side_refusal_note(&out, &who).expect("a note");
+        assert_eq!(note.lines().count(), 1, "{note}");
+        assert!(note.contains(&holder.display().to_string()), "{note}");
         assert!(
-            note.contains("ahma sandbox grant /opt/cache/neubit"),
+            note.contains(&format!("ahma sandbox grant {}", cache.path().display())),
             "{note}"
         );
         assert!(hook_side_refusal_note("BUILD SUCCESSFUL", &who).is_none());
@@ -1110,6 +1163,78 @@ mod context_tests {
             "SSH_AUTH_SOCK=/var/run/com.apple.launchd.2sJPtUp0xm/Listeners\ngit@github.com: Permission denied (publickey).",
         ] {
             assert!(hook_side_refusal_note(out, &who).is_none(), "{out}");
+        }
+    }
+
+    /// Text that quotes a refusal is not one. `grep`, `cat` or `sed` over source,
+    /// docs or logs printed "the sandbox refused a write" with a grant for a
+    /// path that only appeared in a test fixture, and recorded it as a question
+    /// for Claude Code's dialog.
+    #[test]
+    fn quoted_refusals_in_listed_text_are_not_refusals() {
+        let ws = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let who = HookRequester {
+            harness: None,
+            session_id: None,
+            scopes: vec![ws.path().to_path_buf()],
+            command: None,
+        };
+        let real = elsewhere.path().join("x.lock");
+        for out in [
+            // A fixture path that exists nowhere.
+            "let out = \"/Users/u/Library/Caches/sccache/0/1/obj: Operation not permitted\";"
+                .to_string(),
+            // `grep -n` output: `file:line:` then the quoted text, even when the
+            // quoted path is real.
+            format!(
+                "src/x.rs:877:        notify(\"{}: Operation not permitted\");",
+                real.display()
+            ),
+            format!("docs/a.md:12:{}: Permission denied", real.display()),
+        ] {
+            assert!(hook_side_refusal_note(&out, &who).is_none(), "{out}");
+        }
+    }
+
+    /// A path no grant can ever open (credentials, ahma's own settings) gets
+    /// one honest statement, never grant commands or an `always` settings
+    /// line (SPEC R-PERM.4.3, R-PERM.9).
+    #[test]
+    fn a_never_grantable_path_offers_no_grant() {
+        let home = ahma_common::config::ahma_home_dir().expect("home");
+        let key = home.join(".ssh").join("id_ed25519");
+        let ws = tempfile::tempdir().unwrap();
+        let who = HookRequester {
+            harness: Some("Claude Code".into()),
+            session_id: None,
+            scopes: vec![ws.path().to_path_buf()],
+            command: Some("head ~/.ssh/id_ed25519".into()),
+        };
+        for t in [
+            hook_denial_text(&key, ScopeAccess::Ro, "Operation not permitted", &who),
+            runtime_denial_remediation(&key, ScopeAccess::Ro),
+            runtime_denial_remediation_cli(&key, ScopeAccess::Ro),
+        ] {
+            assert!(
+                t.starts_with("Blocked, and no grant can change it:"),
+                "one first line that says nothing can be done here: {t}"
+            );
+            assert!(t.contains("a read of"), "{t}");
+            for never in ["sandbox grant", "If you choose always", "pick a tier"] {
+                assert!(
+                    !t.contains(never),
+                    "offers {never:?} for a refused path: {t}"
+                );
+            }
+            assert!(
+                t.contains("ssh-add"),
+                "says how ssh can still use the key: {t}"
+            );
+            assert!(
+                !t.contains("still work"),
+                "never claims ssh works: it does not when the agent is empty: {t}"
+            );
         }
     }
 
