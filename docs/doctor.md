@@ -53,7 +53,7 @@ Example report:
 | Whether this folder is trusted, and what is always allowed here | info | none — `/settings trust` |
 | Log size, and the most repeated warnings in the newest log | info / warn | none |
 | Antigravity permission grants (`~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/config.json`) | warn / info | prune bloated one-off/malformed entries and install clean prefix token grants |
-| Git authentication from inside the sandbox: SSH agent holds a key; HTTPS credential helper not blocked by a sandbox setting | warn / info | none — the finding names the exact `ssh-add` command or settings key |
+| Git authentication from inside the sandbox: a key the [SSH key broker](ssh-agent-broker.md) signs with, or an agent holding any other key; HTTPS credential helper not blocked by a sandbox setting | warn / info | none — the finding names the exact `ssh-add` or `ssh-keygen` command, or settings key |
 | A build helper (sccache, a Gradle or Kotlin daemon) left running inside a sandbox, by shape: confined, orphaned, your own executable | warn | restart it (`--stop-server` / `--start-server`), refused if the doctor is itself sandboxed |
 | How grant prompts are being answered: median time-to-decision, share under three seconds, advisor followed | info / warn | none — a habit, not a file |
 | Sandbox profiles in effect and the GPU capability (`[sandbox] allow_gpu`) are shown on every scope surface | info | none |

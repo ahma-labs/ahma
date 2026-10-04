@@ -90,9 +90,9 @@ What keeps secrets unreadable on macOS is therefore an explicit **denylist**, no
 
 > **A denylist is a weaker guarantee than a scope, and is worth reading as one.** A scope denies everything it does not name; a denylist denies only what it *does* name, so any secret nobody thought to enumerate is readable. It is the best available answer on this platform — not an equivalent of the Linux position above.
 
-#### Git authentication: SSH through the agent, or HTTPS through a credential helper
+#### Git authentication: SSH through the key broker, or HTTPS through a credential helper
 
-Private keys in `~/.ssh`, whatever they are named, are unreadable inside the sandbox, by design, and no grant can change that. ssh can still use a key without reading it, through the SSH agent: load the key on the host with `ssh-add <key>` (once per login) and sandboxed `git push`/`fetch` sign through the forwarded `$SSH_AUTH_SOCK`. A new host key is added by connecting once from your own terminal. HTTPS works too: git's credential helper (for example `git-credential-osxkeychain`, or `gh auth setup-git`) reads the keychain, which the sandbox allows. ahma says this, in the same words, both when a command is refused a key file and when ssh reports `Permission denied (publickey)`. In terminal hooks, the [SSH key broker](ssh-agent-broker.md) signs for a server you allowed without the agent holding the key.
+Private keys in `~/.ssh`, whatever they are named, are unreadable inside the sandbox, by design, and no grant can change that. ssh can still use a key without reading it: a sandboxed command's `$SSH_AUTH_SOCK` is ahma's [SSH key broker](ssh-agent-broker.md), which signs for a server once a human allows that key for it, with an unencrypted ed25519 key file itself and with a passphrase-protected, RSA, ECDSA or security key only through your own agent (load it on the host with `ssh-add <key>`, once per login). A new host key is added by connecting once from your own terminal. HTTPS works too: git's credential helper (for example `git-credential-osxkeychain`, or `gh auth setup-git`) reads the keychain, which the sandbox allows. ahma says this, in the same words, both when a command is refused a key file and when ssh reports `Permission denied (publickey)`.
 
 #### Keychain access (`gh auth` / `git-credential-osxkeychain`)
 

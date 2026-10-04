@@ -1820,10 +1820,24 @@ mod refused_path_gate_tests {
     }
 }
 
-/// How ssh uses a key the sandbox will never let a command read: through the
-/// SSH agent, which signs without handing the key over. One statement, shared
-/// by the grant refusal and the `Permission denied (publickey)` diagnostic, so
-/// the two never tell different stories about the same failure.
+/// How ssh uses a key the sandbox will never let a command read: through
+/// ahma's SSH key broker, which signs outside the sandbox once a human allowed
+/// that key for that server (SPEC R-CRED.1, R-CRED.3), with the key file itself
+/// or through the human's agent (R-CRED.8). One statement, shared by the grant
+/// refusal and the `Permission denied (publickey)` diagnostic, so the two never
+/// tell different stories about the same failure.
+#[cfg(unix)]
+pub const SSH_KEY_USE: &str = "ssh can still use your key without reading it: ahma's SSH key \
+broker signs for a server once a human allows that key for it (in Claude Code, re-run the command \
+and approve the dialog; elsewhere, run the `ahma permissions grant ssh-sign` line from the \
+broker's refusal). It signs with an unencrypted ed25519 key file itself; a passphrase-protected, \
+RSA, ECDSA or security (`sk-*`) key must first be loaded into your own SSH agent on the host with \
+`ssh-add <key>` (on macOS, `ssh-add --apple-use-keychain <key>`). A new host key is added by \
+connecting once from your own terminal.";
+
+/// Without the broker (it runs on unix only, SPEC R-CRED.1), ssh signs only
+/// through the human's own agent.
+#[cfg(not(unix))]
 pub const SSH_KEY_USE: &str = "ssh can still use your key without reading it, through your \
 SSH agent: load it on the host with `ssh-add <key>` (once per login), and sandboxed git and ssh \
 sign through the agent. A new host key is added by connecting once from your own terminal.";
@@ -1847,12 +1861,23 @@ mod request_context_tests {
 
     /// The refusal for a key under `~/.ssh` says what works, not what may not:
     /// "git and ssh still work through your SSH agent" was false whenever the
-    /// agent held no key, which on macOS is every fresh login.
+    /// agent held no key, which on macOS is every fresh login. Where the SSH
+    /// key broker runs, it is the way through, and the human's step is a
+    /// grant; `ssh-add` is left for the keys the broker cannot sign with itself.
     #[test]
     fn the_ssh_refusal_says_how_to_make_ssh_work() {
         let home = crate::config::ahma_home_dir().expect("home");
         let why = refusal_reason(&home.join(".ssh").join("id_ed25519")).expect("refused");
-        assert!(why.contains("ssh-add"), "{why}");
+        if cfg!(unix) {
+            assert!(why.contains("SSH key broker"), "{why}");
+            assert!(why.contains("ahma permissions grant ssh-sign"), "{why}");
+            let broker = why.find("broker").unwrap();
+            let agent = why.find("ssh-add").expect("agent-only keys");
+            assert!(broker < agent, "the broker comes first: {why}");
+            assert!(why.contains("passphrase-protected"), "{why}");
+        } else {
+            assert!(why.contains("ssh-add"), "{why}");
+        }
         assert!(!why.contains("still work"), "{why}");
     }
 

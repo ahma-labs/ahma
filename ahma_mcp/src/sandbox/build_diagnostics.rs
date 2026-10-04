@@ -386,6 +386,15 @@ mod tests {
             "{}",
             hit.remediation
         );
+        // The broker is the way through (SPEC R-CRED.1); the agent is only
+        // for keys it cannot sign with itself (R-CRED.8).
+        if cfg!(unix) {
+            assert!(
+                hit.remediation.contains("ahma permissions grant ssh-sign"),
+                "{}",
+                hit.remediation
+            );
+        }
         assert!(hit.remediation.contains("ssh-add"));
     }
 }

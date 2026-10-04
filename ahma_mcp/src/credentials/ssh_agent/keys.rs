@@ -437,6 +437,20 @@ mod tests {
         );
     }
 
+    /// `ahma doctor` reads only a key file's header to decide whether a key
+    /// needs the human's agent (SPEC R-DOCTOR.6); it must name exactly the
+    /// keys this parser refuses.
+    #[test]
+    fn the_doctor_agrees_which_key_files_the_host_signs_with() {
+        for text in [PLAIN_ED25519, LOCKED_ED25519, PLAIN_ECDSA, "not a key"] {
+            assert_eq!(
+                ahma_common::ssh_sign::host_signs_key_file(text),
+                parse_private_key(text).is_ok(),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn a_signature_by_another_key_or_algorithm_does_not_verify() {
         let key = parse_private_key(PLAIN_ED25519).unwrap();

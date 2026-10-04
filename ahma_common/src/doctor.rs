@@ -1632,23 +1632,30 @@ mod git_auth_tests {
     use super::*;
     use crate::config::AhmaSettings;
 
-    fn probe(keys: &[&str], identities: Option<usize>, helpers: &[&str]) -> GitAuthProbe {
+    fn probe(
+        keys: &[&str],
+        broker: &[&str],
+        identities: Option<usize>,
+        helpers: &[&str],
+    ) -> GitAuthProbe {
         GitAuthProbe {
             ssh_keys: keys.iter().map(PathBuf::from).collect(),
+            broker_keys: broker.iter().map(PathBuf::from).collect(),
             agent_identities: identities,
             credential_helpers: helpers.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    /// The sandbox denies reads of `~/.ssh/id_*`, so inside it ssh has only the
+    /// The sandbox denies reads of `~/.ssh/id_*`, so a key the broker cannot
+    /// sign with itself (here RSA) reaches a sandboxed ssh only through the
     /// agent — and on the host the user never noticed the agent was empty,
     /// because ssh read the key file directly. The finding says exactly what
-    /// to run.
+    /// to run, and names that key.
     #[test]
-    fn an_empty_ssh_agent_with_keys_present_says_exactly_what_to_run() {
+    fn an_empty_ssh_agent_with_only_agent_keys_says_exactly_what_to_run() {
         let mut out = Vec::new();
         check_git_auth(
-            &probe(&["/h/.ssh/id_ed25519"], Some(0), &[]),
+            &probe(&["/h/.ssh/id_rsa"], &[], Some(0), &[]),
             &AhmaSettings::default(),
             &mut out,
         );
@@ -1659,7 +1666,75 @@ mod git_auth_tests {
         assert_eq!(f.level, Level::Warn);
         assert!(f.detail.starts_with("One thing to do: "), "{}", f.detail);
         assert!(f.detail.contains("ssh-add"), "{}", f.detail);
-        assert!(f.detail.contains("/h/.ssh/id_ed25519"), "{}", f.detail);
+        assert!(f.detail.contains("/h/.ssh/id_rsa"), "{}", f.detail);
+    }
+
+    /// An unencrypted ed25519 key is one the broker signs with on the host
+    /// (SPEC R-CRED.8): an empty agent, or none at all, costs nothing, and
+    /// the doctor says the broker will use the key after one approval per
+    /// server — even when another key needs the agent.
+    #[test]
+    fn a_key_the_broker_signs_with_needs_no_agent() {
+        for identities in [Some(0), None] {
+            let mut out = Vec::new();
+            check_git_auth(
+                &probe(
+                    &["/h/.ssh/id_ecdsa", "/h/.ssh/id_ed25519"],
+                    &["/h/.ssh/id_ed25519"],
+                    identities,
+                    &[],
+                ),
+                &AhmaSettings::default(),
+                &mut out,
+            );
+            assert_eq!(out.len(), 1, "{out:?}");
+            let f = &out[0];
+            assert_eq!(f.level, Level::Info, "{}", f.detail);
+            assert!(f.detail.starts_with("Nothing more to do"), "{}", f.detail);
+            assert!(f.detail.contains("key broker"), "{}", f.detail);
+            assert!(f.detail.contains("/h/.ssh/id_ed25519"), "{}", f.detail);
+            assert!(f.detail.contains("each server"), "{}", f.detail);
+            assert!(!f.detail.contains("ssh-add"), "{}", f.detail);
+        }
+    }
+
+    /// The doctor sees the key files the broker would: every non-`.pub`
+    /// file under `~/.ssh`, whatever it is called, signed with only when it
+    /// is an unencrypted ed25519 key.
+    #[test]
+    fn key_files_are_sorted_into_agent_and_broker_keys() {
+        // `ssh-keygen -t ed25519 -N ''`, made for these tests; it protects nothing.
+        const PLAIN_ED25519: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACB0oJMvoCd/m51H/zkgLaQqlFDFSF4LCx+uTEYv+1580AAAAJBHctMAR3LT
+AAAAAAtzc2gtZWQyNTUxOQAAACB0oJMvoCd/m51H/zkgLaQqlFDFSF4LCx+uTEYv+1580A
+AAAECnXzDMMGVedTdmUvGOkGBVmMAnGzCVA3iMrzC36CjrL3Sgky+gJ3+bnUf/OSAtpCqU
+UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
+-----END OPENSSH PRIVATE KEY-----
+";
+        let home = tempfile::tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), PLAIN_ED25519).unwrap();
+        std::fs::write(ssh.join("id_ed25519.pub"), "ssh-ed25519 AAAA x").unwrap();
+        std::fs::write(ssh.join("work_ed25519"), PLAIN_ED25519).unwrap();
+        std::fs::write(
+            ssh.join("id_rsa"),
+            "-----BEGIN RSA PRIVATE KEY-----\nMII=\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        std::fs::write(ssh.join("known_hosts"), "github.com ssh-ed25519 AAAA\n").unwrap();
+
+        let (ssh_keys, broker_keys) = ssh_key_files(&ssh);
+        assert_eq!(ssh_keys, vec![ssh.join("id_ed25519"), ssh.join("id_rsa")]);
+        if cfg!(unix) {
+            assert_eq!(
+                broker_keys,
+                vec![ssh.join("id_ed25519"), ssh.join("work_ed25519")]
+            );
+        } else {
+            assert!(broker_keys.is_empty(), "no broker here: {broker_keys:?}");
+        }
     }
 
     /// HTTPS is the more common transport. A keychain helper is blocked only by
@@ -1670,7 +1745,11 @@ mod git_auth_tests {
         let mut settings = AhmaSettings::default();
         settings.sandbox.allow_keychain = false;
         let mut out = Vec::new();
-        check_git_auth(&probe(&[], None, &["osxkeychain"]), &settings, &mut out);
+        check_git_auth(
+            &probe(&[], &[], None, &["osxkeychain"]),
+            &settings,
+            &mut out,
+        );
         let f = out
             .iter()
             .find(|f| f.title.contains("HTTPS"))
@@ -1686,7 +1765,12 @@ mod git_auth_tests {
             .push(PathBuf::from("~/.config/gh"));
         let mut out = Vec::new();
         check_git_auth(
-            &probe(&[], None, &["!/opt/homebrew/bin/gh auth git-credential"]),
+            &probe(
+                &[],
+                &[],
+                None,
+                &["!/opt/homebrew/bin/gh auth git-credential"],
+            ),
             &settings,
             &mut out,
         );
@@ -1699,7 +1783,7 @@ mod git_auth_tests {
     fn working_git_auth_is_reported_as_nothing_to_do() {
         let mut out = Vec::new();
         check_git_auth(
-            &probe(&["/h/.ssh/id_ed25519"], Some(1), &["osxkeychain"]),
+            &probe(&["/h/.ssh/id_rsa"], &[], Some(1), &["osxkeychain"]),
             &AhmaSettings::default(),
             &mut out,
         );
@@ -1714,20 +1798,33 @@ mod git_auth_tests {
     }
 
     /// No key, no helper: every push will prompt for a password, which no
-    /// sandboxed command can answer. Still one exact action.
+    /// sandboxed command can answer. Still one exact action, and it is the
+    /// one that works with every git host: an SSH key, which the broker then
+    /// signs with. A host's own CLI comes second.
     #[test]
     fn no_credentials_at_all_is_one_exact_action() {
         let mut out = Vec::new();
-        check_git_auth(&probe(&[], None, &[]), &AhmaSettings::default(), &mut out);
+        check_git_auth(
+            &probe(&[], &[], None, &[]),
+            &AhmaSettings::default(),
+            &mut out,
+        );
         let f = out.iter().find(|f| f.title.contains("Git")).unwrap();
         assert_eq!(f.level, Level::Info);
         assert!(f.detail.starts_with("One thing to do: "), "{}", f.detail);
-        assert!(f.detail.contains("gh auth login"), "{}", f.detail);
+        let keygen = f.detail.find("ssh-keygen -t ed25519").expect("a key first");
+        let gh = f.detail.find("gh auth login").expect("gh second");
+        assert!(keygen < gh, "{}", f.detail);
+        let first_sentence = f.detail.split(". ").next().unwrap();
+        assert!(
+            !first_sentence.contains("GitHub") && !first_sentence.contains("gh "),
+            "{first_sentence}"
+        );
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Git authentication under the sandbox (SPEC R-DOCTOR.4)
+// Git authentication under the sandbox (SPEC R-DOCTOR.6)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// How git can authenticate from inside the sandbox, as observed on this
@@ -1737,6 +1834,9 @@ mod git_auth_tests {
 pub struct GitAuthProbe {
     /// SSH private keys under `~/.ssh` (`id_*` without `.pub`).
     pub ssh_keys: Vec<PathBuf>,
+    /// Key files under `~/.ssh` the SSH key broker signs with itself, on the
+    /// host, with no agent (SPEC R-CRED.8). Empty where there is no broker.
+    pub broker_keys: Vec<PathBuf>,
     /// Identities the SSH agent holds: `Some(0)` is an empty agent, `None`
     /// means no agent answered (`SSH_AUTH_SOCK` unset or dead).
     pub agent_identities: Option<usize>,
@@ -1744,25 +1844,50 @@ pub struct GitAuthProbe {
     pub credential_helpers: Vec<String>,
 }
 
+/// The key files under `ssh_dir`: `id_*` private keys, and every file the
+/// broker would sign with — it reads each non-`.pub` file there, whatever it
+/// is called, as `ssh_agent::broker` does. Reading a key is fine here: the
+/// doctor runs on the host, as the broker does.
+fn ssh_key_files(ssh_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(ssh_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_none_or(|e| e != "pub"))
+        .collect();
+    files.sort();
+    let ssh_keys = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("id_"))
+        })
+        .cloned()
+        .collect();
+    // The broker runs on unix only (SPEC R-CRED.1); elsewhere every key is
+    // used through the agent.
+    let broker_keys = if cfg!(unix) {
+        files
+            .into_iter()
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .is_ok_and(|text| crate::ssh_sign::host_signs_key_file(&text))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (ssh_keys, broker_keys)
+}
+
 impl GitAuthProbe {
     /// Observe the real machine. Each probe is a short local command; a
     /// failure to run one is recorded as "unknown", never as an error.
     pub fn collect(home: Option<&Path>) -> Self {
-        let ssh_keys = home
-            .map(|h| h.join(".ssh"))
-            .and_then(|dir| std::fs::read_dir(dir).ok())
-            .map(|entries| {
-                let mut keys: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        name.starts_with("id_") && !name.ends_with(".pub")
-                    })
-                    .collect();
-                keys.sort();
-                keys
-            })
+        let (ssh_keys, broker_keys) = home
+            .map(|h| ssh_key_files(&h.join(".ssh")))
             .unwrap_or_default();
         let agent_identities = std::process::Command::new("ssh-add")
             .arg("-l")
@@ -1798,6 +1923,7 @@ impl GitAuthProbe {
             .unwrap_or_default();
         Self {
             ssh_keys,
+            broker_keys,
             agent_identities,
             credential_helpers,
         }
@@ -1807,15 +1933,20 @@ impl GitAuthProbe {
 /// Whether `git` can authenticate from inside the sandbox, over SSH and over
 /// HTTPS, and — when it cannot — the one exact thing to do.
 ///
-/// The sandbox denies reads of `~/.ssh/id_*` (R6.2.3), so inside it ssh has
-/// only the agent; on the host ssh reads the key file directly, which is why an
-/// empty agent is invisible until the first sandboxed `git push`. HTTPS is the
-/// more common transport and ahma does not block its helpers: the keychain is
-/// allowed unless `[sandbox] allow_keychain = false`, and `~/.config/gh` is
+/// The sandbox denies reads of `~/.ssh/id_*` (R6.2.3), so inside it ssh signs
+/// only through the agent socket ahma gives it: the SSH key broker, which signs
+/// with an unencrypted ed25519 key file on the host itself and with any other
+/// key only through the human's own agent (SPEC R-CRED.8). An empty agent is
+/// therefore a problem only when no key file is one the broker signs with, and
+/// it is invisible on the host, where ssh reads the key file directly. HTTPS is
+/// the more common transport and ahma does not block its helpers: the keychain
+/// is allowed unless `[sandbox] allow_keychain = false`, and `~/.config/gh` is
 /// readable unless listed in `deny_credential_reads`. Each finding names the
-/// one key or command, per the "do you need to do anything" rule.
+/// one key or command, per the "do you need to do anything" rule (SPEC
+/// R-DOCTOR.6).
 fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<Finding>) {
-    let keys_present = !probe.ssh_keys.is_empty();
+    let keys_present = !probe.ssh_keys.is_empty() || !probe.broker_keys.is_empty();
+    let broker_signs = !probe.broker_keys.is_empty();
     let helpers = &probe.credential_helpers;
     let keychain_helper = helpers.iter().any(|h| h.contains("osxkeychain"));
     let gh_helper = helpers.iter().any(|h| h.contains("gh"));
@@ -1824,6 +1955,8 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
         s.ends_with(".config/gh") || s.ends_with(".config/gh/")
     });
     let mut problems = 0usize;
+    // When the broker signs with no key file, every `id_*` key is one that
+    // only the agent can use: name it.
     let first_key = probe
         .ssh_keys
         .first()
@@ -1834,8 +1967,21 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
     } else {
         format!("ssh-add {first_key}")
     };
+    let needs_agent = if cfg!(unix) {
+        format!(
+            "`{first_key}` is not a key ahma's SSH key broker signs with itself: it signs \
+             unencrypted ed25519 keys, and uses passphrase-protected, RSA, ECDSA and security \
+             keys only through your SSH agent (SPEC R-CRED.8). The key file itself stays \
+             unreadable inside the sandbox (SPEC R6.2.3)"
+        )
+    } else {
+        format!(
+            "The sandbox denies reads of your private keys (`{first_key}`, SPEC R6.2.3), so a \
+             sandboxed `git fetch`/`push` over SSH can authenticate only through the agent"
+        )
+    };
 
-    if keys_present {
+    if keys_present && !broker_signs {
         match probe.agent_identities {
             Some(0) => {
                 problems += 1;
@@ -1844,11 +1990,9 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
                     title: "Git over SSH fails inside the sandbox: the SSH agent holds no key"
                         .into(),
                     detail: format!(
-                        "One thing to do: run `{add_cmd}` in a terminal on the host.\n\nThe \
-                         sandbox denies reads of your private keys (`{first_key}`, SPEC R6.2.3) \
-                         and forwards only the agent socket, so a sandboxed `git fetch`/`push` \
-                         over SSH can authenticate only through the agent. On the host ssh \
-                         reads the key file directly, which is why this was invisible until now."
+                        "One thing to do: run `{add_cmd}` in a terminal on the host.\n\n\
+                         {needs_agent}. On the host ssh reads the key file directly, which is \
+                         why this was invisible until now."
                     ),
                     fix: None,
                 });
@@ -1861,9 +2005,7 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
                     detail: format!(
                         "One thing to do: start an agent and load your key — `eval \"$(ssh-agent \
                          -s)\" && {add_cmd}` — then launch your editor or ahma from that shell so \
-                         `SSH_AUTH_SOCK` is inherited.\n\nInside the sandbox the private key file \
-                         is unreadable by design (SPEC R6.2.3); the agent is the only way ssh \
-                         can sign."
+                         `SSH_AUTH_SOCK` is inherited.\n\n{needs_agent}."
                     ),
                     fix: None,
                 });
@@ -1901,15 +2043,25 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
             fix: None,
         });
     } else if helpers.is_empty() && !keys_present {
+        // An SSH key works with every git host, and the broker signs with a
+        // new ed25519 key with no further setup; a host's own CLI is second.
+        let new_key = if cfg!(unix) {
+            "ahma's SSH key broker signs with it once a human allows it for each server (SPEC \
+             R-CRED.3; a key with a passphrase needs `ssh-add` too)"
+        } else {
+            "then load it into your SSH agent with `ssh-add`"
+        };
         out.push(Finding {
             level: Level::Info,
             title: "Git has no way to authenticate from inside the sandbox".into(),
-            detail: "One thing to do: run `gh auth login` on the host, then `gh auth setup-git` \
-                     (stores a token in the keychain, which the sandbox allows); or create an SSH \
-                     key and load it with `ssh-add`.\n\nNo `credential.helper` is configured and \
-                     no key is under ~/.ssh, so a sandboxed `git push` over HTTPS prompts for a \
-                     password it cannot read. Public clones and fetches still work."
-                .into(),
+            detail: format!(
+                "One thing to do: create an SSH key on the host with `ssh-keygen -t ed25519` and \
+                 add its `.pub` to your git host; {new_key}. For HTTPS instead, give git a \
+                 credential helper the sandbox can reach (on GitHub: `gh auth login`, then `gh \
+                 auth setup-git`).\n\nNo `credential.helper` is configured and no key is under \
+                 ~/.ssh, so a sandboxed `git push` over HTTPS prompts for a password it cannot \
+                 read. Public clones and fetches still work."
+            ),
             fix: None,
         });
         return;
@@ -1921,21 +2073,30 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
         } else {
             format!("HTTPS via {}", helpers.join(", "))
         };
-        let ssh = match (keys_present, probe.agent_identities) {
-            (true, Some(n)) => format!(
+        let ssh = match (
+            probe.broker_keys.first(),
+            keys_present,
+            probe.agent_identities,
+        ) {
+            (Some(key), _, _) => format!(
+                "SSH via ahma's key broker, which signs with `{}` once a human allows it for \
+                 each server (SPEC R-CRED.3)",
+                key.display()
+            ),
+            (None, true, Some(n)) => format!(
                 "SSH via the agent ({n} identit{})",
                 if n == 1 { "y" } else { "ies" }
             ),
-            (true, None) => "SSH: agent state unknown".to_string(),
-            (false, _) => "SSH: no key under ~/.ssh".to_string(),
+            (None, true, None) => "SSH: agent state unknown".to_string(),
+            (None, false, _) => "SSH: no key under ~/.ssh".to_string(),
         };
         out.push(Finding {
             level: Level::Info,
             title: "Git can authenticate from inside the sandbox".into(),
             detail: format!(
-                "Nothing more to do. {https}; {ssh}. The sandbox forwards the agent socket and \
-                 allows the keychain; it denies only the private key files themselves (SPEC \
-                 R6.2.3)."
+                "Nothing more to do. {https}; {ssh}. Sandboxed commands sign through the agent \
+                 socket ahma gives them and may use the keychain; only the private key files \
+                 themselves stay unreadable (SPEC R6.2.3)."
             ),
             fix: None,
         });

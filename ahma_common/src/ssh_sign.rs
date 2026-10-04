@@ -8,6 +8,9 @@
 //! is one owner-only file per grant under `runtime_dir()/ssh-sign/`, bound to
 //! the process whose life it lasts, like a session scope grant
 //! ([`crate::session_grants`]).
+//!
+//! [`host_signs_key_file`] says which key files the broker signs with itself,
+//! so `ahma doctor` knows which keys need the human's agent (SPEC R-DOCTOR.6).
 
 use std::path::{Path, PathBuf};
 
@@ -169,6 +172,129 @@ pub fn allowed(
     grants
         .iter()
         .any(|g| g.covers(key, destination, workspace, now))
+}
+
+/// Whether the broker signs with the private key file `text` on the host
+/// itself: an unencrypted ed25519 `openssh-key-v1` key (SPEC R-CRED.8). Any
+/// other key — passphrase-protected, RSA, ECDSA, a security key — is used only
+/// through the human's own agent. Only the header is read, so `ahma doctor`
+/// can tell which keys need `ssh-add` without parsing a secret;
+/// `ahma_mcp`'s `ssh_agent::keys::parse_private_key` is what signs, and a test
+/// there holds the two to the same answer.
+pub fn host_signs_key_file(text: &str) -> bool {
+    let body: String = text
+        .lines()
+        .map(str::trim)
+        .skip_while(|l| *l != "-----BEGIN OPENSSH PRIVATE KEY-----")
+        .skip(1)
+        .take_while(|l| *l != "-----END OPENSSH PRIVATE KEY-----")
+        .collect();
+    let header = || -> Option<bool> {
+        let raw = decode_base64(&body)?;
+        let mut rest = raw.strip_prefix(b"openssh-key-v1\0")?;
+        let cipher = take_u32_prefixed(&mut rest)?;
+        let kdf = take_u32_prefixed(&mut rest)?;
+        let _kdf_options = take_u32_prefixed(&mut rest)?;
+        if cipher != b"none" || kdf != b"none" {
+            return Some(false);
+        }
+        let key_count = rest.get(..4)?;
+        rest = &rest[4..];
+        let mut public_blob = take_u32_prefixed(&mut rest)?;
+        Some(
+            key_count == 1u32.to_be_bytes()
+                && take_u32_prefixed(&mut public_blob)? == b"ssh-ed25519",
+        )
+    };
+    header().unwrap_or(false)
+}
+
+/// One SSH wire `string` (a big-endian `u32` length, then that many bytes),
+/// taken off the front of `rest`.
+fn take_u32_prefixed<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let value = rest.get(4..4usize.checked_add(len)?)?;
+    *rest = &rest[4 + len..];
+    Some(value)
+}
+
+/// Standard base64 with optional trailing padding: just enough to read a
+/// key file's header, without a dependency `ahma_common` does not otherwise need.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+#[cfg(test)]
+mod key_file_tests {
+    //! Keys made with `ssh-keygen` for these tests (the same fixtures as
+    //! `ahma_mcp`'s `ssh_agent::keys`). They protect nothing.
+    use super::*;
+
+    const PLAIN_ED25519: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACB0oJMvoCd/m51H/zkgLaQqlFDFSF4LCx+uTEYv+1580AAAAJBHctMAR3LT
+AAAAAAtzc2gtZWQyNTUxOQAAACB0oJMvoCd/m51H/zkgLaQqlFDFSF4LCx+uTEYv+1580A
+AAAECnXzDMMGVedTdmUvGOkGBVmMAnGzCVA3iMrzC36CjrL3Sgky+gJ3+bnUf/OSAtpCqU
+UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
+-----END OPENSSH PRIVATE KEY-----
+";
+    /// `ssh-keygen -t ed25519 -N secret`.
+    const LOCKED_ED25519: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDeTrtu0X
+1MxW2Gr960g2jzAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIGkUmTXRaT8jyUUM
+TVcMVJJtkpIIqlTQU+m7SaTUpO4GAAAAkPJ/J591rDg36aO4aRygBcvBa9cBEc6lxVQa2H
+MMsh7MoUmUMFA4xrKwsEicX+GLVKRFl8oVs+cfhGakm9NVV7kyV3FI6rG9s1O8ekrH/+dN
+Jl0xB6PUZH8pwIYOulHc0vIT74eV+7F00Ic8jZ9IZMgmgixMHDgr39vkSWha7uNeLDsHEP
+zdbYUnMIxPdT/DZw==
+-----END OPENSSH PRIVATE KEY-----
+";
+    /// `ssh-keygen -t ecdsa -b 256 -N ''`.
+    const PLAIN_ECDSA: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQSavwEZgQKcuyf3LdGPDXLblrBhuA5A
+nK98/2kDWbfi61tJwDftJicoa05QKuJmij+8DQgky8dh3M7K3kEitjnFAAAAoD18SlY9fE
+pWAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJq/ARmBApy7J/ct
+0Y8NctuWsGG4DkCcr3z/aQNZt+LrW0nAN+0mJyhrTlAq4maKP7wNCCTLx2HczsreQSK2Oc
+UAAAAgb7aSNxA3WMmSyfkRHINIQqv++ErAcI2buzfm4qNRfVgAAAAHZWNAYWhtYQE=
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// `ahma doctor` says "run `ssh-add`" only for a key the broker cannot
+    /// sign with itself, so the header has to be read exactly.
+    #[test]
+    fn only_an_unencrypted_ed25519_key_is_signed_on_the_host() {
+        assert!(host_signs_key_file(PLAIN_ED25519));
+        assert!(!host_signs_key_file(LOCKED_ED25519), "passphrase");
+        assert!(!host_signs_key_file(PLAIN_ECDSA), "ecdsa");
+        assert!(!host_signs_key_file(
+            "-----BEGIN RSA PRIVATE KEY-----\nMII=\n-----END RSA PRIVATE KEY-----"
+        ));
+        assert!(!host_signs_key_file("not a key"));
+        assert!(!host_signs_key_file(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn*=\n-----END OPENSSH PRIVATE KEY-----"
+        ));
+        let truncated: String = PLAIN_ED25519.lines().take(2).collect::<Vec<_>>().join("\n");
+        assert!(!host_signs_key_file(&truncated), "no END line, short body");
+    }
 }
 
 #[cfg(test)]
