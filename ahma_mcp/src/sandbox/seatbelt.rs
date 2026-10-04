@@ -122,7 +122,7 @@ impl Sandbox {
 (allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
 {exec_config_deny_rules}{network_rules}(allow mach-lookup)
 (allow ipc-posix-shm*)
-"#,
+{broker_rules}"#,
             working_dir = wd_str,
             working_dir_write = working_dir_write,
             signal_rules = signal_rules,
@@ -137,6 +137,7 @@ impl Sandbox {
             temp_rules = temp_rules,
             exec_config_deny_rules = exec_config_deny_rules,
             network_rules = network_rules,
+            broker_rules = broker_rules(),
         );
 
         tracing::debug!("Generated macOS Sandbox (Seatbelt) profile:\n{}", profile);
@@ -493,6 +494,24 @@ impl Sandbox {
                 .to_string()
         }
     }
+}
+
+/// The SSH key broker's sockets (SPEC R-CRED.1): a command may reach a
+/// socket in the agent directory and do nothing else there — read it and
+/// write data to it, never create, remove or rename an entry. Emitted last,
+/// after the deny on ahma's own runtime directory it sits inside. Which
+/// socket a command may *use* is the broker's check, by process group.
+fn broker_rules() -> String {
+    let Some(dir) = ahma_common::hub::runtime_dir().map(|d| d.join("agent")) else {
+        return String::new();
+    };
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+    // Connecting needs no network rule: unix sockets are never denied by the
+    // network rules, which concern IP only (R-WEB.16).
+    format!(
+        "(allow file-read* file-write-data (subpath \"{}\"))\n",
+        dir.display()
+    )
 }
 
 #[cfg(test)]

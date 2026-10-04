@@ -525,6 +525,78 @@ fn test_ssh_keys_are_unreadable_whatever_their_name() {
     }
 }
 
+/// Kernel test for the SSH key broker's socket (SPEC R-CRED.1): a sandboxed
+/// command reaches a broker socket in ahma's agent directory — inside the
+/// runtime directory the profile otherwise denies — and lists the key the
+/// broker holds, which it could never read itself.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn test_a_sandboxed_command_reaches_its_ssh_broker() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::credentials::ssh_agent::broker::{
+        Broker, Decision, KeySources, SignConsent, SignRequest,
+    };
+    use ahma_mcp::credentials::ssh_agent::host::{BrokerLease, agent_dir};
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+    use std::sync::Arc;
+
+    struct Deny;
+    #[async_trait::async_trait]
+    impl SignConsent for Deny {
+        async fn decide(&self, _: &SignRequest) -> Decision {
+            Decision::Deny("listing only".into())
+        }
+    }
+    // A key made for this test with `ssh-keygen -t ed25519 -N ''`.
+    const KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACB0oJMvoCd/m51H/zkgLaQqlFDFSF4LCx+uTEYv+1580AAAAJBHctMAR3LT
+AAAAAAtzc2gtZWQyNTUxOQAAACB0oJMvoCd/m51H/zkgLaQqlFDFSF4LCx+uTEYv+1580A
+AAAECnXzDMMGVedTdmUvGOkGBVmMAnGzCVA3iMrzC36CjrL3Sgky+gJ3+bnUf/OSAtpCqU
+UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
+-----END OPENSSH PRIVATE KEY-----
+";
+    let home = TempDir::new().expect("key home");
+    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    std::fs::write(home.path().join(".ssh/id_ed25519"), KEY).unwrap();
+    let broker = Broker::new(KeySources::for_home(home.path(), None), Arc::new(Deny));
+    let lease = BrokerLease::start(broker, &agent_dir().expect("agent dir")).expect("lease");
+
+    let scope = TempDir::new().expect("scope");
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        true,
+        false,
+        false,
+    )
+    .expect("sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    let socket = lease.socket().to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        use std::os::unix::process::CommandExt;
+        // In a process group of its own, led by a child of this process: how
+        // ahma spawns every command, and what the broker admits.
+        Command::new("sandbox-exec")
+            .process_group(0)
+            .args(["-p", &profile, "/usr/bin/ssh-add", "-l"])
+            .env("SSH_AUTH_SOCK", &socket)
+            .current_dir(scope.path())
+            .output()
+            .expect("run sandbox-exec")
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success()
+            && stdout.contains("SHA256:Ve/vkYCtZQZGMMywicF/HCNoDLJfT3cvTqK0iAJLOw0"),
+        "the sandboxed ssh-add lists the broker's key. exit={:?} stdout={stdout} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Verify that real git operations inside a git worktree succeed under macOS Seatbelt,
 /// while writes to .git/hooks in the common repository remain strictly blocked by the kernel.
 #[cfg(target_os = "macos")]
