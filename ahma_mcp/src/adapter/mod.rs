@@ -1898,8 +1898,6 @@ impl std::fmt::Debug for QueueWaitNotice {
 /// A wait shorter than this is not worth a line in the result.
 const QUEUE_WAIT_WORTH_REPORTING: Duration = Duration::from_millis(500);
 
-/// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
-/// command itself starts does not wait for the lease its ancestor holds.
 /// The lines a broker's refusals leave in a command's result, once each.
 #[cfg(unix)]
 fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> Option<String> {
@@ -1915,6 +1913,8 @@ fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> 
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+/// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
+/// command itself starts does not wait for the lease its ancestor holds.
 fn stamp_lease(cmd: &mut tokio::process::Command, lease: Option<&workspace_queue::Lease>) {
     if let Some(lease) = lease {
         cmd.env(

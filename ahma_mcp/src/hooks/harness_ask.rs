@@ -355,6 +355,7 @@ mod tests {
     /// broker refuses a signature no grant allows and remembers it; before
     /// the next command the dialog asks; the approved command's token records
     /// a session grant; the same signature is then allowed.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_refused_signature_is_asked_about_and_a_yes_lets_it_sign() {
         use crate::credentials::ssh_agent::broker::{
