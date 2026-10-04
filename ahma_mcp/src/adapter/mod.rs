@@ -1292,6 +1292,8 @@ impl Adapter {
             drift_root,
             display_command,
             watch_handoff: self.watches_handoff(lane),
+            #[cfg(unix)]
+            credential_brokers: self.credential_brokers.clone(),
         }));
 
         // Store the handle for graceful shutdown
@@ -1648,6 +1650,9 @@ struct AsyncOperationRun {
     display_command: String,
     /// Inventory the trust-handoff deny tier around the run (SPEC R6.1.7).
     watch_handoff: bool,
+    /// Gives the command an SSH key broker (SPEC R-CRED.1).
+    #[cfg(unix)]
+    credential_brokers: Option<Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>>,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -1672,6 +1677,8 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         drift_root,
         display_command,
         watch_handoff,
+        #[cfg(unix)]
+        credential_brokers,
     } = ctx;
 
     // Timed from the moment the task starts, so queueing behind a command mutex
@@ -1778,6 +1785,26 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     };
 
     stamp_lease(&mut proc_cmd, lease.as_ref());
+    // The command's SSH key broker (SPEC R-CRED.1): a refused signature is an
+    // alert on this operation while it still runs (R-CRED.10). Held until the
+    // command has finished.
+    #[cfg(unix)]
+    let _broker = credential_brokers
+        .as_ref()
+        .and_then(|f| f.lease(&wd_path))
+        .inspect(|broker| {
+            proc_cmd.env("SSH_AUTH_SOCK", broker.socket());
+            let (monitor, op_id) = (monitor.clone(), op_id.clone());
+            let runtime = tokio::runtime::Handle::current();
+            broker.observe(Arc::new(move |event| {
+                if let crate::credentials::ssh_agent::broker::BrokerEvent::Refused { why, .. } =
+                    event
+                {
+                    let (monitor, op_id, why) = (monitor.clone(), op_id.clone(), why.clone());
+                    runtime.spawn(async move { monitor.append_alert(&op_id, why).await });
+                }
+            }));
+        });
 
     let timeout_ms = timeout_secs
         .map(|t| t * 1000)

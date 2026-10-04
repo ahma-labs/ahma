@@ -40,21 +40,35 @@ pub fn destination_key(destination: &Destination) -> Option<(String, String)> {
     }
 }
 
-/// The one line a refused signature leaves in the command's output.
-pub fn refusal_line(request: &SignRequest) -> String {
+/// The one line a refused signature leaves in the command's output. `retry_asks`:
+/// a re-run of the command brings up the harness's own dialog (a hooked
+/// command, R-PERM.10); otherwise only a human's grant can allow it.
+pub fn refusal_line(request: &SignRequest, retry_asks: bool) -> String {
     let key = if request.key_comment.is_empty() {
         request.key_fingerprint.clone()
     } else {
         format!("{} ({})", request.key_fingerprint, request.key_comment)
     };
     match destination_key(&request.destination) {
-        Some((destination, label)) => format!(
-            "Blocked until a human approves: ahma's SSH key broker did not sign for {label} \
-             with key {key} in this workspace. In Claude Code, re-run this \
-             command and ahma asks first; elsewhere a human runs `ahma permissions grant \
-             ssh-sign \"{} for {destination}\"` (add `--for 24h` for a lease), then re-run.",
-            request.key_fingerprint
-        ),
+        Some((destination, label)) => {
+            let grant = format!(
+                "`ahma permissions grant ssh-sign \"{} for {destination}\"` (add `--for 24h` \
+                 for a lease)",
+                request.key_fingerprint
+            );
+            let how = if retry_asks {
+                format!(
+                    "In Claude Code, re-run this command and ahma asks first; elsewhere a \
+                     human runs {grant}, then re-run."
+                )
+            } else {
+                format!("A human runs {grant}, then re-run.")
+            };
+            format!(
+                "Blocked until a human approves: ahma's SSH key broker did not sign for \
+                 {label} with key {key} in this workspace. {how}"
+            )
+        }
         None => match &request.destination {
             Destination::Host {
                 host_key_fingerprint,
@@ -130,7 +144,7 @@ impl RecordedConsent {
 impl SignConsent for RecordedConsent {
     async fn decide(&self, request: &SignRequest) -> Decision {
         let Some((destination, label)) = destination_key(&request.destination) else {
-            return Decision::Deny(refusal_line(request));
+            return Decision::Deny(refusal_line(request, false));
         };
         let now = ahma_common::session_grants::now_secs();
         if ssh_sign::allowed(
@@ -142,7 +156,10 @@ impl SignConsent for RecordedConsent {
         ) {
             return Decision::Allow;
         }
-        if let Some(dir) = harness_asks::default_dir() {
+        // Left for the harness dialog only when there is a command whose re-run
+        // it can ask before (R-PERM.10); otherwise it would hold any command.
+        let retry_asks = self.command_digest.is_some();
+        if let Some(dir) = harness_asks::default_dir().filter(|_| retry_asks) {
             let refusal = SshRefusal {
                 key: request.key_fingerprint.clone(),
                 key_comment: request.key_comment.clone(),
@@ -156,7 +173,7 @@ impl SignConsent for RecordedConsent {
                 tracing::debug!("ssh refusal not recorded: {e:#}");
             }
         }
-        Decision::Deny(refusal_line(request))
+        Decision::Deny(refusal_line(request, retry_asks))
     }
 }
 
@@ -212,6 +229,30 @@ impl RecordedBrokers {
     }
 }
 
+/// The human's own agent socket (SPEC R-CRED.7): `SSH_AUTH_SOCK` as this
+/// process sees it, if it is a live socket; else, on macOS, the login
+/// session's agent as launchd knows it — what a long-lived server whose
+/// environment was inherited from elsewhere would otherwise miss.
+pub fn discover_upstream() -> Option<PathBuf> {
+    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from)
+        && is_socket(&sock)
+    {
+        return Some(sock);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("launchctl")
+            .args(["getenv", "SSH_AUTH_SOCK"])
+            .output()
+            .ok()?;
+        let sock = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        if is_socket(&sock) {
+            return Some(sock);
+        }
+    }
+    None
+}
+
 fn is_socket(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket())
@@ -261,13 +302,37 @@ mod tests {
         }
     }
 
+    /// SPEC R-PERM.10: a refusal is asked about only on a retry of the command
+    /// it was for. An MCP command has no harness dialog to retry into, so its
+    /// refusal is never left for one to pick up before an unrelated hooked
+    /// command, and its line names only what a human can do.
+    #[tokio::test]
+    async fn a_refusal_with_no_command_to_retry_is_not_left_for_the_dialog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let consent = RecordedConsent::new(ws.clone(), None, None);
+        let Decision::Deny(line) = consent.decide(&request(github())).await else {
+            panic!("no grant")
+        };
+        assert!(!line.contains("Claude Code"), "{line}");
+        assert!(
+            line.contains("ahma permissions grant ssh-sign \"SHA256:key for host:SHA256:host\""),
+            "{line}"
+        );
+        let dir = harness_asks::default_dir().unwrap();
+        let asks = harness_asks::load(&dir, &ws, ahma_common::session_grants::now_secs());
+        assert!(asks.ssh_refusals.is_empty(), "nothing for a dialog to ask");
+    }
+
     #[tokio::test]
     async fn a_recorded_grant_allows_and_anything_else_is_refused_and_remembered() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let settings = tmp.path().join("settings.toml");
-        let consent = RecordedConsent::new(ws.clone(), Some(settings.clone()), Some(42));
+        let consent = RecordedConsent::new(ws.clone(), Some(settings.clone()), Some(42))
+            .for_command("git push");
 
         let refused = consent.decide(&request(github())).await;
         let Decision::Deny(line) = refused else {

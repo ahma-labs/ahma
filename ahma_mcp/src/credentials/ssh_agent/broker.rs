@@ -116,7 +116,13 @@ pub struct Broker {
     sources: KeySources,
     consent: Arc<dyn SignConsent>,
     events: parking_lot::Mutex<Vec<BrokerEvent>>,
+    /// Told of each event as it happens, so a running operation can say a
+    /// signature was refused while the command still runs (SPEC R-CRED.10).
+    observer: parking_lot::Mutex<Option<EventObserver>>,
 }
+
+/// Called with each [`BrokerEvent`] the moment the broker records it.
+pub type EventObserver = Arc<dyn Fn(&BrokerEvent) + Send + Sync>;
 
 impl Broker {
     pub fn new(sources: KeySources, consent: Arc<dyn SignConsent>) -> Arc<Self> {
@@ -124,6 +130,7 @@ impl Broker {
             sources,
             consent,
             events: parking_lot::Mutex::new(Vec::new()),
+            observer: parking_lot::Mutex::new(None),
         })
     }
 
@@ -132,8 +139,17 @@ impl Broker {
         self.events.lock().clone()
     }
 
+    /// Tell `observer` of every event from now on.
+    pub fn observe(&self, observer: EventObserver) {
+        *self.observer.lock() = Some(observer);
+    }
+
     fn record(&self, event: BrokerEvent) {
         tracing::info!(?event, "ssh broker");
+        let observer = self.observer.lock().clone();
+        if let Some(observer) = observer {
+            observer(&event);
+        }
         self.events.lock().push(event);
     }
 

@@ -211,6 +211,28 @@ impl<'a> ServiceBuilder<'a> {
                     .with_source_readers(config.source_readers.clone()),
             ),
         );
+        // Every command signs with SSH keys through a broker (SPEC R-CRED.1),
+        // whose thread starts now, before the scope is committed and the
+        // process restricts itself (R-CRED.9).
+        #[cfg(unix)]
+        let adapter = match ahma_common::config::ahma_home_dir() {
+            Some(home) => {
+                crate::credentials::ssh_agent::host::start();
+                let factory = crate::credentials::ssh_agent::consent::RecordedBrokers::new(
+                    home,
+                    crate::credentials::ssh_agent::consent::discover_upstream(),
+                    config.settings_origin.user_settings_file(),
+                    None,
+                    sandbox.scopes().to_vec(),
+                );
+                Arc::new(
+                    Arc::try_unwrap(adapter)
+                        .map_err(|_| anyhow::anyhow!("the adapter is not shared yet"))?
+                        .with_credential_brokers(Arc::new(factory)),
+                )
+            }
+            None => adapter,
+        };
 
         let raw_configs = load_tool_configs(config, config.tools_dir.as_deref())
             .await
