@@ -239,11 +239,20 @@ pub fn is_read_denied(path: &Path) -> bool {
     let Some(home) = ahma_common::config::ahma_home_dir() else {
         return false;
     };
-    path.parent() == Some(home.join(".ssh").as_path())
-        && path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.starts_with("id_") && !name.ends_with(".pub"))
+    let ssh = ssh_dir(&home);
+    let Ok(inside) = path.strip_prefix(&ssh) else {
+        return false;
+    };
+    // `~/.ssh` is denied whole; only its client files, and the directories
+    // that hold no secret, are read.
+    let mut parts = inside.components();
+    match (parts.next(), parts.next()) {
+        (None, _) => false,
+        (Some(first), None) => !first.as_os_str().to_str().is_some_and(is_ssh_client_file),
+        (Some(first), Some(_)) => !ssh_client_readable_dirs(&home)
+            .iter()
+            .any(|d| d.file_name() == Some(first.as_os_str())),
+    }
 }
 
 /// Install whether sandboxed tools may access the macOS keychain (called once at

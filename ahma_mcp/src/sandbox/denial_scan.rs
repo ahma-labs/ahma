@@ -424,6 +424,20 @@ mod tests {
         let hit = scan_denial_streams(&line, "").expect("a refusal");
         assert_eq!(hit.path, key);
         assert_eq!(hit.access, ScopeAccess::Ro, "{hit:?}");
+        // `~/.ssh` is denied whole: a key of any name is a read refused.
+        let other = home.join(".ssh").join("github_ed25519");
+        let line = format!("cat: {}: Operation not permitted", other.display());
+        assert_eq!(
+            scan_denial_streams(&line, "").unwrap().access,
+            ScopeAccess::Ro
+        );
+        // `known_hosts` is readable, so a refusal there was a write.
+        let known = home.join(".ssh").join("known_hosts");
+        let line = format!("ssh: {}: Operation not permitted", known.display());
+        assert_eq!(
+            scan_denial_streams(&line, "").unwrap().access,
+            ScopeAccess::Rw
+        );
         // Anywhere else a refused write is still a write.
         let hit = scan_denial_streams("cp: /opt/x/y: Operation not permitted", "").unwrap();
         assert_eq!(hit.access, ScopeAccess::Rw);
