@@ -33,6 +33,7 @@ mod freeform_args_test;
 mod full_system_integration_bug_test;
 mod generate_schema_test;
 mod hub_lifecycle_test;
+mod kernel_denial_spike_test;
 mod linux_legacy_kernel_sandbox_test;
 mod linux_sandbox_integration_test;
 mod macos_sandbox_integration_test;
