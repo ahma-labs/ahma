@@ -1447,7 +1447,8 @@ pub struct SandboxSettings {
     /// `builtin-profile(<name>)` provenance) and **refusable** (remove a name, or
     /// set this to `[]`, to harden further).
     ///
-    /// Built-in: `rust`, `node`, `go`, `common`. All are enabled by default, so
+    /// Built-in: `rust`, `node`, `go`, `android`, `apple`, `common`, `gh`,
+    /// `sccache` (`ahma permissions list` shows each). All are enabled by default, so
     /// out-of-the-box behavior is exactly what it has always been — the change is
     /// that you can now see it and switch it off.
     /// Default: all built-in profiles
