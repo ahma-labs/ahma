@@ -2009,6 +2009,13 @@ async fn kernel_report_result(
             }
             .into())
         }
+        None if report.unfixable => Err(sandbox::SandboxError::Unfixable {
+            details: format!(
+                "{}\n\n{lines}",
+                result.err().map(|e| e.to_string()).unwrap_or_default()
+            ),
+        }
+        .into()),
         None => match result {
             Ok(out) => Ok(format!("{out}\n\n{lines}")),
             Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),

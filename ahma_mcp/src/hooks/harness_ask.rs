@@ -240,6 +240,68 @@ pub(super) fn ssh_ask_reason(refusal: &harness_asks::SshRefusal) -> String {
     )
 }
 
+/// Remember that `command` in `cwd` was refused something no grant or setting
+/// allows (SPEC R-ESCAPE.1), so the harness dialog can offer to run exactly
+/// it once outside the sandbox when it is run again.
+pub(super) fn record_escape(cwd: &Path, command: &str, why: &str) {
+    let Some(dir) = harness_asks::default_dir() else {
+        return;
+    };
+    let refusal = harness_asks::EscapeRefusal {
+        command_digest: ahma_common::digest::sha256_hex(command.as_bytes()),
+        why: why.to_string(),
+        at: ahma_common::session_grants::now_secs(),
+        harness_pid: harness_pid(),
+    };
+    if let Err(e) = harness_asks::record_escape(&dir, &workspace_for(cwd), refusal) {
+        tracing::debug!("escape question not recorded: {e:#}");
+    }
+}
+
+/// The escape question before `command` runs again, with its token.
+pub(super) fn next_escape_ask(
+    cwd: &Path,
+    session_id: &str,
+    command: &str,
+) -> Option<(harness_asks::EscapeRefusal, String)> {
+    let dir = harness_asks::default_dir()?;
+    let workspace = workspace_for(cwd);
+    let now = ahma_common::session_grants::now_secs();
+    let asks = harness_asks::load(&dir, &workspace, now);
+    let refusal = harness_asks::next_escape_question(&asks, session_id, command)?;
+    let token =
+        harness_asks::mark_escape_asked(&dir, &workspace, session_id, &refusal, now).ok()?;
+    Some((refusal, token))
+}
+
+/// The dialog text for an escape (SPEC R-ESCAPE.2): what was refused, that a
+/// yes runs this exact command once **without** ahma's sandbox, and that it
+/// is recorded.
+pub(super) fn escape_ask_reason(refusal: &harness_asks::EscapeRefusal) -> String {
+    format!(
+        "ahma: this exact command was refused something no grant or setting can allow ({}). \
+         Approve to run it ONCE OUTSIDE ahma's sandbox: its writes are not confined to the \
+         workspace, and the run is recorded in the audit log. Deny to keep it sandboxed; ahma \
+         will not ask again this session.",
+        refusal.why
+    )
+}
+
+/// Spend an escape `token` for exactly `command` in `cwd`: `Some` (the
+/// refusal it answers) when this command may now run once outside the
+/// sandbox. A token the agent wrote itself is refused before this
+/// ([`carries_approval`]), so only a human's yes reaches here.
+pub(super) fn take_escape(
+    token: &str,
+    cwd: &Path,
+    command: &str,
+) -> Option<harness_asks::EscapeRefusal> {
+    let dir = harness_asks::default_dir()?;
+    let now = ahma_common::session_grants::now_secs();
+    harness_asks::take_escape_approved(&dir, &workspace_for(cwd), token, command, now)
+        .map(|asked| asked.refusal)
+}
+
 /// Spend an approval `token` for `command` in `cwd`: apply the session grant
 /// the human approved in the harness dialog, and say so in one line. `None`
 /// when the token is unknown, spent, expired, for another command, or the
@@ -399,6 +461,38 @@ mod tests {
         let line = apply_approval(&token, &ws, "git push").expect("a line");
         assert!(line.contains("approved"), "{line}");
         assert_eq!(consent.decide(&request).await, Decision::Allow);
+    }
+
+    /// SPEC R-ESCAPE: what nothing allows is offered, when this exact command
+    /// is run again, as one run outside the sandbox; the dialog says so, and
+    /// the token runs it once.
+    #[test]
+    fn an_unfixable_refusal_is_offered_once_as_one_unsandboxed_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let cmd = "open -a Simulator";
+        record_escape(&ws, cmd, "Blocked: ahma's kernel sandbox refused `lsopen`");
+        assert!(next_escape_ask(&ws, "s1", "open -a Xcode").is_none());
+        let (refusal, token) = next_escape_ask(&ws, "s1", cmd).expect("asked");
+        let reason = escape_ask_reason(&refusal);
+        assert!(
+            reason.contains("ONCE OUTSIDE")
+                && reason.contains("audit log")
+                && reason.contains("lsopen"),
+            "{reason}"
+        );
+        assert!(
+            next_escape_ask(&ws, "s1", cmd).is_none(),
+            "once per session"
+        );
+        assert!(
+            take_escape(&token, &ws, "open -a Xcode").is_none(),
+            "only this command"
+        );
+        assert!(take_escape(&token, &ws, cmd).is_some());
+        assert!(take_escape(&token, &ws, cmd).is_none(), "once");
     }
 
     /// The whole R-PERM.10 loop at the hook: a refusal is recorded; the next

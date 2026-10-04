@@ -147,6 +147,106 @@ impl Answered {
     }
 }
 
+/// A command the kernel refused something no grant or setting allows (SPEC
+/// R-ESCAPE.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscapeRefusal {
+    /// Digest of the exact command: only that command is ever offered.
+    pub command_digest: String,
+    /// What the kernel refused, for the dialog.
+    pub why: String,
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_pid: Option<u32>,
+}
+
+/// An escape question put to the human, with its one-use token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedEscape {
+    pub session_id: String,
+    pub refusal: EscapeRefusal,
+    pub token: String,
+    pub asked_at: u64,
+    #[serde(default)]
+    pub used: bool,
+}
+
+/// Remember that `refusal.command_digest` was refused what nothing allows.
+pub fn record_escape(dir: &Path, workspace: &Path, refusal: EscapeRefusal) -> Result<()> {
+    update(dir, workspace, refusal.at, |asks| {
+        asks.escapes
+            .retain(|r| r.command_digest != refusal.command_digest);
+        asks.escapes.push(refusal);
+    })
+}
+
+/// The escape to ask about before `command` runs in `session_id`: one
+/// recorded for exactly this command, not yet asked in this session.
+pub fn next_escape_question(
+    asks: &WorkspaceAsks,
+    session_id: &str,
+    command: &str,
+) -> Option<EscapeRefusal> {
+    let digest = crate::digest::sha256_hex(command.as_bytes());
+    asks.escapes
+        .iter()
+        .find(|r| {
+            r.command_digest == digest
+                && !asks
+                    .escapes_asked
+                    .iter()
+                    .any(|a| a.session_id == session_id && a.refusal.command_digest == digest)
+        })
+        .cloned()
+}
+
+/// Record that the escape was asked, returning the one-use token.
+pub fn mark_escape_asked(
+    dir: &Path,
+    workspace: &Path,
+    session_id: &str,
+    refusal: &EscapeRefusal,
+    now: u64,
+) -> Result<String> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let asked = AskedEscape {
+        session_id: session_id.to_string(),
+        refusal: refusal.clone(),
+        token: token.clone(),
+        asked_at: now,
+        used: false,
+    };
+    update(dir, workspace, now, |asks| asks.escapes_asked.push(asked))?;
+    Ok(token)
+}
+
+/// Spend an escape `token` for exactly `command`: once, within
+/// [`TOKEN_TTL_SECS`] of the question. The refusal is forgotten, so the next
+/// refusal of the same command is asked about again.
+pub fn take_escape_approved(
+    dir: &Path,
+    workspace: &Path,
+    token: &str,
+    command: &str,
+    now: u64,
+) -> Option<AskedEscape> {
+    let digest = crate::digest::sha256_hex(command.as_bytes());
+    update(dir, workspace, now, |asks| {
+        let asked = asks.escapes_asked.iter_mut().find(|a| {
+            a.token == token
+                && !a.used
+                && a.refusal.command_digest == digest
+                && now.saturating_sub(a.asked_at) <= TOKEN_TTL_SECS
+        })?;
+        asked.used = true;
+        let asked = asked.clone();
+        asks.escapes.retain(|r| r.command_digest != digest);
+        Some(asked)
+    })
+    .ok()
+    .flatten()
+}
+
 /// Everything recorded for one workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceAsks {
@@ -164,6 +264,14 @@ pub struct WorkspaceAsks {
     /// Questions about them put to the human through the harness dialog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_asked: Vec<AskedSsh>,
+    /// Commands the kernel refused something no grant or setting allows
+    /// (SPEC R-ESCAPE): asked about, when run again, as one run outside the
+    /// sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escapes: Vec<EscapeRefusal>,
+    /// Those questions, put to the human through the harness dialog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escapes_asked: Vec<AskedEscape>,
 }
 
 /// One signature the SSH key broker refused a hooked command because no grant
@@ -374,6 +482,10 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
     asks.ssh_refusals
         .retain(|r| now.saturating_sub(r.at) <= MAX_AGE_SECS);
     asks.ssh_asked
+        .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
+    asks.escapes
+        .retain(|r| now.saturating_sub(r.at) <= MAX_AGE_SECS);
+    asks.escapes_asked
         .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
 }
 
@@ -723,6 +835,45 @@ mod tests {
             "once"
         );
         assert!(load(dir.path(), ws, 107).ssh_refusals.is_empty());
+    }
+
+    /// SPEC R-ESCAPE: an escape is offered for exactly the refused command,
+    /// once per harness session, and its token runs that command once.
+    #[test]
+    fn an_escape_is_for_one_command_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Path::new("/ws/repo");
+        let cmd = "open -a Simulator";
+        record_escape(
+            dir.path(),
+            ws,
+            EscapeRefusal {
+                command_digest: crate::digest::sha256_hex(cmd.as_bytes()),
+                why: "lsopen".into(),
+                at: 100,
+                harness_pid: Some(7),
+            },
+        )
+        .unwrap();
+        let asks = load(dir.path(), ws, 101);
+        assert!(
+            next_escape_question(&asks, "s1", "open -a Xcode").is_none(),
+            "another command"
+        );
+        let q = next_escape_question(&asks, "s1", cmd).expect("this command");
+        let token = mark_escape_asked(dir.path(), ws, "s1", &q, 102).unwrap();
+        let asks = load(dir.path(), ws, 103);
+        assert!(
+            next_escape_question(&asks, "s1", cmd).is_none(),
+            "once per session"
+        );
+        assert!(take_escape_approved(dir.path(), ws, &token, "open -a Xcode", 104).is_none());
+        assert!(take_escape_approved(dir.path(), ws, &token, cmd, 104).is_some());
+        assert!(
+            take_escape_approved(dir.path(), ws, &token, cmd, 105).is_none(),
+            "once"
+        );
+        assert!(load(dir.path(), ws, 106).escapes.is_empty());
     }
 
     fn refusal(path: &Path, access: ScopeAccess) -> Refusal {

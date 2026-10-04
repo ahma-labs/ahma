@@ -99,6 +99,17 @@ A few deliberate details:
 Only **always** touches disk, and only after you've seen the exact file and the
 exact line.
 
+## When nothing can allow it: one run outside the sandbox
+
+Some refusals no grant or setting can change: opening an app with `open` (macOS runs it
+outside any sandbox), a setuid program such as `ps`, an operation the sandbox withholds.
+When the kernel's own record says a hooked command hit one of those (macOS), the command's
+output says so. In Claude Code, run the same command again: ahma's dialog asks whether to
+run **that exact command once, outside the sandbox**. A yes runs it once, says so before it
+runs, and records it in the execution audit log; a no keeps it sandboxed, and ahma does not
+ask again that session. Nothing is offered for a path you could grant, a credential, a GPU
+or a host. SPEC [R-ESCAPE](../SPEC.md).
+
 ## Kinds of permission
 
 `ahma permissions list` groups every grant by kind; `--kind` and `revoke` take the

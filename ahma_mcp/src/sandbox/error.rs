@@ -30,6 +30,14 @@ pub enum SandboxError {
         details: String,
     },
 
+    /// The kernel's own record says a command was refused something no grant
+    /// or setting allows (SPEC R-DENY.2): opening an app, a setuid program, an
+    /// operation the sandbox withholds. `details` carries the output and the
+    /// record's lines. A human may run this exact command once outside the
+    /// sandbox (SPEC R-ESCAPE).
+    #[error("{details}")]
+    Unfixable { details: String },
+
     #[error(
         "Landlock is not available on this system (requires Linux kernel 5.13+ with Landlock LSM enabled). To run without sandboxing, add --no-sandbox to your mcp.json tool definition. Example: \"args\": [\"serve\", \"stdio\", \"--no-sandbox\"]"
     )]
