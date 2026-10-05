@@ -538,8 +538,9 @@ pub fn hook_denial_text(
     };
     format!(
         "The sandbox refused a {} outside the workspace: '{}'. If this command needs it, a human \
-         must grant it; ahma will not run it unsandboxed.\n\n{}\nOne thing to do (pick a tier), \
-         then re-run the command:\n  ahma sandbox \
+         must grant it; ahma will not run it unsandboxed.\n\n{}\nIn Claude Code, re-run this \
+         command and ahma will ask you in a dialog to approve the grant; or a human can run \
+         (pick a tier), then re-run the command:\n  ahma sandbox \
          grant {target}{ro_flag} --session   # this terminal session only, at most 12h\n  ahma \
          sandbox grant {target}{ro_flag}             # until revoked, bound to this workspace\n\n\
          Either applies on your next command; nothing to restart.",
@@ -1419,7 +1420,7 @@ mod context_tests {
     const GOLDEN_HOOK_HEAD: &str = "The sandbox refused a write outside the workspace: \
         '/opt/cache/x.bin'. If this command needs it, a human must grant it; ahma will not run it \
         unsandboxed.";
-    const GOLDEN_HOOK_TAIL: &str = r#"One thing to do (pick a tier), then re-run the command:
+    const GOLDEN_HOOK_TAIL: &str = r#"In Claude Code, re-run this command and ahma will ask you in a dialog to approve the grant; or a human can run (pick a tier), then re-run the command:
   ahma sandbox grant /opt/cache --session   # this terminal session only, at most 12h
   ahma sandbox grant /opt/cache             # until revoked, bound to this workspace
 

@@ -82,11 +82,92 @@ pub struct Refusal {
     pub command_digest: Option<String>,
 }
 
+/// The digest a command is recorded and matched under: of the command with
+/// surrounding whitespace trimmed, so a re-run that differs only by a
+/// trailing newline is still "the same command" (SPEC R-PERM.10).
+pub fn command_digest(command: &str) -> String {
+    crate::digest::sha256_hex(command.trim().as_bytes())
+}
+
+/// Whether `command` can use the SSH agent: `ssh`, `scp`, `sftp`, `rsync`, or
+/// a `git` subcommand that reaches a remote or signs (a commit, tag or merge
+/// signed with an SSH key). Leading `VAR=value` assignments, a path prefix on
+/// the program and git's global options are skipped; anything after a shell
+/// operator is not looked at.
+pub fn may_use_ssh_agent(command: &str) -> bool {
+    let mut words = command
+        .split_whitespace()
+        .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+    let Some(program) = words.next() else {
+        return false;
+    };
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(program);
+    match program {
+        "ssh" | "scp" | "sftp" | "rsync" => true,
+        "git" => {
+            // Global options that take their value as the next word.
+            const WITH_VALUE: &[&str] = &[
+                "-C",
+                "-c",
+                "--git-dir",
+                "--work-tree",
+                "--namespace",
+                "--config-env",
+            ];
+            let mut subcommand = None;
+            while let Some(w) = words.next() {
+                if WITH_VALUE.contains(&w) {
+                    words.next();
+                } else if !w.starts_with('-') {
+                    subcommand = Some(w);
+                    break;
+                }
+            }
+            matches!(
+                subcommand,
+                Some(
+                    "fetch"
+                        | "pull"
+                        | "push"
+                        | "clone"
+                        | "ls-remote"
+                        | "submodule"
+                        | "remote"
+                        | "archive"
+                        | "lfs"
+                        | "commit"
+                        | "tag"
+                        | "merge"
+                        | "rebase"
+                        | "cherry-pick"
+                        | "revert"
+                        | "am"
+                )
+            )
+        }
+        _ => false,
+    }
+}
+
 /// Whether a refusal recorded for `recorded` (a command digest) is one to
 /// ask about before `command` runs: the same command run again. A refusal
 /// recorded without a digest (an older ahma) matches any command.
 pub fn refused_for(recorded: Option<&str>, command: &str) -> bool {
-    recorded.is_none_or(|d| d == crate::digest::sha256_hex(command.as_bytes()))
+    recorded.is_none_or(|d| d == command_digest(command))
+}
+
+/// Whether an SSH signature refused for `recorded` is one to ask about before
+/// `command` runs: the same command again, or any command that can use the
+/// agent ([`may_use_ssh_agent`]). The second is what makes `git fetch` ask
+/// after `git fetch origin` was refused, and what lets a refusal recorded
+/// without a command (an MCP `run_terminal_command`) be asked about at all —
+/// without ever holding an unrelated command such as `cargo build` or
+/// `git status`.
+pub fn refused_for_ssh(recorded: Option<&str>, command: &str) -> bool {
+    recorded.is_some_and(|d| d == command_digest(command)) || may_use_ssh_agent(command)
 }
 
 /// A question put to the human through a harness dialog.
@@ -187,7 +268,7 @@ pub fn next_escape_question(
     session_id: &str,
     command: &str,
 ) -> Option<EscapeRefusal> {
-    let digest = crate::digest::sha256_hex(command.as_bytes());
+    let digest = command_digest(command);
     asks.escapes
         .iter()
         .find(|r| {
@@ -230,7 +311,7 @@ pub fn take_escape_approved(
     command: &str,
     now: u64,
 ) -> Option<AskedEscape> {
-    let digest = crate::digest::sha256_hex(command.as_bytes());
+    let digest = command_digest(command);
     update(dir, workspace, now, |asks| {
         let asked = asks.escapes_asked.iter_mut().find(|a| {
             a.token == token
@@ -498,7 +579,7 @@ pub fn record_ssh_refusal(dir: &Path, workspace: &Path, refusal: SshRefusal) -> 
 }
 
 /// The SSH signature to ask about before `command` runs in harness session
-/// `session_id`: one refused when `command` last ran ([`refused_for`]), that
+/// `session_id`: one refused when `command` last ran ([`refused_for_ssh`]), that
 /// no grant covers (`covered`), and not yet asked in this session, whatever
 /// the answer was.
 pub fn next_ssh_question(
@@ -509,7 +590,7 @@ pub fn next_ssh_question(
 ) -> Option<SshRefusal> {
     asks.ssh_refusals
         .iter()
-        .filter(|r| refused_for(r.command_digest.as_deref(), command) && !covered(r))
+        .filter(|r| refused_for_ssh(r.command_digest.as_deref(), command) && !covered(r))
         .find(|r| {
             !asks
                 .ssh_asked
@@ -535,7 +616,7 @@ pub fn mark_ssh_asked(
         session_id: session_id.to_string(),
         refusal: refusal.clone(),
         token: token.clone(),
-        command_digest: crate::digest::sha256_hex(command.as_bytes()),
+        command_digest: command_digest(command),
         asked_at: now,
         harness_pid,
         used: false,
@@ -552,7 +633,7 @@ pub fn take_ssh_approved(
     command: &str,
     now: u64,
 ) -> Option<AskedSsh> {
-    let digest = crate::digest::sha256_hex(command.as_bytes());
+    let digest = command_digest(command);
     update(dir, workspace, now, |asks| {
         let asked = asks.ssh_asked.iter_mut().find(|a| {
             a.token == token
@@ -730,7 +811,7 @@ pub fn mark_asked(
         session_id: session_id.to_string(),
         question: question.clone(),
         token: token.clone(),
-        command_digest: crate::digest::sha256_hex(command.as_bytes()),
+        command_digest: command_digest(command),
         asked_at: now,
         harness_pid,
         used: false,
@@ -749,7 +830,7 @@ pub fn take_approved(
     command: &str,
     now: u64,
 ) -> Option<Asked> {
-    let digest = crate::digest::sha256_hex(command.as_bytes());
+    let digest = command_digest(command);
     update(dir, workspace, now, |asks| {
         let asked = asks.asked.iter_mut().find(|a| {
             a.token == token
@@ -1213,5 +1294,77 @@ mod tests {
         let ws = h.join("work/project");
         std::fs::create_dir_all(&ws).unwrap();
         assert!(!widening_is_safe(&h.join("work"), Some(h), &[ws]));
+    }
+
+    #[test]
+    fn a_git_ssh_refusal_matches_git_retries_and_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Path::new("/ws/repo");
+        let refusal = SshRefusal {
+            key: "SHA256:key".into(),
+            key_comment: "me@laptop".into(),
+            destination: "host:SHA256:host".into(),
+            label: "github.com".into(),
+            at: 100,
+            harness_pid: Some(7),
+            command_digest: Some(crate::digest::sha256_hex(b"git fetch origin")),
+        };
+        record_ssh_refusal(dir.path(), ws, refusal).unwrap();
+        let asks = load(dir.path(), ws, 100);
+
+        // An unrelated command does not match, nor does git that stays local.
+        assert!(next_ssh_question(&asks, "s1", "cargo build", &|_| false).is_none());
+        assert!(next_ssh_question(&asks, "s1", "git status", &|_| false).is_none());
+        assert!(next_ssh_question(&asks, "s1", "git log --oneline", &|_| false).is_none());
+
+        // A retry with git fetch (without origin) or with flags/whitespace matches
+        assert!(next_ssh_question(&asks, "s1", "git fetch", &|_| false).is_some());
+        assert!(next_ssh_question(&asks, "s1", "git fetch origin\n", &|_| false).is_some());
+        assert!(next_ssh_question(&asks, "s1", "git pull", &|_| false).is_some());
+
+        // Approving with git fetch spends the token
+        let q = next_ssh_question(&asks, "s1", "git fetch", &|_| false).unwrap();
+        let token = mark_ssh_asked(dir.path(), ws, "s1", &q, "git fetch", Some(7), 100).unwrap();
+        assert!(take_ssh_approved(dir.path(), ws, &token, "git fetch", 100).is_some());
+    }
+
+    #[test]
+    fn only_commands_that_can_use_the_agent_may_use_ssh_agent() {
+        for yes in [
+            "git fetch",
+            "git -C ../other push origin main",
+            "GIT_TRACE=1 git pull",
+            "/usr/bin/git -c commit.gpgsign=true commit -m x",
+            "git --git-dir .git tag -s v1",
+            "ssh git@github.com",
+            "scp a host:b",
+            "rsync -a x host:y",
+        ] {
+            assert!(may_use_ssh_agent(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "git",
+            "git status",
+            "git -C fetch status",
+            "git diff --stat",
+            "cargo build",
+            "echo git fetch",
+        ] {
+            assert!(!may_use_ssh_agent(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_command_is_the_same_command_whatever_its_surrounding_whitespace() {
+        assert_eq!(
+            command_digest("  make build\n"),
+            command_digest("make build")
+        );
+        assert_ne!(command_digest("make build"), command_digest("make  build"));
+        assert!(refused_for(
+            Some(&command_digest("make build")),
+            "make build\n"
+        ));
     }
 }

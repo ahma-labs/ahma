@@ -80,7 +80,7 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
         access,
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
-        command_digest: Some(ahma_common::digest::sha256_hex(command.as_bytes())),
+        command_digest: Some(ahma_common::harness_asks::command_digest(command)),
     };
     if let Err(e) = harness_asks::record_refusal(&dir, &workspace_for(cwd), refusal) {
         tracing::debug!("harness question not recorded: {e:#}");
@@ -248,7 +248,7 @@ pub(super) fn record_escape(cwd: &Path, command: &str, why: &str) {
         return;
     };
     let refusal = harness_asks::EscapeRefusal {
-        command_digest: ahma_common::digest::sha256_hex(command.as_bytes()),
+        command_digest: ahma_common::harness_asks::command_digest(command),
         why: why.to_string(),
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
@@ -691,5 +691,156 @@ mod tests {
             "{r}"
         );
         assert!(r.contains("ahma sandbox grant /opt/neubit-cache"), "{r}");
+    }
+
+    #[test]
+    fn pre_exec_path_outside_sandbox_is_recorded_and_asked_on_rerun() {
+        use super::super::{
+            HookEnvironment, HookPlatform, HookScope, HooksDecision, HooksExecArgs,
+            ask_first_if_refused_before, compute_exec_decision_internal,
+            report_shell_execution_error,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let cache = tmp.path().join("neubit-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = dunce::canonicalize(&cache).unwrap();
+
+        let who = crate::sandbox::grant_channel::HookRequester {
+            harness: Some("claude".into()),
+            session_id: Some("s1".into()),
+            scopes: vec![ws.clone()],
+            command: Some("scripts/heavy build".into()),
+        };
+        let err = crate::sandbox::SandboxError::PathOutsideSandbox {
+            path: cache.join("lock"),
+            scopes: vec![ws.clone()],
+        };
+        let _ = report_shell_execution_error(err.into(), &who, &ws);
+
+        if harness_pid().is_none() {
+            return;
+        }
+
+        let env = HookEnvironment {
+            home_dir: tmp.path().join("home"),
+            project_root: ws.clone(),
+            current_exe: PathBuf::from("/usr/local/bin/ahma"),
+        };
+        let args = HooksExecArgs {
+            platform: HookPlatform::Claude,
+            scope: HookScope::Project,
+            managed_id: super::super::MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
+        };
+        let cfg = crate::shell::cli::AppConfig::default();
+
+        // Testing sessionId casing (camelCase)
+        let input = serde_json::json!({
+            "sessionId": "s1",
+            "cwd": ws.display().to_string(),
+            "tool_input": { "command": "scripts/heavy build" }
+        });
+        let d = compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+        let decision = ask_first_if_refused_before(d, &input, &args, &env, &cfg);
+        assert!(
+            matches!(decision, HooksDecision::AskGrant { .. }),
+            "PathOutsideSandbox was recorded and asked even with camelCase sessionId: {decision:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_refusal_without_command_still_asks_git_retry() {
+        use crate::credentials::ssh_agent::broker::{
+            Decision, Destination, SignConsent, SignRequest,
+        };
+        use crate::credentials::ssh_agent::consent::RecordedConsent;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let workspace = workspace_for(&ws);
+        let owner = std::process::id();
+
+        // Consent created without for_command (e.g. MCP run_terminal_command)
+        let consent = RecordedConsent::new(workspace.clone(), None, Some(owner));
+        let request = SignRequest {
+            key_fingerprint: "SHA256:mcpkey".into(),
+            key_comment: "me@laptop".into(),
+            destination: Destination::Host {
+                host_key_fingerprint: "SHA256:github".into(),
+                names: vec!["github.com".into()],
+            },
+        };
+        assert!(matches!(consent.decide(&request).await, Decision::Deny(_)));
+
+        // Unrelated command is not held
+        assert!(next_ssh_ask(&ws, "s-mcp", "cargo build", None).is_none());
+
+        // Git command IS asked
+        let (refusal, _token) =
+            next_ssh_ask(&ws, "s-mcp", "git fetch origin", None).expect("git command asks");
+        assert_eq!(refusal.key, "SHA256:mcpkey");
+    }
+
+    #[test]
+    fn nested_sandbox_records_escape_and_asks_on_rerun() {
+        use super::super::{
+            HookEnvironment, HookPlatform, HookScope, HooksDecision, HooksExecArgs,
+            ask_first_if_refused_before, compute_exec_decision_internal,
+            report_shell_execution_error,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+
+        let cmd = "xcodebuild -workspace Neubit.xcworkspace -scheme Neubit build";
+        let who = crate::sandbox::grant_channel::HookRequester {
+            harness: Some("claude".into()),
+            session_id: Some("s1".into()),
+            scopes: vec![ws.clone()],
+            command: Some(cmd.into()),
+        };
+        let err = crate::sandbox::SandboxError::Unfixable {
+            details: "Blocked: ahma's kernel sandbox refused nested `sandbox-exec` (macOS does not allow nested sandboxes).\n\nA tool in this command applied its own sandbox (`sandbox-exec`) and macOS refused to nest it inside ahma's: `sandbox_apply: Operation not permitted`.".into(),
+        };
+        let reported = report_shell_execution_error(err.into(), &who, &ws);
+        assert!(reported.is_err());
+        let err_msg = reported.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("-IDEPackageSupportDisableManifestSandbox=YES")
+                || err_msg.contains("ONCE OUTSIDE")
+                || err_msg.contains("run the same command again")
+        );
+
+        let env = HookEnvironment {
+            home_dir: tmp.path().join("home"),
+            project_root: ws.clone(),
+            current_exe: PathBuf::from("/usr/local/bin/ahma"),
+        };
+        let args = HooksExecArgs {
+            platform: HookPlatform::Claude,
+            scope: HookScope::Project,
+            managed_id: super::super::MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
+        };
+        let cfg = crate::shell::cli::AppConfig::default();
+
+        let input = serde_json::json!({
+            "session_id": "s1",
+            "cwd": ws.display().to_string(),
+            "tool_input": { "command": cmd }
+        });
+        let d = compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+        let decision = ask_first_if_refused_before(d, &input, &args, &env, &cfg);
+        assert!(
+            matches!(decision, HooksDecision::AskGrant { .. }),
+            "Nested sandbox refusal offers escape ask on re-run: {decision:?}"
+        );
+        if let HooksDecision::AskGrant { reason, .. } = decision {
+            assert!(reason.contains("ONCE OUTSIDE"));
+        }
     }
 }
