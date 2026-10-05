@@ -495,8 +495,12 @@ impl Adapter {
         &self,
         cmd: &mut tokio::process::Command,
         working_dir: &std::path::Path,
+        command: Option<&str>,
     ) -> Option<crate::credentials::ssh_agent::host::BrokerLease> {
-        let lease = self.credential_brokers.as_ref()?.lease(working_dir)?;
+        let lease = self
+            .credential_brokers
+            .as_ref()?
+            .lease_for_command(working_dir, command)?;
         cmd.env("SSH_AUTH_SOCK", lease.socket());
         Some(lease)
     }
@@ -774,6 +778,7 @@ impl Adapter {
                 timeout,
                 lane,
                 lease.as_ref(),
+                shell_command_line(args.as_ref()),
             )
             .await;
         if let Some(watch) = handoff
@@ -855,7 +860,9 @@ impl Adapter {
         timeout: Duration,
         lane: workspace_queue::Lane,
         lease: Option<&workspace_queue::Lease>,
+        shell_command: Option<&str>,
     ) -> SyncRun {
+        let effective_command = shell_command.unwrap_or(command);
         // Create sandboxed command.
         // `create_shell_command` is only needed for raw /bin/sh invocations where
         // the caller has NOT already added the -c flag via a subcommand config.
@@ -879,7 +886,7 @@ impl Adapter {
         };
         stamp_lease(&mut cmd, lease);
         #[cfg(unix)]
-        let broker = self.lease_credential_broker(&mut cmd, safe_wd);
+        let broker = self.lease_credential_broker(&mut cmd, safe_wd, Some(effective_command));
         // The tag the kernel's records of this command's denials carry
         // (SPEC R-DENY.1).
         let denial_tag = sandbox::kernel_denials::tag_of(cmd.as_std().get_args());
@@ -983,7 +990,7 @@ impl Adapter {
         if result.is_err() {
             return self
                 .finalize_sync_denial(
-                    command,
+                    effective_command,
                     op_id,
                     exit_code,
                     &stdout,
@@ -1051,26 +1058,9 @@ impl Adapter {
         // it as a typed error so the MCP boundary attaches a structured
         // `sandbox_denial` payload (path + grant->restart->retry remediation)
         // instead of leaving the agent with a raw `os error 1`.
-        let Some(hit) = sandbox::scan_denial_streams(stderr, stdout) else {
-            // A refused `kill` is a boundary too (SPEC R6.2.6): say so, or the
-            // agent reads "Operation not permitted" as a dead pid and escalates.
-            // Likewise a GPU the sandbox would not open (SPEC R6.2.7): a capability,
-            // not a path, so the agent must not go looking for a directory to grant.
-            let result = match sandbox::signal_denial_note(stderr, stdout)
-                .or_else(|| sandbox::gpu_denial_note(stderr, stdout))
-                .or_else(|| sandbox::setuid_denial_note(stderr, stdout))
-                .or_else(|| sandbox::launch_services_denial_note(stderr, stdout))
-            {
-                Some(note) => result.map_err(|e| anyhow::anyhow!("{e}\n\n{note}")),
-                None => result,
-            };
-            return SyncRun {
-                outcome: audit::Outcome::Failed,
-                exit_code,
-                result,
-            };
-        };
-        if !self.sandbox.is_path_in_scope_in_dir(&hit.path, safe_wd) {
+        let hit = sandbox::scan_denial_streams(stderr, stdout)
+            .filter(|hit| !self.sandbox.is_path_in_scope_in_dir(&hit.path, safe_wd));
+        if let Some(hit) = hit {
             let target = sandbox::grant_channel::resolve_grant_target(
                 &hit.path,
                 Some(safe_wd),
@@ -1095,7 +1085,7 @@ impl Adapter {
         SyncRun {
             outcome: audit::Outcome::Failed,
             exit_code,
-            result,
+            result: explain_ungrantable_failure(result, stderr, stdout),
         }
     }
 
@@ -1442,7 +1432,7 @@ impl Adapter {
             #[cfg(unix)]
             let broker = credential_brokers
                 .as_ref()
-                .and_then(|f| f.lease(&safe_wd))
+                .and_then(|f| f.lease_for_command(&safe_wd, Some(&command_str)))
                 .inspect(|broker| alert_broker_refusals(broker, &monitor, &op_id_task));
             #[cfg(unix)]
             let broker_socket = broker.as_ref().map(|b| b.socket().to_path_buf());
@@ -1866,7 +1856,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     #[cfg(unix)]
     let broker = credential_brokers
         .as_ref()
-        .and_then(|f| f.lease(&wd_path))
+        .and_then(|f| f.lease_for_command(&wd_path, Some(&display_command)))
         .inspect(|broker| {
             proc_cmd.env("SSH_AUTH_SOCK", broker.socket());
             alert_broker_refusals(broker, &monitor, &op_id);
@@ -2020,8 +2010,6 @@ fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> 
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
-/// command itself starts does not wait for the lease its ancestor holds.
 /// A failed command's result, as the kernel's records describe it (SPEC
 /// R-DENY): a grantable denial is the typed [`sandbox::SandboxError::RuntimeDenial`]
 /// the MCP boundary turns into a structured `sandbox_denial` payload, with
@@ -2064,6 +2052,54 @@ async fn kernel_report_result(
     }
 }
 
+/// The first line of the [`sandbox::SandboxError::Unfixable`] a nested
+/// `sandbox-exec` refusal becomes; the hook quotes it in the escape dialog
+/// (SPEC R-ESCAPE.1).
+const NESTED_SANDBOX_BLOCKED: &str = "Blocked: ahma's kernel sandbox refused a nested \
+     `sandbox-exec` (macOS does not allow nested sandboxes).";
+
+/// A failed command's result when no grantable path explains it.
+///
+/// A nested-sandbox refusal is [`sandbox::SandboxError::Unfixable`]: no grant
+/// or setting opens it, and Seatbelt leaves no kernel record of it, so its
+/// output is the only evidence (SPEC R-ESCAPE.1). Every other recognised
+/// failure keeps its error and gains an explanation: a build/credential
+/// diagnostic, then a capability the sandbox refused (a `kill`, R6.2.6; a GPU,
+/// R6.2.7; a setuid exec; a LaunchServices launch, R6.2.10), so the agent does
+/// not go looking for a directory to grant.
+fn explain_ungrantable_failure(
+    result: Result<String, anyhow::Error>,
+    stderr: &str,
+    stdout: &str,
+) -> Result<String, anyhow::Error> {
+    let hint = sandbox::build_diagnostics::diagnose_streams(stderr, stdout);
+    if let Some(hint) = &hint
+        && hint.kind == sandbox::build_diagnostics::ContaminationKind::NestedSandbox
+    {
+        let error = result.err().map(|e| format!("{e}\n\n")).unwrap_or_default();
+        return Err(sandbox::SandboxError::Unfixable {
+            details: format!("{error}{NESTED_SANDBOX_BLOCKED}\n\n{}", hint.remediation),
+        }
+        .into());
+    }
+    let notes: Vec<String> = hint
+        .map(|h| h.remediation)
+        .into_iter()
+        .chain(
+            sandbox::signal_denial_note(stderr, stdout)
+                .or_else(|| sandbox::gpu_denial_note(stderr, stdout))
+                .or_else(|| sandbox::setuid_denial_note(stderr, stdout))
+                .or_else(|| sandbox::launch_services_denial_note(stderr, stdout)),
+        )
+        .collect();
+    if notes.is_empty() {
+        return result;
+    }
+    result.map_err(|e| anyhow::anyhow!("{e}\n\n{}", notes.join("\n\n")))
+}
+
+/// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
+/// command itself starts does not wait for the lease its ancestor holds.
 fn stamp_lease(cmd: &mut tokio::process::Command, lease: Option<&workspace_queue::Lease>) {
     if let Some(lease) = lease {
         cmd.env(
@@ -3090,6 +3126,46 @@ async fn process_streaming_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nested_sandbox_refusal_is_unfixable_and_keeps_the_original_error() {
+        let stderr = "sandbox-exec: sandbox_apply: Operation not permitted";
+        let err =
+            explain_ungrantable_failure(Err(anyhow::anyhow!("exit 65")), stderr, "").unwrap_err();
+        let Some(sandbox::SandboxError::Unfixable { details }) =
+            err.downcast_ref::<sandbox::SandboxError>()
+        else {
+            panic!("expected Unfixable, got {err:?}");
+        };
+        assert!(details.starts_with("exit 65\n\n"), "{details}");
+        // The hook quotes this line in the escape dialog (R-ESCAPE.1).
+        assert!(
+            details.lines().any(|l| l == NESTED_SANDBOX_BLOCKED),
+            "{details}"
+        );
+        assert!(
+            details.contains("IDEPackageSupportDisableManifestSandbox"),
+            "{details}"
+        );
+    }
+
+    #[test]
+    fn a_launch_services_refusal_is_explained_but_not_unfixable_on_output_alone() {
+        // Only the kernel's record may class `lsopen` unfixable (R-ESCAPE.1):
+        // any command can print this line.
+        let stderr = "LSOpenURLsWithRole() failed with error -54 for the file /x/App.app.";
+        let err =
+            explain_ungrantable_failure(Err(anyhow::anyhow!("exit 1")), stderr, "").unwrap_err();
+        assert!(err.downcast_ref::<sandbox::SandboxError>().is_none());
+        assert!(err.to_string().contains("R6.2.10"), "{err}");
+    }
+
+    #[test]
+    fn an_unrecognised_failure_passes_through_unchanged() {
+        let err =
+            explain_ungrantable_failure(Err(anyhow::anyhow!("exit 2")), "boom", "").unwrap_err();
+        assert_eq!(err.to_string(), "exit 2");
+    }
 
     /// The CPU liveness probe must always fire *inside* the idle budget.
     ///

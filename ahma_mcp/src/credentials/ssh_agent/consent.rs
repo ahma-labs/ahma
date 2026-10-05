@@ -19,6 +19,12 @@ pub trait BrokerFactory: Send + Sync + std::fmt::Debug {
     /// A broker for a command running in `working_dir`, or `None` when none
     /// can be served (the command then keeps the human's own agent socket).
     fn lease(&self, working_dir: &Path) -> Option<BrokerLease>;
+
+    /// A broker lease for a command running in `working_dir` for `command`.
+    fn lease_for_command(&self, working_dir: &Path, command: Option<&str>) -> Option<BrokerLease> {
+        let _ = command;
+        self.lease(working_dir)
+    }
 }
 
 /// The grant key for a destination: `host:SHA256:…` or `sshsig:<namespace>`.
@@ -118,7 +124,7 @@ impl RecordedConsent {
 
     /// Answer for `command`: a refusal is asked about when it runs again.
     pub fn for_command(mut self, command: &str) -> Self {
-        self.command_digest = Some(ahma_common::digest::sha256_hex(command.as_bytes()));
+        self.command_digest = Some(ahma_common::harness_asks::command_digest(command));
         self
     }
 
@@ -156,10 +162,12 @@ impl SignConsent for RecordedConsent {
         ) {
             return Decision::Allow;
         }
-        // Left for the harness dialog only when there is a command whose re-run
-        // it can ask before (R-PERM.10); otherwise it would hold any command.
-        let retry_asks = self.command_digest.is_some();
-        if let Some(dir) = harness_asks::default_dir().filter(|_| retry_asks) {
+        // Left for the harness dialog, which asks before this command runs
+        // again or before any command that can use the agent (R-PERM.10,
+        // `harness_asks::refused_for_ssh`) — never before an unrelated one, so
+        // a refusal with no command of its own is still worth recording.
+        let retry_asks = self.command_digest.is_some() || self.harness_pid.is_some();
+        if retry_asks && let Some(dir) = harness_asks::default_dir() {
             let refusal = SshRefusal {
                 key: request.key_fingerprint.clone(),
                 key_comment: request.key_comment.clone(),
@@ -276,13 +284,19 @@ fn is_socket(path: &Path) -> bool {
 
 impl BrokerFactory for RecordedBrokers {
     fn lease(&self, working_dir: &Path) -> Option<BrokerLease> {
+        self.lease_for_command(working_dir, None)
+    }
+
+    /// `command` names the refusal for the harness dialog's re-ask
+    /// (R-PERM.10); without one, the command this factory was built for.
+    fn lease_for_command(&self, working_dir: &Path, command: Option<&str>) -> Option<BrokerLease> {
         let workspace = self.workspace.clone().unwrap_or_else(|| {
             crate::adapter::workspace_queue::workspace_key(working_dir, &self.scopes)
         });
         let mut consent =
             RecordedConsent::new(workspace, self.settings_file.clone(), self.harness_pid);
-        if let Some(command) = &self.command {
-            consent = consent.for_command(command);
+        if let Some(cmd) = command.or(self.command.as_deref()) {
+            consent = consent.for_command(cmd);
         }
         let consent = Arc::new(consent);
         let broker = Broker::new(

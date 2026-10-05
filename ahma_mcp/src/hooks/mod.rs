@@ -1865,10 +1865,23 @@ fn report_shell_execution_error(
     };
     // Remembered so a re-run of this command can ask first (R-PERM.10).
     // A path no grant can open is never asked about (R-PERM.4.3).
-    if let crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } = sandbox_err
-        && ahma_common::scope_grant::refusal_reason(path).is_none()
-    {
-        harness_ask::record_refusal(cwd, path, *access, who.command.as_deref().unwrap_or(""));
+    match sandbox_err {
+        crate::sandbox::SandboxError::RuntimeDenial { path, access, .. }
+            if ahma_common::scope_grant::refusal_reason(path).is_none() =>
+        {
+            harness_ask::record_refusal(cwd, path, *access, who.command.as_deref().unwrap_or(""));
+        }
+        crate::sandbox::SandboxError::PathOutsideSandbox { path, .. }
+            if ahma_common::scope_grant::refusal_reason(path).is_none() =>
+        {
+            harness_ask::record_refusal(
+                cwd,
+                path,
+                ahma_common::config::ScopeAccess::Rw,
+                who.command.as_deref().unwrap_or(""),
+            );
+        }
+        _ => {}
     }
     let remediation = match sandbox_err {
         crate::sandbox::SandboxError::RuntimeDenial {
@@ -2112,9 +2125,11 @@ fn ask_first_if_refused_before(
     {
         return decision;
     }
-    let Some(session_id) = input.get("session_id").and_then(Value::as_str) else {
-        return decision;
-    };
+    let session_id = input
+        .get("session_id")
+        .or_else(|| input.get("sessionId"))
+        .and_then(Value::as_str)
+        .unwrap_or("harness");
     let Ok(Some(tool)) = extract_tool_args(input) else {
         return decision;
     };
