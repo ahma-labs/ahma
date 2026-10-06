@@ -310,6 +310,25 @@ fn package_version_in_lock(lock_contents: &str, package: &str) -> Option<String>
     None
 }
 
+/// Check whether `lock_contents` contains a package block with `name = package` and `version = version`.
+/// Correctly distinguishes coexisting versions of the same crate name.
+fn has_package_version_in_lock(lock_contents: &str, package: &str, version: &str) -> bool {
+    let name_target = format!("name = \"{package}\"");
+    let ver_target = format!("version = \"{version}\"");
+    let mut in_target = false;
+    for line in lock_contents.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            in_target = false;
+        } else if trimmed == name_target {
+            in_target = true;
+        } else if in_target && trimmed == ver_target {
+            return true;
+        }
+    }
+    false
+}
+
 /// Re-apply the source file's trailing newline after line-oriented edits.
 fn restore_trailing_newline(edited: &str, original: &str) -> String {
     if original.ends_with('\n') {
@@ -1730,7 +1749,7 @@ fn apply_upgrade(root: &Path, up: &Upgrade, is_direct: bool) -> ApplyResult {
         // Pin Cargo.lock. `name@old --precise new` disambiguates when several
         // versions of `name` coexist — the bare `-p name` form errors as
         // "specification is ambiguous" and used to fail silently.
-        run_cargo_capture(
+        let pin_res = run_cargo_capture(
             root,
             &[
                 "update",
@@ -1739,7 +1758,22 @@ fn apply_upgrade(root: &Path, up: &Upgrade, is_direct: bool) -> ApplyResult {
                 "--precise",
                 &up.new_ver,
             ],
-        )
+        );
+        if pin_res.is_err() {
+            // A preceding upgrade in the batch may have already bumped this dependency
+            // to up.new_ver (removing up.old_ver from Cargo.lock), in which case `cargo update`
+            // errors with "package ID specification did not match any packages".
+            // If the lockfile already contains up.new_ver and no longer contains up.old_ver,
+            // the upgrade is already successfully in place.
+            let lock_path = root.join("Cargo.lock");
+            if let Ok(content) = fs::read_to_string(&lock_path)
+                && has_package_version_in_lock(&content, &up.name, &up.new_ver)
+                && !has_package_version_in_lock(&content, &up.name, &up.old_ver)
+            {
+                return Ok(());
+            }
+        }
+        pin_res
     })();
 
     match &result {
@@ -2357,5 +2391,40 @@ version = "0.12.19"
             Some(bumped),
             "a stale Cargo.lock must be detectable as not matching the bumped version"
         );
+    }
+
+    #[test]
+    fn test_has_package_version_in_lock() {
+        let lock = r#"
+[[package]]
+name = "syn"
+version = "1.0.109"
+
+[[package]]
+name = "syn"
+version = "3.0.6"
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.4"
+"#;
+        assert!(super::has_package_version_in_lock(lock, "syn", "1.0.109"));
+        assert!(super::has_package_version_in_lock(lock, "syn", "3.0.6"));
+        assert!(!super::has_package_version_in_lock(lock, "syn", "3.0.3"));
+        assert!(super::has_package_version_in_lock(
+            lock,
+            "ureq-proto",
+            "0.6.4"
+        ));
+        assert!(!super::has_package_version_in_lock(
+            lock,
+            "ureq-proto",
+            "0.6.0"
+        ));
+        assert!(!super::has_package_version_in_lock(
+            lock,
+            "nonexistent",
+            "1.0.0"
+        ));
     }
 }
