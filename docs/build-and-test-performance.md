@@ -27,7 +27,10 @@ target-dir GC is open as rust-lang/cargo#13136).
 `RUSTFLAGS` / `--cfg` are deliberately *excluded* from that hash so that toggling them rebuilds
 **in place** — a time cost, not a disk cost. That is why `--cfg reqwest_unstable` lives in
 `.cargo/config.toml` and must be carried by every invocation, and why `cargo llvm-cov`
-(`-C instrument-coverage`) keeps its own `target/llvm-cov-target/`.
+(`-C instrument-coverage`) keeps its own `target/llvm-cov-target/`. It sits in a
+`[target.'cfg(all())']` table rather than `[build] rustflags`: cargo discards `build.rustflags`
+whenever any `target.*.rustflags` matches (a developer's `~/.cargo/config.toml` linker flags are
+enough), whereas `target.<triple>` and `target.<cfg>` flags are joined.
 
 ## The three multipliers, measured on this workspace (2026-09-02, M-series Mac, 10 cores)
 
