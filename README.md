@@ -19,11 +19,18 @@ Ahma is an MCP server for running real project work through existing CLI tools w
 
 ## Quickstart
 
-**Linux / macOS — first-time install**
+**macOS — first-time install**
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc — reload your shell after
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+**Linux — first-time install**
+
+```bash
+curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 ```
 
 The installer also runs `ahma setup`, which configures MCP entries and agent skills for the
