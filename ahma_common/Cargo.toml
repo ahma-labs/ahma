@@ -62,12 +62,11 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [target.'cfg(windows)'.dependencies]
 socket2.workspace = true
 # `CancelIoEx`: wakes the receive blocked on a connection whose stream was dropped, so the
-# socket closes (`local_socket`, SPEC R-HUB.2). Already unified in `workspace-hack`.
+# socket closes (`local_socket`, SPEC R-HUB.2).
 windows-sys = { workspace = true, features = ["Win32_System_IO"] }
 
 [[bin]]

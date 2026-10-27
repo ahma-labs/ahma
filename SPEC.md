@@ -67,7 +67,7 @@ invariant decides.
 Everything except `ahma_tui` and `ahma_bin` is MIT OR Apache-2.0, so the engine can be
 embedded without copyleft; the end-user product surface is AGPL-3.0. A permissive crate
 never depends on an AGPL one (`scripts/check-license-boundaries.sh`). Dev-only crates:
-`ahma_test_support`, `generate_tool_schema`, `xtask`, `workspace-hack`.
+`ahma_test_support`, `generate_tool_schema`, `xtask`.
 
 ### 2.2 Processes
 

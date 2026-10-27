@@ -33,12 +33,11 @@ SPEC, not here and not only in code.
 * **The one sanctioned `-p`: `xtask`.** It is not in `default-members`, so no ordinary
   invocation reaches it — it had zero CI coverage until v0.20.2, and its tests had never
   run outside a developer's machine, despite `cargo xtask bump-version` being the command
-  that cuts every release. It is also excluded from cargo-hakari on purpose (its `ureq`
-  wants `ring`, which `scripts/check-dependency-graph.sh` bans from the product graph), so
-  `--workspace` is the wrong tool. CI now runs `cargo clippy -p xtask --all-targets` and
-  `cargo nextest run -p xtask`. Don't make a habit of it locally: on a persistent `target/`
-  that invocation forks the dependency resolution and costs a parallel copy of ~45 shared
-  crates. On a fresh CI runner the cost is discarded.
+  that cuts every release. Its `ureq` wants `ring`, which `scripts/check-dependency-graph.sh`
+  bans from the product graph, so `--workspace` is the wrong tool. CI now runs
+  `cargo clippy -p xtask --all-targets` and `cargo nextest run -p xtask`. Don't make a habit
+  of it locally: on a persistent `target/` that invocation forks the dependency resolution
+  and costs a parallel copy of ~45 shared crates. On a fresh CI runner the cost is discarded.
 
 ```bash
 # Update stable toolchain
@@ -77,14 +76,8 @@ Before you claim "all green" and stop work, run:
    what broke main (#470): `zip 8.6`'s default features silently pulled in `bzip2`,
    whose licence is not on the allow-list. A new transitive dep arrives with a licence you did
    not choose, so the advisories subset proves nothing about it.
-8. **If you touched any `[dependencies]`/`[dev-dependencies]` section:**
-   `cargo hakari generate && cargo hakari manage-deps` — regenerates `workspace-hack/`, the
-   crate that pins one third-party feature set for every invocation. `cargo hakari verify`
-   runs in `scripts/check-dependency-graph.sh` (called by the pre-push guardrails and by
-   PR CI), so a stale hack fails before it lands. Install once with
-   `cargo install cargo-hakari --locked`.
-9. **If you added a dependency that touches TLS** (anything with a `rustls`, `rcgen`,
-   `quinn` or `*-tls` feature): the same script also checks that `aws-lc-rs` is the *only*
+8. **If you added a dependency that touches TLS** (anything with a `rustls`, `rcgen`,
+   `quinn` or `*-tls` feature): `scripts/check-dependency-graph.sh` checks that `aws-lc-rs` is the *only*
    rustls crypto provider in the product graph. `ring` is a second provider (another
    native build, another copy of every primitive in every binary) and only ever arrives
    through a dependency's *default* features — turn them off, as `ahma_http_bridge/Cargo.toml`
@@ -165,7 +158,7 @@ simplify`, `-p xtask` and `clippy --all-targets` afterwards — no source change
 | Multiplier | Rule |
 |---|---|
 | Feature flavours of workspace crates (`--no-default-features`, `--features x`, a no-op feature used as a CI test selector) | **One canonical flavour** (default features) for every build/test/clippy/doc invocation, locally and in CI. Select tests by name/binary, never by feature. |
-| Third-party feature unification differing between `-p X` and the workspace build | **`workspace-hack/` (cargo-hakari)** pins the union of features for every invocation. Regenerate after any dependency edit (Definition of Done step 8). |
+| Third-party feature unification differing between `-p X` and the workspace build | **Whole-workspace invocations** (`cargo build`, `cargo nextest run`, `cargo clippy --all-targets` with no `-p` flags) so Cargo unifies features across all `default-members` in one pass. |
 | One statically-linked executable per `tests/*.rs` file (143 executables = 3.2 GB, each re-linked per flavour, each with its own `incremental/` session) | **One test binary per harness class per crate** (`tests/unit.rs`, `tests/e2e.rs`, …); new integration tests are a `mod` inside one of them, never a new top-level `tests/*.rs` file — enforced by `scripts/check-guardrails.sh`. |
 
 Full analysis, measurements and the industry references behind these rules:
@@ -605,7 +598,7 @@ Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single te
 - **R-GUARD.1**: Pre-commit and pre-push guardrail script: `./scripts/check-guardrails.sh`.
 - **R-GUARD.2**: Guardrail scripts **must** reject newly added literal `Duration::from_secs(...)` / `Duration::from_millis(...)` patterns in timeout-sensitive handshake/bridge integration tests (`scripts/lint_test_paths.sh`).
 - **R-GUARD.3**: Guardrail scripts **should** verify that custom HTTP bridge integration tests use shared startup helpers from `tests/common/server.rs`.
-- **R-GUARD.4**: Guardrail scripts **must** run `scripts/check-dependency-graph.sh` (`cargo hakari verify` plus the single-crypto-provider check), so a dependency edit that was not followed by `cargo hakari generate && cargo hakari manage-deps`, or that drags `ring` back in through a default feature, fails before push. PR CI runs the same script on every PR.
+- **R-GUARD.4**: Guardrail scripts **must** run `scripts/check-dependency-graph.sh` (the single-crypto-provider check), so a dependency edit that drags `ring` back in through a default feature fails before push. PR CI runs the same script on every PR.
 - **R-GUARD.5**: Guardrail scripts **must** reject a new top-level `tests/*.rs` file that is not on the per-crate root-binary allowlist (see [Test Binary Layout](#test-binary-layout--one-binary-per-harness-class)).
 - **R-GUARD.6**: Guardrail scripts **must** reject any `skills/*/SKILL.md` over the SPEC.md
   R-SK3 500-line cap, so a skill can grow with every feature PR without anyone noticing it

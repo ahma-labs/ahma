@@ -31,7 +31,6 @@ uuid.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["tokio"] }

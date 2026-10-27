@@ -260,9 +260,9 @@ bash ./scripts/check-license-boundaries.sh
 echo "=== Guardrail: workspace cargo check ==="
 cargo check --workspace --locked
 
-echo "=== Guardrail: dependency graph invariants (hakari in sync, one crypto provider) ==="
-# Shared with PR CI so a PR cannot land a stale workspace-hack/ or a second
-# rustls crypto provider; see the script for the rationale of each invariant.
+echo "=== Guardrail: dependency graph invariants (one crypto provider) ==="
+# Shared with PR CI so a PR cannot land a second rustls crypto provider; see
+# the script for the rationale of the invariant.
 bash ./scripts/check-dependency-graph.sh
 
 echo "=== Guardrail: integration tests live in per-harness-class binaries ==="
@@ -328,10 +328,9 @@ echo "=== Guardrail: cargo smoke test scope (ahma_mcp::unit binary) ==="
 # The previous incarnation named a test path that did not exist, so `cargo test`
 # matched nothing and exited 0 — a silent no-op for its whole life.
 #
-# Workspace-level, not `-p ahma_mcp`: with the workspace-hack in place a `-p` build
-# resolves the same third-party features as the workspace build, and ahma_mcp has
-# no features of its own any more (simplify moved to the ahma_simplify crate) —
-# but `--workspace` is what CI runs, so it is what the smoke test must exercise.
+# Workspace-level, not `-p ahma_mcp`: `--workspace` is what CI runs and avoids
+# single-package feature resolution differences, so it is what the smoke test
+# must exercise.
 cargo nextest run --workspace --test unit -E 'test(test_classify_ref_branch_and_release)' --no-fail-fast
 
 echo "=== Guardrail: nextest diagnostics config ==="

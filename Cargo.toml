@@ -48,10 +48,6 @@ members = [
     # AGPL-3.0 crates (end-user product surface)
     "ahma_tui",
     "ahma_bin",
-    # cargo-hakari workspace-hack: pins one third-party feature set for every
-    # invocation so `-p` builds reuse the workspace build's artifacts. Managed by
-    # `cargo hakari generate`; see .config/hakari.toml for the measurements.
-    "workspace-hack",
     # dev-only workspace automation (not published, not in default-members)
     "xtask",
 ]
@@ -124,7 +120,7 @@ tui-textarea = { package = "tui-textarea-2", version = "0.10.2", features = [
 ] }
 serde = "1.0"
 serde_json = { version = "1.0", features = ["preserve_order"] }
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 # `AF_UNIX` sockets on Windows, where tokio cannot register them (`ahma_common::local_socket`).
 socket2 = "0.6.5"
 subtle = "2.6"
@@ -137,7 +133,7 @@ tokio = { version = "1.53.1", features = [
     "fs",
     "signal",
 ] }
-tokio-util = "0.7.19"
+tokio-util = "0.7.20"
 toml = "1.1"
 uuid = { version = "1.26.1", features = ["v4"] }
 tracing = "0.1.44"
