@@ -639,8 +639,9 @@ mod nested_and_sccache_tests {
             text.contains(&format!("SCCACHE_SERVER_PORT={port}")),
             "the workspace's own port: {text}"
         );
+        let cache = std::path::Path::new("/work/alpha").join(".sccache");
         assert!(
-            text.contains("SCCACHE_DIR=/work/alpha/.sccache"),
+            text.contains(&format!("SCCACHE_DIR={}", cache.display())),
             "the workspace's own cache: {text}"
         );
         assert!(text.contains("sccache --start-server"), "{text}");
