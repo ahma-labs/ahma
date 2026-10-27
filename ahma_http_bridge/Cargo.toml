@@ -59,7 +59,6 @@ rustls-pki-types = "1"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing.workspace = true
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [features]
 # See ahma_mcp/Cargo.toml's `otel` comment — same rationale. This crate calls

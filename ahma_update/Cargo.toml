@@ -37,7 +37,7 @@ sigstore = { version = "0.14", default-features = false, features = [
 x509-cert = "0.2"
 # `sha2` 0.10 (not the workspace's 0.11): `Verifier::verify_digest` takes a
 # `sha2` 0.10 `Sha256`, and we re-derive the transparency-log payload hash.
-sha2 = "0.10"
+sha2 = "0.11.1"
 # GitHub serves out-of-band attestation bundles Snappy-compressed (`.json.sn`).
 snap = "1"
 tar = "0.4"
@@ -48,8 +48,7 @@ tracing.workspace = true
 # which emits deflate) and write deflate zips in tests. zip's default features
 # additionally pull in bzip2, aes-crypto, lzma, zstd, xz, ppmd and deflate64 —
 # dead weight, and bzip2's licence is not on the `cargo deny` allow-list.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+zip = { version = "9.1.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 parking_lot.workspace = true
