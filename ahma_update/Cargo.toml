@@ -48,7 +48,7 @@ tracing.workspace = true
 # which emits deflate) and write deflate zips in tests. zip's default features
 # additionally pull in bzip2, aes-crypto, lzma, zstd, xz, ppmd and deflate64 —
 # dead weight, and bzip2's licence is not on the `cargo deny` allow-list.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 parking_lot.workspace = true
