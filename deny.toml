@@ -25,6 +25,18 @@ ignore = [
     # if sigstore ever stops chaining those features together.
     { id = "RUSTSEC-2023-0071", reason = "rsa used for public-key JWT verify only via openidconnect; no private-key ops in this path; no fix available upstream" },
 
+    # crypto-bigint 0.5.5 has multiple timing variability issues in operations
+    # intended to be constant-time. No patch is available for the 0.5.x line
+    # (fixed in >= 0.7.6, which has breaking API changes not yet adopted by
+    # elliptic-curve 0.13 / openidconnect 4.0).
+    #
+    # sigstore only pulls openidconnect because its own `verify` feature enables
+    # `fulcio` → `oauth`; ahma enables neither and signs nothing. Our use of
+    # sigstore is strictly public-key verification of release attestations
+    # (`ahma verify`, `ahma update`), never private-key operations with secrets.
+    # Drop this entry if sigstore decouples fulcio/oauth or openidconnect upgrades.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x used via sigstore -> openidconnect; public-key release attestation verification only, no private-key ops; no fix available upstream for 0.5.x" },
+
     # RUSTSEC-2024-0370 (proc-macro-error) and RUSTSEC-2026-0215 (smallstr) were
     # ignored here until v0.19.8.  Both arrived through
     # sigstore-verification → sigstore 0.13 → json-syntax; moving `ahma verify` to
