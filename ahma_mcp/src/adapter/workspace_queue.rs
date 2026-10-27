@@ -1490,7 +1490,7 @@ mod edit_conflict_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod unreadable_lock_dir_tests {
     use super::*;
 

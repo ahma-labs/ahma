@@ -31,10 +31,12 @@
 //! self-terminates on idle); installing the watchdog there would kill it
 //! immediately.
 
+#[cfg(unix)]
 use std::time::Duration;
 
 /// How often the watchdog re-checks its parent. A few seconds of latency is
 /// irrelevant for orphan reaping and keeps the syscall cost negligible.
+#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Pure decision predicate, extracted for unit testing.

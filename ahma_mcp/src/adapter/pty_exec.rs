@@ -416,12 +416,18 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::operation_monitor::{MonitorConfig, Operation, OperationMonitor, OperationStatus};
+    #[cfg(unix)]
     use crate::sandbox::{Sandbox, SandboxMode};
+    #[cfg(unix)]
     use ahma_common::timeouts::TestTimeouts;
+    #[cfg(unix)]
     use std::sync::Arc;
 
+    #[cfg(unix)]
     use tempfile::TempDir;
+    #[cfg(unix)]
     use tokio_util::sync::CancellationToken;
 
     /// `pty_available()` must run without panicking and return a `bool`.

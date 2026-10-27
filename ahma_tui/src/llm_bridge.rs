@@ -715,7 +715,7 @@ pub fn spawn_window_llm_task(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
