@@ -1540,6 +1540,14 @@ pub fn resolve_hook_sandbox_scopes(cwd: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// The scopes a hooked command's refusals are judged against: the sandbox's own,
+/// with the human's grants folded in. The bare hook scopes lack them, so a
+/// refusal inside an already granted directory (one a helper confined by an
+/// older sandbox hit) read as a request to grant it again.
+fn refusal_judging_scopes(sandbox: &crate::sandbox::Sandbox) -> Vec<PathBuf> {
+    sandbox.scopes().to_vec()
+}
+
 async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // Before anything restricts this process (SPEC R-CRED.9).
     #[cfg(unix)]
@@ -1575,7 +1583,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         .with_context(|| format!("Failed to change directory to {}", payload.cwd))?;
     // Who a denial's grant question names (SPEC R-PERM.3.4). The harness is
     // named from its environment markers, which may name but never decide (R7).
-    let requester = crate::sandbox::grant_channel::HookRequester {
+    let mut requester = crate::sandbox::grant_channel::HookRequester {
         harness: crate::sandbox::detect_host_sandbox()
             .filter(|h| !matches!(h, crate::sandbox::HostSandbox::Unidentified))
             .map(|h| h.label().to_string()),
@@ -1615,6 +1623,8 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             .await;
         }
     };
+
+    requester.scopes = refusal_judging_scopes(&sandbox);
 
     // SPEC R7.6 / R7.2: the only deferral a hook ever makes is the kernel's.
     // When macOS refuses to nest ahma's profile, this process is already inside
@@ -3463,6 +3473,53 @@ fn powershell_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// REGRESSION: a confined sccache server refused `<granted cache>/preprocessor`,
+    /// and the hook told the human to grant a directory they had already granted,
+    /// because it judged the refusal against the bare workspace scopes. A path the
+    /// human granted is in scope for the command; asking for it again is a loop
+    /// an agent never leaves.
+    #[test]
+    fn a_refusal_inside_a_granted_directory_does_not_ask_for_that_grant_again() {
+        let workspace = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::create_dir(cache.path().join("preprocessor")).unwrap();
+        let sandbox = crate::sandbox::Sandbox::new(
+            vec![workspace.path().to_path_buf()],
+            crate::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .with_persistent_scopes(vec![cache.path().to_path_buf()], vec![]);
+        let output = format!(
+            "warning: ring@0.17.14: sccache: caused by: failed to create directory `{}`: \
+             Operation not permitted (os error 1)",
+            cache.path().join("preprocessor").display()
+        );
+        let who = |scopes| crate::sandbox::grant_channel::HookRequester {
+            harness: None,
+            session_id: None,
+            scopes,
+            command: Some("cargo build".into()),
+        };
+        assert!(
+            crate::sandbox::grant_channel::hook_side_refusal(
+                &output,
+                &who(vec![workspace.path().to_path_buf()])
+            )
+            .is_some(),
+            "precondition: the bare workspace scopes call it refused"
+        );
+        assert_eq!(
+            crate::sandbox::grant_channel::hook_side_refusal(
+                &output,
+                &who(refusal_judging_scopes(&sandbox))
+            ),
+            None
+        );
+    }
 
     fn test_env() -> HookEnvironment {
         let temp = tempdir().expect("tempdir");

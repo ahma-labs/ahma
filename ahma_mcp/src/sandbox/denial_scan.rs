@@ -119,7 +119,11 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
 
         // Track a path on this line as the candidate for a later keyword line,
         // and age out a previously tracked path so it cannot match too far away.
-        if let Some(path) = extract_path(line) {
+        // A quoted wrapper invocation names the program being wrapped, never a
+        // path the kernel refused (see `is_wrapper_probe_line`).
+        if !is_wrapper_probe_line(line)
+            && let Some(path) = extract_path(line)
+        {
             recent_path = Some((path, 0));
         } else if let Some((path, age)) = recent_path.take()
             && age < MULTILINE_LOOKBACK
@@ -128,6 +132,18 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
         }
     }
     None
+}
+
+/// True for cargo's report of a failed compiler probe through a wrapper:
+/// ``process didn't exit successfully: `sccache /path/to/rustc -vV` ``.
+///
+/// The only path on that line is the wrapped compiler. When the wrapper is what
+/// failed (sccache's client could not reach or start its server), a later bare
+/// `Operation not permitted` belongs to the wrapper, not to that path, and a grant
+/// on the toolchain directory would not fix anything. A wrapper that writes a path
+/// of its own names it on the line that fails, which is still matched.
+fn is_wrapper_probe_line(line: &str) -> bool {
+    line.contains("process didn't exit successfully: `sccache ")
 }
 
 /// The access level a denial keyword implies, for a line that contains a denial
@@ -788,5 +804,30 @@ Caused by:
         let hit = scan_denial(stderr).expect("quoted directory 'target' must be detected");
         assert_eq!(hit.path, PathBuf::from("target"));
         assert_eq!(hit.access, ScopeAccess::Rw);
+    }
+    /// REGRESSION: cargo probes the compiler through the wrapper
+    /// (`sccache <rustc> -vV`) and quotes that command when the probe fails.
+    /// The `rustc` path in that line is the program being wrapped, not a path the
+    /// sandbox denied; offering a read+write grant on `~/.rustup/.../bin` sent the
+    /// user down a dead end when the real fault was sccache's server.
+    #[test]
+    fn a_wrapped_compiler_path_in_a_failed_sccache_probe_is_not_a_denial() {
+        let output = "error: process didn't exit successfully: \
+            `sccache /Users/me/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/rustc -vV` (exit status: 2)\n\
+            --- stderr\n\
+            sccache: error: Operation not permitted (os error 1)\n\
+            \n\
+            error: command `/Users/me/.rustup/toolchains/1.95.0-aarch64-apple-darwin/bin/cargo metadata` failed";
+        assert_eq!(scan_denial(output), None);
+        assert_eq!(scan_denial_streams("", output), None);
+    }
+
+    /// The exemption is narrow: a real out-of-scope write by sccache still names its path.
+    #[test]
+    fn a_real_sccache_cache_write_denial_still_names_the_cache() {
+        let output = "sccache: error: cache write failed: \
+            /Volumes/T7/caches/sccache/a/b: Operation not permitted (os error 1)";
+        let hit = scan_denial(output).expect("a cache write denial must still be found");
+        assert_eq!(hit.path, PathBuf::from("/Volumes/T7/caches/sccache/a/b"));
     }
 }

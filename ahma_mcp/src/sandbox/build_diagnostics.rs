@@ -40,6 +40,95 @@ pub struct ContaminationHint {
     pub remediation: String,
 }
 
+impl ContaminationHint {
+    /// The remediation, completed with what only the workspace knows.
+    ///
+    /// The `sccache` hint carries the exact server command for the port and cache
+    /// a sandboxed build in `workspace` uses (SPEC R-PERM.5.5): a bare
+    /// `sccache --start-server` listens on a different port, so a server started
+    /// that way is one the sandboxed build never reaches. When the user's own
+    /// `SCCACHE_DIR` is not `writable` by the sandbox, the hint leads with the
+    /// grant that fixes it (SPEC R-DOCTOR.9). Every other kind is returned as it is.
+    pub fn remediation_for(
+        &self,
+        workspace: Option<&std::path::Path>,
+        writable: &dyn Fn(&std::path::Path) -> bool,
+    ) -> String {
+        self.remediation_with_env(
+            workspace,
+            std::env::var("SCCACHE_SERVER_PORT").ok(),
+            std::env::var("SCCACHE_DIR").ok(),
+            writable,
+        )
+    }
+
+    /// [`remediation_for`](Self::remediation_for) with the user's `SCCACHE_SERVER_PORT`
+    /// and `SCCACHE_DIR` passed in, so the result does not depend on the process
+    /// environment. A value given here wins over the profile's, as it does for the
+    /// sandboxed command itself (SPEC R-PERM.5.5).
+    fn remediation_with_env(
+        &self,
+        workspace: Option<&std::path::Path>,
+        port: Option<String>,
+        dir: Option<String>,
+        writable: &dyn Fn(&std::path::Path) -> bool,
+    ) -> String {
+        if self.kind != ContaminationKind::SccacheWrapper {
+            return self.remediation.clone();
+        }
+        let blocked_cache = dir
+            .as_deref()
+            .filter(|d| !writable(std::path::Path::new(d)))
+            .map(|d| format!("{} ", sccache_cache_grant_note(std::path::Path::new(d))))
+            .unwrap_or_default();
+        let Some(ws) = workspace else {
+            return format!("{blocked_cache}{}", self.remediation);
+        };
+        let port = port.unwrap_or_else(|| super::profiles::workspace_port(ws).to_string());
+        let dir = dir.unwrap_or_else(|| ws.join(".sccache").display().to_string());
+        format!(
+            "{blocked_cache}{} The server command for this workspace (a human runs it in a \
+terminal that is not inside any sandbox): \
+`sccache --stop-server; SCCACHE_SERVER_PORT={port} SCCACHE_DIR={dir} sccache --start-server`.",
+            self.remediation
+        )
+    }
+}
+
+/// The user's own sccache cache directory, when an sccache failure is the
+/// command's and that directory is not `in_scope` (SPEC R-DOCTOR.9).
+///
+/// The `sccache` profile never overrides a `SCCACHE_DIR` the user set
+/// (R-PERM.5.5), so that cache can lie outside the workspace, where neither the
+/// build nor a server it starts may write. That is a grantable denial of the
+/// cache directory, and the caller reports it as one, so every harness offers
+/// the grant it already knows how to offer. `user_dir` is passed in so the
+/// decision does not depend on the process environment.
+pub fn sccache_cache_outside_scope(
+    stderr: &str,
+    stdout: &str,
+    user_dir: Option<String>,
+    in_scope: &dyn Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    let hint = diagnose_streams(stderr, stdout)?;
+    if hint.kind != ContaminationKind::SccacheWrapper {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(user_dir.filter(|d| !d.is_empty())?);
+    (!in_scope(&dir)).then_some(dir)
+}
+
+/// The sentence that names an out-of-scope sccache cache and its grant.
+pub fn sccache_cache_grant_note(dir: &std::path::Path) -> String {
+    format!(
+        "sccache's cache directory `{dir}` (your SCCACHE_DIR) is outside this sandbox's write \
+scope, so sccache cannot use it from a sandboxed build. Fix: a human runs \
+`ahma sandbox grant {dir}` once (an agent cannot widen the sandbox itself; ask the human \
+for exactly that command), then re-run the same command.",
+        dir = dir.display()
+    )
+}
+
 /// The class of contamination detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContaminationKind {
@@ -199,14 +288,23 @@ IDE background `cargo check`, or a build whose compiler wrapper changed). Fix: r
 contaminated build directory and rebuild — `rm -rf target`. Avoid running a second sandboxed build \
 against the same target dir concurrently.";
 
-const SCCACHE_REMEDIATION: &str = "Build failed and `sccache` (via RUSTC_WRAPPER) was active. The \
-usual cause is the shared sccache *server*: if it was started by a command inside some session's \
-ahma sandbox it inherited that sandbox, serves every session on this machine, and can write only \
-that one checkout — every other checkout then fails under its own `target/` with a bare \
-`Operation not permitted`. One thing for the human to do: `sccache --stop-server && sccache \
---start-server` in a terminal that is not inside any sandbox; `ahma doctor` reports a confined \
-server by pid. If the server is fine, the cache directory itself may be outside the sandbox: ask \
-the human to grant it, or clear the wrapper for this build (`RUSTC_WRAPPER=\"\" cargo …`).";
+const SCCACHE_REMEDIATION: &str = "The build failed in `sccache`, the compiler cache named by \
+RUSTC_WRAPPER (`sccache: error: Operation not permitted`). This is a sandbox problem, not a \
+problem in the code, and re-running the same command will fail the same way. Quickest fix, \
+always works: run the same command with the cache turned off, `RUSTC_WRAPPER= cargo …` (add \
+`CARGO_BUILD_RUSTC_WRAPPER=` too if a cargo config names the wrapper); the build is slower, \
+nothing else changes. To keep the cache, run `sccache --show-stats` here to tell which case \
+this is. (a) It fails with `Operation not permitted` too: this sandbox refuses the loopback \
+connection to the sccache server. Host sandboxes (VS Code, Cursor, Antigravity) do that, and no \
+directory grant helps: use the quickest fix, or run the build in a plain terminal or through \
+ahma's own sandbox, which allows loopback unless `--restrict-network` is on. (b) It prints \
+statistics: the server is reachable but was most likely started from inside a sandbox, so it \
+can write only the checkout it started in. A human restarts it from a terminal that is not \
+inside any sandbox (`ahma doctor` run there finds such a server by pid). Sandboxed builds use \
+the per-workspace port and cache directory of ahma's `sccache` profile (`ahma permissions \
+list`), not sccache's default port, so a plain `sccache --start-server` starts a server they \
+never look for. If you set SCCACHE_DIR to a directory outside the workspace, the human must \
+also grant that directory to the sandbox.";
 
 const NESTED_SANDBOX_REMEDIATION: &str = "A tool in this command applied its own sandbox \
 (`sandbox-exec`) and macOS refused to nest it inside ahma's: `sandbox_apply: Operation not \
@@ -502,8 +600,7 @@ mod nested_and_sccache_tests {
         let hit = diagnose(stderr).unwrap();
         assert_eq!(hit.kind, ContaminationKind::SccacheWrapper);
         assert!(
-            hit.remediation
-                .contains("sccache --stop-server && sccache --start-server"),
+            hit.remediation.contains("started from inside a sandbox"),
             "{}",
             hit.remediation
         );
@@ -511,6 +608,160 @@ mod nested_and_sccache_tests {
             hit.remediation.contains("ahma doctor"),
             "{}",
             hit.remediation
+        );
+    }
+    /// The failure the sandbox actually provoked for a user whose `~/.cargo/config.toml`
+    /// names `sccache`: the client cannot reach (or start) its server.
+    const SERVER_UNREACHABLE: &str = "error: process didn't exit successfully: \
+        `sccache /Users/me/.rustup/toolchains/1.95.0/bin/rustc -vV` (exit status: 2)\n\
+        --- stderr\n\
+        sccache: error: Operation not permitted (os error 1)";
+
+    /// "Tell me how to set this up": the hint must say what is wrong in words, give
+    /// the per-build escape, and give the exact server command for the port and cache
+    /// the sandboxed build uses (a plain `sccache --start-server` uses another port).
+    #[test]
+    fn an_unreachable_sccache_server_gets_a_complete_setup_walkthrough() {
+        let hit = diagnose(SERVER_UNREACHABLE).expect("must be diagnosed");
+        assert_eq!(hit.kind, ContaminationKind::SccacheWrapper);
+        let text = hit.remediation_with_env(
+            Some(std::path::Path::new("/work/alpha")),
+            None,
+            None,
+            &|_| true,
+        );
+        let port = crate::sandbox::profiles::workspace_port(std::path::Path::new("/work/alpha"));
+        assert!(
+            text.contains("RUSTC_WRAPPER= cargo"),
+            "per-build escape: {text}"
+        );
+        assert!(
+            text.contains(&format!("SCCACHE_SERVER_PORT={port}")),
+            "the workspace's own port: {text}"
+        );
+        assert!(
+            text.contains("SCCACHE_DIR=/work/alpha/.sccache"),
+            "the workspace's own cache: {text}"
+        );
+        assert!(text.contains("sccache --start-server"), "{text}");
+        assert!(
+            text.contains("not inside any sandbox"),
+            "must say where to run it: {text}"
+        );
+        assert!(
+            text.contains("loopback") || text.contains("localhost"),
+            "must name the host-sandbox limit that makes the server unreachable: {text}"
+        );
+        assert!(
+            !text.contains("sandbox grant"),
+            "no path grant fixes an unreachable server: {text}"
+        );
+    }
+
+    #[test]
+    fn a_port_and_cache_the_user_set_name_the_server_the_build_will_look_for() {
+        let hit = diagnose(SERVER_UNREACHABLE).unwrap();
+        let text = hit.remediation_with_env(
+            Some(std::path::Path::new("/work/alpha")),
+            Some("4226".into()),
+            Some("/Volumes/T7/caches/sccache".into()),
+            &|_| true,
+        );
+        assert!(text.contains("SCCACHE_SERVER_PORT=4226"), "{text}");
+        assert!(
+            text.contains("SCCACHE_DIR=/Volumes/T7/caches/sccache"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn without_a_workspace_the_hint_still_reads_whole() {
+        let hit = diagnose(SERVER_UNREACHABLE).unwrap();
+        let text = hit.remediation_for(None, &|_| true);
+        assert!(text.contains("RUSTC_WRAPPER= cargo"), "{text}");
+        assert!(!text.contains("SCCACHE_SERVER_PORT=20"), "{text}");
+    }
+
+    /// REGRESSION: the user's own `SCCACHE_DIR` (which the profile never overrides)
+    /// lies outside the workspace, so the server the sandboxed build starts cannot
+    /// open it and the client prints a bare `Operation not permitted`. That *is* a
+    /// missing grant, of the cache directory, and the remediation must say so with
+    /// the exact command — an agent told "no grant helps" never finds the fix.
+    #[test]
+    fn a_cache_outside_the_sandbox_is_named_with_its_grant() {
+        let hit = diagnose(SERVER_UNREACHABLE).unwrap();
+        let text = hit.remediation_with_env(
+            Some(std::path::Path::new("/work/alpha")),
+            Some("22975".into()),
+            Some("/Volumes/T7/caches/sccache".into()),
+            &|_| false,
+        );
+        assert!(
+            text.contains("ahma sandbox grant /Volumes/T7/caches/sccache"),
+            "the exact grant: {text}"
+        );
+        assert!(text.contains("outside"), "says why: {text}");
+        assert!(text.contains("SCCACHE_DIR"), "names the setting: {text}");
+        assert!(
+            text.contains("RUSTC_WRAPPER= cargo"),
+            "still offers the per-build escape: {text}"
+        );
+        assert!(
+            !text.contains("No directory grant"),
+            "must not contradict the grant it offers: {text}"
+        );
+    }
+
+    #[test]
+    fn a_cache_inside_the_sandbox_is_not_offered_a_grant() {
+        let hit = diagnose(SERVER_UNREACHABLE).unwrap();
+        let text = hit.remediation_with_env(
+            Some(std::path::Path::new("/work/alpha")),
+            None,
+            None,
+            &|_| true,
+        );
+        assert!(!text.contains("ahma sandbox grant"), "{text}");
+    }
+
+    /// The decision the adapter turns into a grantable `RuntimeDenial`: only an
+    /// sccache failure, only with a cache directory the user set, only when it is
+    /// out of scope.
+    #[test]
+    fn the_out_of_scope_cache_is_found_only_for_an_sccache_failure() {
+        let dir = Some("/Volumes/T7/caches/sccache".to_string());
+        assert_eq!(
+            sccache_cache_outside_scope(SERVER_UNREACHABLE, "", dir.clone(), &|_| false),
+            Some(std::path::PathBuf::from("/Volumes/T7/caches/sccache"))
+        );
+        assert_eq!(
+            sccache_cache_outside_scope(SERVER_UNREACHABLE, "", dir.clone(), &|_| true),
+            None,
+            "a cache in scope is not the cause"
+        );
+        assert_eq!(
+            sccache_cache_outside_scope(SERVER_UNREACHABLE, "", None, &|_| false),
+            None,
+            "no SCCACHE_DIR set: the profile's cache is inside the workspace"
+        );
+        assert_eq!(
+            sccache_cache_outside_scope("error[E0382]: borrow of moved value", "", dir, &|_| false),
+            None,
+            "an ordinary build failure is not an sccache denial"
+        );
+    }
+
+    #[test]
+    fn other_kinds_are_unchanged_by_the_workspace() {
+        let hit = diagnose("sccache: error: x\nOperation not permitted (os error 1)");
+        let _ = hit; // shape covered above; kinds other than sccache return remediation as-is
+        let prov = diagnose(
+            "error writing dependencies to `/p/target/debug/deps/x.d`: Operation not permitted (os error 1)",
+        )
+        .unwrap();
+        assert_eq!(
+            prov.remediation_for(Some(std::path::Path::new("/p")), &|_| true),
+            prov.remediation
         );
     }
 }
