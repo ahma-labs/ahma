@@ -1082,10 +1082,42 @@ impl Adapter {
                 .into()),
             };
         }
+        // sccache prints a bare `Operation not permitted` with no path when the
+        // cache the user set lies outside the scope; name that directory as the
+        // denial, so every harness offers its grant (SPEC R-DOCTOR.9).
+        if let Some(dir) = sandbox::build_diagnostics::sccache_cache_outside_scope(
+            stderr,
+            stdout,
+            std::env::var("SCCACHE_DIR").ok(),
+            &|dir| self.sandbox.is_path_in_scope_in_dir(dir, safe_wd),
+        ) {
+            audit::record_sandbox_denial(
+                Some(op_id),
+                &dir,
+                ahma_common::config::ScopeAccess::Rw.label(),
+                command,
+            )
+            .await;
+            let error = result.err().map(|e| e.to_string()).unwrap_or_default();
+            let note = sandbox::build_diagnostics::sccache_cache_grant_note(&dir);
+            return SyncRun {
+                outcome: audit::Outcome::Failed,
+                exit_code,
+                result: Err(sandbox::SandboxError::RuntimeDenial {
+                    path: dir,
+                    access: ahma_common::config::ScopeAccess::Rw,
+                    scopes: self.sandbox.scopes().to_vec(),
+                    details: format!("{error}\n\n{note}"),
+                }
+                .into()),
+            };
+        }
         SyncRun {
             outcome: audit::Outcome::Failed,
             exit_code,
-            result: explain_ungrantable_failure(result, stderr, stdout),
+            result: explain_ungrantable_failure(result, stderr, stdout, &|hint| {
+                remediation_in_workspace(hint, &self.sandbox, Some(safe_wd))
+            }),
         }
     }
 
@@ -2066,11 +2098,13 @@ const NESTED_SANDBOX_BLOCKED: &str = "Blocked: ahma's kernel sandbox refused a n
 /// failure keeps its error and gains an explanation: a build/credential
 /// diagnostic, then a capability the sandbox refused (a `kill`, R6.2.6; a GPU,
 /// R6.2.7; a setuid exec; a LaunchServices launch, R6.2.10), so the agent does
-/// not go looking for a directory to grant.
+/// not go looking for a directory to grant. `complete` turns a build diagnostic
+/// into its text for the workspace the command ran in.
 fn explain_ungrantable_failure(
     result: Result<String, anyhow::Error>,
     stderr: &str,
     stdout: &str,
+    complete: &dyn Fn(&sandbox::build_diagnostics::ContaminationHint) -> String,
 ) -> Result<String, anyhow::Error> {
     let hint = sandbox::build_diagnostics::diagnose_streams(stderr, stdout);
     if let Some(hint) = &hint
@@ -2083,7 +2117,7 @@ fn explain_ungrantable_failure(
         .into());
     }
     let notes: Vec<String> = hint
-        .map(|h| h.remediation)
+        .map(|h| complete(&h))
         .into_iter()
         .chain(
             sandbox::signal_denial_note(stderr, stdout)
@@ -2788,6 +2822,25 @@ fn capability_enforcing_layer() -> sandbox::EnforcingLayer {
     }
 }
 
+/// A build diagnostic's remediation, completed for the workspace the command ran in.
+///
+/// A plain function, not inline, because the scopes guard is not `Send` and the
+/// callers hold the alert's `.await` right after: the guard must be gone first.
+fn remediation_in_workspace(
+    hint: &sandbox::build_diagnostics::ContaminationHint,
+    sandbox: &sandbox::Sandbox,
+    working_dir: Option<&Path>,
+) -> String {
+    // Copied out so the guard is released before the scope checks take it again.
+    let workspace = working_dir
+        .map(Path::to_path_buf)
+        .or_else(|| sandbox.scopes().first().cloned());
+    let base = workspace.clone().unwrap_or_default();
+    hint.remediation_for(workspace.as_deref(), &|dir| {
+        sandbox.is_path_in_scope_in_dir(dir, &base)
+    })
+}
+
 /// Diagnose a failed streaming operation's stdout/stderr and surface whatever
 /// remediation applies: an out-of-scope sandbox grant, a build-contamination
 /// hint, or a non-path capability denial disclosure. Best-effort — each check
@@ -2828,7 +2881,8 @@ async fn record_failure_diagnostics(
             op_monitor.append_alert(op_id, line).await;
         }
         if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
-            op_monitor.append_alert(op_id, hint.remediation).await;
+            let remediation = remediation_in_workspace(&hint, sandbox, working_dir);
+            op_monitor.append_alert(op_id, remediation).await;
         }
         return;
     }
@@ -2895,13 +2949,14 @@ async fn record_failure_diagnostics(
         // as a bare `os error 1`. Diagnose it and attach the remediation as an
         // alert so the user gets an actionable line, not an errno.
         if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
+            let remediation = remediation_in_workspace(&hint, sandbox, working_dir);
             tracing::warn!(
                 "Operation {} failed with sandbox diagnostic ({:?}): {}",
                 op_id,
                 hint.kind,
-                hint.remediation
+                remediation
             );
-            op_monitor.append_alert(op_id, hint.remediation).await;
+            op_monitor.append_alert(op_id, remediation).await;
         }
     }
 
@@ -3130,8 +3185,10 @@ mod tests {
     #[test]
     fn a_nested_sandbox_refusal_is_unfixable_and_keeps_the_original_error() {
         let stderr = "sandbox-exec: sandbox_apply: Operation not permitted";
-        let err =
-            explain_ungrantable_failure(Err(anyhow::anyhow!("exit 65")), stderr, "").unwrap_err();
+        let err = explain_ungrantable_failure(Err(anyhow::anyhow!("exit 65")), stderr, "", &|h| {
+            h.remediation.clone()
+        })
+        .unwrap_err();
         let Some(sandbox::SandboxError::Unfixable { details }) =
             err.downcast_ref::<sandbox::SandboxError>()
         else {
@@ -3154,16 +3211,41 @@ mod tests {
         // Only the kernel's record may class `lsopen` unfixable (R-ESCAPE.1):
         // any command can print this line.
         let stderr = "LSOpenURLsWithRole() failed with error -54 for the file /x/App.app.";
-        let err =
-            explain_ungrantable_failure(Err(anyhow::anyhow!("exit 1")), stderr, "").unwrap_err();
+        let err = explain_ungrantable_failure(Err(anyhow::anyhow!("exit 1")), stderr, "", &|h| {
+            h.remediation.clone()
+        })
+        .unwrap_err();
         assert!(err.downcast_ref::<sandbox::SandboxError>().is_none());
         assert!(err.to_string().contains("R6.2.10"), "{err}");
     }
 
+    /// REGRESSION: the bare sccache failure a hooked `cargo` printed reached the
+    /// agent with no explanation at all. It must carry the workspace's hint.
+    #[test]
+    fn an_sccache_failure_is_explained_with_the_workspace_hint() {
+        let stderr = "error: process didn't exit successfully: \
+            `sccache /r/bin/rustc -vV` (exit status: 2)\n--- stderr\n\
+            sccache: error: Operation not permitted (os error 1)";
+        let err = explain_ungrantable_failure(Err(anyhow::anyhow!("exit 101")), stderr, "", &|h| {
+            format!("{} [completed]", h.remediation)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("exit 101\n\n"), "{err}");
+        assert!(err.contains("RUSTC_WRAPPER= cargo"), "{err}");
+        assert!(err.contains("sccache --show-stats"), "{err}");
+        assert!(
+            err.ends_with("[completed]"),
+            "the workspace completion is used: {err}"
+        );
+    }
+
     #[test]
     fn an_unrecognised_failure_passes_through_unchanged() {
-        let err =
-            explain_ungrantable_failure(Err(anyhow::anyhow!("exit 2")), "boom", "").unwrap_err();
+        let err = explain_ungrantable_failure(Err(anyhow::anyhow!("exit 2")), "boom", "", &|h| {
+            h.remediation.clone()
+        })
+        .unwrap_err();
         assert_eq!(err.to_string(), "exit 2");
     }
 

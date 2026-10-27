@@ -11,16 +11,30 @@ fetch-recurse-submodules = false
 [target.aarch64-unknown-linux-gnu]
 # Use mold - far lower RAM usage than GNU ld, and much faster.
 # gcc 12+ supports -fuse-ld=mold natively; no clang needed.
-# --cfg reqwest_unstable enables HTTP/3 (QUIC) support in reqwest.
-rustflags = ["-C", "link-arg=-fuse-ld=mold", "--cfg", "reqwest_unstable"]
+# (--cfg reqwest_unstable is joined in from the `cfg(all())` table below.)
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [target.x86_64-pc-windows-msvc]
 # Use rust-lld (bundled with the Rust toolchain since 1.71) instead of the
 # default MSVC link.exe.  lld is significantly faster for incremental links
 # and reduces the Windows CI build time by ~25-40% on large workspaces.
-# reqwest_unstable cfg is repeated here so it applies when building without
-# the workspace-level [build] rustflags (e.g. cross or direct target builds).
-rustflags = ["-C", "linker=rust-lld", "--cfg", "reqwest_unstable"]
+# (--cfg reqwest_unstable is joined in from the `cfg(all())` table below.)
+rustflags = ["-C", "linker=rust-lld"]
+
+# Enable reqwest's unstable HTTP/3 (QUIC) feature. This cfg is part of the
+# canonical flag set — every build, test, clippy and doc invocation must carry
+# it (it does, via this table), or cargo fingerprints a second copy of the tree.
+#
+# It lives in a `target.'cfg(all())'` table, NOT `[build] rustflags`, on purpose:
+# cargo ignores `build.rustflags` entirely whenever any `target.<triple>` or
+# `target.<cfg>` rustflags match — including ones in a developer's own
+# `~/.cargo/config.toml` (e.g. `[target.aarch64-apple-darwin] rustflags = [lld…]`).
+# That silently dropped the cfg and broke the build with reqwest's "http3 feature
+# is unstable" compile_error. `target.<triple>` and `target.<cfg>` rustflags are
+# *joined* instead, so this table composes with any per-machine linker flags.
+# (An explicit RUSTFLAGS env var still overrides all config — CI sets the cfg there.)
+[target.'cfg(all())']
+rustflags = ["--cfg", "reqwest_unstable"]
 
 [build]
 # Do NOT set `jobs` here. A repo-level cap applies to every machine that clones
@@ -32,9 +46,6 @@ rustflags = ["-C", "linker=rust-lld", "--cfg", "reqwest_unstable"]
 #     [build]
 #     jobs = 4
 #
-# Enable reqwest's unstable HTTP/3 (QUIC) feature. This cfg is part of the
-# canonical flag set — every build, test, clippy and doc invocation must carry
-# it (it does, via this file), or cargo fingerprints a second copy of the tree.
-rustflags = ["--cfg", "reqwest_unstable"]
+# Do NOT put rustflags here either — see the `target.'cfg(all())'` table above.
 
 
