@@ -90,7 +90,7 @@ impl Sandbox {
         // The one exception is xcrun's cache file, named and placed exactly,
         // without which `strings`, `otool` and `nm` (xcrun shims) fail.
         let temp_rules = if writable {
-            self.get_macos_temp_rules()
+            self.get_macos_temp_rules(&git_resolution_roots)
         } else if self.no_temp_files {
             String::new()
         } else {
@@ -475,17 +475,63 @@ impl Sandbox {
         rules
     }
 
-    fn get_macos_temp_rules(&self) -> String {
+    /// The temp directories, and the per-user temporary items of each other
+    /// volume a writable root is on (see [`volume_temporary_items_rules`]).
+    fn get_macos_temp_rules(&self, writable_roots: &[PathBuf]) -> String {
         if self.no_temp_files {
             String::new()
         } else {
-            "(allow file-read* (subpath \"/private/tmp\"))\n\
+            let mut rules = "(allow file-read* (subpath \"/private/tmp\"))\n\
              (allow file-write* (subpath \"/private/tmp\"))\n\
              (allow file-read* (subpath \"/private/var/folders\"))\n\
              (allow file-write* (subpath \"/private/var/folders\"))\n"
-                .to_string()
+                .to_string();
+            rules.push_str(&volume_temporary_items_rules(writable_roots));
+            rules
         }
     }
+}
+
+/// Write access to `/Volumes/<name>/.TemporaryItems/folders.<uid>` for each
+/// volume other than the boot volume that holds one of `roots`.
+///
+/// Foundation saves a file atomically by writing it into a temporary directory
+/// *on the same volume* and renaming it into place. On the boot volume that is
+/// `$TMPDIR`, already allowed; on any other volume it is that volume's own
+/// per-user temporary items, which nothing allowed. So every Cocoa tool —
+/// Xcode, `xcodebuild`, `plutil`, anything using `NSData`'s atomic write —
+/// failed to save a file *inside* a workspace on an external disk, with an
+/// "Operation not permitted" that named the in-scope target. The directory is
+/// the volume's equivalent of `$TMPDIR`: per user, and created by the OS on
+/// first use.
+fn volume_temporary_items_rules(roots: &[PathBuf]) -> String {
+    // SAFETY: getuid cannot fail and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    let mut volumes: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let mut parts = root.components();
+        let volume = match (parts.next(), parts.next(), parts.next()) {
+            (
+                Some(std::path::Component::RootDir),
+                Some(std::path::Component::Normal(v)),
+                Some(std::path::Component::Normal(name)),
+            ) if v == "Volumes" => Path::new("/Volumes").join(name),
+            _ => continue,
+        };
+        if !volumes.contains(&volume) {
+            volumes.push(volume);
+        }
+    }
+    volumes
+        .iter()
+        .map(|v| {
+            let dir = v.join(".TemporaryItems").join(format!("folders.{uid}"));
+            format!(
+                "(allow file-read* (subpath \"{0}\"))\n(allow file-write* (subpath \"{0}\"))\n",
+                dir.display()
+            )
+        })
+        .collect()
 }
 
 /// Each container socket under both spellings. Canonicalizing the socket
@@ -612,6 +658,64 @@ mod tests {
     /// fail without it, and a broader temp rule would make a workspace under
     /// the temp directory writable (bug report: `strings` refused with
     /// "couldn't create cache file …/T/xcrun_db-…").
+    /// REGRESSION (field, Xcode on an external volume): with DerivedData and
+    /// every SwiftPM path inside the workspace, the build still failed writing
+    /// `<workspace>/build/dd/info.plist` — "Operation not permitted" on a path
+    /// in scope. Foundation saves atomically: it writes the new file into the
+    /// volume's own `.TemporaryItems/folders.<uid>` and renames it into place.
+    /// On the boot volume that is `$TMPDIR`; on any other volume it is a
+    /// directory no rule allowed, so every Cocoa tool failed there.
+    #[test]
+    fn a_writable_root_on_another_volume_gets_that_volumes_temporary_items() {
+        let uid = unsafe { libc::getuid() };
+        let rules = super::volume_temporary_items_rules(&[
+            PathBuf::from("/Volumes/T7/github/neubit4"),
+            PathBuf::from("/Volumes/T7/caches/swiftpm"),
+            PathBuf::from("/Volumes/Work/repo"),
+            PathBuf::from("/Users/me/repo"),
+        ]);
+        let t7 =
+            format!("(allow file-write* (subpath \"/Volumes/T7/.TemporaryItems/folders.{uid}\"))");
+        assert!(rules.contains(&t7), "{rules}");
+        assert_eq!(
+            rules.matches("/Volumes/T7/").count(),
+            2,
+            "once per volume: {rules}"
+        );
+        assert!(rules.contains("/Volumes/Work/.TemporaryItems/"), "{rules}");
+        assert!(
+            !rules.contains("/Users/"),
+            "the boot volume uses $TMPDIR: {rules}"
+        );
+        assert!(super::volume_temporary_items_rules(&[PathBuf::from("/Volumes")]).is_empty());
+    }
+
+    /// The volume's temporary items follow the temp rules (the read-only
+    /// lane, which gets no temp rules, gets none of them either).
+    #[test]
+    fn volume_temporary_items_ride_with_the_temp_rules() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let temp = sb.get_macos_temp_rules(&[PathBuf::from("/Volumes/T7/github/neubit4")]);
+        assert!(
+            temp.contains("/Volumes/T7/.TemporaryItems/folders."),
+            "{temp}"
+        );
+        assert!(
+            temp.contains("(subpath \"/private/var/folders\")"),
+            "{temp}"
+        );
+        let ro = sb.generate_read_only_seatbelt_profile_test(dir.path());
+        assert!(!ro.contains(".TemporaryItems"), "{ro}");
+    }
+
     #[test]
     fn the_read_only_lane_lets_xcrun_cache_and_nothing_else_in_temp() {
         let dir = tempdir().unwrap();
