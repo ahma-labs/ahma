@@ -88,6 +88,11 @@ enum HooksDecision {
     /// **Refuse**: the command is one only the hook may write (an approval
     /// token the agent tried to pass itself).
     Refuse { reason: String },
+    /// **Fail closed**: ahma cannot tell which sandbox applies — a settings
+    /// file was read but does not parse, or the hook itself failed — so the
+    /// call is refused with what to fix, rather than let through unsandboxed
+    /// (SPEC R-CFG6.4). Built for every platform: each one can deny.
+    FailClosed { reason: String },
 }
 
 impl HooksDecision {
@@ -100,6 +105,7 @@ impl HooksDecision {
             HooksDecision::AllowWithWarning { .. } => "allow_unsandboxed",
             HooksDecision::AskGrant { .. } => "ask_grant",
             HooksDecision::Refuse { .. } => "refuse_forged_approval",
+            HooksDecision::FailClosed { .. } => "refuse_fail_closed",
         }
     }
 }
@@ -619,6 +625,44 @@ pub fn try_emit_exec_parse_error_fallback() -> bool {
     true
 }
 
+/// Last-resort guard for a hook entry point that failed after its arguments
+/// parsed: `run` returned an error, or panicked. A harness reads a hook's
+/// non-zero exit as "no decision" and runs the call as written, so any failure
+/// we did not decide on would let it through unsandboxed, silently (SPEC
+/// R-CFG6.4). Refuse it instead, saying why.
+///
+/// Returns `true` when it wrote a refusal (the caller then exits 0); `false`
+/// when this process is not a refusing hook entry point (`exec`, `edit-guard`).
+pub fn try_emit_hook_failure_refusal(failure: &str) -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(output) = hook_failure_refusal(&args, failure) else {
+        return false;
+    };
+    let _ = write_exec_output(&output);
+    true
+}
+
+fn hook_failure_refusal(args: &[String], failure: &str) -> Option<Value> {
+    let is = |sub: &str| args.windows(2).any(|w| w[0] == "hooks" && w[1] == sub);
+    let reason = format!(
+        "ahma refused this call: its hook failed before it could decide ({}), so it cannot \
+         sandbox the call and will not run it unsandboxed. Run `ahma doctor` to see why.",
+        failure.lines().next().unwrap_or(failure).trim()
+    );
+    let platform = sniff_platform(args);
+    if is("exec") {
+        let decision = HooksDecision::FailClosed { reason };
+        return Some(build_exec_output(
+            decision,
+            platform.unwrap_or(HookPlatform::Claude),
+        ));
+    }
+    if is("edit-guard") {
+        return edit_guard::refusal_output(platform, &Value::Null, reason);
+    }
+    None
+}
+
 /// Parse `--platform <value>` (or `--platform=<value>`) out of raw argv for the
 /// parse-error fallback, where clap's own parsing is unavailable. Returns `None`
 /// for a missing/unknown value so the caller can apply its default.
@@ -710,6 +754,15 @@ fn print_doctor_consent_info() {
         }
     } else {
         println!("  consent      : none (fall-open fails closed; commands are blocked)");
+    }
+}
+
+impl HooksCommand {
+    /// Whether a harness runs this command as a hook and reads its stdout as
+    /// the decision. These must answer even when the settings do not parse:
+    /// exiting non-zero is read as "no decision" and lets the call through.
+    pub fn is_harness_entry(&self) -> bool {
+        matches!(self, Self::Exec(_) | Self::EditGuard(_) | Self::Observe(_))
     }
 }
 
@@ -837,6 +890,45 @@ fn hook_status_string(path: &Path, platform: HookPlatform) -> Result<String> {
 /// the hook automatically passes commands through to the default terminal.
 fn is_ahma_hooks_active() -> bool {
     is_ahma_hooks_active_with_configs(&detect_active_mcp_configs())
+}
+
+/// The settings file that failed to parse at startup, recorded instead of
+/// aborting when this process is a harness hook entry point (exec, edit guard,
+/// observer). Exiting there would be fail-*open*: a harness reads a hook's
+/// non-zero exit as "no decision" and runs the call as written, unsandboxed
+/// (SPEC R-CFG6.4). The entry point refuses the call instead.
+static UNUSABLE_SETTINGS: std::sync::OnceLock<ahma_common::config::SettingsFileError> =
+    std::sync::OnceLock::new();
+
+/// Record that a settings file did not parse, so the hook entry point
+/// refuses the call instead of the process exiting (SPEC R-CFG6.4).
+pub fn note_unusable_settings(err: ahma_common::config::SettingsFileError) {
+    let _ = UNUSABLE_SETTINGS.set(err);
+}
+
+fn unusable_settings() -> Option<&'static ahma_common::config::SettingsFileError> {
+    UNUSABLE_SETTINGS.get()
+}
+
+/// The one-line refusal every hooked call carries while a settings file does
+/// not parse (SPEC R-CFG6.4): the file, the line, the reason, and what to do.
+/// Commands are written to be pasted into any shell as they stand.
+pub fn unusable_settings_message(err: &ahma_common::config::SettingsFileError) -> String {
+    let fix = match (err.line, err.reason.as_str(), err.source_line.as_deref()) {
+        (Some(line), "duplicate key", Some(text)) if text.starts_with('[') => format!(
+            "{text} appears twice: delete line {line} and move the keys under it into the \
+             first {text}"
+        ),
+        (Some(line), _, _) => format!("fix line {line}"),
+        _ => "fix the file".to_string(),
+    };
+    format!(
+        "ahma refused this call: the settings file does not parse — {}. Until it parses, \
+         ahma cannot know which sandbox rules it sets, so it refuses every hooked call \
+         instead of running it unsandboxed. Fix: {fix}, then run `ahma doctor` to confirm. \
+         Only the human can edit this file.",
+        err.summary()
+    )
 }
 
 /// Process-wide hooks-mode override set from the `--hooks` CLI flag.
@@ -1382,7 +1474,10 @@ fn scope_fingerprint(scopes: &[PathBuf]) -> String {
 fn emit_decision(decision: HooksDecision, platform: HookPlatform) -> Result<()> {
     match &decision {
         HooksDecision::AllowWithWarning { user_message, .. }
-        | HooksDecision::DenyPendingConsent { user_message, .. } => {
+        | HooksDecision::DenyPendingConsent { user_message, .. }
+        | HooksDecision::FailClosed {
+            reason: user_message,
+        } => {
             eprintln!("{user_message}");
         }
         HooksDecision::AllowRewrite {
@@ -2207,6 +2302,11 @@ fn ask_first_if_refused_before(
 ///    runs unsandboxed with a loud, counted warning. ahma never silently runs a
 ///    command unsandboxed while it believes it is active.
 fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment) -> HooksDecision {
+    if let Some(err) = unusable_settings()
+        && let Some(refusal) = unusable_settings_decision(input, is_ahma_hooks_active(), err)
+    {
+        return refusal;
+    }
     let consented = HookConsentStore::current().is_consented();
     let mut decision =
         compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active(), consented);
@@ -2231,6 +2331,25 @@ fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment)
         }
     }
     decision
+}
+
+/// The refusal for a hooked shell command while a settings file does not
+/// parse (SPEC R-CFG6.1, R-CFG6.4), or `None` where the hook would not have
+/// sandboxed the call anyway: not a shell call, already wrapped (its
+/// `run-shell` re-reads the settings and fails closed itself), or the hook
+/// inactive.
+fn unusable_settings_decision(
+    input: &Value,
+    active: bool,
+    err: &ahma_common::config::SettingsFileError,
+) -> Option<HooksDecision> {
+    let args = extract_tool_args(input).ok().flatten()?;
+    if !active || is_wrapped_shell_command(&args.command) {
+        return None;
+    }
+    Some(HooksDecision::FailClosed {
+        reason: unusable_settings_message(err),
+    })
 }
 
 fn compute_exec_decision_internal(
@@ -2389,7 +2508,9 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
         }),
         // Never built for Cursor; should one arrive, refusing is the safe
         // reading of a question this contract cannot ask.
-        HooksDecision::AskGrant { reason, .. } | HooksDecision::Refuse { reason } => json!({
+        HooksDecision::AskGrant { reason, .. }
+        | HooksDecision::Refuse { reason }
+        | HooksDecision::FailClosed { reason } => json!({
             "permission": "deny",
             "user_message": reason,
             "agent_message": reason,
@@ -2439,7 +2560,9 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
             "reason": user_message,
         }),
         // Never built for Antigravity (see the Cursor builder).
-        HooksDecision::AskGrant { reason, .. } | HooksDecision::Refuse { reason } => json!({
+        HooksDecision::AskGrant { reason, .. }
+        | HooksDecision::Refuse { reason }
+        | HooksDecision::FailClosed { reason } => json!({
             "decision": "deny",
             "reason": reason,
         }),
@@ -2577,7 +2700,7 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
             }),
             None,
         ),
-        HooksDecision::Refuse { reason } => (
+        HooksDecision::Refuse { reason } | HooksDecision::FailClosed { reason } => (
             json!({
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
@@ -3473,6 +3596,103 @@ fn powershell_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The settings error of the field report: a second `[tools]` appended to
+    /// a file that already had one.
+    fn duplicate_table_error() -> (tempfile::TempDir, ahma_common::config::SettingsFileError) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[tools]\n\n[tools]\ntimeout_secs = 90000\n").unwrap();
+        let err = ahma_common::config::AhmaSettings::load_from_checked(&path).unwrap_err();
+        (dir, err)
+    }
+
+    /// REGRESSION (R-CFG6.4): with a settings file that did not parse, the hook
+    /// exited 1, which Claude Code reads as "no decision" — every Bash command
+    /// then ran unsandboxed, with nothing said to anyone. A hooked shell call is
+    /// now refused, in the harness's own deny format.
+    #[test]
+    fn a_shell_call_is_refused_while_the_settings_do_not_parse() {
+        let (_dir, err) = duplicate_table_error();
+        let input = json!({"cwd": "/w", "tool_input": {"command": "echo hi"}});
+        let decision = unusable_settings_decision(&input, true, &err)
+            .expect("an active hook refuses a shell call");
+        assert_eq!(decision.audit_label(), "refuse_fail_closed");
+        for platform in HookPlatform::all() {
+            let out = build_exec_output(
+                unusable_settings_decision(&input, true, &err).unwrap(),
+                platform,
+            )
+            .to_string();
+            assert!(out.contains("deny"), "{platform:?} must deny: {out}");
+            assert!(
+                !out.contains("\"allow\""),
+                "{platform:?} must not allow: {out}"
+            );
+        }
+    }
+
+    /// Where the hook would not have sandboxed the call, it does not refuse it
+    /// either: an inactive hook passes everything through by the user's choice,
+    /// and a wrapped command's `run-shell` re-reads the file and fails closed.
+    #[test]
+    fn an_unusable_settings_file_refuses_only_what_the_hook_would_sandbox() {
+        let (_dir, err) = duplicate_table_error();
+        let shell = json!({"tool_input": {"command": "echo hi"}});
+        assert!(unusable_settings_decision(&shell, false, &err).is_none());
+        let not_shell = json!({"tool_input": {"file_path": "/w/a.rs"}});
+        assert!(unusable_settings_decision(&not_shell, true, &err).is_none());
+    }
+
+    /// Any failure of a refusing hook entry point is a refusal, never an exit
+    /// the harness would read as "allow" (R-CFG6.4); other commands are left
+    /// to fail normally.
+    #[test]
+    fn a_hook_that_fails_refuses_the_call_in_the_harness_format() {
+        let argv = |rest: &[&str]| {
+            ["ahma"]
+                .iter()
+                .chain(rest)
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        let claude = hook_failure_refusal(
+            &argv(&["hooks", "exec", "--platform", "claude", "--scope", "user"]),
+            "boom\nsecond line",
+        )
+        .unwrap();
+        let out = &claude["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny");
+        let reason = out["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("(boom)"), "{reason}");
+
+        let cursor = hook_failure_refusal(
+            &argv(&["hooks", "exec", "--platform=cursor", "--scope", "user"]),
+            "boom",
+        )
+        .unwrap();
+        assert_eq!(cursor["permission"], "deny");
+
+        let guard = hook_failure_refusal(&argv(&["hooks", "edit-guard"]), "boom").unwrap();
+        assert_eq!(guard["hookSpecificOutput"]["permissionDecision"], "deny");
+
+        assert!(hook_failure_refusal(&argv(&["hooks", "observe"]), "boom").is_none());
+        assert!(hook_failure_refusal(&argv(&["serve"]), "boom").is_none());
+    }
+
+    /// The refusal is one line naming the file, the line, the text on it and a
+    /// fix a human can act on (R-CFG6.4).
+    #[test]
+    fn the_unusable_settings_refusal_names_the_file_line_and_fix() {
+        let (_dir, err) = duplicate_table_error();
+        let msg = unusable_settings_message(&err);
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(msg.contains(&err.path.display().to_string()), "{msg}");
+        assert!(msg.contains("line 3"), "{msg}");
+        assert!(msg.contains("duplicate key"), "{msg}");
+        assert!(msg.contains("delete line 3"), "{msg}");
+        assert!(msg.contains("`ahma doctor`"), "{msg}");
+    }
 
     /// REGRESSION: a confined sccache server refused `<granted cache>/preprocessor`,
     /// and the hook told the human to grant a directory they had already granted,

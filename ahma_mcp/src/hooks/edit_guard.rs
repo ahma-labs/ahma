@@ -404,7 +404,41 @@ pub fn decide(
     queue: &WorkspaceQueue,
     allowed: Option<&[PathBuf]>,
 ) -> Option<Value> {
-    let reason = refusal(payload, queue, allowed);
+    render(platform, payload, refusal(payload, queue, allowed))
+}
+
+/// The refusal for an edit while a settings file does not parse (SPEC
+/// R-CFG6.4), or `None` when the payload is not an edit.
+pub fn unusable_settings_decision(
+    platform: Option<HookPlatform>,
+    payload: &Value,
+    err: &ahma_common::config::SettingsFileError,
+) -> Option<Value> {
+    if tool_name(payload).is_some_and(|name| !is_edit_tool(name)) {
+        return None;
+    }
+    render(
+        platform,
+        payload,
+        Some(super::unusable_settings_message(err)),
+    )
+}
+
+/// A refusal in the calling harness's format.
+pub fn refusal_output(
+    platform: Option<HookPlatform>,
+    payload: &Value,
+    reason: String,
+) -> Option<Value> {
+    render(platform, payload, Some(reason))
+}
+
+/// A refusal reason, or none, in the calling harness's format.
+fn render(
+    platform: Option<HookPlatform>,
+    payload: &Value,
+    reason: Option<String>,
+) -> Option<Value> {
     match (dialect(platform, payload), reason) {
         (Dialect::ClaudeLike, Some(r)) => Some(json!({
             "hookSpecificOutput": {
@@ -435,6 +469,14 @@ pub fn run(args: &HooksEditGuardArgs, cfg: &crate::shell::cli::AppConfig) -> Res
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let payload = serde_json::from_str::<Value>(&input).unwrap_or(Value::Null);
+    if let Some(err) = super::unusable_settings()
+        && super::is_ahma_hooks_active()
+        && let Some(decision) = unusable_settings_decision(args.platform, &payload, err)
+    {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout().lock(), "{decision}");
+        return Ok(());
+    }
     let queue = if cfg.edit_guard {
         WorkspaceQueue::new(true)
     } else {
@@ -613,6 +655,25 @@ mod tests {
     use crate::adapter::workspace_queue::HolderInfo;
     use tempfile::{TempDir, tempdir};
     use tokio_util::sync::CancellationToken;
+
+    /// R-CFG6.4: while a settings file does not parse, an edit is refused in
+    /// the harness's format; a non-edit tool is left alone.
+    #[test]
+    fn an_edit_is_refused_while_the_settings_do_not_parse() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[tools]\n[tools]\n").unwrap();
+        let err = ahma_common::config::AhmaSettings::load_from_checked(&path).unwrap_err();
+
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/w/a.rs"}});
+        let out = unusable_settings_decision(None, &edit, &err).expect("an edit is refused");
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+        let cursor = unusable_settings_decision(Some(HookPlatform::Cursor), &edit, &err).unwrap();
+        assert_eq!(cursor["permission"], "deny");
+
+        let read = json!({"tool_name": "Read", "tool_input": {"file_path": "/w/a.rs"}});
+        assert!(unusable_settings_decision(None, &read, &err).is_none());
+    }
 
     /// A repository with a running exclusive operation, and the queue that sees it.
     async fn busy_repo() -> (

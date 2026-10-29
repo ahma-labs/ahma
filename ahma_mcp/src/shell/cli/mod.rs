@@ -2782,14 +2782,14 @@ fn apply_project_settings(
 
     let load = match load_project_settings(&path) {
         Ok(load) => load,
+        // R-CFG6.1 applies to this file too: readable but unparseable must
+        // abort, or a corrupt project file quietly changes behaviour.
         Err(e) => {
-            // R-CFG6.1 applies to this file too: readable but unparseable must
-            // abort, or a corrupt project file quietly changes behaviour.
-            eprintln!(
-                "ahma: fatal: {e}\n\
-                 Fix or delete the file; it may set preference-tier keys only."
+            return unusable_settings(
+                cli,
+                e,
+                "Fix or delete the file; it may set preference-tier keys only.",
             );
-            std::process::exit(1);
         }
     };
 
@@ -2854,16 +2854,47 @@ fn load_user_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
     let Some(path) = path else {
         return AhmaSettings::default();
     };
-    match AhmaSettings::load_from_result(&path) {
+    match AhmaSettings::load_from_checked(&path) {
         Ok(settings) => settings,
-        Err(e) => {
+        Err(e) => unusable_settings(
+            cli,
+            e,
+            "Fix the line named, then confirm with `ahma doctor`. `ahma settings init --force` \
+             resets the whole file to defaults instead, dropping every grant in it.",
+        ),
+    }
+}
+
+/// A settings file was read but does not parse (SPEC R-CFG6.1): abort, except
+/// where aborting would do harm (R-CFG6.4).
+///
+/// * A harness hook entry point must still answer. A harness reads a hook's
+///   non-zero exit as "no decision" and runs the call as written — unsandboxed
+///   — so the error is recorded and the hook refuses the call itself.
+/// * `doctor` and `settings` are how the file gets fixed; they run on
+///   compiled-in defaults (they read the file themselves) after a warning.
+fn unusable_settings(
+    cli: &Cli,
+    err: ahma_common::config::SettingsFileError,
+    fix: &str,
+) -> ahma_common::config::AhmaSettings {
+    match &cli.command {
+        Subcommands::Hooks(hooks) if hooks.command.is_harness_entry() => {
+            crate::hooks::note_unusable_settings(err);
+        }
+        Subcommands::Doctor(_) | Subcommands::Settings(_) => {
             eprintln!(
-                "ahma: fatal: {e}\n\
-                 Fix or delete the file, or run `ahma settings init --force` to reset it."
+                "ahma: warning: settings file does not parse: {}. Running on compiled-in \
+                 defaults so this command can help fix it.",
+                err.summary()
             );
+        }
+        _ => {
+            eprintln!("ahma: fatal: {err}\n{fix}");
             std::process::exit(1);
         }
     }
+    ahma_common::config::AhmaSettings::default()
 }
 
 /// Resolved execution-tier settings (see [`parse_execution_settings`]).

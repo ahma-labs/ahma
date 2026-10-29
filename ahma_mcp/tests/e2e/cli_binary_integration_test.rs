@@ -733,4 +733,57 @@ mod hooks_exec_fail_open_tests {
             "clap top-level about banner leaked into hook output:\n{combined}",
         );
     }
+
+    /// REGRESSION (SPEC R-CFG6.4, field report on 0.22.4): a duplicate `[tools]`
+    /// table in the settings file made `ahma hooks exec` exit 1 with the parse
+    /// error on stderr. Claude Code reads a PreToolUse hook's exit 1 as "no
+    /// decision" and ran every Bash command as written — unsandboxed, unlogged,
+    /// with nothing shown to the agent. The hook must answer `deny`, exit 0,
+    /// and name the file and line.
+    #[test]
+    fn hooks_exec_refuses_when_settings_do_not_parse() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let temp = TempDir::new().expect("create temp dir");
+        let settings = temp.path().join("settings.toml");
+        std::fs::write(&settings, "[tools]\ntimeout_secs = 10\n\n[tools]\n").unwrap();
+        let cwd = temp.path().display().to_string();
+
+        let mut child = Command::new(&binary)
+            .arg("--settings-path")
+            .arg(&settings)
+            .args(["hooks", "exec", "--platform", "claude", "--scope", "user"])
+            .env("AHMA_HOOKS", "on")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn `ahma hooks exec`");
+        if let Some(mut stdin) = child.stdin.take() {
+            let payload = serde_json::json!({
+                "session_id": "s",
+                "cwd": cwd,
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+            });
+            stdin.write_all(payload.to_string().as_bytes()).unwrap();
+        }
+        let output = child
+            .wait_with_output()
+            .expect("wait for `ahma hooks exec`");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "a non-zero exit is read as allow; got {:?}.\nstdout: {stdout}\nstderr: {stderr}",
+            output.status.code(),
+        );
+        let decision: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout must be a JSON decision, got {stdout:?}: {e}"));
+        let out = &decision["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny", "{stdout}");
+        let reason = out["permissionDecisionReason"].as_str().unwrap_or_default();
+        assert!(reason.contains("settings.toml line 4"), "{reason}");
+        assert!(reason.contains("duplicate key"), "{reason}");
+    }
 }

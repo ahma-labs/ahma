@@ -40,12 +40,34 @@ fn main() -> Result<()> {
                 .block_on(async_main())
         })
         .context("Failed to start ahma's main thread")?;
-    match worker.join() {
+    let outcome = worker.join();
+    // A hook entry point that fails must refuse the call, not exit non-zero:
+    // a harness reads that as "no decision" and runs the call unsandboxed.
+    let failure = match &outcome {
+        Ok(Err(e)) => Some(format!("{e:#}")),
+        Err(panic) => Some(panic_message(panic.as_ref())),
+        Ok(Ok(())) => None,
+    };
+    if let Some(failure) = failure
+        && ahma_mcp::hooks::try_emit_hook_failure_refusal(&failure)
+    {
+        eprintln!("ahma: hook failed: {failure}");
+        std::process::exit(0);
+    }
+    match outcome {
         Ok(result) => result,
         // Re-raise the panic on the real main thread so the exit status and the
         // message are exactly what they were under `#[tokio::main]`.
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_string())
 }
 
 async fn async_main() -> Result<()> {
