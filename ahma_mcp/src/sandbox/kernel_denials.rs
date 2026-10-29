@@ -202,7 +202,7 @@ pub fn one_line(denial: &KernelDenial, class: &DenialClass) -> String {
         DenialClass::Grant { path, access } => format!(
             "Blocked until a human grants it: {what}. A human runs `ahma sandbox grant {}{}`, \
              or answers the question ahma raised; then re-run.",
-            super::grant_channel::grant_dir_for(path).display(),
+            super::grant_channel::offered_dir_for(path, &[]).display(),
             if access.is_write() {
                 ""
             } else {

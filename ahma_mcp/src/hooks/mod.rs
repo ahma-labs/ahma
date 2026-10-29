@@ -1993,7 +1993,8 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
                     access,
                     &payload.command,
                 );
-                let note = crate::sandbox::grant_channel::refusal_note(&path, access);
+                let note =
+                    crate::sandbox::grant_channel::refusal_note(&path, access, &requester.scopes);
                 crate::utils::stdio::emit_stdout_text(&format!("{note}\n"))?;
             }
             Ok(())

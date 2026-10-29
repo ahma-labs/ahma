@@ -63,13 +63,16 @@ session; past that the agent is told to ask you in conversation instead.
 
 **Commands run through Claude Code's Bash tool** (the terminal hook) are refused
 mid-command, where no prompt is possible. ahma remembers the refusal, and before
-the **next** command in that workspace Claude Code shows its own permission dialog
-with ahma's question: which directory, which refused paths it covers, and what yes
-and no mean. **Yes** grants it for this Claude Code session and runs the command;
-**no** runs nothing, and ahma does not ask about that directory again this session.
-Related paths are asked as one directory when that is safe (`~/.cache/neubit`, never
-`~/.cache`, your home folder, a folder of projects, or anything holding credentials).
-For "always", the dialog names the `ahma sandbox grant` command (SPEC R-PERM.10).
+the refused command — or any later one running the same program, `xcodebuild` with
+different flags, say — runs again in that workspace, Claude Code shows its own
+permission dialog with ahma's question: which directory, which refused paths it
+covers, and what yes and no mean. The directory is the tool's own folder
+(`/Volumes/T7/caches/swiftpm`, not the deepest folder that was refused), never a
+folder many tools share (`~/.cache`, `~/Library`, a cache folder, a volume root, the
+system temp directory), your home folder, a folder of projects, or anything holding
+credentials. **Yes** grants it, runs the command, and is **remembered**: the dialog
+names the `ahma sandbox revoke` that undoes it. **No** runs nothing, and ahma does not
+ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).
 If `ahma tui` is open, the same question appears there as soon as the refusal is
 recorded, and answering it in the TUI (deny, this session, 24 hours or always) means
 Claude Code never shows the dialog for it.
@@ -137,7 +140,11 @@ next session; see
 - **Scope**: a filesystem grant is bound to the workspace it was approved for
   (the session's project root; `ahma sandbox grant` uses the repository enclosing
   your current directory, or `--workspace <DIR>`). Agents in other projects never
-  see it. `--global` is the explicit opt-out, and `ahma doctor` flags grants that
+  see it. A grant bound to a folder applies to every workspace inside it, so when
+  you approve, in Claude Code's dialog, a directory already granted to a sibling
+  checkout (`~/src/alt2/app` after `~/src/app`), the grant moves to the folder that
+  holds both (`~/src`) and covers every checkout there — never your home folder or a
+  volume root (SPEC R5.4.11.1). `--global` is the explicit opt-out, and `ahma doctor` flags grants that
   have no workspace.
 - **Tier**: at a prompt you can answer for this session only (`read-write-session`
   / `read-only-session`, or `y` / `r` in the TUI): applied now, audited, never

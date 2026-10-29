@@ -324,6 +324,7 @@ mod tests {
                 at: 100,
                 harness_pid: Some(std::process::id()),
                 command_digest: None,
+                programs: Vec::new(),
             },
         )
         .unwrap();

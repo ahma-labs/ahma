@@ -54,6 +54,8 @@ const SHARED_ROOTS: &[&[&str]] = &[
     &[".local", "state"],
     &["Library"],
     &["Library", "Caches"],
+    &["Library", "Developer"],
+    &["Library", "Developer", "Xcode"],
     &["Library", "Application Support"],
     &["Library", "Preferences"],
     &["Library", "Containers"],
@@ -80,6 +82,54 @@ pub struct Refusal {
     /// command is run again, never before an unrelated one (SPEC R-PERM.10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_digest: Option<String>,
+    /// The programs that command ran ([`command_programs`]): a later command
+    /// running one of them is asked about too (SPEC R-PERM.10.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<String>,
+}
+
+/// Words that start a shell command segment without being the program that
+/// needs a grant: navigation, printing and inspection. A refusal is never
+/// matched to a later command through one of these.
+const NOT_THE_PROGRAM: &[&str] = &[
+    "cd", "pushd", "popd", "echo", "printf", "true", "false", ":", "export", "set", "unset",
+    "test", "[", "pwd", "sleep", "ls", "cat", "head", "tail", "grep", "wc", "which", "type",
+];
+
+/// Words that run the program named after them.
+const RUNS_THE_NEXT: &[&str] = &["env", "time", "nice", "nohup", "exec", "command", "sudo"];
+
+/// The programs a shell command line runs, by file name, in order: the first
+/// word of each `&&`, `||`, `;`, `|` or `&` segment, past `VAR=value`
+/// assignments and wrappers such as `env` and `time`, skipping
+/// navigation and printing (`cd`, `echo`, `ls`, …). `cd ios && xcodebuild -scheme A build` runs
+/// `["xcodebuild"]`. A heuristic over the text, not a shell parse: what it
+/// gets wrong costs one extra question or one missed one, never a grant.
+pub fn command_programs(command: &str) -> Vec<String> {
+    let mut programs = Vec::new();
+    let segments = command.split(['&', '|', ';', '\n', '(', ')']);
+    for segment in segments {
+        let mut words = segment.split_whitespace().skip_while(|w| {
+            (w.contains('=') && !w.starts_with('-'))
+                || RUNS_THE_NEXT.contains(w)
+                || w.starts_with('-')
+        });
+        let Some(word) = words.next() else {
+            continue;
+        };
+        let word = word.trim_matches(|c| c == '"' || c == '\'');
+        let name = Path::new(word)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(word)
+            .to_string();
+        // `2>&1` splits at its `&`; what follows is a descriptor, not a program.
+        let is_name = name.chars().any(char::is_alphabetic);
+        if is_name && !NOT_THE_PROGRAM.contains(&name.as_str()) && !programs.contains(&name) {
+            programs.push(name);
+        }
+    }
+    programs
 }
 
 /// The digest a command is recorded and matched under: of the command with
@@ -152,11 +202,82 @@ pub fn may_use_ssh_agent(command: &str) -> bool {
     }
 }
 
-/// Whether a refusal recorded for `recorded` (a command digest) is one to
-/// ask about before `command` runs: the same command run again. A refusal
-/// recorded without a digest (an older ahma) matches any command.
-pub fn refused_for(recorded: Option<&str>, command: &str) -> bool {
-    recorded.is_none_or(|d| d == command_digest(command))
+/// Whether `refusal` is one to ask about before `command` runs: the same
+/// command run again, or one that runs a program the refused command ran
+/// (SPEC R-PERM.10.1). An agent rarely re-runs a command byte for byte — it
+/// adds a flag, a pipe, a `cd` — so asking only on an identical re-run meant
+/// the question never came. A refusal recorded without a digest (an older
+/// ahma) matches any command.
+pub fn refused_for(refusal: &Refusal, command: &str) -> bool {
+    let Some(digest) = refusal.command_digest.as_deref() else {
+        return true;
+    };
+    digest == command_digest(command)
+        || command_programs(command)
+            .iter()
+            .any(|p| refusal.programs.contains(p))
+}
+
+/// The directory to offer for a refusal under `dir`: the widest ancestor that
+/// is still one tool's own folder. Climbs while the parent passes
+/// [`widening_is_safe`], so it stops below home, a folder many tools share,
+/// a volume root, a credential folder and a folder of projects. A refused
+/// `/Volumes/T7/caches/swiftpm/manifests/ManifestLoading` offers
+/// `/Volumes/T7/caches/swiftpm`: offering the deepest directory meant the next
+/// file elsewhere in the same cache was refused again, and asked again.
+pub fn tool_root(dir: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> PathBuf {
+    let mut root = dir.to_path_buf();
+    while let Some(parent) = root.parent() {
+        if !widening_is_safe(parent, home, scopes) {
+            break;
+        }
+        root = parent.to_path_buf();
+    }
+    root
+}
+
+/// Folder names that hold many tools' data by convention, wherever they are.
+const SHARED_FOLDER_NAMES: &[&str] = &[
+    "cache",
+    "caches",
+    ".cache",
+    "Caches",
+    "tmp",
+    "temp",
+    "Temp",
+    "TemporaryItems",
+];
+
+/// Whether `dir` is a system temp directory or an ancestor of one: shared by
+/// every program on the machine, like a folder in [`SHARED_ROOTS`].
+fn is_system_temp(dir: &Path) -> bool {
+    let tmpdir = std::env::temp_dir();
+    let tmpdir = dunce::canonicalize(&tmpdir).unwrap_or(tmpdir);
+    [
+        tmpdir.as_path(),
+        Path::new("/tmp"),
+        Path::new("/private/tmp"),
+        Path::new("/var/tmp"),
+        Path::new("/private/var/tmp"),
+    ]
+    .iter()
+    .any(|t| t.starts_with(dir))
+}
+
+/// Whether `dir` is the root of a mounted volume: `/Volumes/<name>` (macOS),
+/// `/mnt/<name>`, `/media/<user>/<name>` or `/run/media/<user>/<name>`.
+pub fn is_volume_root(dir: &Path) -> bool {
+    let parts: Vec<&str> = dir
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(p) => p.to_str(),
+            _ => None,
+        })
+        .collect();
+    matches!(
+        parts.as_slice(),
+        ["Volumes", _] | ["mnt", _] | ["media", _, _] | ["run", "media", _, _]
+    )
 }
 
 /// Whether an SSH signature refused for `recorded` is one to ask about before
@@ -419,7 +540,14 @@ pub fn widening_is_safe(dir: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> 
         .components()
         .filter(|c| matches!(c, std::path::Component::Normal(_)))
         .count();
-    if normal < 2 {
+    if normal < 2 || is_volume_root(dir) || is_system_temp(dir) {
+        return false;
+    }
+    if dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| SHARED_FOLDER_NAMES.contains(&n))
+    {
         return false;
     }
     if matches!(
@@ -970,6 +1098,7 @@ mod tests {
             at: 100,
             harness_pid: None,
             command_digest: None,
+            programs: Vec::new(),
         }
     }
 
@@ -1362,9 +1491,79 @@ mod tests {
             command_digest("make build")
         );
         assert_ne!(command_digest("make build"), command_digest("make  build"));
+        let mut refused = refusal(Path::new("/w/x"), ScopeAccess::Rw);
+        refused.command_digest = Some(command_digest("make build"));
+        assert!(refused_for(&refused, "make build\n"));
+    }
+
+    /// SPEC R-PERM.10.1: the programs of a command line, past `cd`, `env`,
+    /// assignments and paths.
+    #[test]
+    fn the_programs_of_a_command_line() {
+        assert_eq!(
+            command_programs("cd ios/Neubit && xcodebuild -scheme A build 2>&1 | tail -5"),
+            ["xcodebuild"]
+        );
+        assert_eq!(
+            command_programs("FOO=1 env BAR=2 ./scripts/audition ask r1; echo done"),
+            ["audition"]
+        );
+        assert_eq!(command_programs("time cargo build && ls"), ["cargo"]);
+        assert!(command_programs("cd x && ls && echo hi").is_empty());
+    }
+
+    /// SPEC R-PERM.10.1 (field case): an agent changes the command before it
+    /// runs it again — a new flag, a `cd`, a pipe — so the question waited
+    /// for a byte-identical re-run that never came. A command running the
+    /// same program is asked about; an unrelated one, or one that only
+    /// navigates, is not.
+    #[test]
+    fn a_refusal_is_asked_about_before_the_same_program_runs_again() {
+        let refused_command = "cd ios/Neubit && xcodebuild -scheme Neubit build";
+        let mut refused = refusal(Path::new("/w/x"), ScopeAccess::Rw);
+        refused.command_digest = Some(command_digest(refused_command));
+        refused.programs = command_programs(refused_command);
+        assert!(refused_for(&refused, refused_command));
         assert!(refused_for(
-            Some(&command_digest("make build")),
-            "make build\n"
+            &refused,
+            "xcodebuild -scheme Neubit -derivedDataPath build/dd build | tail"
         ));
+        assert!(!refused_for(&refused, "cargo build"));
+        assert!(!refused_for(&refused, "cd ios/Neubit && ls"));
+    }
+
+    /// SPEC R-PERM.10.1: the directory offered is the tool's own folder —
+    /// below home, a shared folder, a folder named like a cache, a volume
+    /// root — not the deepest refused one.
+    #[test]
+    fn the_directory_offered_is_the_tools_own_folder() {
+        let home = Path::new("/Users/me");
+        let root = |p: &str| tool_root(Path::new(p), Some(home), &[]);
+        assert_eq!(
+            root("/Volumes/T7/caches/swiftpm/manifests/ManifestLoading"),
+            Path::new("/Volumes/T7/caches/swiftpm")
+        );
+        assert_eq!(
+            root("/Volumes/T7/caches/DerivedData/Neubit-ab/SourcePackages/artifacts"),
+            Path::new("/Volumes/T7/caches/DerivedData")
+        );
+        assert_eq!(
+            root("/Users/me/Library/Developer/Xcode/DerivedData/Neubit-ab/Logs"),
+            Path::new("/Users/me/Library/Developer/Xcode/DerivedData")
+        );
+        assert_eq!(
+            root("/Users/me/.cache/neubit/blobs/aa"),
+            Path::new("/Users/me/.cache/neubit")
+        );
+        assert_eq!(root("/Volumes/T7/x"), Path::new("/Volumes/T7/x"));
+        let tmp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        let in_tmp = tmp.join("tool-cache").join("blobs");
+        assert_eq!(
+            tool_root(&in_tmp, Some(home), &[]),
+            tmp.join("tool-cache"),
+            "never the system temp directory itself"
+        );
+        assert!(is_volume_root(Path::new("/Volumes/T7")));
+        assert!(!is_volume_root(Path::new("/Volumes/T7/caches")));
     }
 }
