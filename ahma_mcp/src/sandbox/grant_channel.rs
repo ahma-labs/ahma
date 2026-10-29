@@ -63,6 +63,16 @@ pub(crate) fn grant_dir_for(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The directory a terminal hook offers for a refused `path`: the tool's own
+/// folder (`harness_asks::tool_root` over [`grant_dir_for`], SPEC
+/// R-PERM.10.1), so the advice printed and the dialog that follows name the
+/// same directory, and one grant covers the whole cache. `scopes` are the
+/// command's own, which no offer may sit above.
+pub(crate) fn offered_dir_for(path: &Path, scopes: &[PathBuf]) -> PathBuf {
+    let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
+    ahma_common::harness_asks::tool_root(&grant_dir_for(path), home.as_deref(), scopes)
+}
+
 /// What every surface says about a refusal no grant can change (SPEC
 /// R-PERM.4.3, R-PERM.9): one first line saying so, and why. Never grant
 /// commands, a tier to pick or an `always` line: the hard denylist refuses
@@ -524,7 +534,7 @@ pub fn hook_denial_text(
     if let Some(text) = never_grantable_text(path, access) {
         return text;
     }
-    let target = grant_dir_for(path);
+    let target = offered_dir_for(path, &who.scopes);
     let body = ahma_common::grant_prompt::render_for_hook(
         &target,
         access,
@@ -539,7 +549,8 @@ pub fn hook_denial_text(
     format!(
         "The sandbox refused a {} outside the workspace: '{}'. If this command needs it, a human \
          must grant it; ahma will not run it unsandboxed.\n\n{}\nIn Claude Code, re-run this \
-         command and ahma will ask you in a dialog to approve the grant; or a human can run \
+         command (or another running the same program) and ahma will ask you in a dialog to \
+         approve the grant; or a human can run \
          (pick a tier), then re-run the command:\n  ahma sandbox \
          grant {target}{ro_flag} --session   # this terminal session only, at most 12h\n  ahma \
          sandbox grant {target}{ro_flag}             # until revoked, bound to this workspace\n\n\
@@ -560,7 +571,7 @@ pub fn hook_denial_text(
 /// a block. `None` when the output shows no refusal outside the scope.
 pub fn hook_side_refusal_note(output: &str, who: &HookRequester) -> Option<String> {
     let (path, access) = hook_side_refusal(output, who)?;
-    Some(refusal_note(&path, access))
+    Some(refusal_note(&path, access, &who.scopes))
 }
 
 /// The out-of-scope path and access a hooked command that **succeeded** was
@@ -652,8 +663,12 @@ fn is_listed_text(line: &str) -> bool {
 }
 
 /// The one-line note for a refusal a hooked command shrugged off.
-pub fn refusal_note(path: &Path, access: ahma_common::config::ScopeAccess) -> String {
-    let target = grant_dir_for(path);
+pub fn refusal_note(
+    path: &Path,
+    access: ahma_common::config::ScopeAccess,
+    scopes: &[PathBuf],
+) -> String {
+    let target = offered_dir_for(path, scopes);
     let (verb, ro) = if access.is_write() {
         ("write", "")
     } else {
@@ -663,7 +678,7 @@ pub fn refusal_note(path: &Path, access: ahma_common::config::ScopeAccess) -> St
         "ahma: the sandbox refused a {verb} outside the workspace ({}) and the command went on \
          without it; if it needs that, a human can run `ahma sandbox grant {}{ro}` (add \
          `--session` for this terminal session only); in Claude Code, ahma asks in its \
-         dialog when the command is run again.",
+         dialog before this program runs again.",
         path.display(),
         target.display()
     )
@@ -1420,7 +1435,7 @@ mod context_tests {
     const GOLDEN_HOOK_HEAD: &str = "The sandbox refused a write outside the workspace: \
         '/opt/cache/x.bin'. If this command needs it, a human must grant it; ahma will not run it \
         unsandboxed.";
-    const GOLDEN_HOOK_TAIL: &str = r#"In Claude Code, re-run this command and ahma will ask you in a dialog to approve the grant; or a human can run (pick a tier), then re-run the command:
+    const GOLDEN_HOOK_TAIL: &str = r#"In Claude Code, re-run this command (or another running the same program) and ahma will ask you in a dialog to approve the grant; or a human can run (pick a tier), then re-run the command:
   ahma sandbox grant /opt/cache --session   # this terminal session only, at most 12h
   ahma sandbox grant /opt/cache             # until revoked, bound to this workspace
 

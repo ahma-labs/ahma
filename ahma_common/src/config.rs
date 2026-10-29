@@ -1226,7 +1226,7 @@ pub enum GrantOutcome {
 /// Compare two scope paths for equivalence after `~` expansion, so that
 /// `~/Library/Caches/x` and `/Users/me/Library/Caches/x` match. Falls back to a
 /// plain comparison when the home directory cannot be resolved.
-fn scope_paths_equiv(a: &Path, b: &Path) -> bool {
+pub(crate) fn scope_paths_equiv(a: &Path, b: &Path) -> bool {
     expand_home(a) == expand_home(b)
 }
 

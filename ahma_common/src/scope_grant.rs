@@ -1128,6 +1128,50 @@ pub struct NewGrant<'a> {
     pub expires_at: Option<u64>,
 }
 
+/// The workspace binding for a grant of `path` approved in `workspace`, and
+/// the existing bindings of the same grant it replaces (SPEC R5.4.11.1).
+///
+/// A grant is bound to the workspace it was approved in, and applies to
+/// everything inside that binding (R5.4.11). So when `path` is already granted
+/// for another workspace — a sibling clone of the same project — the binding
+/// becomes the folder that holds both, and one grant covers every checkout
+/// under it. That folder must be safe to bind to: not home or above it, not a
+/// volume or filesystem root, and at least two levels deep. Otherwise the new
+/// workspace gets its own binding, and nothing is replaced. Path-based on
+/// purpose: nothing in a repository (its remote, its history) can make a
+/// directory inherit another's grants.
+pub fn binding_for(
+    path: &Path,
+    workspace: &Path,
+    existing: &[PersistentScope],
+    home: Option<&Path>,
+) -> (PathBuf, Vec<PathBuf>) {
+    let mut binding = workspace.to_path_buf();
+    let mut replaced = Vec::new();
+    for other in existing
+        .iter()
+        .filter(|s| crate::config::scope_paths_equiv(&s.path, path))
+        .filter_map(|s| s.workspace.as_deref())
+    {
+        let Some(shared) = binding.ancestors().find(|a| other.starts_with(a)) else {
+            continue;
+        };
+        let deep_enough = shared
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count()
+            >= 2;
+        let safe = deep_enough
+            && !crate::harness_asks::is_volume_root(shared)
+            && home.is_none_or(|h| !h.starts_with(shared));
+        if safe {
+            binding = shared.to_path_buf();
+            replaced.push(other.to_path_buf());
+        }
+    }
+    (binding, replaced)
+}
+
 /// Whether a persistent grant made for `workspace` applies to a session whose
 /// committed scopes are `scopes` (SPEC R5.4.11). A grant with no workspace is a
 /// legacy global grant and applies everywhere. Otherwise it applies when a
@@ -1207,6 +1251,64 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope_for(path: &str, workspace: &str) -> PersistentScope {
+        PersistentScope {
+            path: PathBuf::from(path),
+            access: ScopeAccess::Rw,
+            workspace: Some(PathBuf::from(workspace)),
+            granted_by: None,
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        }
+    }
+
+    /// SPEC R5.4.11.1 (field case): four clones of one repository, side by
+    /// side. A grant approved in one did not apply in the others, so each
+    /// clone failed and asked again. Approving the same directory in a second
+    /// clone binds it to the folder holding both.
+    #[test]
+    fn a_grant_approved_in_a_sibling_clone_binds_to_the_folder_holding_both() {
+        let home = Some(Path::new("/Users/me"));
+        let cache = "/Volumes/T7/caches/swiftpm";
+        let existing = [scope_for(cache, "/Volumes/T7/github/neubit4")];
+        let (binding, replaced) = binding_for(
+            Path::new(cache),
+            Path::new("/Volumes/T7/github/alt2/neubit4"),
+            &existing,
+            home,
+        );
+        assert_eq!(binding, Path::new("/Volumes/T7/github"));
+        assert_eq!(replaced, [PathBuf::from("/Volumes/T7/github/neubit4")]);
+        assert!(
+            grant_applies(
+                Some(&binding),
+                &[PathBuf::from("/Volumes/T7/github/alt3/neubit4")]
+            ),
+            "and to every other clone under it"
+        );
+    }
+
+    /// The folder holding both must be one a binding may name: never home or
+    /// above, never a volume or filesystem root.
+    #[test]
+    fn a_binding_never_widens_to_home_a_volume_or_the_root() {
+        let home = Some(Path::new("/Users/me"));
+        let p = Path::new("/Users/me/.cache/neubit");
+        for (a, b) in [
+            ("/Users/me/a", "/Users/me/b"),
+            ("/Volumes/T7/a", "/Volumes/T7/b"),
+            ("/Users/me/a", "/Volumes/T7/b"),
+        ] {
+            let existing = [scope_for(p.to_str().unwrap(), a)];
+            let (binding, replaced) = binding_for(p, Path::new(b), &existing, home);
+            assert_eq!(binding, Path::new(b), "{a} + {b}");
+            assert!(replaced.is_empty(), "{a} + {b}");
+        }
+        let (binding, _) = binding_for(p, Path::new("/Users/me/w"), &[], home);
+        assert_eq!(binding, Path::new("/Users/me/w"), "nothing to share with");
+    }
     use tempfile::tempdir;
 
     fn coord() -> GrantCoordinator {

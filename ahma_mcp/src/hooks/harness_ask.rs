@@ -74,13 +74,19 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
     let Some(dir) = harness_asks::default_dir() else {
         return;
     };
+    // Offer the tool's own folder, not the deepest refused one (R-PERM.10.1).
+    let grant_dir = crate::sandbox::grant_channel::offered_dir_for(
+        path,
+        &super::resolve_hook_sandbox_scopes(cwd),
+    );
     let refusal = Refusal {
         path: path.to_path_buf(),
-        grant_dir: crate::sandbox::grant_channel::grant_dir_for(path),
+        grant_dir,
         access,
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
         command_digest: Some(ahma_common::harness_asks::command_digest(command)),
+        programs: ahma_common::harness_asks::command_programs(command),
     };
     if let Err(e) = harness_asks::record_refusal(&dir, &workspace_for(cwd), refusal) {
         tracing::debug!("harness question not recorded: {e:#}");
@@ -106,12 +112,11 @@ pub(super) fn next_ask(
         crate::adapter::lane::classify_shell_command(command),
         crate::adapter::workspace_queue::Lane::ReadOnly
     );
-    // Asked when the refused command is run again: a "no" then stops only
-    // the retry it was about, never an unrelated command (SPEC R-PERM.10).
-    asks.refusals.retain(|r| {
-        (may_write || !r.access.is_write())
-            && harness_asks::refused_for(r.command_digest.as_deref(), command)
-    });
+    // Asked before the refused command, or one running the same program,
+    // runs again: a "no" then stops only the retry it was about, never an
+    // unrelated command (SPEC R-PERM.10, R-PERM.10.1).
+    asks.refusals
+        .retain(|r| (may_write || !r.access.is_write()) && harness_asks::refused_for(r, command));
     if asks.refusals.is_empty() {
         return None;
     }
@@ -145,10 +150,10 @@ pub(super) fn next_ask(
 /// The dialog text for `question`: what was refused, what a yes grants and
 /// for how long, what a no means, and how to make it permanent.
 pub(super) fn ask_reason(question: &Question) -> String {
-    let (verb, ro) = if question.access.is_write() {
-        ("write", "")
+    let verb = if question.access.is_write() {
+        "write"
     } else {
-        ("read", " --read-only")
+        "read"
     };
     let mut covers: Vec<String> = question
         .covers
@@ -167,9 +172,9 @@ pub(super) fn ask_reason(question: &Question) -> String {
         };
     format!(
         "ahma: an earlier command here was refused {verb} access to {} ({}). Approve to let \
-         commands in this workspace {verb} it for this session, then run this command. Deny and \
-         ahma will not ask about it again this session.{risk} To allow it always: `ahma sandbox \
-         grant {}{ro}`.",
+         commands in this workspace {verb} it from now on (remembered; undo with `ahma sandbox \
+         revoke {}`), then run this command. Deny and ahma will not ask about it again this \
+         session.{risk}",
         question.dir.display(),
         covers.join(", "),
         question.dir.display(),
@@ -329,6 +334,8 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<S
         ));
     }
     let owner = asked.harness_pid?;
+    // The session grant reaches this very command: its settings were read
+    // before the token was spent. The persisted one reaches every later one.
     crate::sandbox::record_session_grant(
         &q.dir,
         q.access,
@@ -337,10 +344,66 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<S
         "harness dialog",
     );
     let verb = if q.access.is_write() { "write" } else { "read" };
-    Some(format!(
-        "ahma: approved — commands in this workspace may {verb} {} for this session.",
-        q.dir.display()
-    ))
+    Some(match persist_approval(q, &workspace) {
+        Ok(binding) if binding == workspace => format!(
+            "ahma: approved — commands in this workspace may {verb} {} from now on.",
+            q.dir.display()
+        ),
+        Ok(binding) => format!(
+            "ahma: approved — commands in every workspace under {} may {verb} {} from now on.",
+            binding.display(),
+            q.dir.display()
+        ),
+        Err(e) => format!(
+            "ahma: approved for this session — commands in this workspace may {verb} {}. It \
+             could not be remembered ({e:#}); to keep it, run `ahma sandbox grant {}`.",
+            q.dir.display(),
+            q.dir.display()
+        ),
+    })
+}
+
+/// Remember a grant the human approved in the harness dialog (SPEC
+/// R-PERM.10.1): persisted, bound by [`binding_for`] so a sibling clone that
+/// approved the same directory shares one grant. Returns the binding.
+///
+/// [`binding_for`]: ahma_common::scope_grant::binding_for
+fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Result<PathBuf> {
+    use ahma_common::config::{AhmaSettings, settings_path};
+    use ahma_common::scope_grant::{NewGrant, binding_for, persist_grant};
+    let file = settings_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let existing = AhmaSettings::load_from_checked(&file)
+        .map_err(|e| anyhow::anyhow!("{}", e.summary()))?
+        .sandbox
+        .persistent_scopes;
+    let home = ahma_common::config::ahma_home_dir();
+    let (binding, replaced) = binding_for(&q.dir, workspace, &existing, home.as_deref());
+    persist_grant(
+        &file,
+        NewGrant {
+            path: &q.dir,
+            access: q.access,
+            granted_by: Some("harness dialog".to_string()),
+            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            note: None,
+            surface: "harness",
+            // Never above the workspace it was approved in (R-PERM.4.3).
+            live_scopes: &[workspace.to_path_buf()],
+            workspace: Some(&binding),
+            expires_at: None,
+        },
+    )?;
+    // After the wider grant is written, so a failure here leaves more
+    // granted than asked for in one more place, never less.
+    if !replaced.is_empty() {
+        let mut settings = AhmaSettings::load_from_checked(&file)
+            .map_err(|e| anyhow::anyhow!("{}", e.summary()))?;
+        for old in &replaced {
+            settings.sandbox.revoke_scope(&q.dir, Some(old));
+        }
+        settings.save_to(&file)?;
+    }
+    Ok(binding)
 }
 
 /// Record the session grant a yes to an SSH-signature question gives.
@@ -498,7 +561,8 @@ mod tests {
     /// The whole R-PERM.10 loop at the hook: a refusal is recorded; the next
     /// Claude Code Bash call is answered `ask` with a token-carrying command;
     /// the same session is not asked again; a yes (the command running with
-    /// the token) applies a session grant once.
+    /// the token) applies a session grant once, for this command, and is
+    /// remembered for later ones (SPEC R-PERM.10.1).
     #[test]
     fn a_refused_path_is_asked_once_and_a_yes_applies_a_session_grant() {
         use super::super::{
@@ -591,6 +655,19 @@ mod tests {
                 .any(|g| g.path == cache && g.access.is_write()),
             "the yes became a session grant: {granted:?}"
         );
+        let file = ahma_common::config::settings_path().unwrap();
+        let saved = ahma_common::config::AhmaSettings::load_from_checked(&file).unwrap();
+        assert!(
+            saved
+                .sandbox
+                .persistent_scopes
+                .iter()
+                .any(|s| s.path == cache
+                    && s.access.is_write()
+                    && s.workspace.as_deref() == Some(ws.as_path())),
+            "and is remembered, bound to this workspace: {:?}",
+            saved.sandbox.persistent_scopes
+        );
         let again = apply_approval(&token, &ws, "make heavy").unwrap();
         assert!(again.contains("already used"), "{again}");
     }
@@ -619,6 +696,7 @@ mod tests {
                 at: ahma_common::session_grants::now_secs(),
                 harness_pid: Some(stale),
                 command_digest: None,
+                programs: Vec::new(),
             },
         )
         .unwrap();
@@ -685,12 +763,13 @@ mod tests {
             "{r}"
         );
         assert!(r.contains("heavy.lock.holder"), "{r}");
-        assert!(r.contains("for this session"), "{r}");
+        // SPEC R-PERM.10.1: a yes is remembered, and says how to undo it.
+        assert!(r.contains("from now on (remembered"), "{r}");
+        assert!(r.contains("ahma sandbox revoke /opt/neubit-cache"), "{r}");
         assert!(
             r.contains("will not ask about it again this session"),
             "{r}"
         );
-        assert!(r.contains("ahma sandbox grant /opt/neubit-cache"), "{r}");
     }
 
     #[test]
