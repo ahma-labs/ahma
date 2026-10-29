@@ -368,7 +368,7 @@ pub struct ToolApproval {
 ///
 /// Filesystem scopes and web domains keep their established tables; this holds
 /// what previously had no home in the settings file at all.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PermissionSettings {
     /// Per-workspace tool approvals ("always allow", migrated from the retired
@@ -384,6 +384,19 @@ pub struct PermissionSettings {
     /// without it. Default: `6`
     #[serde(default = "default_advisor_timeout_secs")]
     pub advisor_timeout_secs: u64,
+}
+
+// Not derived: a derived `Default` gave `false`/`0` while the serde field
+// defaults give `true`/`6`, so a settings file without `[permissions]` turned
+// the advisor off and one with an empty table turned it on.
+impl Default for PermissionSettings {
+    fn default() -> Self {
+        Self {
+            tool_approvals: Vec::new(),
+            advisor: default_true(),
+            advisor_timeout_secs: default_advisor_timeout_secs(),
+        }
+    }
 }
 
 fn default_true() -> bool {
