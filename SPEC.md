@@ -514,6 +514,13 @@ Server configuration (everything except MTDF tool definitions) **must** be deter
 - **R-CFG8.2**: Red team: a project `<workspace>/.ahma/settings.toml` containing `sandbox.disable = true`, widened `sandbox.scopes`, or `auth` keys **must not** affect behavior, and the ignored keys **must** appear in startup warnings.
 - **R-CFG8.3**: Precedence matrix per R-CFG5.3; parse-failure abort per R-CFG6.1; `--no-x` overriding a settings-file `x = true` per R-CFG1.4.
 
+### R-CFG10: One-Line Settings Edits
+
+- **R-CFG10.1**: `ahma settings set <table>.<key> <value>` and `ahma settings unset <table>.<key>` **must** change exactly that key, in its own table, through the renderer the startup sync uses — so a file can never gain a second table — and print the old and new value. The value is read as TOML, else as a plain string, so a string needs no quoting. Field case: a suggested shell line ending in a `#` comment failed in interactive zsh (which does not treat `#` as a comment by default), the human appended a raw `[tools]` table instead, the file gained a second `[tools]`, and every hooked command ran unsandboxed (R-CFG6.4).
+- **R-CFG10.2**: It **must** refuse, writing nothing, an unknown key, a value the setting's type rejects, and a file that does not parse (naming its line, R-CFG6.4); and it **must** re-read the file it wrote.
+- **R-CFG10.3**: Every remediation ahma prints for a setting **should** be that one command, and any command ahma suggests a human paste **must** be a single line without a trailing comment, valid as written in bash, zsh, fish and PowerShell where the command itself is.
+- **R-CFG10.4**: The compiled-in defaults **must** equal what an empty file — and a file with every table present but empty — parses to. A struct whose derived `Default` disagreed with its serde field defaults made "no settings file" quietly differ from "an empty one" (the TUI's permission advisor was off without a file, on with one).
+
 ### R-CFG9: Test-Only Configuration
 
 Production and test code must be separated so that test harness machinery can never alter production security decisions.

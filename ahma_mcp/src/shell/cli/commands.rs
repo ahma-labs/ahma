@@ -225,7 +225,29 @@ pub(crate) fn run_settings_command(
     match args.command {
         SettingsCommand::Init { force, path } => run_settings_init(force, path),
         SettingsCommand::Show { origin } => run_settings_show(origin, origin_ctx),
+        SettingsCommand::Set { key, value, path } => run_settings_set(&key, Some(&value), path),
+        SettingsCommand::Unset { key, path } => run_settings_set(&key, None, path),
     }
+}
+
+/// `ahma settings set` / `unset` (SPEC R-CFG10).
+fn run_settings_set(key: &str, value: Option<&str>, path: Option<PathBuf>) -> Result<()> {
+    use ahma_common::config::{AhmaSettings, settings_path};
+    let target = path.or_else(settings_path).ok_or_else(|| {
+        anyhow::anyhow!("cannot find the home directory for ~/.ahma/settings.toml")
+    })?;
+    let edit = AhmaSettings::set_in_file(&target, key, value)?;
+    if edit.before == edit.after {
+        println!("{key} is already {} ({})", edit.after, target.display());
+    } else {
+        println!(
+            "{key}: {} -> {} ({})",
+            edit.before,
+            edit.after,
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

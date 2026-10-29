@@ -1750,6 +1750,24 @@ pub enum SettingsCommand {
         #[arg(long)]
         origin: bool,
     },
+    /// Set one setting, e.g. `ahma settings set tools.timeout_secs 3600`. Edits the key in its own table (never adds a second one), refuses an unknown key or a value of the wrong type, and leaves a file that parses; prints the old and new value. A string needs no quotes; lists and tables are TOML (`'["a", "b"]'`). One line, safe to paste into any shell.
+    Set {
+        /// `<table>.<key>`, as `ahma settings show` lists them.
+        key: String,
+        /// The new value.
+        value: String,
+        /// Edit this file instead of `~/.ahma/settings.toml`.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Return one setting to its compiled-in default, e.g. `ahma settings unset tools.timeout_secs`.
+    Unset {
+        /// `<table>.<key>`, as `ahma settings show` lists them.
+        key: String,
+        /// Edit this file instead of `~/.ahma/settings.toml`.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
 }
 
 /// Provenance context for `ahma settings show --origin` (R-CFG5.1): which

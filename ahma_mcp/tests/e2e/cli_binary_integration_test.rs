@@ -787,3 +787,58 @@ mod hooks_exec_fail_open_tests {
         assert!(reason.contains("duplicate key"), "{reason}");
     }
 }
+
+// ============================================================================
+// `ahma settings set` / `unset` (SPEC R-CFG10)
+// ============================================================================
+
+mod settings_set_tests {
+    use super::*;
+
+    fn ahma_settings(binary: &std::path::Path, args: &[&str]) -> std::process::Output {
+        Command::new(binary)
+            .arg("settings")
+            .args(args)
+            .output()
+            .expect("run `ahma settings`")
+    }
+
+    /// The one-line edit an agent can suggest: it changes the key in its own
+    /// table, and a mistyped key fails without touching the file.
+    #[test]
+    fn settings_set_and_unset_edit_one_key() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let temp = TempDir::new().expect("create temp dir");
+        let file = temp.path().join("settings.toml");
+        let path = file.to_str().unwrap();
+
+        let out = ahma_settings(
+            &binary,
+            &["set", "tools.timeout_secs", "90000", "--path", path],
+        );
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("tools.timeout_secs: 1800 -> 90000"),
+            "{stdout}"
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("timeout_secs = 90000"), "{text}");
+
+        let out = ahma_settings(&binary, &["set", "tools.timeout_sec", "5", "--path", path]);
+        assert!(!out.status.success(), "a mistyped key must fail");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            text,
+            "file untouched"
+        );
+
+        let out = ahma_settings(&binary, &["unset", "tools.timeout_secs", "--path", path]);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            !std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("timeout_secs = 90000")
+        );
+    }
+}
