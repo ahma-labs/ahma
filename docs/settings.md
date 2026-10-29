@@ -37,6 +37,21 @@ default logs nothing. On Unix, a settings file that group or others can write
 also logs a `warn` with the fix (`chmod go-w <file>`): whoever can edit that
 file can change how ahma confines your agent (SPEC R-CFG6.3).
 
+## A settings file that does not parse
+
+ahma will not guess. A settings file it can read but cannot parse (a typo, or a
+table such as `[tools]` written twice) stops every command that would use it
+(SPEC R-CFG6.1). For terminal hooks that means **every hooked command is
+refused**, not run unsandboxed: the agent gets one line naming the file, the
+line, the reason and the fix, for example
+
+```
+ahma refused this call: the settings file does not parse — /home/me/.ahma/settings.toml line 254 (`[tools]`): duplicate key. … Fix: [tools] appears twice: delete line 254 and move the keys under it into the first [tools], then run `ahma doctor` to confirm.
+```
+
+`ahma doctor` and `ahma settings` still run, on compiled-in defaults, so you
+can diagnose and repair the file (SPEC R-CFG6.4).
+
 ## File location
 
 | Platform | Default path |

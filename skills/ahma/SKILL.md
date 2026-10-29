@@ -278,7 +278,7 @@ Validate configs: `ahma tool validate .ahma/`
 
 ## Permissions & Network Management
 
-Every permission lives in `~/.ahma/settings.toml`, outside every sandbox scope.
+Every permission lives in `~/.ahma/settings.toml`, outside every sandbox scope. If every hooked call is refused because that file does not parse, relay the refusal line to the human and stop: retrying cannot succeed, and only they can edit it.
 
 ```bash
 ahma permissions list [--expiring 12h]         # every grant, or the leases to renew before a long run

@@ -2060,6 +2060,84 @@ impl Default for NetworkSettings {
     }
 }
 
+/// A settings file ahma could read but not use (SPEC R-CFG6.1), located well
+/// enough to be reported on one line: the file, the line, the text on it and
+/// the parser's reason (R-CFG6.4).
+///
+/// `Display` is the full multi-line report (the parser's own, with its caret
+/// under the error) that the startup path prints; [`summary`](Self::summary)
+/// is the one-line form a hooked command's refusal carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsFileError {
+    /// The file that failed.
+    pub path: PathBuf,
+    /// 1-based line of the error, when the parser reported where it is.
+    pub line: Option<usize>,
+    /// The text of that line, trimmed.
+    pub source_line: Option<String>,
+    /// The parser's short reason (`duplicate key`), or the I/O error.
+    pub reason: String,
+    /// The complete report.
+    detail: String,
+}
+
+impl SettingsFileError {
+    fn parse(path: &Path, contents: &str, err: &toml::de::Error, what: &str) -> Self {
+        let line = err.span().map(|span| {
+            contents
+                .get(..span.start)
+                .unwrap_or(contents)
+                .matches('\n')
+                .count()
+                + 1
+        });
+        let source_line = line
+            .and_then(|n| contents.lines().nth(n - 1))
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty());
+        Self {
+            path: path.to_path_buf(),
+            line,
+            source_line,
+            reason: err.message().trim().to_string(),
+            detail: format!("{what} {}: {err}", path.display()),
+        }
+    }
+
+    fn read(path: &Path, err: &std::io::Error) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            line: None,
+            source_line: None,
+            reason: err.to_string(),
+            detail: format!("failed to read {}: {err}", path.display()),
+        }
+    }
+
+    /// One line, no caret art: the file, `line N`, the text on that line in
+    /// backticks, then the reason.
+    pub fn summary(&self) -> String {
+        let mut out = self.path.display().to_string();
+        if let Some(line) = self.line {
+            out.push_str(&format!(" line {line}"));
+        }
+        if let Some(text) = &self.source_line {
+            out.push_str(&format!(" (`{text}`)"));
+        }
+        out.push_str(": ");
+        out.push_str(&self.reason.replace('\n', " "));
+        out
+    }
+}
+
+impl std::fmt::Display for SettingsFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SettingsFileError {}
+
 /// Top-level user settings loaded from `~/.ahma/settings.toml`.
 ///
 /// All fields have sensible defaults — an empty file (or no file at all) is
@@ -2220,9 +2298,17 @@ impl AhmaSettings {
     /// applies only to a file we *can* read but that fails to **parse** — a
     /// tampered/corrupt file must never silently change behavior.
     pub fn load_from_result(path: &Path) -> Result<Self, String> {
+        Self::load_from_checked(path).map_err(|e| e.to_string())
+    }
+
+    /// [`load_from_result`](Self::load_from_result) with the error located:
+    /// file, line and reason, for callers that must report it on one line
+    /// (a hooked command's refusal, SPEC R-CFG6.4). Same read/parse rules.
+    pub fn load_from_checked(path: &Path) -> Result<Self, SettingsFileError> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => Self::parse(&contents)
-                .map_err(|e| format!("failed to parse settings file {}: {e}", path.display())),
+            Ok(contents) => toml::from_str(&contents).map_err(|e| {
+                SettingsFileError::parse(path, &contents, &e, "failed to parse settings file")
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 warn!(
@@ -2233,7 +2319,7 @@ impl AhmaSettings {
                 );
                 Ok(Self::default())
             }
-            Err(e) => Err(format!("failed to read {}: {e}", path.display())),
+            Err(e) => Err(SettingsFileError::read(path, &e)),
         }
     }
 
@@ -4315,6 +4401,38 @@ timeout_secs = 600
         }
     }
 
+    /// R-CFG6.4: an unparseable file is reported on one line that names the
+    /// file, the line, the offending text and the parser's reason — the shape
+    /// every hooked command's refusal carries. The duplicate `[tools]` table is
+    /// the field case: a second table appended below a commented-out first one.
+    #[test]
+    fn a_parse_error_summary_names_file_line_text_and_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[tools]\ntimeout_secs = 10\n\n[tools]\ntimeout_secs = 90000\n",
+        )
+        .unwrap();
+
+        let err = AhmaSettings::load_from_checked(&path).unwrap_err();
+        assert_eq!(err.path, path);
+        assert_eq!(err.line, Some(4));
+        assert_eq!(err.source_line.as_deref(), Some("[tools]"));
+        let summary = err.summary();
+        assert!(!summary.contains('\n'), "one line: {summary}");
+        assert!(summary.contains(&path.display().to_string()), "{summary}");
+        assert!(summary.contains("line 4"), "{summary}");
+        assert!(summary.contains("`[tools]`"), "{summary}");
+        assert!(summary.contains("duplicate key"), "{summary}");
+        // The multi-line report the startup path has always printed is kept.
+        assert_eq!(
+            AhmaSettings::load_from_result(&path).unwrap_err(),
+            err.to_string()
+        );
+        assert!(err.to_string().contains("TOML parse error at line 4"));
+    }
+
     /// Regression: a settings file that cannot be *read* because access is
     /// denied must fall back to compiled-in defaults, NOT abort. `~/.ahma` is
     /// intentionally out of sandbox scope (SPEC R5.4.8), so whenever ahma runs
@@ -5156,7 +5274,7 @@ pub fn project_settings_path(tools_dir: &Path) -> PathBuf {
 /// `PermissionDenied` gets the same treatment [`AhmaSettings::load_from_result`]
 /// gives it and for the same reason (R5.4.8). A file that exists, is readable,
 /// and does not **parse** is an error, per R-CFG6.1.
-pub fn load_project_settings(path: &Path) -> Result<ProjectSettingsLoad, String> {
+pub fn load_project_settings(path: &Path) -> Result<ProjectSettingsLoad, SettingsFileError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -5169,14 +5287,11 @@ pub fn load_project_settings(path: &Path) -> Result<ProjectSettingsLoad, String>
             );
             return Ok(ProjectSettingsLoad::default());
         }
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+        Err(e) => return Err(SettingsFileError::read(path, &e)),
     };
 
     let parsed: toml::Table = toml::from_str(&contents).map_err(|e| {
-        format!(
-            "failed to parse project settings file {}: {e}",
-            path.display()
-        )
+        SettingsFileError::parse(path, &contents, &e, "failed to parse project settings file")
     })?;
 
     Ok(classify_project_settings(parsed))
@@ -5417,7 +5532,9 @@ timeout_secs = 42
         // change behaviour by falling back.
         let dir = tempfile::tempdir().unwrap();
         let path = write_project(dir.path(), "this is : not [[[ valid toml");
-        assert!(load_project_settings(&path).is_err());
+        let err = load_project_settings(&path).unwrap_err();
+        assert_eq!(err.line, Some(1));
+        assert!(err.to_string().contains("project settings file"), "{err}");
     }
 
     /// R-CFG5.3: the documented precedence and the implemented precedence must
