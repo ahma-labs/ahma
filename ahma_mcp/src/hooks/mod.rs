@@ -283,6 +283,14 @@ pub struct HooksRunShellArgs {
     /// dialog (SPEC R-PERM.10). Written only by the hook.
     #[arg(long = "approve-grant", hide = true)]
     pub approve_grant: Option<String>,
+
+    /// The harness runs this call in the background (SPEC R-SETUP.2.1).
+    #[arg(long, hide = true)]
+    pub background: bool,
+
+    /// The harness's own time limit for this call, in milliseconds.
+    #[arg(long = "harness-timeout-ms", hide = true)]
+    pub harness_timeout_ms: Option<u64>,
 }
 
 impl HooksRunShellArgs {
@@ -315,6 +323,10 @@ impl HooksRunShellArgs {
             cwd,
             command,
             session_id: self.session_id,
+            intent: HarnessIntent {
+                background: self.background,
+                timeout_ms: self.harness_timeout_ms,
+            },
         })
     }
 }
@@ -528,6 +540,86 @@ pub struct WrappedShellPayload {
     /// to negotiate — still decodes.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// What the harness declared about how it runs this call.
+    #[serde(default)]
+    pub intent: HarnessIntent,
+}
+
+/// What a harness declared about how it runs one shell call, read from the
+/// hook payload's tool input (SPEC R-SETUP.2.1). The harness owns the call's
+/// lifetime; ahma's own limit must not undercut it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HarnessIntent {
+    /// The harness runs it in the background (Claude Code's `run_in_background`)
+    /// and returns to the model at once.
+    #[serde(default)]
+    pub background: bool,
+    /// The harness's own time limit for the call, in milliseconds (Claude
+    /// Code's `timeout`, Codex's `timeout_ms`).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// A time limit far enough away to be none (a century).
+const NO_LIMIT_SECS: u64 = 100 * 365 * 24 * 60 * 60;
+
+impl HarnessIntent {
+    fn from_tool_input(tool_input: &Map<String, Value>) -> Self {
+        Self {
+            background: tool_input
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            timeout_ms: tool_input
+                .get("timeout")
+                .or_else(|| tool_input.get("timeout_ms"))
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0),
+        }
+    }
+
+    /// The `run-shell` flags that carry this intent.
+    fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.background {
+            args.push("--background".to_string());
+        }
+        if let Some(ms) = self.timeout_ms {
+            args.extend(["--harness-timeout-ms".to_string(), ms.to_string()]);
+        }
+        args
+    }
+
+    /// ahma's time limit for this call and the setting it comes from, or
+    /// `None` when ahma sets none. A background call is limited only by
+    /// `tools.background_timeout_secs` (`0`, the default, is none); a
+    /// foreground call by the harness's own limit when it declared one, else
+    /// `tools.timeout_secs`.
+    pub fn limit(&self, cfg: &AppConfig) -> Option<TimeLimit> {
+        if self.background {
+            return (cfg.background_timeout_secs > 0).then_some(TimeLimit {
+                secs: cfg.background_timeout_secs,
+                source: "tools.background_timeout_secs",
+            });
+        }
+        Some(match self.timeout_ms {
+            Some(ms) => TimeLimit {
+                secs: ms.div_ceil(1000),
+                source: "the harness's own timeout for this call",
+            },
+            None => TimeLimit {
+                secs: cfg.timeout_secs,
+                source: "tools.timeout_secs",
+            },
+        })
+    }
+}
+
+/// ahma's time limit for one hooked call, and where it was set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeLimit {
+    pub secs: u64,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1733,15 +1825,18 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         );
     }
 
+    // The harness owns this call's lifetime (SPEC R-SETUP.2.1).
+    let limit = payload.intent.limit(&cfg);
+    let limit_secs = limit.map_or(NO_LIMIT_SECS, |l| l.secs);
     let monitor_config = crate::operation_monitor::MonitorConfig::with_timeout(
-        std::time::Duration::from_secs(cfg.timeout_secs),
+        std::time::Duration::from_secs(limit_secs),
     );
     let operation_monitor = std::sync::Arc::new(crate::operation_monitor::OperationMonitor::new(
         monitor_config,
     ));
 
     let shell_pool_config = crate::shell_pool::ShellPoolConfig {
-        command_timeout: std::time::Duration::from_secs(cfg.timeout_secs),
+        command_timeout: std::time::Duration::from_secs(limit_secs),
     };
     let shell_pool_manager =
         std::sync::Arc::new(crate::shell_pool::ShellPoolManager::new(shell_pool_config));
@@ -1816,7 +1911,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     );
     adapter_args.insert("c_flag".to_string(), serde_json::Value::Bool(true));
 
-    let timeout = Some(cfg.timeout_secs);
+    let timeout = Some(limit_secs);
     let subcommand_config = crate::AhmaMcpService::build_shell_subcommand_config(
         timeout,
         &crate::adapter::ExecutionMode::Synchronous,
@@ -1920,7 +2015,10 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // grant ...` recovery line so the agent gets a next step instead of a raw
         // `os error 1`. The native-terminal hook uses the CLI grant path (not the
         // MCP grant/restart tools).
-        Err(e) => report_shell_execution_error(e, &requester, Path::new(&payload.cwd)),
+        Err(e) => match e.downcast_ref::<crate::adapter::time_limit::LimitReached>() {
+            Some(stopped) => Err(anyhow!(time_limit_message(stopped, limit))),
+            None => report_shell_execution_error(e, &requester, Path::new(&payload.cwd)),
+        },
     }
 }
 
@@ -1960,6 +2058,38 @@ fn die_by_signal(signo: i32) -> Result<String> {
 /// write mid-command) and a *pre-exec* denial (the path was rejected before the
 /// command ran). The second used to fall through as a raw error — a denial the
 /// user could see but not act on.
+/// What a hooked command stopped at ahma's time limit says (SPEC
+/// R-SETUP.2.2): first line, who ended it, after how long, and which setting;
+/// then the one fix that applies, written for a hook caller (which cannot pass
+/// an MCP `timeout_seconds`); then what it printed before it was stopped.
+fn time_limit_message(
+    stopped: &crate::adapter::time_limit::LimitReached,
+    limit: Option<TimeLimit>,
+) -> String {
+    let source = limit.map_or("tools.timeout_secs", |l| l.source);
+    let secs = stopped.limit_secs;
+    let fix = match source {
+        "tools.background_timeout_secs" => format!(
+            "To give background commands longer, set `background_timeout_secs = {}` (or `0` for \
+             no limit) under `[tools]` in ~/.ahma/settings.toml.",
+            secs * 2
+        ),
+        "tools.timeout_secs" => format!(
+            "If it is healthy, run it in the background (Claude Code: `run_in_background`), \
+             which ahma does not time-limit, or set `timeout_secs = {}` under `[tools]` in \
+             ~/.ahma/settings.toml.",
+            secs * 2
+        ),
+        _ => "Ask for a longer `timeout` for this call, or run it in the background.".to_string(),
+    };
+    let mut msg = format!("ended by ahma after {secs} s ({source}). {fix}");
+    if !stopped.output.trim().is_empty() {
+        msg.push_str("\n\nOutput before it was stopped:\n");
+        msg.push_str(&stopped.output);
+    }
+    msg
+}
+
 fn report_shell_execution_error(
     e: anyhow::Error,
     who: &crate::sandbox::grant_channel::HookRequester,
@@ -2273,6 +2403,7 @@ fn ask_first_if_refused_before(
         &tool.command,
         Some(session_id.to_string()),
         Some(&token),
+        HarnessIntent::from_tool_input(&tool.tool_input),
     ) {
         Ok(wrapped) => HooksDecision::AskGrant {
             updated_input: updated_tool_input(&tool.tool_input, wrapped, &tool.arg_key),
@@ -2404,7 +2535,8 @@ fn compute_exec_decision_internal(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    match build_wrapped_shell_command(scope, env, &cwd, &args.command, session_id, None) {
+    let intent = HarnessIntent::from_tool_input(&args.tool_input);
+    match build_wrapped_shell_command(scope, env, &cwd, &args.command, session_id, None, intent) {
         Ok(wrapped) => {
             let updated = updated_tool_input(&args.tool_input, wrapped.clone(), &args.arg_key);
             HooksDecision::AllowRewrite {
@@ -2723,6 +2855,7 @@ fn build_wrapped_shell_command(
     command: &str,
     session_id: Option<String>,
     approval_token: Option<&str>,
+    intent: HarnessIntent,
 ) -> Result<String> {
     let mut args = vec!["hooks".to_string(), "run-shell".to_string()];
     if let Some(token) = approval_token {
@@ -2739,6 +2872,7 @@ fn build_wrapped_shell_command(
         args.push("--session-id".to_string());
         args.push(sid.clone());
     }
+    args.extend(intent.args());
     args.push("--command".to_string());
     args.push(command.to_string());
 
@@ -4154,12 +4288,165 @@ mod tests {
         );
     }
 
+    fn cfg_with_limits(timeout_secs: u64, background_timeout_secs: u64) -> AppConfig {
+        AppConfig {
+            timeout_secs,
+            background_timeout_secs,
+            ..AppConfig::default()
+        }
+    }
+
+    /// SPEC R-SETUP.2.1: the hook reads what the harness declared about the
+    /// call. It used to read only the command and cwd, so a waiter Claude Code
+    /// ran in the background was killed at the 30-minute foreground limit.
+    #[test]
+    fn the_harness_intent_is_read_from_the_tool_input() {
+        let input = |v: Value| v.as_object().unwrap().clone();
+        assert_eq!(
+            HarnessIntent::from_tool_input(&input(json!({
+                "command": "scripts/audition ask r1",
+                "run_in_background": true,
+            }))),
+            HarnessIntent {
+                background: true,
+                timeout_ms: None,
+            }
+        );
+        assert_eq!(
+            HarnessIntent::from_tool_input(&input(json!({"command": "x", "timeout": 600000}))),
+            HarnessIntent {
+                background: false,
+                timeout_ms: Some(600_000),
+            }
+        );
+        assert_eq!(
+            HarnessIntent::from_tool_input(&input(json!({"command": "x", "timeout_ms": 5000})))
+                .timeout_ms,
+            Some(5000)
+        );
+        assert_eq!(
+            HarnessIntent::from_tool_input(&input(json!({"command": "x"}))),
+            HarnessIntent::default()
+        );
+    }
+
+    /// SPEC R-SETUP.2.1: a background call has no ahma limit unless one is
+    /// set for background calls; a foreground call takes the harness's own
+    /// limit when it declared one, else `tools.timeout_secs`.
+    #[test]
+    fn the_time_limit_follows_the_harness() {
+        let cfg = cfg_with_limits(1800, 0);
+        let background = HarnessIntent {
+            background: true,
+            timeout_ms: Some(120_000),
+        };
+        assert_eq!(
+            background.limit(&cfg),
+            None,
+            "the harness owns its lifetime"
+        );
+        assert_eq!(
+            background.limit(&cfg_with_limits(1800, 7200)),
+            Some(TimeLimit {
+                secs: 7200,
+                source: "tools.background_timeout_secs",
+            })
+        );
+        let declared = HarnessIntent {
+            background: false,
+            timeout_ms: Some(2_500),
+        };
+        assert_eq!(declared.limit(&cfg).map(|l| l.secs), Some(3), "rounded up");
+        assert_eq!(
+            HarnessIntent::default().limit(&cfg),
+            Some(TimeLimit {
+                secs: 1800,
+                source: "tools.timeout_secs",
+            })
+        );
+    }
+
+    /// The intent survives the rewrite: the flags the hook writes are the
+    /// flags `run-shell` parses back into its payload.
+    #[test]
+    fn the_harness_intent_reaches_run_shell() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: HooksRunShellArgs,
+        }
+        let intent = HarnessIntent {
+            background: true,
+            timeout_ms: Some(90_000),
+        };
+        let mut argv = vec!["run-shell".to_string(), "--cwd".into(), "/w".into()];
+        argv.extend(intent.args());
+        argv.extend(["--command".to_string(), "echo hi".into()]);
+        let payload = Wrapper::try_parse_from(argv)
+            .unwrap()
+            .args
+            .resolve_payload()
+            .unwrap();
+        assert_eq!(payload.intent, intent);
+
+        let env = test_env();
+        let cmd = build_wrapped_shell_command(
+            HookScope::Project,
+            &env,
+            "/w",
+            "echo hi",
+            None,
+            None,
+            intent,
+        )
+        .unwrap();
+        assert!(cmd.contains("--background"), "{cmd}");
+        assert!(cmd.contains("--harness-timeout-ms 90000"), "{cmd}");
+    }
+
+    /// SPEC R-SETUP.2.2: the first line says ahma ended it, after how long,
+    /// and which setting; the fix is one a hook caller can follow; the output
+    /// before the kill follows.
+    #[test]
+    fn a_hooked_command_stopped_at_its_limit_says_who_ended_it_and_how_to_avoid_it() {
+        let stopped = crate::adapter::time_limit::LimitReached {
+            limit_secs: 1800,
+            output: "waiting for the human".to_string(),
+        };
+        let limit = HarnessIntent::default().limit(&cfg_with_limits(1800, 0));
+        let msg = time_limit_message(&stopped, limit);
+        let first = msg.lines().next().unwrap();
+        assert!(
+            first.starts_with("ended by ahma after 1800 s (tools.timeout_secs)."),
+            "{first}"
+        );
+        assert!(first.contains("run_in_background"), "{first}");
+        assert!(first.contains("timeout_secs = 3600"), "{first}");
+        assert!(
+            !msg.contains("timeout_seconds"),
+            "no MCP-only advice: {msg}"
+        );
+        assert!(msg.ends_with("waiting for the human"), "{msg}");
+
+        let bg = HarnessIntent {
+            background: true,
+            timeout_ms: None,
+        };
+        let msg = time_limit_message(&stopped, bg.limit(&cfg_with_limits(1800, 1800)));
+        assert!(msg.contains("background_timeout_secs"), "{msg}");
+    }
+
     #[test]
     fn test_wrapped_payload_round_trips() {
         let payload = WrappedShellPayload {
             cwd: "/tmp/work".to_string(),
             command: "echo hello && cargo test".to_string(),
             session_id: Some("cc-session-1".to_string()),
+            intent: HarnessIntent {
+                background: true,
+                timeout_ms: Some(5000),
+            },
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         let decoded = decode_wrapped_shell_payload(&encoded).unwrap();
@@ -5065,6 +5352,7 @@ mod tests {
             "cargo build",
             None,
             None,
+            HarnessIntent::default(),
         )
         .unwrap();
         assert!(cmd.starts_with("ahma hooks run-shell"));
@@ -5084,6 +5372,7 @@ mod tests {
             "echo x",
             None,
             None,
+            HarnessIntent::default(),
         )
         .unwrap();
         assert!(cmd.contains("/work/dir"));
@@ -5099,6 +5388,8 @@ mod tests {
             command: Some("cargo test".to_string()),
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
             approve_grant: None,
+            background: false,
+            harness_timeout_ms: None,
             raw_command: Vec::new(),
         };
         let payload = args.resolve_payload().unwrap();
@@ -5116,6 +5407,8 @@ mod tests {
             command: None,
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
             approve_grant: None,
+            background: false,
+            harness_timeout_ms: None,
             raw_command: vec![
                 "cargo".to_string(),
                 "check".to_string(),
@@ -5134,6 +5427,7 @@ mod tests {
             cwd: "/work/old".to_string(),
             command: "echo old".to_string(),
             session_id: None,
+            intent: HarnessIntent::default(),
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&original).unwrap());
         let args = HooksRunShellArgs {
@@ -5143,6 +5437,8 @@ mod tests {
             command: None,
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
             approve_grant: None,
+            background: false,
+            harness_timeout_ms: None,
             raw_command: Vec::new(),
         };
         let payload = args.resolve_payload().unwrap();

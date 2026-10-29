@@ -50,7 +50,7 @@ pub mod mutex_groups;
 mod preparer;
 mod pty_exec;
 pub mod spill;
-mod time_limit;
+pub(crate) mod time_limit;
 mod types;
 pub mod workspace_queue;
 
@@ -934,14 +934,17 @@ impl Adapter {
                         op_id
                     );
                 }
-                stdout_task.abort();
-                stderr_task.abort();
+                // Keep what it printed: a command stopped at its limit is the
+                // one whose last lines say what it was stuck on.
+                let output = Self::output_after_kill(stdout_task, stderr_task).await;
                 return SyncRun {
                     outcome: audit::Outcome::TimedOut,
                     exit_code: None,
-                    result: Err(anyhow::anyhow!(time_limit::limit_reached(
-                        timeout.as_secs()
-                    ))),
+                    result: Err(time_limit::LimitReached {
+                        limit_secs: timeout.as_secs(),
+                        output,
+                    }
+                    .into()),
                 };
             }
             Ok(Err(e)) => {
@@ -1139,6 +1142,28 @@ impl Adapter {
             Ok(buf)
         });
         (stdout_task, stderr_task)
+    }
+
+    /// What a killed command had printed, stdout then stderr. Its pipes close
+    /// once the process tree is gone; a descendant that escaped the kill and
+    /// still holds one is not waited for.
+    async fn output_after_kill(stdout: OutputReadTask, stderr: OutputReadTask) -> String {
+        async fn drain(mut task: OutputReadTask) -> String {
+            match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+                Ok(Ok(Ok(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+                Ok(_) => String::new(),
+                Err(_) => {
+                    task.abort();
+                    String::new()
+                }
+            }
+        }
+        let (out, err) = tokio::join!(drain(stdout), drain(stderr));
+        [out, err]
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Synchronously executes a command with optional retry logic for transient errors.
@@ -3544,6 +3569,38 @@ mod tests {
             Lane::Exclusive,
             "only a shell command line (c_flag) is classified"
         );
+    }
+
+    /// SPEC R-SETUP.2.2: a command stopped at its time limit keeps what it
+    /// printed. The output was thrown away with the reader tasks, so the one
+    /// result most likely to say what the command was stuck on said nothing.
+    #[tokio::test]
+    async fn a_command_stopped_at_its_limit_keeps_its_output() {
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        // `echo` and `sleep` mean the same in sh and PowerShell.
+        let line = "echo before-the-limit; sleep 30";
+        let config = crate::AhmaMcpService::build_shell_subcommand_config(
+            Some(1),
+            &ExecutionMode::Synchronous,
+        );
+        let err = adapter
+            .execute_sync_in_dir(
+                crate::shell_pool::platform_shell_program(),
+                Some(shell_args(line)),
+                &td.path().to_string_lossy(),
+                Some(1),
+                Some(&config),
+            )
+            .await
+            .expect_err("stopped at its one-second limit");
+        let stopped = err
+            .downcast_ref::<time_limit::LimitReached>()
+            .unwrap_or_else(|| panic!("a typed time-limit error, got: {err:#}"));
+        assert_eq!(stopped.limit_secs, 1);
+        assert!(stopped.output.contains("before-the-limit"), "{stopped:?}");
+        let text = err.to_string();
+        assert!(text.contains("exceeded timeout limit"), "{text}");
+        assert!(text.contains("before-the-limit"), "{text}");
     }
 
     /// SPEC R2.7.1: the synchronous path (terminal hooks, CLI one-shots,

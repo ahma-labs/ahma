@@ -15,6 +15,29 @@ pub(crate) fn limit_reached(limit_secs: u64) -> String {
     )
 }
 
+/// A synchronous command stopped at its time limit, with what it printed
+/// first. `Display` is the MCP caller's message; a terminal hook renders its
+/// own from the fields (SPEC R-SETUP.2.2), because the advice differs.
+#[derive(Debug)]
+pub struct LimitReached {
+    /// The limit it was stopped at.
+    pub limit_secs: u64,
+    /// Its stdout then stderr up to the kill, possibly empty.
+    pub output: String,
+}
+
+impl std::fmt::Display for LimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&limit_reached(self.limit_secs))?;
+        if !self.output.trim().is_empty() {
+            write!(f, "\n\nOutput before it was stopped:\n{}", self.output)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LimitReached {}
+
 /// The alert sent once a running command has used 80% of its limit.
 pub(crate) fn near_limit(limit_secs: u64) -> String {
     let left = limit_secs - limit_secs * 8 / 10;
