@@ -889,6 +889,13 @@ pub struct ToolSettings {
     /// Default: `1800`
     #[serde(default = "default_tool_timeout_secs")]
     pub timeout_secs: u64,
+    /// Time limit for a hooked command the harness runs in the background
+    /// (Claude Code's `run_in_background`), in seconds. `0`: no ahma limit —
+    /// the harness owns a background command's lifetime and can end it itself,
+    /// and a waiter that waits hours for a human is its intended use (SPEC
+    /// R-SETUP.2.1).
+    /// Default: `0`
+    pub background_timeout_secs: u64,
     /// Default timeout for the `await` tool in seconds.
     /// Default: [`DEFAULT_AWAIT_TIMEOUT_SECS`] (30 minutes)
     #[serde(default = "default_await_timeout_secs")]
@@ -990,6 +997,7 @@ impl Default for ToolSettings {
     fn default() -> Self {
         Self {
             timeout_secs: default_tool_timeout_secs(),
+            background_timeout_secs: 0,
             await_timeout_secs: default_await_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
             request_budget_override_secs: None,
@@ -2554,6 +2562,13 @@ impl AhmaSettings {
             d.tools.timeout_secs.to_string(),
         );
         w.setting(
+            "Time limit in seconds for a hooked command the harness runs in the \
+             background (0 = none: the harness owns its lifetime).",
+            "background_timeout_secs",
+            self.tools.background_timeout_secs.to_string(),
+            d.tools.background_timeout_secs.to_string(),
+        );
+        w.setting(
             "Default timeout for the await tool in seconds.",
             "await_timeout_secs",
             self.tools.await_timeout_secs.to_string(),
@@ -3596,6 +3611,7 @@ mod tests {
             },
             tools: ToolSettings {
                 timeout_secs: 123,
+                background_timeout_secs: 86_400,
                 await_timeout_secs: 456,
                 idle_timeout_secs: 789,
                 request_budget_override_secs: Some(120),

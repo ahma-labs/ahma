@@ -1059,6 +1059,7 @@ mod tests {
             timeout_secs: 1800,
             await_timeout_secs: 1800,
             tool_idle_timeout_secs: 1800,
+            background_timeout_secs: 0,
             request_budget_override_secs: None,
             force_progress_notifications: false,
             execution_mode: ahma_common::config::ExecutionPolicy::default(),

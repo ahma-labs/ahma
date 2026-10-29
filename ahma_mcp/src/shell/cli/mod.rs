@@ -96,6 +96,10 @@ pub struct AppConfig {
     /// and burns no CPU for this long, it is timed out as stalled. 0 disables the
     /// watchdog. From `tools.idle_timeout_secs` in settings.toml.
     pub tool_idle_timeout_secs: u64,
+    /// Time limit for a hooked command its harness runs in the background, in
+    /// seconds; `0` is none (SPEC R-SETUP.2.1). From
+    /// `tools.background_timeout_secs` in settings.toml.
+    pub background_timeout_secs: u64,
     /// Override for the SPEC R2.6.5 fallback single-request budget — used
     /// only when there is no confirmed live push channel to verify liveness
     /// directly (SPEC R2.6.5.3). `None` means trust the built-in conservative
@@ -279,6 +283,7 @@ impl Default for AppConfig {
             timeout_secs: 1800,
             await_timeout_secs: ahma_common::config::default_await_timeout_secs(),
             tool_idle_timeout_secs: ahma_common::config::default_idle_timeout_secs(),
+            background_timeout_secs: 0,
             request_budget_override_secs: None,
             force_progress_notifications: false,
             execution_mode: ahma_common::config::ExecutionPolicy::default(),
@@ -2905,6 +2910,7 @@ struct ExecutionSettings {
     timeout_secs: u64,
     await_timeout_secs: u64,
     tool_idle_timeout_secs: u64,
+    background_timeout_secs: u64,
     request_budget_override_secs: Option<u64>,
     force_progress_notifications: bool,
     execution_mode: ahma_common::config::ExecutionPolicy,
@@ -2934,6 +2940,7 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
         timeout_secs: cli.timeout.unwrap_or(s.tools.timeout_secs),
         await_timeout_secs: cli.await_timeout.unwrap_or(s.tools.await_timeout_secs),
         tool_idle_timeout_secs: s.tools.idle_timeout_secs,
+        background_timeout_secs: s.tools.background_timeout_secs,
         request_budget_override_secs: cli
             .request_budget_secs
             .or(s.tools.request_budget_override_secs),
@@ -3445,6 +3452,7 @@ pub fn build_app_config_with_settings(
         timeout_secs: exec.timeout_secs,
         await_timeout_secs: exec.await_timeout_secs,
         tool_idle_timeout_secs: exec.tool_idle_timeout_secs,
+        background_timeout_secs: exec.background_timeout_secs,
         request_budget_override_secs: exec.request_budget_override_secs,
         force_progress_notifications: exec.force_progress_notifications,
         execution_mode: exec.execution_mode,
