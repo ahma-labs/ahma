@@ -10,6 +10,8 @@ ignored with a warning ([environment-variables.md](environment-variables.md)).
 ahma settings init        # create with all defaults commented out
 ahma settings show        # print effective configuration (with source annotations)
 ahma settings show --origin  # print exact per-key provenance (cli / user / default + file path)
+ahma settings set tools.timeout_secs 3600   # change one key, in its own table, checked
+ahma settings unset tools.timeout_secs      # back to the compiled-in default
 ahma --no-settings serve stdio  # ignore settings file for one invocation
 ```
 
@@ -232,7 +234,7 @@ Both files coexist independently.
 | File | Purpose | Managed with |
 |------|---------|-------------|
 | `~/.ahma/config.toml` | LLM providers | `ahma llm add/remove` |
-| `~/.ahma/settings.toml` | Runtime behaviour defaults | `ahma settings init` + text editor |
+| `~/.ahma/settings.toml` | Runtime behaviour defaults | `ahma settings set <table>.<key> <value>` (or `ahma settings init` + a text editor) |
 
 ---
 

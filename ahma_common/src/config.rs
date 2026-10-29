@@ -2138,6 +2138,14 @@ impl std::fmt::Display for SettingsFileError {
 
 impl std::error::Error for SettingsFileError {}
 
+/// One setting changed by [`AhmaSettings::set_in_file`]: its value before and
+/// after, as TOML (`"(unset)"` for an optional key with no value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsEdit {
+    pub before: String,
+    pub after: String,
+}
+
 /// Top-level user settings loaded from `~/.ahma/settings.toml`.
 ///
 /// All fields have sensible defaults — an empty file (or no file at all) is
@@ -3018,6 +3026,81 @@ impl AhmaSettings {
 
     /// [`Self::ensure_current`] against the standard `~/.ahma/settings.toml`.
     /// Returns `Ok(false)` (no-op) when the home directory can't be determined.
+    /// Set (`Some(raw)`) or unset (`None`, back to the default) one setting,
+    /// `<table>.<key>`, in the settings file at `path` (SPEC R-CFG10).
+    ///
+    /// The file is parsed, the key set in its own table, the result checked by
+    /// deserializing it (so a value of the wrong type is refused), and written
+    /// through [`render_documented`](Self::render_documented) — the renderer the
+    /// startup sync uses — so it cannot gain a second table. `raw` is read as a
+    /// TOML value (`3600`, `true`, `["a", "b"]`), else as a plain string, so a
+    /// string needs no quoting on the command line. Refused, with nothing
+    /// written: an unknown key, a value that does not fit, a file that does not
+    /// parse (its line is named — fix that first).
+    pub fn set_in_file(path: &Path, key: &str, raw: Option<&str>) -> Result<SettingsEdit> {
+        let Some((table, field)) = key
+            .split_once('.')
+            .filter(|(t, k)| !t.is_empty() && !k.is_empty() && !k.contains('.'))
+        else {
+            anyhow::bail!(
+                "`{key}` is not a setting name; names are `<table>.<key>`, e.g. \
+                 `tools.timeout_secs`. `ahma settings show` lists them."
+            );
+        };
+        if settings_tier(table, field).is_none() {
+            anyhow::bail!("unknown setting `{key}`. `ahma settings show` lists every setting.");
+        }
+        let current = Self::load_from_checked(path).map_err(|e| {
+            anyhow::anyhow!("{}. Fix that line first; nothing was changed.", e.summary())
+        })?;
+
+        let value_of = |settings: &Self| -> String {
+            toml::Value::try_from(settings)
+                .ok()
+                .and_then(|v| v.get(table)?.get(field).cloned())
+                .map_or_else(|| "(unset)".to_string(), |v| v.to_string())
+        };
+        let mut doc = toml::Value::try_from(&current)
+            .with_context(|| format!("could not represent the settings in {}", path.display()))?;
+        let tables = doc
+            .as_table_mut()
+            .context("settings did not serialize to a table")?;
+        let entry = tables
+            .entry(table.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let section = entry
+            .as_table_mut()
+            .with_context(|| format!("`{table}` is not a table"))?;
+        match raw {
+            Some(raw) => {
+                let value = toml::from_str::<toml::Table>(&format!("v = {raw}"))
+                    .ok()
+                    .and_then(|mut t| t.remove("v"))
+                    .unwrap_or_else(|| toml::Value::String(raw.to_string()));
+                section.insert(field.to_string(), value);
+            }
+            None => {
+                section.remove(field);
+            }
+        }
+        let updated: Self = doc.try_into().map_err(|e: toml::de::Error| {
+            anyhow::anyhow!(
+                "`{key}` cannot be `{}`: {}. Nothing was changed.",
+                raw.unwrap_or_default(),
+                e.message().trim()
+            )
+        })?;
+
+        atomic_write_toml(path, &updated.render_documented())?;
+        // The file on disk, not the struct in hand, is what the next ahma reads.
+        let written = Self::load_from_checked(path)
+            .map_err(|e| anyhow::anyhow!("the file written does not parse: {}", e.summary()))?;
+        Ok(SettingsEdit {
+            before: value_of(&current),
+            after: value_of(&written),
+        })
+    }
+
     pub fn ensure_current_default_path() -> Result<bool> {
         match settings_path() {
             Some(p) => Self::ensure_current(&p),
@@ -4399,6 +4482,114 @@ timeout_secs = 600
                 "path should contain settings.toml: {s}"
             );
         }
+    }
+
+    /// The compiled-in defaults and an empty file are the same settings. A
+    /// struct whose `#[derive(Default)]` disagrees with its serde field
+    /// defaults makes "no settings file" (and `--no-settings`, and every
+    /// fallback to defaults) quietly differ from "an empty one": the TUI's
+    /// permission advisor was off without a file and on with an empty one.
+    #[test]
+    fn the_compiled_in_defaults_are_what_an_empty_file_parses_to() {
+        let defaults = AhmaSettings::default();
+        assert_eq!(AhmaSettings::parse("").unwrap(), defaults);
+        // Every table present but empty: what serde fills in field by field.
+        let rendered = defaults.render_documented();
+        assert_eq!(
+            AhmaSettings::parse(&rendered).unwrap(),
+            defaults,
+            "{rendered}"
+        );
+        let headers: String = rendered
+            .lines()
+            .filter(|l| l.starts_with('['))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            AhmaSettings::parse(&headers).unwrap(),
+            defaults,
+            "{headers}"
+        );
+    }
+
+    /// R-CFG10.1: `ahma settings set` edits the key in its own table, checks
+    /// the value's type and leaves a file that parses. The field case it
+    /// replaces: an appended `[tools]` table, a second one, which broke the
+    /// whole file.
+    #[test]
+    fn set_in_file_edits_one_key_and_leaves_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, AhmaSettings::default().render_documented()).unwrap();
+
+        let edit = AhmaSettings::set_in_file(&path, "tools.timeout_secs", Some("90000")).unwrap();
+        assert_eq!(edit.before, "1800");
+        assert_eq!(edit.after, "90000");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.matches("\n[tools]").count(),
+            1,
+            "one [tools] table:\n{text}"
+        );
+        assert_eq!(
+            AhmaSettings::load_from_checked(&path)
+                .unwrap()
+                .tools
+                .timeout_secs,
+            90000
+        );
+
+        // Setting it again is the same one table, not another.
+        AhmaSettings::set_in_file(&path, "tools.timeout_secs", Some("3600")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\n[tools]").count(), 1, "{text}");
+
+        let edit = AhmaSettings::set_in_file(&path, "tools.timeout_secs", None).unwrap();
+        assert_eq!(edit.after, "1800", "unset returns the default");
+        assert_eq!(
+            AhmaSettings::load_from_checked(&path).unwrap(),
+            AhmaSettings::default()
+        );
+
+        // A string value needs no TOML quoting on the command line.
+        let edit = AhmaSettings::set_in_file(&path, "logging.target", Some("stderr")).unwrap();
+        assert_eq!(edit.after, "\"stderr\"");
+    }
+
+    /// R-CFG10.2: what `set` refuses, it refuses before writing anything.
+    #[test]
+    fn set_in_file_refuses_unknown_keys_wrong_types_and_a_broken_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, AhmaSettings::default().render_documented()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = AhmaSettings::set_in_file(&path, "tools.timeout_sec", Some("1")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown setting `tools.timeout_sec`"),
+            "{err}"
+        );
+        let err = AhmaSettings::set_in_file(&path, "timeout_secs", Some("1")).unwrap_err();
+        assert!(err.to_string().contains("<table>.<key>"), "{err}");
+        let err = AhmaSettings::set_in_file(&path, "tools.timeout_secs", Some("soon")).unwrap_err();
+        assert!(err.to_string().contains("tools.timeout_secs"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing written"
+        );
+
+        std::fs::write(&path, "[tools]\n[tools]\n").unwrap();
+        let err = AhmaSettings::set_in_file(&path, "tools.timeout_secs", Some("1")).unwrap_err();
+        assert!(
+            err.to_string().contains("line 2"),
+            "names the broken line: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[tools]\n[tools]\n"
+        );
     }
 
     /// R-CFG6.4: an unparseable file is reported on one line that names the
