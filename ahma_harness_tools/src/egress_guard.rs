@@ -207,6 +207,39 @@ impl std::fmt::Debug for RedirectDomainGuard {
     }
 }
 
+fn is_blocked_ipv4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    // 100.64.0.0/10 carrier-grade NAT
+    let is_cgnat = (o[0], o[1] & 0xc0) == (100, 64);
+    [
+        v4.is_loopback(),
+        v4.is_private(),
+        v4.is_link_local(),
+        v4.is_unspecified(),
+        v4.is_broadcast(),
+        v4.is_documentation(),
+        v4.is_multicast(),
+        is_cgnat,
+    ]
+    .contains(&true)
+}
+
+fn is_blocked_ipv6(v6: &std::net::Ipv6Addr) -> bool {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return is_blocked_ipv4(&mapped);
+    }
+    let seg0 = v6.segments()[0];
+    // fc00::/7 unique-local, fe80::/10 link-local
+    [
+        v6.is_loopback(),
+        v6.is_unspecified(),
+        v6.is_multicast(),
+        (seg0 & 0xfe00) == 0xfc00,
+        (seg0 & 0xffc0) == 0xfe80,
+    ]
+    .contains(&true)
+}
+
 /// Return `true` if `ip` is in a range that outbound tool requests must never
 /// reach: loopback, RFC-1918 private, link-local / cloud-metadata
 /// (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), unspecified, broadcast,
@@ -215,31 +248,8 @@ impl std::fmt::Debug for RedirectDomainGuard {
 /// address (`::ffff:a.b.c.d`).
 pub fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_multicast()
-                // 100.64.0.0/10 carrier-grade NAT
-                || (o[0] == 100 && (o[1] & 0xc0) == 64)
-        }
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_blocked_ip(&IpAddr::V4(mapped));
-            }
-            let seg0 = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // fc00::/7 unique-local
-                || (seg0 & 0xfe00) == 0xfc00
-                // fe80::/10 link-local
-                || (seg0 & 0xffc0) == 0xfe80
-        }
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
     }
 }
 
@@ -266,14 +276,7 @@ impl EgressBlocked {
 
 /// Whether `error` was caused by the guard refusing its destination.
 pub fn is_egress_blocked(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(e) = current {
-        if e.is::<EgressBlocked>() {
-            return true;
-        }
-        current = e.source();
-    }
-    false
+    std::iter::successors(Some(error), |e| (*e).source()).any(|e| e.is::<EgressBlocked>())
 }
 
 /// A [`reqwest`] DNS resolver that drops blocked addresses from every
@@ -311,6 +314,14 @@ impl Resolve for GuardedResolver {
     }
 }
 
+fn blocked_ip_literal(url: &reqwest::Url, block_private: bool) -> Option<IpAddr> {
+    block_private
+        .then(|| url.host_str())
+        .flatten()
+        .and_then(|h| h.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+        .filter(is_blocked_ip)
+}
+
 /// Redirect policy for a fetch **without** a [`RedirectDomainGuard`]: cap the
 /// chain and reject any redirect whose target host is a blocked IP *literal*
 /// (hostname targets are re-checked by the resolver). A guarded fetch turns
@@ -322,12 +333,7 @@ fn redirect_policy(block_private: bool) -> redirect::Policy {
         }
         // Copy any blocked IP-literal target out of the borrowed `attempt` before
         // moving it into `error()`/`follow()`.
-        let blocked = block_private
-            .then(|| attempt.url().host_str())
-            .flatten()
-            .and_then(|h| h.trim_matches(['[', ']']).parse::<IpAddr>().ok())
-            .filter(is_blocked_ip);
-        if let Some(ip) = blocked {
+        if let Some(ip) = blocked_ip_literal(attempt.url(), block_private) {
             return attempt.error(anyhow!(
                 "egress blocked: redirect to private/loopback address {ip} (SSRF protection)"
             ));
@@ -349,11 +355,8 @@ pub fn check_url(url: &str, block_private: bool) -> Result<()> {
             ));
         }
     }
-    if block_private
-        && let Some(host) = parsed.host_str()
-        && let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>()
-        && is_blocked_ip(&ip)
-    {
+    if blocked_ip_literal(&parsed, block_private).is_some() {
+        let host = parsed.host_str().unwrap_or_default();
         return Err(anyhow!(
             "egress blocked: '{host}' is a private/loopback/link-local address (SSRF protection)"
         ));

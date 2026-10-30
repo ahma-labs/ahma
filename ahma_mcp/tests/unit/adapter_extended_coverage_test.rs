@@ -46,6 +46,45 @@ async fn create_adapter_with_root(root: std::path::PathBuf) -> Arc<Adapter> {
     Arc::new(Adapter::new(monitor, shell_pool, sandbox).unwrap())
 }
 
+async fn create_monitored_test_adapter() -> (tempfile::TempDir, Arc<OperationMonitor>, Arc<Adapter>)
+{
+    let temp = tempdir().unwrap();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![temp.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+    let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
+    (temp, monitor, adapter)
+}
+
+async fn exec_echo_sync(
+    args: Option<Map<String, Value>>,
+    subcommand_config: Option<&SubcommandConfig>,
+) -> String {
+    let adapter = create_test_adapter().await;
+    let temp = tempdir().unwrap();
+    adapter
+        .execute_sync_in_dir(
+            "echo",
+            args,
+            temp.path().to_str().unwrap(),
+            None,
+            subcommand_config,
+        )
+        .await
+        .expect("echo sync execution should succeed")
+}
+
 // === ExecutionMode Tests ===
 
 #[test]
@@ -182,36 +221,15 @@ async fn test_adapter_with_root() {
 
 #[tokio::test]
 async fn test_execute_sync_simple_echo() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
-    let result = adapter
-        .execute_sync_in_dir("echo", None, temp.path().to_str().unwrap(), None, None)
-        .await;
-
-    assert!(result.is_ok());
+    let _ = exec_echo_sync(None, None).await;
 }
 
 #[tokio::test]
 async fn test_execute_sync_with_args() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     args.insert("args".to_string(), json!(["hello", "world"]));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     assert!(output.contains("hello"));
     assert!(output.contains("world"));
 }
@@ -317,46 +335,19 @@ async fn test_execute_async_with_options() {
 
 #[tokio::test]
 async fn test_boolean_arg_true() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     args.insert("verbose".to_string(), Value::Bool(true));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
+    let _ = exec_echo_sync(Some(args), None).await;
 }
 
 #[tokio::test]
 async fn test_boolean_arg_false_not_added() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     args.insert("verbose".to_string(), Value::Bool(false));
 
     // When bool is false, the flag should not be added
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     // The output should not contain --verbose
     assert!(!output.contains("--verbose"));
 }
@@ -365,7 +356,6 @@ async fn test_boolean_arg_false_not_added() {
 
 #[tokio::test]
 async fn test_meta_params_not_passed_as_args() {
-    let adapter = create_test_adapter().await;
     let temp = tempdir().unwrap();
 
     let mut args = Map::new();
@@ -381,18 +371,7 @@ async fn test_meta_params_not_passed_as_args() {
     args.insert("timeout_seconds".to_string(), Value::Number(30.into()));
     args.insert("args".to_string(), json!(["actual", "args"]));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     // Should contain actual args but not meta-parameters
     assert!(output.contains("actual"));
     assert!(!output.contains("working_directory"));
@@ -404,24 +383,10 @@ async fn test_meta_params_not_passed_as_args() {
 
 #[tokio::test]
 async fn test_array_args() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     args.insert("args".to_string(), json!(["one", "two", "three"]));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     assert!(output.contains("one"));
     assert!(output.contains("two"));
     assert!(output.contains("three"));
@@ -431,25 +396,11 @@ async fn test_array_args() {
 
 #[tokio::test]
 async fn test_null_values_ignored() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     args.insert("null_param".to_string(), Value::Null);
     args.insert("args".to_string(), json!(["hello"]));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     assert!(output.contains("hello"));
     // Null params should not produce any output
     assert!(!output.contains("null"));
@@ -459,24 +410,10 @@ async fn test_null_values_ignored() {
 
 #[tokio::test]
 async fn test_number_args() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     args.insert("count".to_string(), Value::Number(42.into()));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     assert!(output.contains("42"));
 }
 
@@ -552,26 +489,12 @@ fn create_subcommand_with_positional() -> SubcommandConfig {
 
 #[tokio::test]
 async fn test_positional_args_handling() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let subcommand_config = create_subcommand_with_positional();
 
     let mut args = Map::new();
     args.insert("file".to_string(), Value::String("myfile.txt".to_string()));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            Some(&subcommand_config),
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), Some(&subcommand_config)).await;
     // Positional arg should be passed directly without --file
     assert!(output.contains("myfile.txt"));
 }
@@ -621,9 +544,6 @@ async fn test_path_option_validation() {
 
 #[tokio::test]
 async fn test_option_with_alias_uses_short_flag() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let subcommand_config = SubcommandConfig {
         name: "test_sub".to_string(),
         description: "Test subcommand".to_string(),
@@ -645,18 +565,7 @@ async fn test_option_with_alias_uses_short_flag() {
     let mut args = Map::new();
     args.insert("verbose".to_string(), Value::Bool(true));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            Some(&subcommand_config),
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), Some(&subcommand_config)).await;
     // Should use -v instead of --verbose due to alias
     assert!(output.contains("-v"));
 }
@@ -667,22 +576,7 @@ async fn test_option_with_alias_uses_short_flag() {
 async fn test_async_cancellation_before_execution() {
     use ahma_mcp::operation_monitor::OperationStatus;
 
-    let temp = tempdir().unwrap();
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(30));
-    let monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_pool_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
+    let (temp, monitor, adapter) = create_monitored_test_adapter().await;
 
     // Start a slow operation
     let op_id = adapter
@@ -738,22 +632,7 @@ async fn test_async_cancellation_before_execution() {
 #[tokio::test]
 async fn test_async_with_callback_none() {
     // Test the async execution with no callback (callback=None path)
-    let temp = tempdir().unwrap();
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(30));
-    let monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_pool_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
+    let (temp, monitor, adapter) = create_monitored_test_adapter().await;
 
     let op_id = adapter
         .execute_async_in_dir(
@@ -799,22 +678,7 @@ async fn test_async_timeout_path() {
     // Test that timeout path works correctly
     use ahma_mcp::operation_monitor::OperationStatus;
 
-    let temp = tempdir().unwrap();
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(30));
-    let monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_pool_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
+    let (temp, monitor, adapter) = create_monitored_test_adapter().await;
 
     let op_id = adapter
         .execute_async_in_dir(
@@ -857,9 +721,6 @@ async fn test_async_timeout_path() {
 
 #[tokio::test]
 async fn test_boolean_string_true() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     // Create subcommand config with boolean option
     let subcommand_config = SubcommandConfig {
         name: "test_sub".to_string(),
@@ -883,27 +744,13 @@ async fn test_boolean_string_true() {
     // Pass "true" as a string instead of a boolean
     args.insert("verbose".to_string(), Value::String("true".to_string()));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            Some(&subcommand_config),
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), Some(&subcommand_config)).await;
     // Should have added --verbose flag because the string "true" evaluates to true
     assert!(output.contains("--verbose"));
 }
 
 #[tokio::test]
 async fn test_boolean_string_false() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let subcommand_config = SubcommandConfig {
         name: "test_sub".to_string(),
         description: "Test subcommand".to_string(),
@@ -926,18 +773,7 @@ async fn test_boolean_string_false() {
     // Pass "false" as a string
     args.insert("verbose".to_string(), Value::String("false".to_string()));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            Some(&subcommand_config),
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), Some(&subcommand_config)).await;
     // Should NOT have added --verbose because "false" evaluates to false
     assert!(!output.contains("--verbose"));
 }
@@ -996,27 +832,13 @@ async fn test_sync_command_exit_code_failure() {
 
 #[tokio::test]
 async fn test_array_with_null_elements() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     args.insert(
         "args".to_string(),
         json!(["one", null, "three"]), // null in the middle
     );
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     // Should contain the non-null elements
     assert!(output.contains("one"));
     assert!(output.contains("three"));
@@ -1028,26 +850,12 @@ async fn test_array_with_null_elements() {
 
 #[tokio::test]
 async fn test_object_value_skipped() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let mut args = Map::new();
     // Object values should be skipped (value_to_string returns None for objects)
     args.insert("nested".to_string(), json!({"key": "value"}));
     args.insert("args".to_string(), json!(["hello"]));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), None).await;
     assert!(output.contains("hello"));
     // Object should be skipped entirely
     assert!(!output.contains("key"));
@@ -1107,27 +915,13 @@ async fn test_file_arg_creates_temp_file() {
 
 #[tokio::test]
 async fn test_file_arg_null_value_skipped() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let subcommand_config = create_subcommand_with_file_arg();
 
     let mut args = Map::new();
     args.insert("message".to_string(), Value::Null);
     args.insert("args".to_string(), json!(["hello"]));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            Some(&subcommand_config),
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), Some(&subcommand_config)).await;
     assert!(output.contains("hello"));
     // Should NOT contain -F since the value was null
     assert!(!output.contains("-F"));
@@ -1135,27 +929,13 @@ async fn test_file_arg_null_value_skipped() {
 
 #[tokio::test]
 async fn test_file_arg_empty_string_skipped() {
-    let adapter = create_test_adapter().await;
-    let temp = tempdir().unwrap();
-
     let subcommand_config = create_subcommand_with_file_arg();
 
     let mut args = Map::new();
     args.insert("message".to_string(), Value::String("".to_string()));
     args.insert("args".to_string(), json!(["hello"]));
 
-    let result = adapter
-        .execute_sync_in_dir(
-            "echo",
-            Some(args),
-            temp.path().to_str().unwrap(),
-            None,
-            Some(&subcommand_config),
-        )
-        .await;
-
-    assert!(result.is_ok());
-    let output = result.unwrap();
+    let output = exec_echo_sync(Some(args), Some(&subcommand_config)).await;
     assert!(output.contains("hello"));
     // Should NOT contain -F since the value was empty
     assert!(!output.contains("-F"));

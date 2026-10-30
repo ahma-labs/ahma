@@ -160,12 +160,11 @@ impl HarnessGuard {
         name: &mut String,
         args: &mut Map<String, Value>,
     ) -> GuardOutcome {
-        for guard in &self.pipeline {
-            if let GuardOutcome::Block(msg) = guard.inspect(ctx, name, args) {
-                return GuardOutcome::Block(msg);
-            }
-        }
-        GuardOutcome::Proceed
+        self.pipeline
+            .iter()
+            .map(|guard| guard.inspect(ctx, name, args))
+            .find(|outcome| matches!(outcome, GuardOutcome::Block(_)))
+            .unwrap_or(GuardOutcome::Proceed)
     }
 
     /// Notify every guard of a completed call so stateful guards can update.
@@ -200,17 +199,21 @@ mod tests {
         assert_eq!(args.get("args").unwrap(), &serde_json::json!(["echo hi"]));
     }
 
+    fn guard_after_failures(tool: &str, count: usize) -> HarnessGuard {
+        let guard = HarnessGuard::new(true);
+        let args = Map::new();
+        for _ in 0..count {
+            guard.observe(tool, &args, true);
+        }
+        guard
+    }
+
     #[test]
     fn pipeline_blocks_after_three_identical_failures() {
-        let guard = HarnessGuard::new(true);
+        let guard = guard_after_failures("status", 3);
         let known = ["status"];
-        let args = Map::new();
-
-        for _ in 0..3 {
-            guard.observe("status", &args, true);
-        }
         let mut name = "status".to_string();
-        let mut a = args.clone();
+        let mut a = Map::new();
         match guard.inspect(&ctx(&known), &mut name, &mut a) {
             GuardOutcome::Block(msg) => assert!(msg.contains("LOOP_DETECTED")),
             GuardOutcome::Proceed => panic!("expected the loop to be blocked"),
@@ -219,15 +222,12 @@ mod tests {
 
     #[test]
     fn pipeline_success_clears_the_loop() {
-        let guard = HarnessGuard::new(true);
+        let guard = guard_after_failures("status", 3);
         let known = ["status"];
         let args = Map::new();
-        for _ in 0..3 {
-            guard.observe("status", &args, true);
-        }
         guard.observe("status", &args, false); // success resets
         let mut name = "status".to_string();
-        let mut a = args.clone();
+        let mut a = args;
         assert!(matches!(
             guard.inspect(&ctx(&known), &mut name, &mut a),
             GuardOutcome::Proceed

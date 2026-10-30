@@ -22,7 +22,7 @@
 //! so that "the manifest says SHA-256" is true.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -59,8 +59,19 @@ pub struct BundleAuditResult {
 }
 
 impl BundleAuditResult {
-    fn add(&mut self, finding: AuditFinding) {
-        self.findings.push(finding);
+    fn record(
+        &mut self,
+        severity: BundleAuditSeverity,
+        file: &str,
+        description: impl Into<String>,
+        recommendation: &str,
+    ) {
+        self.findings.push(AuditFinding {
+            severity,
+            file: file.to_string(),
+            description: description.into(),
+            recommendation: recommendation.into(),
+        });
     }
 
     fn finalize(&mut self) {
@@ -93,19 +104,7 @@ impl BundleChecksummer {
     pub fn write_manifest(bundle_dir: &Path) -> Result<HashMap<String, String>> {
         let mut digests = HashMap::new();
 
-        for entry in std::fs::read_dir(bundle_dir)
-            .with_context(|| format!("Cannot read bundle dir: {}", bundle_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+        for (path, filename) in json_files_in_dir(bundle_dir)? {
             // The manifest cannot record its own digest: writing the digest
             // changes the file it describes. Including it meant a second run over
             // an already-checksummed bundle recorded the *previous* manifest's
@@ -166,21 +165,27 @@ impl BundleVerifier {
         let expected: HashMap<String, String> = serde_json::from_str(&manifest_str)?;
 
         for (filename, expected_hash) in &expected {
-            let file_path = bundle_dir.join(filename);
-            if !file_path.exists() {
-                warn!("Bundle missing file: {filename}");
-                return Ok(false);
-            }
-            let contents = std::fs::read(&file_path)?;
-            let actual_hash = sha256_hex(&contents);
-            if actual_hash != *expected_hash {
-                warn!("Bundle file hash mismatch: {filename}");
+            if !verify_file_digest(bundle_dir, filename, expected_hash)? {
                 return Ok(false);
             }
         }
 
         Ok(true)
     }
+}
+
+fn verify_file_digest(bundle_dir: &Path, filename: &str, expected_hash: &str) -> Result<bool> {
+    let file_path = bundle_dir.join(filename);
+    if !file_path.exists() {
+        warn!("Bundle missing file: {filename}");
+        return Ok(false);
+    }
+    let contents = std::fs::read(&file_path)?;
+    if sha256_hex(&contents) != expected_hash {
+        warn!("Bundle file hash mismatch: {filename}");
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,80 +196,113 @@ impl BundleVerifier {
 pub fn audit_bundle(bundle_dir: &Path) -> Result<BundleAuditResult> {
     let mut result = BundleAuditResult::default();
 
-    for entry in std::fs::read_dir(bundle_dir)
-        .with_context(|| format!("Cannot read bundle dir: {}", bundle_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    for (path, filename) in json_files_in_dir(bundle_dir)? {
         result.files_checked += 1;
 
-        let filename = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
 
-        // Pattern: embedded secrets (API keys)
-        for pattern in ["sk-", "AKIA", "ghp_", "glpat-", "xoxb-", "xoxp-", "AIzaSy"] {
-            if contents.contains(pattern) {
-                result.add(AuditFinding {
-                    severity: BundleAuditSeverity::Critical,
-                    file: filename.clone(),
-                    description: format!("Possible embedded secret matching prefix `{pattern}`"),
-                    recommendation: "Remove credentials from the bundle JSON.".into(),
-                });
-            }
-        }
-
-        // Pattern: missing format: "path" on path-like argument names
-        let lower = contents.to_ascii_lowercase();
-        if (lower.contains("\"path\"") || lower.contains("\"file\"") || lower.contains("\"dir\""))
-            && !lower.contains("\"format\": \"path\"")
-            && !lower.contains("\"format\":\"path\"")
-        {
-            result.add(AuditFinding {
-                severity: BundleAuditSeverity::Warning,
-                file: filename.clone(),
-                description: "Path-like argument may be missing `format: \"path\"` — potential sandbox escape".into(),
-                recommendation: "Add `\"format\": \"path\"` to all path-type arguments.".into(),
-            });
-        }
-
-        // Pattern: prompt injection via long description / hint
-        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_default();
-        if let Some(desc) = parsed["description"].as_str() {
-            if desc.len() > 512 {
-                result.add(AuditFinding {
-                    severity: BundleAuditSeverity::Warning,
-                    file: filename.clone(),
-                    description: "Unusually long description — possible prompt injection payload"
-                        .into(),
-                    recommendation: "Review description for embedded instructions.".into(),
-                });
-            }
-            for injection_marker in ["ignore previous", "jailbreak", "system:", "assistant:"] {
-                if desc.to_ascii_lowercase().contains(injection_marker) {
-                    result.add(AuditFinding {
-                        severity: BundleAuditSeverity::Critical,
-                        file: filename.clone(),
-                        description: format!(
-                            "Possible prompt injection: description contains `{injection_marker}`"
-                        ),
-                        recommendation: "Remove or rewrite the suspicious description.".into(),
-                    });
-                }
-            }
-        }
+        check_embedded_secrets(&filename, &contents, &mut result);
+        check_missing_path_format(&filename, &contents, &mut result);
+        check_description_injection(&filename, &contents, &mut result);
     }
 
     result.finalize();
     Ok(result)
+}
+
+fn json_files_in_dir(bundle_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(bundle_dir)
+        .with_context(|| format!("Cannot read bundle dir: {}", bundle_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        files.push((path, filename));
+    }
+    Ok(files)
+}
+
+const SECRET_PREFIXES: &[&str] = &["sk-", "AKIA", "ghp_", "glpat-", "xoxb-", "xoxp-", "AIzaSy"];
+const INJECTION_MARKERS: &[&str] = &["ignore previous", "jailbreak", "system:", "assistant:"];
+const PATH_ARG_MARKERS: &[&str] = &["\"path\"", "\"file\"", "\"dir\""];
+const PATH_FORMAT_MARKERS: &[&str] = &["\"format\": \"path\"", "\"format\":\"path\""];
+
+fn check_forbidden_substrings(
+    filename: &str,
+    haystack: &str,
+    patterns: &[&str],
+    label: &str,
+    recommendation: &str,
+    result: &mut BundleAuditResult,
+) {
+    for pattern in patterns.iter().copied().filter(|p| haystack.contains(p)) {
+        result.record(
+            BundleAuditSeverity::Critical,
+            filename,
+            format!("{label} `{pattern}`"),
+            recommendation,
+        );
+    }
+}
+
+fn check_embedded_secrets(filename: &str, contents: &str, result: &mut BundleAuditResult) {
+    // Pattern: embedded secrets (API keys)
+    check_forbidden_substrings(
+        filename,
+        contents,
+        SECRET_PREFIXES,
+        "Possible embedded secret matching prefix",
+        "Remove credentials from the bundle JSON.",
+        result,
+    );
+}
+
+fn check_missing_path_format(filename: &str, contents: &str, result: &mut BundleAuditResult) {
+    // Pattern: missing format: "path" on path-like argument names
+    let lower = contents.to_ascii_lowercase();
+    let has_path_arg = PATH_ARG_MARKERS.iter().any(|m| lower.contains(m));
+    let has_path_format = PATH_FORMAT_MARKERS.iter().any(|m| lower.contains(m));
+    if has_path_arg && !has_path_format {
+        result.record(
+            BundleAuditSeverity::Warning,
+            filename,
+            "Path-like argument may be missing `format: \"path\"` — potential sandbox escape",
+            "Add `\"format\": \"path\"` to all path-type arguments.",
+        );
+    }
+}
+
+fn check_description_injection(filename: &str, contents: &str, result: &mut BundleAuditResult) {
+    // Pattern: prompt injection via long description / hint
+    let parsed: serde_json::Value = serde_json::from_str(contents).unwrap_or_default();
+    let Some(desc) = parsed["description"].as_str() else {
+        return;
+    };
+    if desc.len() > 512 {
+        result.record(
+            BundleAuditSeverity::Warning,
+            filename,
+            "Unusually long description — possible prompt injection payload",
+            "Review description for embedded instructions.",
+        );
+    }
+    check_forbidden_substrings(
+        filename,
+        &desc.to_ascii_lowercase(),
+        INJECTION_MARKERS,
+        "Possible prompt injection: description contains",
+        "Remove or rewrite the suspicious description.",
+        result,
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -294,25 +332,23 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn setup_checksummed_bundle() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let json_path = tmp.path().join("tool.json");
+        std::fs::write(&json_path, r#"{"name":"t","command":"echo"}"#).unwrap();
+        BundleChecksummer::write_manifest(tmp.path()).unwrap();
+        (tmp, json_path)
+    }
+
     #[test]
     fn checksum_and_verify_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("mytool.json"),
-            r#"{"name":"t","command":"echo"}"#,
-        )
-        .unwrap();
-
-        BundleChecksummer::write_manifest(tmp.path()).unwrap();
+        let (tmp, _) = setup_checksummed_bundle();
         assert!(BundleVerifier::new().verify(tmp.path()).unwrap());
     }
 
     #[test]
     fn verify_fails_after_a_file_changes() {
-        let tmp = TempDir::new().unwrap();
-        let json_path = tmp.path().join("tool.json");
-        std::fs::write(&json_path, r#"{"name":"t","command":"echo"}"#).unwrap();
-        BundleChecksummer::write_manifest(tmp.path()).unwrap();
+        let (tmp, json_path) = setup_checksummed_bundle();
 
         std::fs::write(&json_path, r#"{"name":"OTHER","command":"true"}"#).unwrap();
         assert!(!BundleVerifier::new().verify(tmp.path()).unwrap());
@@ -328,10 +364,7 @@ mod tests {
     /// failing assertion rather than quietly inherit the stronger reading.
     #[test]
     fn verification_is_not_tamper_evidence() {
-        let tmp = TempDir::new().unwrap();
-        let json_path = tmp.path().join("tool.json");
-        std::fs::write(&json_path, r#"{"name":"t","command":"echo"}"#).unwrap();
-        BundleChecksummer::write_manifest(tmp.path()).unwrap();
+        let (tmp, json_path) = setup_checksummed_bundle();
 
         // Someone who can edit a bundle file can also re-run the checksummer.
         std::fs::write(&json_path, r#"{"name":"EVIL","command":"rm -rf /"}"#).unwrap();

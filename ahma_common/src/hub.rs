@@ -968,6 +968,12 @@ fn events_upgrade_request() -> String {
 /// Gives up at the end of the first line if it is not an HTTP one, which is
 /// what a pre-upgrade client sends: a bare JSON line and then a wait for an
 /// answer that, read to a blank line, would never come.
+/// True when the first line of `head` has just ended (`byte == b'\n'`) without
+/// a preceding `\r`.
+fn is_non_crlf_first_line(head: &[u8]) -> bool {
+    head.ends_with(b"\n") && !head.ends_with(b"\r\n") && !head[..head.len() - 1].contains(&b'\n')
+}
+
 async fn read_http_head<S>(stream: &mut S) -> std::io::Result<String>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -983,8 +989,7 @@ where
         if head.ends_with(b"\r\n\r\n") {
             return Ok(String::from_utf8_lossy(&head).into_owned());
         }
-        let first_line_ended = byte[0] == b'\n' && !head[..head.len() - 1].contains(&b'\n');
-        if first_line_ended && !head.ends_with(b"\r\n") || head.len() > MAX_UPGRADE_HEAD {
+        if is_non_crlf_first_line(&head) || head.len() > MAX_UPGRADE_HEAD {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "not an HTTP head",
@@ -1552,52 +1557,62 @@ impl Hub {
     /// command may well have finished — so it is closed as `interrupted`
     /// rather than left running forever (a spinner that never resolves) or
     /// called failed (an invention).
-    async fn load_history(&self, records: Vec<crate::hub_history::HistoryRecord>) {
+    fn apply_history_record(
+        &self,
+        record: crate::hub_history::HistoryRecord,
+        hist: &mut std::collections::HashMap<String, InstanceOpHistory>,
+        ended: &mut std::collections::HashMap<String, InstanceInfo>,
+        ended_at: &mut std::collections::HashMap<String, u64>,
+    ) {
         use crate::hub_history::HistoryRecord as R;
+        match record {
+            R::Started {
+                instance, event, ..
+            } => {
+                let Some(op_id) = op_id_of(&event) else {
+                    return;
+                };
+                let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
+                hist.entry(instance.id.clone()).or_default().insert(
+                    op_id,
+                    OpSnapshot {
+                        seq,
+                        started: event,
+                        finished: None,
+                        tail: std::collections::VecDeque::new(),
+                        finished_at_ms: None,
+                    },
+                );
+                ended.entry(instance.id.clone()).or_insert(instance);
+            }
+            R::Finished {
+                ts,
+                instance_id,
+                event,
+                tail,
+            } => {
+                let Some(op_id) = op_id_of(&event) else {
+                    return;
+                };
+                if let Some(snap) = hist.get_mut(&instance_id).and_then(|i| i.get_mut(&op_id)) {
+                    snap.finished = Some(event);
+                    snap.finished_at_ms = Some(ts);
+                    snap.tail = tail.into_iter().collect();
+                }
+            }
+            R::InstanceEnded { ts, instance_id } => {
+                ended_at.insert(instance_id, ts);
+            }
+        }
+    }
+
+    async fn load_history(&self, records: Vec<crate::hub_history::HistoryRecord>) {
         let mut hist = self.op_history.lock().await;
         let mut ended = self.ended_instances.lock().await;
         let mut ended_at: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
         for record in records {
-            match record {
-                R::Started {
-                    instance, event, ..
-                } => {
-                    let Some(op_id) = op_id_of(&event) else {
-                        continue;
-                    };
-                    let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
-                    hist.entry(instance.id.clone()).or_default().insert(
-                        op_id,
-                        OpSnapshot {
-                            seq,
-                            started: event,
-                            finished: None,
-                            tail: std::collections::VecDeque::new(),
-                            finished_at_ms: None,
-                        },
-                    );
-                    ended.entry(instance.id.clone()).or_insert(instance);
-                }
-                R::Finished {
-                    ts,
-                    instance_id,
-                    event,
-                    tail,
-                } => {
-                    let Some(op_id) = op_id_of(&event) else {
-                        continue;
-                    };
-                    if let Some(snap) = hist.get_mut(&instance_id).and_then(|i| i.get_mut(&op_id)) {
-                        snap.finished = Some(event);
-                        snap.finished_at_ms = Some(ts);
-                        snap.tail = tail.into_iter().collect();
-                    }
-                }
-                R::InstanceEnded { ts, instance_id } => {
-                    ended_at.insert(instance_id, ts);
-                }
-            }
+            self.apply_history_record(record, &mut hist, &mut ended, &mut ended_at);
         }
 
         stamp_instance_end_times(&mut ended, &ended_at);
@@ -1730,21 +1745,27 @@ impl Hub {
 /// considered — so this can leave `hist` above `max` when everything left is
 /// still in flight; that is by design, matching the age-out pass above it,
 /// which never drops a running op either.
+fn find_oldest_finished_op(
+    hist: &std::collections::HashMap<String, InstanceOpHistory>,
+) -> Option<(u64, String, String)> {
+    hist.iter()
+        .flat_map(|(inst, ops)| {
+            ops.iter()
+                .filter(|(_, s)| s.finished.is_some())
+                .map(move |(op, s)| (s.seq, inst.clone(), op.clone()))
+        })
+        .min()
+}
+
 fn evict_oldest_finished_until_ceiling(
     hist: &mut std::collections::HashMap<String, InstanceOpHistory>,
     max: usize,
 ) {
     let mut total: usize = hist.values().map(|o| o.len()).sum();
     while total > max {
-        let oldest = hist
-            .iter()
-            .flat_map(|(inst, ops)| {
-                ops.iter()
-                    .filter(|(_, s)| s.finished.is_some())
-                    .map(move |(op, s)| (s.seq, inst.clone(), op.clone()))
-            })
-            .min();
-        let Some((_, inst, op)) = oldest else { break };
+        let Some((_, inst, op)) = find_oldest_finished_op(hist) else {
+            break;
+        };
         if let Some(ops) = hist.get_mut(&inst) {
             ops.remove(&op);
             if ops.is_empty() {
@@ -1785,34 +1806,36 @@ fn stamp_instance_end_times(
 /// `interrupted` rather than left running forever (a spinner that never
 /// resolves) or called failed (an invention). Returns how many operations
 /// were restored this way, for the caller to log.
+fn mark_snap_interrupted_if_unfinished(snap: &mut OpSnapshot) -> bool {
+    if snap.finished.is_some() {
+        return false;
+    }
+    let Some(op_id) = op_id_of(&snap.started) else {
+        return false;
+    };
+    snap.finished_at_ms = Some(now_epoch_ms());
+    snap.finished = Some(HubEvent::OpFinished {
+        id: op_id,
+        // "Failed" is what a reader that predates `interrupted` sees;
+        // a current one renders the flag instead (R24.5).
+        status: OpStatus::Failed,
+        result_summary: Some("interrupted: the hub watching this operation exited".to_string()),
+        duration_ms: 0,
+        ended_epoch_ms: snap.finished_at_ms,
+        exit_code: None,
+        denial: None,
+        interrupted: true,
+    });
+    true
+}
+
 fn mark_unfinished_ops_interrupted(
     hist: &mut std::collections::HashMap<String, InstanceOpHistory>,
 ) -> usize {
-    let mut interrupted = 0usize;
-    for ops in hist.values_mut() {
-        for snap in ops.values_mut() {
-            if snap.finished.is_some() {
-                continue;
-            }
-            let Some(op_id) = op_id_of(&snap.started) else {
-                continue;
-            };
+    let mut interrupted = 0;
+    for snap in hist.values_mut().flat_map(|ops| ops.values_mut()) {
+        if mark_snap_interrupted_if_unfinished(snap) {
             interrupted += 1;
-            snap.finished_at_ms = Some(now_epoch_ms());
-            snap.finished = Some(HubEvent::OpFinished {
-                id: op_id,
-                // "Failed" is what a reader that predates `interrupted` sees;
-                // a current one renders the flag instead (R24.5).
-                status: OpStatus::Failed,
-                result_summary: Some(
-                    "interrupted: the hub watching this operation exited".to_string(),
-                ),
-                duration_ms: 0,
-                ended_epoch_ms: snap.finished_at_ms,
-                exit_code: None,
-                denial: None,
-                interrupted: true,
-            });
         }
     }
     interrupted
@@ -3567,6 +3590,42 @@ mod tests {
         tokio::spawn(async move { server.serve().await });
     }
 
+    fn test_register_msg() -> ClientMsg {
+        ClientMsg::Register {
+            pid: std::process::id(),
+            mode: "stdio".to_string(),
+            scope: "/test/scope".to_string(),
+            label: "TestInstance".to_string(),
+            client: None,
+            session_id: None,
+            client_pid: None,
+            sampling: false,
+            elicitation: false,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
+            native_terminal: None,
+        }
+    }
+
+    fn test_op_started_event(id: impl Into<String>) -> HubEvent {
+        HubEvent::OpStarted {
+            id: id.into(),
+            tool_name: "t".into(),
+            description: "d".into(),
+            scope: "/w".into(),
+            parent_id: None,
+            started_epoch_ms: None,
+            title: None,
+            cwd: None,
+            command: None,
+            origin: None,
+            partial: false,
+            unsandboxed: false,
+        }
+    }
+
     /// A TUI that opens while a question waits is shown it; an answered
     /// question is not replayed; and when the asking instance goes, every TUI
     /// is told to take its questions down (SPEC R-PERM.3.7).
@@ -3578,27 +3637,7 @@ mod tests {
 
         let inst = connect_to_hub_at(&sock).await.expect("connect instance");
         let (ir, mut iw) = tokio::io::split(inst);
-        send_msg(
-            &mut iw,
-            &ClientMsg::Register {
-                pid: std::process::id(),
-                mode: "stdio".to_string(),
-                scope: "/test/scope".to_string(),
-                label: "TestInstance".to_string(),
-                client: None,
-                session_id: None,
-                client_pid: None,
-                sampling: false,
-                elicitation: false,
-                scopes: vec![],
-                read_scopes: vec![],
-                grants: vec![],
-                enforcement: None,
-                native_terminal: None,
-            },
-        )
-        .await
-        .unwrap();
+        send_msg(&mut iw, &test_register_msg()).await.unwrap();
         let ask = |id: &str| {
             ClientMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: crate::scope_grant::ScopeGrantRequest {
@@ -3702,27 +3741,7 @@ mod tests {
         let inst = connect_to_hub_at(&sock).await.expect("connect instance");
         let (ir, mut iw) = tokio::io::split(inst);
         let mut inst_reader = BufReader::new(ir);
-        send_msg(
-            &mut iw,
-            &ClientMsg::Register {
-                pid: std::process::id(),
-                mode: "stdio".to_string(),
-                scope: "/test/scope".to_string(),
-                label: "TestInstance".to_string(),
-                client: None,
-                session_id: None,
-                client_pid: None,
-                sampling: false,
-                elicitation: false,
-                scopes: vec![],
-                read_scopes: vec![],
-                grants: vec![],
-                enforcement: None,
-                native_terminal: None,
-            },
-        )
-        .await
-        .unwrap();
+        send_msg(&mut iw, &test_register_msg()).await.unwrap();
         async fn next_viewers<R: tokio::io::AsyncRead + Unpin>(r: &mut BufReader<R>) -> usize {
             let wait = crate::timeouts::TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick);
             tokio::time::timeout(wait, async {
@@ -3776,27 +3795,7 @@ mod tests {
         // ── Instance registers ─────────────────────────────────────────────
         let inst = connect_to_hub_at(&sock).await.expect("connect instance");
         let (_, mut iw) = tokio::io::split(inst);
-        send_msg(
-            &mut iw,
-            &ClientMsg::Register {
-                pid: std::process::id(),
-                mode: "stdio".to_string(),
-                scope: "/test/scope".to_string(),
-                label: "TestInstance".to_string(),
-                client: None,
-                session_id: None,
-                client_pid: None,
-                sampling: false,
-                elicitation: false,
-                scopes: vec![],
-                read_scopes: vec![],
-                grants: vec![],
-                enforcement: None,
-                native_terminal: None,
-            },
-        )
-        .await
-        .unwrap();
+        send_msg(&mut iw, &test_register_msg()).await.unwrap();
 
         // Subscriber receives InstanceRegistered.
         let reg: HubMsg = recv_msg(&mut sub_reader).await.unwrap();
@@ -4041,24 +4040,8 @@ mod tests {
             "OpOutput must not be replayed"
         );
 
-        hub.record_op_event(
-            "i1",
-            &HubEvent::OpStarted {
-                id: "op-1".into(),
-                tool_name: "t".into(),
-                description: "d".into(),
-                scope: "/w".into(),
-                parent_id: None,
-                started_epoch_ms: None,
-                title: None,
-                cwd: None,
-                command: None,
-                origin: None,
-                partial: false,
-                unsandboxed: false,
-            },
-        )
-        .await;
+        hub.record_op_event("i1", &test_op_started_event("op-1"))
+            .await;
         assert_eq!(hub.replay_events().await.len(), 1);
 
         // When an instance unregisters its history is dropped (mirrors the
@@ -4387,24 +4370,7 @@ mod tests {
         // Fill to the cap with fully-finished ops.
         for i in 0..MAX_OPS_PER_INSTANCE {
             let id = format!("op-{i}");
-            hub.record_op_event(
-                "i1",
-                &HubEvent::OpStarted {
-                    id: id.clone(),
-                    tool_name: "t".into(),
-                    description: "d".into(),
-                    scope: "/w".into(),
-                    parent_id: None,
-                    started_epoch_ms: None,
-                    title: None,
-                    cwd: None,
-                    command: None,
-                    origin: None,
-                    partial: false,
-                    unsandboxed: false,
-                },
-            )
-            .await;
+            hub.record_op_event("i1", &test_op_started_event(&id)).await;
             hub.record_op_event(
                 "i1",
                 &HubEvent::OpFinished {
@@ -4426,24 +4392,8 @@ mod tests {
         );
 
         // One more started op pushes over the cap → oldest finished (op-0) evicted.
-        hub.record_op_event(
-            "i1",
-            &HubEvent::OpStarted {
-                id: "op-new".into(),
-                tool_name: "t".into(),
-                description: "d".into(),
-                scope: "/w".into(),
-                parent_id: None,
-                started_epoch_ms: None,
-                title: None,
-                cwd: None,
-                command: None,
-                origin: None,
-                partial: false,
-                unsandboxed: false,
-            },
-        )
-        .await;
+        hub.record_op_event("i1", &test_op_started_event("op-new"))
+            .await;
 
         let hist = hub.op_history.lock().await;
         let inst = hist.get("i1").unwrap();
@@ -4466,24 +4416,8 @@ mod tests {
         // Insert cap+1 *running* ops — none are eligible for eviction, so the
         // history is allowed to exceed the cap (running ops are never dropped).
         for i in 0..=MAX_OPS_PER_INSTANCE {
-            hub.record_op_event(
-                "i1",
-                &HubEvent::OpStarted {
-                    id: format!("op-{i}"),
-                    tool_name: "t".into(),
-                    description: "d".into(),
-                    scope: "/w".into(),
-                    parent_id: None,
-                    started_epoch_ms: None,
-                    title: None,
-                    cwd: None,
-                    command: None,
-                    origin: None,
-                    partial: false,
-                    unsandboxed: false,
-                },
-            )
-            .await;
+            hub.record_op_event("i1", &test_op_started_event(format!("op-{i}")))
+                .await;
         }
 
         assert_eq!(
@@ -5509,6 +5443,23 @@ mod tests {
 
     // ── serve_instance event forwarding ───────────────────────────────────────
 
+    async fn assert_relay_forwarded<W, R>(iw: &mut W, srdr: &mut BufReader<R>, relay: HubRelay)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        send_msg(iw, &ClientMsg::Relay(relay.clone()))
+            .await
+            .unwrap();
+        match recv_msg::<_, HubMsg>(srdr).await.unwrap() {
+            HubMsg::Relay(received) => assert_eq!(
+                serde_json::to_value(&received).unwrap(),
+                serde_json::to_value(&relay).unwrap()
+            ),
+            other => panic!("expected Relay({relay:?}), got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn hub_forwards_instance_events_to_subscriber() {
         use crate::scope_grant::{GrantReason, ScopeGrantRequest};
@@ -5530,87 +5481,34 @@ mod tests {
         // Instance registers.
         let inst = connect_to_hub_at(&sock).await.unwrap();
         let (_ir, mut iw) = tokio::io::split(inst);
-        send_msg(
-            &mut iw,
-            &ClientMsg::Register {
-                pid: 9,
-                mode: "stdio".into(),
-                scope: "/w".into(),
-                label: "L".into(),
-                client: None,
-                session_id: None,
-                client_pid: None,
-                sampling: false,
-                elicitation: false,
-                scopes: vec![],
-                read_scopes: vec![],
-                grants: vec![],
-                enforcement: None,
-                native_terminal: None,
-            },
-        )
-        .await
-        .unwrap();
+        send_msg(&mut iw, &test_register_msg()).await.unwrap();
         assert!(matches!(
             recv_msg::<_, HubMsg>(&mut srdr).await.unwrap(),
             HubMsg::InstanceRegistered { .. }
         ));
 
-        // ChatToken → ChatToken.
-        send_msg(
-            &mut iw,
-            &ClientMsg::Relay(HubRelay::ChatToken {
+        for relay in [
+            HubRelay::ChatToken {
                 token: "tok".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::ChatToken { token }) => assert_eq!(token, "tok"),
-            other => panic!("expected ChatToken, got {other:?}"),
-        }
-
-        // ApprovalRequested → ApprovalRequested.
-        send_msg(
-            &mut iw,
-            &ClientMsg::Relay(HubRelay::ApprovalRequested {
+            },
+            HubRelay::ApprovalRequested {
                 id: "c1".into(),
                 tool: "sh".into(),
                 args: "ls".into(),
                 workspace: None,
-            }),
-        )
-        .await
-        .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::ApprovalRequested { id, tool, args, .. }) => {
-                assert_eq!(id, "c1");
-                assert_eq!(tool, "sh");
-                assert_eq!(args, "ls");
-            }
-            other => panic!("expected ApprovalRequested, got {other:?}"),
-        }
-
-        // ScopeGrantRequested → ScopeGrantRequested.
-        let req = ScopeGrantRequest {
-            decision_id: "d9".into(),
-            path: std::path::PathBuf::from("/opt/x"),
-            access: crate::config::ScopeAccess::Rw,
-            reason: GrantReason::StderrHeuristic,
-            tool: Some("sccache".into()),
-            context: Default::default(),
-        };
-        send_msg(
-            &mut iw,
-            &ClientMsg::Relay(HubRelay::ScopeGrantRequested { request: req }),
-        )
-        .await
-        .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::ScopeGrantRequested { request }) => {
-                assert_eq!(request.decision_id, "d9")
-            }
-            other => panic!("expected ScopeGrantRequested, got {other:?}"),
+            },
+            HubRelay::ScopeGrantRequested {
+                request: ScopeGrantRequest {
+                    decision_id: "d9".into(),
+                    path: std::path::PathBuf::from("/opt/x"),
+                    access: crate::config::ScopeAccess::Rw,
+                    reason: GrantReason::StderrHeuristic,
+                    tool: Some("sccache".into()),
+                    context: Default::default(),
+                },
+            },
+        ] {
+            assert_relay_forwarded(&mut iw, &mut srdr, relay).await;
         }
 
         // ScopeGrantResolved → ScopeGrantDismiss.
@@ -5627,93 +5525,40 @@ mod tests {
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
         }
 
-        // ToolCallStarted → ToolCallStarted.
-        send_msg(
-            &mut iw,
-            &ClientMsg::Relay(HubRelay::ToolCallStarted {
+        for relay in [
+            HubRelay::ToolCallStarted {
                 id: "t1".into(),
                 name: "read_file".into(),
                 args: "{}".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::ToolCallStarted { id, name, .. }) => {
-                assert_eq!(id, "t1");
-                assert_eq!(name, "read_file");
-            }
-            other => panic!("expected ToolCallStarted, got {other:?}"),
-        }
-
-        // ToolCallFinished → ToolCallFinished.
-        send_msg(
-            &mut iw,
-            &ClientMsg::Relay(HubRelay::ToolCallFinished {
+            },
+            HubRelay::ToolCallFinished {
                 id: "t1".into(),
                 result: "ok".into(),
                 failed: false,
-            }),
-        )
-        .await
-        .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::ToolCallFinished { id, failed, .. }) => {
-                assert_eq!(id, "t1");
-                assert!(!failed);
-            }
-            other => panic!("expected ToolCallFinished, got {other:?}"),
-        }
-
-        // Usage → Usage.
-        send_msg(
-            &mut iw,
-            &ClientMsg::Relay(HubRelay::Usage {
+            },
+            HubRelay::Usage {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
-            }),
-        )
-        .await
-        .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::Usage {
-                prompt_tokens,
-                total_tokens,
-                ..
-            }) => {
-                assert_eq!(prompt_tokens, 100);
-                assert_eq!(total_tokens, 120);
-            }
-            other => panic!("expected Usage, got {other:?}"),
+            },
+        ] {
+            assert_relay_forwarded(&mut iw, &mut srdr, relay).await;
         }
 
         // Pong produces NO broadcast; the next AgentDone proves it was swallowed.
         send_msg(&mut iw, &ClientMsg::Pong { seq: 5 })
             .await
             .unwrap();
-        send_msg(&mut iw, &ClientMsg::Relay(HubRelay::AgentDone))
-            .await
-            .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::AgentDone) => {}
-            other => panic!("expected AgentDone (Pong must not broadcast), got {other:?}"),
-        }
-
-        // AgentError → AgentError.
-        send_msg(
+        assert_relay_forwarded(&mut iw, &mut srdr, HubRelay::AgentDone).await;
+        assert_relay_forwarded(
             &mut iw,
-            &ClientMsg::Relay(HubRelay::AgentError {
+            &mut srdr,
+            HubRelay::AgentError {
                 error: "boom".into(),
                 transient: false,
-            }),
+            },
         )
-        .await
-        .unwrap();
-        match recv_msg::<_, HubMsg>(&mut srdr).await.unwrap() {
-            HubMsg::Relay(HubRelay::AgentError { error, .. }) => assert_eq!(error, "boom"),
-            other => panic!("expected AgentError, got {other:?}"),
-        }
+        .await;
     }
 
     // ── handle_connection routing arms ────────────────────────────────────────

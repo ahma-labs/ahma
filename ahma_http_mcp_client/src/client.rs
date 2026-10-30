@@ -89,6 +89,28 @@ enum AuthState {
     Authenticated(StoredToken),
 }
 
+fn build_atlassian_oauth_client(
+    atlassian_client_id: Option<String>,
+    atlassian_client_secret: Option<String>,
+) -> Result<Option<ConfiguredOAuthClient>> {
+    let (Some(client_id), Some(client_secret)) = (atlassian_client_id, atlassian_client_secret)
+    else {
+        return Ok(None);
+    };
+    let client = BasicClient::new(ClientId::new(client_id))
+        .set_client_secret(ClientSecret::new(client_secret))
+        .set_auth_uri(AuthUrl::new(
+            "https://auth.atlassian.com/authorize".to_string(),
+        )?)
+        .set_token_uri(TokenUrl::new(
+            "https://auth.atlassian.com/oauth/token".to_string(),
+        )?)
+        .set_redirect_uri(RedirectUrl::new(format!(
+            "http://localhost:{OAUTH_CALLBACK_PORT}"
+        ))?);
+    Ok(Some(client))
+}
+
 impl HttpMcpTransport {
     /// Creates a new `HttpMcpTransport`.
     ///
@@ -118,29 +140,10 @@ impl HttpMcpTransport {
         atlassian_client_id: Option<String>,
         atlassian_client_secret: Option<String>,
     ) -> Result<Self> {
-        let oauth_client = if let (Some(atlassian_client_id), Some(atlassian_client_secret)) =
-            (atlassian_client_id, atlassian_client_secret)
-        {
-            let mut client = BasicClient::new(ClientId::new(atlassian_client_id))
-                .set_client_secret(ClientSecret::new(atlassian_client_secret))
-                .set_auth_uri(AuthUrl::new(
-                    "https://auth.atlassian.com/authorize".to_string(),
-                )?)
-                .set_token_uri(TokenUrl::new(
-                    "https://auth.atlassian.com/oauth/token".to_string(),
-                )?);
-            client = client.set_redirect_uri(RedirectUrl::new(format!(
-                "http://localhost:{OAUTH_CALLBACK_PORT}"
-            ))?);
-            Some(client)
-        } else {
-            None
-        };
-
+        let oauth_client =
+            build_atlassian_oauth_client(atlassian_client_id, atlassian_client_secret)?;
         let (sender, receiver) = mpsc::channel(100);
-
-        let initial_token = load_token()?;
-        let initial_state = match initial_token {
+        let initial_state = match load_token()? {
             Some(token) => AuthState::Authenticated(token),
             None => AuthState::Unauthenticated,
         };
@@ -151,16 +154,14 @@ impl HttpMcpTransport {
             .build()
             .map_err(|e| McpHttpError::Custom(format!("Failed to build HTTP client: {e}")))?;
 
-        let transport = Self {
+        Ok(Self {
             client: http_client,
             mcp_url: url,
             auth_state: Arc::new(StateMachine::new(initial_state)),
             oauth_client,
             receiver: Arc::new(Mutex::new(receiver)),
             sender,
-        };
-
-        Ok(transport)
+        })
     }
 
     /// Checks if a valid token exists, and if not, initiates the OAuth2 flow.
@@ -176,13 +177,13 @@ impl HttpMcpTransport {
     ///
     /// If no OAuth2 client is configured, this returns an error if no token is present.
     pub async fn ensure_authenticated(&self) -> Result<()> {
-        loop {
-            enum Action {
-                PerformAuth(Arc<Notify>),
-                Wait(Arc<Notify>),
-                Ok,
-            }
+        enum Action {
+            PerformAuth(Arc<Notify>),
+            Wait(Arc<Notify>),
+            Ok,
+        }
 
+        loop {
             let action = self.auth_state.transition(|state| match state {
                 AuthState::Authenticated(_) => Action::Ok,
                 AuthState::Authenticating(notify) => Action::Wait(notify.clone()),
@@ -195,37 +196,35 @@ impl HttpMcpTransport {
 
             match action {
                 Action::Ok => return Ok(()),
-                Action::Wait(notify) => {
-                    notify.notified().await;
-                    continue;
-                }
-                Action::PerformAuth(notify) => {
-                    let result = match &self.oauth_client {
-                        Some(oauth_client) => {
-                            info!("No token found, starting authentication flow.");
-                            self.perform_oauth_flow(oauth_client).await
-                        }
-                        None => Err(McpHttpError::Auth(
-                            "OAuth client not configured, but authentication is required."
-                                .to_string(),
-                        )),
-                    };
-
-                    // One transition+notify+return for both outcomes, rather
-                    // than duplicating that sequence per error source.
-                    let (new_state, outcome) = match result {
-                        Ok(new_token) => {
-                            info!("Authentication successful.");
-                            (AuthState::Authenticated(new_token), Ok(()))
-                        }
-                        Err(e) => (AuthState::Unauthenticated, Err(e)),
-                    };
-                    self.auth_state.transition(|state| *state = new_state);
-                    notify.notify_waiters();
-                    return outcome;
-                }
+                Action::Wait(notify) => notify.notified().await,
+                Action::PerformAuth(notify) => return self.finish_authentication(notify).await,
             }
         }
+    }
+
+    async fn finish_authentication(&self, notify: Arc<Notify>) -> Result<()> {
+        let result = match &self.oauth_client {
+            Some(oauth_client) => {
+                info!("No token found, starting authentication flow.");
+                self.perform_oauth_flow(oauth_client).await
+            }
+            None => Err(McpHttpError::Auth(
+                "OAuth client not configured, but authentication is required.".to_string(),
+            )),
+        };
+
+        // One transition+notify+return for both outcomes, rather
+        // than duplicating that sequence per error source.
+        let (new_state, outcome) = match result {
+            Ok(new_token) => {
+                info!("Authentication successful.");
+                (AuthState::Authenticated(new_token), Ok(()))
+            }
+            Err(e) => (AuthState::Unauthenticated, Err(e)),
+        };
+        self.auth_state.transition(|state| *state = new_state);
+        notify.notify_waiters();
+        outcome
     }
 
     async fn perform_oauth_flow(
@@ -385,6 +384,40 @@ impl HttpMcpTransport {
     }
 }
 
+async fn read_success_response_bytes(res: reqwest::Response) -> Result<bytes::Bytes> {
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        let err_msg = format!("HTTP Error: {} - {}", status, text);
+        error!("{}", err_msg);
+        return Err(McpHttpError::Custom(err_msg));
+    }
+    Ok(res.bytes().await?)
+}
+
+async fn forward_response_body(
+    body_bytes: &[u8],
+    sender: &mpsc::Sender<RxJsonRpcMessage<RoleClient>>,
+) -> Result<()> {
+    if body_bytes.is_empty() {
+        return Ok(());
+    }
+    let msg = serde_json::from_slice::<RxJsonRpcMessage<RoleClient>>(body_bytes).map_err(|e| {
+        error!("Failed to parse response body: {}", e);
+        // Start of body for debugging context (first 100 chars)
+        let preview = String::from_utf8_lossy(body_bytes)
+            .chars()
+            .take(100)
+            .collect::<String>();
+        error!("Response body start: {:?}", preview);
+        McpHttpError::Json(e)
+    })?;
+    sender.send(msg).await.map_err(|e| {
+        error!("Failed to send response to channel: {}", e);
+        McpHttpError::Custom(format!("Channel error: {}", e))
+    })
+}
+
 impl Transport<RoleClient> for HttpMcpTransport {
     type Error = McpHttpError;
 
@@ -412,43 +445,11 @@ impl Transport<RoleClient> for HttpMcpTransport {
                 .send()
                 .await?;
 
-            if !res.status().is_success() {
-                let status = res.status();
-                let text = res.text().await.unwrap_or_default();
-                let err_msg = format!("HTTP Error: {} - {}", status, text);
-                error!("{}", err_msg);
-                return Err(McpHttpError::Custom(err_msg));
-            }
-
-            // Try to parse response as JSON-RPC message and send to channel
             // Note: Notifications might not return a body, or return empty body
             // We read the full body bytes to determine if it's empty, rather than relying on
             // Content-Length header which might be missing or unreliable in some environments (e.g. CI).
-            let body_bytes = res.bytes().await?;
-            if !body_bytes.is_empty() {
-                // Try to parse non-empty body
-                match serde_json::from_slice::<RxJsonRpcMessage<RoleClient>>(&body_bytes) {
-                    Ok(msg) => {
-                        if let Err(e) = sender.send(msg).await {
-                            error!("Failed to send response to channel: {}", e);
-                            return Err(McpHttpError::Custom(format!("Channel error: {}", e)));
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to parse response body: {}", e);
-                        // Start of body for debugging context (first 100 chars)
-                        let preview = String::from_utf8_lossy(&body_bytes)
-                            .chars()
-                            .take(100)
-                            .collect::<String>();
-                        error!("Response body start: {:?}", preview);
-
-                        return Err(McpHttpError::Json(e));
-                    }
-                }
-            }
-
-            Ok(())
+            let body_bytes = read_success_response_bytes(res).await?;
+            forward_response_body(&body_bytes, &sender).await
         }
     }
 
@@ -906,22 +907,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn send_receive_round_trip_with_stored_token() {
-        use rmcp::service::TxJsonRpcMessage;
-        use rmcp::transport::Transport;
+    async fn spawn_authenticated_mock_transport(
+        token_path: &std::path::Path,
+        access_token: &str,
+        response: wiremock::ResponseTemplate,
+    ) -> (wiremock::MockServer, HttpMcpTransport) {
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
-        let _guard = token_env_guard().lock();
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("send_token.json");
         unsafe {
             env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap());
         }
         let token = StoredToken {
-            access_token: "round_trip_token".to_string(),
+            access_token: access_token.to_string(),
             refresh_token: None,
             expires_in: Some(3600),
             scopes: None,
@@ -931,27 +929,49 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": { "marker": "pong_42" }
-            })))
+            .respond_with(response)
             .expect(1)
             .mount(&server)
             .await;
 
         let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
+        let transport = HttpMcpTransport::new(url, None, None).unwrap();
+        (server, transport)
+    }
 
-        let request: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
+    fn ping_rpc_request() -> rmcp::service::TxJsonRpcMessage<RoleClient> {
+        serde_json::from_value(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "ping",
             "params": {}
         }))
-        .unwrap();
+        .unwrap()
+    }
 
-        transport.send(request).await.expect("send should succeed");
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_receive_round_trip_with_stored_token() {
+        use rmcp::transport::Transport;
+        use wiremock::ResponseTemplate;
+
+        let _guard = token_env_guard().lock();
+        let tmp = tempdir().unwrap();
+        let (_server, mut transport) = spawn_authenticated_mock_transport(
+            &tmp.path().join("send_token.json"),
+            "round_trip_token",
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "marker": "pong_42" }
+            })),
+        )
+        .await;
+
+        transport
+            .send(ping_rpc_request())
+            .await
+            .expect("send should succeed");
 
         let received = tokio::time::timeout(TestTimeouts::scale_secs(5), transport.receive())
             .await
@@ -971,23 +991,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn send_without_token_yields_missing_access_token() {
-        use rmcp::service::TxJsonRpcMessage;
         use rmcp::transport::Transport;
 
         let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
         let mut transport = isolated_transport(&tmp.path().join("absent.json"));
 
-        let request: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/list",
-            "params": {}
-        }))
-        .unwrap();
-
         let err = transport
-            .send(request)
+            .send(ping_rpc_request())
             .await
             .expect_err("send must fail without an access token");
         assert!(
@@ -1003,46 +1014,20 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn send_propagates_http_error_status() {
-        use rmcp::service::TxJsonRpcMessage;
         use rmcp::transport::Transport;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::ResponseTemplate;
 
         let _guard = token_env_guard().lock();
         let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("err_token.json");
-        unsafe {
-            env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap());
-        }
-        let token = StoredToken {
-            access_token: "any".to_string(),
-            refresh_token: None,
-            expires_in: None,
-            scopes: None,
-        };
-        save_token(&token).unwrap();
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "ping",
-            "params": {}
-        }))
-        .unwrap();
+        let (_server, mut transport) = spawn_authenticated_mock_transport(
+            &tmp.path().join("err_token.json"),
+            "any",
+            ResponseTemplate::new(500).set_body_string("boom"),
+        )
+        .await;
 
         let err = transport
-            .send(request)
+            .send(ping_rpc_request())
             .await
             .expect_err("send must surface a non-2xx HTTP status");
         let msg = err.to_string();

@@ -2201,17 +2201,7 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 
     // From the key table the bindings are tested against: the focused
     // panel's own keys first, then the global ones that apply there.
-    use crate::keymap::{KeyScope, key_docs};
-    let scopes: &[KeyScope] = match state.focus {
-        Focus::Work => &[KeyScope::Work, KeyScope::Global],
-        Focus::Log => &[KeyScope::Log, KeyScope::Global],
-        _ => &[KeyScope::Chat],
-    };
-    let keys: Vec<(&str, &str)> = scopes
-        .iter()
-        .flat_map(|&scope| key_docs(scope))
-        .filter_map(|d| d.footer.map(|short| (d.label, short)))
-        .collect();
+    let keys = footer_keys_for_focus(state.focus);
 
     let mut spans: Vec<Span> = vec![
         Span::styled(format!(" {mode_label} "), theme.footer_key()),
@@ -2220,24 +2210,7 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     // A running turn leads with the key that stops it; the key works from
     // any panel (Ctrl-C) and from the chat input (Esc).
     if let Some(turn) = &state.turn {
-        let key = if state.focus == Focus::Chat {
-            "  Esc "
-        } else {
-            "  Ctrl-C "
-        };
-        spans.push(Span::styled(key, theme.footer_key()));
-        spans.push(Span::styled("cancel turn", theme.footer()));
-        if turn.is_stalled(std::time::Instant::now()) {
-            let warn = if state.unicode { "⚠" } else { "!" };
-            spans.push(Span::styled(
-                format!(
-                    "  {warn} no response for {}s",
-                    turn.last_event.elapsed().as_secs()
-                ),
-                theme.pending(),
-            ));
-        }
-        spans.push(Span::styled(" │", theme.dim()));
+        append_turn_footer_spans(&mut spans, turn, state, theme);
     }
     for (key, desc) in keys {
         spans.push(Span::styled(format!("  {key} "), theme.footer_key()));
@@ -2248,6 +2221,46 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         Paragraph::new(Line::from(spans)).style(theme.footer()),
         area,
     );
+}
+
+fn footer_keys_for_focus(focus: Focus) -> Vec<(&'static str, &'static str)> {
+    use crate::keymap::{KeyScope, key_docs};
+    let scopes: &[KeyScope] = match focus {
+        Focus::Work => &[KeyScope::Work, KeyScope::Global],
+        Focus::Log => &[KeyScope::Log, KeyScope::Global],
+        _ => &[KeyScope::Chat],
+    };
+    scopes
+        .iter()
+        .flat_map(|&scope| key_docs(scope))
+        .filter_map(|d| d.footer.map(|short| (d.label, short)))
+        .collect()
+}
+
+fn append_turn_footer_spans(
+    spans: &mut Vec<Span<'static>>,
+    turn: &crate::state::ChatTurn,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let key = if state.focus == Focus::Chat {
+        "  Esc "
+    } else {
+        "  Ctrl-C "
+    };
+    spans.push(Span::styled(key, theme.footer_key()));
+    spans.push(Span::styled("cancel turn", theme.footer()));
+    if turn.is_stalled(std::time::Instant::now()) {
+        let warn = if state.unicode { "⚠" } else { "!" };
+        spans.push(Span::styled(
+            format!(
+                "  {warn} no response for {}s",
+                turn.last_event.elapsed().as_secs()
+            ),
+            theme.pending(),
+        ));
+    }
+    spans.push(Span::styled(" │", theme.dim()));
 }
 
 /// Content lines for the `/scope` window — the persistent TUI scope panel
@@ -2411,51 +2424,7 @@ fn session_scope_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
         theme.dim(),
     )));
     for inst in live.iter().take(8) {
-        let who = inst.client.as_deref().unwrap_or(&inst.label);
-        let enforcement = match inst.enforcement.as_deref() {
-            Some("ahma") => "ahma".to_string(),
-            Some("ahma_nested_in_host") => "ahma+host".to_string(),
-            Some("deferred_to_host") => "DEFERRED".to_string(),
-            Some("disabled") => "NO SANDBOX".to_string(),
-            Some(other) => other.to_string(),
-            None => "unreported".to_string(),
-        };
-        let roots = if inst.scopes.is_empty() {
-            if inst.scope.is_empty() {
-                "no scope yet".to_string()
-            } else {
-                shorten_path(&inst.scope, 40)
-            }
-        } else {
-            let first = shorten_path(&inst.scopes[0], 40);
-            if inst.scopes.len() > 1 {
-                format!("{first} +{} more", inst.scopes.len() - 1)
-            } else {
-                first
-            }
-        };
-        let grants = if inst.grants.is_empty() {
-            String::new()
-        } else {
-            format!(" · {} grant(s)", inst.grants.len())
-        };
-        let style = match inst.enforcement.as_deref() {
-            Some("deferred_to_host") | Some("disabled") => theme.pending(),
-            _ => theme.normal(),
-        };
-        let mut row = vec![
-            Span::styled(format!("  {who}: "), theme.dim()),
-            Span::styled(format!("{enforcement} · {roots}{grants}"), style),
-        ];
-        // SPEC R7.8: the client's own terminal is a separate fact from the
-        // sandbox above, and the one most easily assumed.
-        if inst.native_terminal.as_deref() == Some("unconfined") {
-            row.push(Span::styled(
-                " · its own terminal: NOT sandboxed".to_string(),
-                theme.pending(),
-            ));
-        }
-        lines.push(Line::from(row));
+        lines.push(format_instance_scope_line(inst, theme));
     }
     if live.len() > 8 {
         lines.push(Line::from(Span::styled(
@@ -2464,6 +2433,65 @@ fn session_scope_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+fn format_instance_scope_line(
+    inst: &ahma_common::hub::InstanceInfo,
+    theme: &Theme,
+) -> Line<'static> {
+    let who = inst.client.as_deref().unwrap_or(&inst.label);
+    let enforcement = format_instance_enforcement(inst.enforcement.as_deref());
+    let roots = format_instance_roots(inst);
+    let grants = if inst.grants.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} grant(s)", inst.grants.len())
+    };
+    let style = match inst.enforcement.as_deref() {
+        Some("deferred_to_host") | Some("disabled") => theme.pending(),
+        _ => theme.normal(),
+    };
+    let mut row = vec![
+        Span::styled(format!("  {who}: "), theme.dim()),
+        Span::styled(format!("{enforcement} · {roots}{grants}"), style),
+    ];
+    // SPEC R7.8: the client's own terminal is a separate fact from the
+    // sandbox above, and the one most easily assumed.
+    if inst.native_terminal.as_deref() == Some("unconfined") {
+        row.push(Span::styled(
+            " · its own terminal: NOT sandboxed".to_string(),
+            theme.pending(),
+        ));
+    }
+    Line::from(row)
+}
+
+fn format_instance_enforcement(enforcement: Option<&str>) -> &str {
+    match enforcement {
+        Some("ahma") => "ahma",
+        Some("ahma_nested_in_host") => "ahma+host",
+        Some("deferred_to_host") => "DEFERRED",
+        Some("disabled") => "NO SANDBOX",
+        Some(other) => other,
+        None => "unreported",
+    }
+}
+
+fn format_instance_roots(inst: &ahma_common::hub::InstanceInfo) -> String {
+    if inst.scopes.is_empty() {
+        if inst.scope.is_empty() {
+            "no scope yet".to_string()
+        } else {
+            shorten_path(&inst.scope, 40)
+        }
+    } else {
+        let first = shorten_path(&inst.scopes[0], 40);
+        if inst.scopes.len() > 1 {
+            format!("{first} +{} more", inst.scopes.len() - 1)
+        } else {
+            first
+        }
+    }
 }
 
 fn scope_window_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
@@ -3803,86 +3831,8 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         format!(" Sandbox · grant access? ({waiting} more waiting) ")
     };
 
-    // SPEC R-PERM.3.4: the same sections every surface shows. The compact view
-    // keeps who / what / minimum / allows / risk; `?` adds the agent's claim,
-    // the evidence line and the exact settings line.
-    let compact_headings = [
-        "Who is asking",
-        "What was blocked",
-        "Minimum that would work",
-        "What a grant allows",
-        "Risk",
-    ];
-    let mut lines = vec![Line::from(Span::styled(
-        body.title.clone(),
-        theme.success().bold(),
-    ))];
-    // The exact settings line (R-PERM.2): a saving answer is taken only while
-    // this whole section is on screen (R-PERM.3.5).
-    let mut save_section = None;
-    for section in &body.sections {
-        if !gate.show_detail && !compact_headings.contains(&section.heading.as_str()) {
-            continue;
-        }
-        let section_start = lines.len();
-        let style = if section.heading == "Risk"
-            && gate
-                .request
-                .context
-                .risk
-                .as_ref()
-                .is_some_and(|r| r.class != "normal")
-        {
-            theme.failed().bold()
-        } else {
-            theme.normal().bold()
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{}:", section.heading),
-            style,
-        )));
-        let mut text = section.body.clone();
-        if !gate.show_detail && section.heading == "What was blocked" {
-            // Compact: the first line only (what tried to touch what).
-            text = text.lines().next().unwrap_or("").to_string();
-        }
-        for l in text.lines() {
-            lines.push(Line::from(Span::styled(format!("  {l}"), theme.normal())));
-        }
-        if section.heading == "If you choose always" {
-            save_section = Some(section_start..lines.len());
-        }
-    }
-    // SPEC R-PERM.8: the advisor's line is labelled, visually distinct, and
-    // changes nothing below it.
-    if let Some(advice) = &gate.advice {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  {}", advice.line()),
-            theme.pending().italic(),
-        )));
-    }
-    lines.push(Line::from(""));
-    let answers = body
-        .options
-        .iter()
-        .map(|o| {
-            let key_style = match o.decision {
-                ahma_common::scope_grant::GrantDecision::Deny => theme.failed().bold(),
-                // Saved grants, permanent or leased, stand out from the
-                // session-only ones.
-                ahma_common::scope_grant::GrantDecision::GrantRo
-                | ahma_common::scope_grant::GrantDecision::GrantRw
-                | ahma_common::scope_grant::GrantDecision::GrantRoLease
-                | ahma_common::scope_grant::GrantDecision::GrantRwLease => theme.pending().bold(),
-                _ => theme.success().bold(),
-            };
-            vec![
-                Span::styled(format!("[{}] ", o.key), key_style),
-                Span::styled(o.label.clone(), theme.normal()),
-            ]
-        })
-        .collect();
+    let (lines, save_section) = build_scope_grant_body(gate, &body, theme);
+    let answers = build_scope_grant_answers(&body.options, theme);
     let mut notes = vec![Line::from(Span::styled(
         if gate.show_detail {
             "  Enter / Esc = Deny · [?] less detail"
@@ -3910,6 +3860,109 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
         },
     );
     gate.view.set(view);
+}
+
+fn build_scope_grant_body(
+    gate: &crate::state::ScopeGrantGate,
+    body: &ahma_common::grant_prompt::PromptBody,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Option<std::ops::Range<usize>>) {
+    // SPEC R-PERM.3.4: the same sections every surface shows. The compact view
+    // keeps who / what / minimum / allows / risk; `?` adds the agent's claim,
+    // the evidence line and the exact settings line.
+    let compact_headings = [
+        "Who is asking",
+        "What was blocked",
+        "Minimum that would work",
+        "What a grant allows",
+        "Risk",
+    ];
+    let mut lines = vec![Line::from(Span::styled(
+        body.title.clone(),
+        theme.success().bold(),
+    ))];
+    // The exact settings line (R-PERM.2): a saving answer is taken only while
+    // this whole section is on screen (R-PERM.3.5).
+    let mut save_section = None;
+    for section in &body.sections {
+        if !gate.show_detail && !compact_headings.contains(&section.heading.as_str()) {
+            continue;
+        }
+        let section_start = lines.len();
+        append_scope_grant_section(&mut lines, gate, section, theme);
+        if section.heading == "If you choose always" {
+            save_section = Some(section_start..lines.len());
+        }
+    }
+    // SPEC R-PERM.8: the advisor's line is labelled, visually distinct, and
+    // changes nothing below it.
+    if let Some(advice) = &gate.advice {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", advice.line()),
+            theme.pending().italic(),
+        )));
+    }
+    lines.push(Line::from(""));
+    (lines, save_section)
+}
+
+fn append_scope_grant_section(
+    lines: &mut Vec<Line<'static>>,
+    gate: &crate::state::ScopeGrantGate,
+    section: &ahma_common::grant_prompt::PromptSection,
+    theme: &Theme,
+) {
+    let style = if section.heading == "Risk"
+        && gate
+            .request
+            .context
+            .risk
+            .as_ref()
+            .is_some_and(|r| r.class != "normal")
+    {
+        theme.failed().bold()
+    } else {
+        theme.normal().bold()
+    };
+    lines.push(Line::from(Span::styled(
+        format!("{}:", section.heading),
+        style,
+    )));
+    let text = if !gate.show_detail && section.heading == "What was blocked" {
+        // Compact: the first line only (what tried to touch what).
+        section.body.lines().next().unwrap_or("")
+    } else {
+        section.body.as_str()
+    };
+    for l in text.lines() {
+        lines.push(Line::from(Span::styled(format!("  {l}"), theme.normal())));
+    }
+}
+
+fn build_scope_grant_answers(
+    options: &[ahma_common::grant_prompt::PromptOption],
+    theme: &Theme,
+) -> Vec<Vec<Span<'static>>> {
+    options
+        .iter()
+        .map(|o| {
+            let key_style = match o.decision {
+                ahma_common::scope_grant::GrantDecision::Deny => theme.failed().bold(),
+                // Saved grants, permanent or leased, stand out from the
+                // session-only ones.
+                ahma_common::scope_grant::GrantDecision::GrantRo
+                | ahma_common::scope_grant::GrantDecision::GrantRw
+                | ahma_common::scope_grant::GrantDecision::GrantRoLease
+                | ahma_common::scope_grant::GrantDecision::GrantRwLease => theme.pending().bold(),
+                _ => theme.success().bold(),
+            };
+            vec![
+                Span::styled(format!("[{}] ", o.key), key_style),
+                Span::styled(o.label.clone(), theme.normal()),
+            ]
+        })
+        .collect()
 }
 
 // ─── Grant question popup ─────────────────────────────────────────────────────
@@ -3955,37 +4008,16 @@ fn draw_gate_popup(
     // does, so showing the bar never re-wraps the body.
     let text_w = inner_w.saturating_sub(1).max(1);
 
-    // Wrap first, recording where each logical line starts, so the watched
-    // section can be found in rows.
-    let mut body: Vec<Line<'static>> = Vec::new();
-    let mut row_of = Vec::with_capacity(p.body.len() + 1);
-    for line in &p.body {
-        row_of.push(body.len());
-        body.extend(wrap_indented(line, text_w));
-    }
-    row_of.push(body.len());
-    let watched = p.watched.map(|r| row_of[r.start]..row_of[r.end]);
-
-    let mut footer = flow_answers(p.answers, inner_w);
-    for note in &p.notes {
-        footer.extend(wrap_indented(note, inner_w));
-    }
-
-    let max_h = if area.height > 20 {
-        area.height - 2
-    } else {
-        area.height
-    };
-    let wanted = body.len() + footer.len() + 2;
-    let height = wanted.min(max_h as usize) as u16;
-    let popup = centered_rect(width, height, area);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(Span::styled(p.title, theme.title().bold()))
-        .borders(Borders::ALL)
-        .border_style(theme.border_focused());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    let (body, watched) = wrap_gate_body(&p.body, text_w, p.watched);
+    let footer = build_gate_footer(p.answers, &p.notes, inner_w);
+    let inner = render_gate_frame(
+        frame,
+        theme,
+        area,
+        p.title,
+        width,
+        body.len() + footer.len() + 2,
+    );
 
     // The footer is placed first and takes what it needs; the body gets the
     // rest.
@@ -4023,22 +4055,12 @@ fn draw_gate_popup(
 
     let mut shown: Vec<Line<'static>> = body[scroll..end].to_vec();
     if overflow && body_h >= 2 {
-        let below = body.len() - end;
-        let (arrow, n, side) = match (below > 0, p.unicode) {
-            (true, true) => ("↓", below, "below"),
-            (true, false) => ("v", below, "below"),
-            (false, true) => ("↑", scroll, "above"),
-            (false, false) => ("^", scroll, "above"),
-        };
-        let keys = if p.unicode {
-            "↑↓ PgUp PgDn"
-        } else {
-            "j k PgUp PgDn"
-        };
-        shown.push(Line::from(Span::styled(
-            format!("  {arrow} {n} more {side} · {keys}"),
-            theme.pending(),
-        )));
+        shown.push(gate_overflow_line(
+            body.len() - end,
+            scroll,
+            p.unicode,
+            theme,
+        ));
     }
     let text_a = Rect {
         width: (text_w as u16).min(body_a.width),
@@ -4065,6 +4087,79 @@ fn draw_gate_popup(
         page: text_h.max(1),
         save_line_visible,
     }
+}
+
+fn build_gate_footer(
+    answers: Vec<Vec<Span<'static>>>,
+    notes: &[Line<'static>],
+    inner_w: usize,
+) -> Vec<Line<'static>> {
+    let mut footer = flow_answers(answers, inner_w);
+    for note in notes {
+        footer.extend(wrap_indented(note, inner_w));
+    }
+    footer
+}
+
+fn render_gate_frame(
+    frame: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    title: String,
+    width: u16,
+    wanted_rows: usize,
+) -> Rect {
+    let max_h = if area.height > 20 {
+        area.height - 2
+    } else {
+        area.height
+    };
+    let height = wanted_rows.min(max_h as usize) as u16;
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(title, theme.title().bold()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    inner
+}
+
+fn wrap_gate_body(
+    lines: &[Line<'static>],
+    text_w: usize,
+    watched: Option<std::ops::Range<usize>>,
+) -> (Vec<Line<'static>>, Option<std::ops::Range<usize>>) {
+    // Wrap first, recording where each logical line starts, so the watched
+    // section can be found in rows.
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let mut row_of = Vec::with_capacity(lines.len() + 1);
+    for line in lines {
+        row_of.push(body.len());
+        body.extend(wrap_indented(line, text_w));
+    }
+    row_of.push(body.len());
+    let watched = watched.map(|r| row_of[r.start]..row_of[r.end]);
+    (body, watched)
+}
+
+fn gate_overflow_line(below: usize, scroll: usize, unicode: bool, theme: &Theme) -> Line<'static> {
+    let (arrow, n, side) = match (below > 0, unicode) {
+        (true, true) => ("↓", below, "below"),
+        (true, false) => ("v", below, "below"),
+        (false, true) => ("↑", scroll, "above"),
+        (false, false) => ("^", scroll, "above"),
+    };
+    let keys = if unicode {
+        "↑↓ PgUp PgDn"
+    } else {
+        "j k PgUp PgDn"
+    };
+    Line::from(Span::styled(
+        format!("  {arrow} {n} more {side} · {keys}"),
+        theme.pending(),
+    ))
 }
 
 /// Lay the answers out in rows, two spaces in and three apart, starting a new
@@ -4541,33 +4636,42 @@ fn draw_intro(frame: &mut Frame, theme: &Theme, area: Rect, selected: usize, exp
 
     let mut lines = Vec::new();
     for (i, topic) in topics.iter().enumerate() {
-        let here = i == selected;
-        let marker = match (here, expanded) {
-            (true, true) => "▾ ",
-            (true, false) => "▸ ",
-            _ => "  ",
-        };
-        let title_style = if here {
-            theme.title().bold()
-        } else {
-            theme.normal().bold()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(marker, theme.title()),
-            Span::styled(topic.title, title_style),
-        ]));
-        lines.push(Line::from(Span::styled(
-            format!("  {}", topic.summary),
-            if here { theme.normal() } else { theme.dim() },
-        )));
-        if here && expanded {
-            for d in topic.detail {
-                lines.push(Line::from(Span::styled(format!("    {d}"), theme.dim())));
-            }
-            lines.push(Line::default());
-        }
+        append_intro_topic_lines(&mut lines, topic, i == selected, expanded, theme);
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn append_intro_topic_lines(
+    lines: &mut Vec<Line<'static>>,
+    topic: &crate::intro::Topic,
+    here: bool,
+    expanded: bool,
+    theme: &Theme,
+) {
+    let marker = match (here, expanded) {
+        (true, true) => "▾ ",
+        (true, false) => "▸ ",
+        _ => "  ",
+    };
+    let title_style = if here {
+        theme.title().bold()
+    } else {
+        theme.normal().bold()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(marker, theme.title()),
+        Span::styled(topic.title, title_style),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", topic.summary),
+        if here { theme.normal() } else { theme.dim() },
+    )));
+    if here && expanded {
+        for d in topic.detail {
+            lines.push(Line::from(Span::styled(format!("    {d}"), theme.dim())));
+        }
+        lines.push(Line::default());
+    }
 }
 
 fn draw_help(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {

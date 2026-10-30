@@ -331,30 +331,35 @@ fn grant_tool_allow_entries(path: &Path) -> Vec<String> {
         return Vec::new();
     };
     let mut hits = Vec::new();
-    fn walk(v: &serde_json::Value, under_allow: bool, hits: &mut Vec<String>) {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, child) in map {
-                    walk(child, under_allow || k == "allow", hits);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    walk(item, under_allow, hits);
-                }
-            }
-            serde_json::Value::String(s)
-                if under_allow
-                    && GRANT_TOOLS.iter().any(|t| s.contains(t))
-                    && !hits.contains(s) =>
-            {
-                hits.push(s.clone());
-            }
-            _ => {}
-        }
-    }
-    walk(&doc, false, &mut hits);
+    collect_grant_tool_allow_entries(&doc, false, &mut hits);
     hits
+}
+
+fn collect_grant_tool_allow_entries(
+    v: &serde_json::Value,
+    under_allow: bool,
+    hits: &mut Vec<String>,
+) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map {
+                collect_grant_tool_allow_entries(child, under_allow || k == "allow", hits);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_grant_tool_allow_entries(item, under_allow, hits);
+            }
+        }
+        serde_json::Value::String(s) if is_new_grant_tool_hit(s, under_allow, hits) => {
+            hits.push(s.clone());
+        }
+        _ => {}
+    }
+}
+
+fn is_new_grant_tool_hit(s: &String, under_allow: bool, hits: &[String]) -> bool {
+    under_allow && GRANT_TOOLS.iter().any(|t| s.contains(t)) && !hits.contains(s)
 }
 
 /// Warn when a harness is configured to approve `sandbox_grant`/`network_grant`
@@ -904,53 +909,48 @@ fn check_grant_array(arr: &serde_json::Value, clean_grants: &[String]) -> (usize
     (bloated, malformed, missing)
 }
 
+fn accumulate_grant_section(
+    section: Option<&serde_json::Value>,
+    clean_grants: &[String],
+    totals: &mut (usize, usize, bool),
+) {
+    let Some(allow) = section else {
+        totals.2 = true;
+        return;
+    };
+    let (sb, sm, smiss) = check_grant_array(allow, clean_grants);
+    totals.0 += sb;
+    totals.1 += sm;
+    totals.2 |= smiss;
+}
+
 fn scan_antigravity_file(
     path: &Path,
     is_config: bool,
     clean_grants: &[String],
 ) -> (usize, usize, bool) {
-    if !path.exists() {
-        return (0, 0, false);
-    }
     let Ok(content) = std::fs::read_to_string(path) else {
         return (0, 0, false);
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
         return (0, 0, false);
     };
-    let mut total_bloated = 0;
-    let mut total_malformed = 0;
-    let mut missing = false;
-
-    if let Some(perms_allow) = doc.get("permissions").and_then(|p| p.get("allow")) {
-        let (sb, sm, smiss) = check_grant_array(perms_allow, clean_grants);
-        total_bloated += sb;
-        total_malformed += sm;
-        if smiss {
-            missing = true;
-        }
-    } else {
-        missing = true;
-    }
-
+    let mut totals = (0, 0, false);
+    accumulate_grant_section(
+        doc.get("permissions").and_then(|p| p.get("allow")),
+        clean_grants,
+        &mut totals,
+    );
     if is_config {
-        if let Some(gpg_allow) = doc
-            .get("userSettings")
-            .and_then(|u| u.get("globalPermissionGrants"))
-            .and_then(|g| g.get("allow"))
-        {
-            let (sb, sm, smiss) = check_grant_array(gpg_allow, clean_grants);
-            total_bloated += sb;
-            total_malformed += sm;
-            if smiss {
-                missing = true;
-            }
-        } else {
-            missing = true;
-        }
+        accumulate_grant_section(
+            doc.get("userSettings")
+                .and_then(|u| u.get("globalPermissionGrants"))
+                .and_then(|g| g.get("allow")),
+            clean_grants,
+            &mut totals,
+        );
     }
-
-    (total_bloated, total_malformed, missing)
+    totals
 }
 
 fn check_ide_has_retired_tmp(ide_path: &Path) -> bool {
@@ -991,7 +991,6 @@ fn check_antigravity_permissions(
     }
 
     let clean_grants = antigravity_clean_grants(current_exe);
-
     let (cb, cm, cmiss) = scan_antigravity_file(&cli_path, false, &clean_grants);
     let (gb, gm, gmiss) = scan_antigravity_file(&config_path, true, &clean_grants);
 
@@ -999,39 +998,40 @@ fn check_antigravity_permissions(
     let total_malformed = cm + gm;
     let missing_clean = (cli_path.exists() && cmiss) || (config_path.exists() && gmiss);
     let ide_has_retired_tmp = check_ide_has_retired_tmp(&ide_path);
+    let has_warnings = total_bloated > 0 || total_malformed > 0 || ide_has_retired_tmp;
 
-    if total_bloated > 0 || total_malformed > 0 || missing_clean || ide_has_retired_tmp {
-        let level = if total_bloated > 0 || total_malformed > 0 || ide_has_retired_tmp {
-            Level::Warn
-        } else {
-            Level::Info
-        };
-        let mut detail = format!(
-            "Found {total_bloated} bloated one-off wrapped command(s) and {total_malformed} malformed grant(s) across ~/.gemini settings. \
-             These cause Antigravity to repeatedly prompt for permission on every tool call."
-        );
-        if ide_has_retired_tmp {
-            detail.push_str(" Also found retired --tmp flag in ~/.antigravity/mcp.json.");
-        }
-        out.push(Finding {
-            level,
-            title: "Antigravity permission grants need cleanup".into(),
-            detail,
-            fix: Some(Fix::RepairAntigravityPermissions {
-                cli_settings: cli_path.exists().then_some(cli_path),
-                config_file: config_path.exists().then_some(config_path),
-                ide_mcp: (ide_path.exists() && ide_has_retired_tmp).then_some(ide_path),
-                clean_grants,
-            }),
-        });
-    } else {
+    if !has_warnings && !missing_clean {
         out.push(Finding {
             level: Level::Ok,
             title: "Antigravity command permissions are clean".into(),
             detail: "Clean prefix grants are active in ~/.gemini config files; no bloated or malformed entries found.".into(),
             fix: None,
         });
+        return;
     }
+
+    let mut detail = format!(
+        "Found {total_bloated} bloated one-off wrapped command(s) and {total_malformed} malformed grant(s) across ~/.gemini settings. \
+         These cause Antigravity to repeatedly prompt for permission on every tool call."
+    );
+    if ide_has_retired_tmp {
+        detail.push_str(" Also found retired --tmp flag in ~/.antigravity/mcp.json.");
+    }
+    out.push(Finding {
+        level: if has_warnings {
+            Level::Warn
+        } else {
+            Level::Info
+        },
+        title: "Antigravity permission grants need cleanup".into(),
+        detail,
+        fix: Some(Fix::RepairAntigravityPermissions {
+            cli_settings: cli_path.exists().then_some(cli_path),
+            config_file: config_path.exists().then_some(config_path),
+            ide_mcp: ide_has_retired_tmp.then_some(ide_path),
+            clean_grants,
+        }),
+    });
 }
 
 fn inspect_log_dir(dir: &Path) -> Option<(u64, Option<PathBuf>)> {
@@ -1944,17 +1944,10 @@ impl GitAuthProbe {
 /// readable unless listed in `deny_credential_reads`. Each finding names the
 /// one key or command, per the "do you need to do anything" rule (SPEC
 /// R-DOCTOR.6).
-fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<Finding>) {
-    let keys_present = !probe.ssh_keys.is_empty() || !probe.broker_keys.is_empty();
-    let broker_signs = !probe.broker_keys.is_empty();
-    let helpers = &probe.credential_helpers;
-    let keychain_helper = helpers.iter().any(|h| h.contains("osxkeychain"));
-    let gh_helper = helpers.iter().any(|h| h.contains("gh"));
-    let gh_denied = settings.sandbox.deny_credential_reads.iter().any(|p| {
-        let s = p.to_string_lossy();
-        s.ends_with(".config/gh") || s.ends_with(".config/gh/")
-    });
-    let mut problems = 0usize;
+fn check_git_ssh_auth(probe: &GitAuthProbe, keys_present: bool, out: &mut Vec<Finding>) -> usize {
+    if !keys_present || !probe.broker_keys.is_empty() {
+        return 0;
+    }
     // When the broker signs with no key file, every `id_*` key is one that
     // only the agent can use: name it.
     let first_key = probe
@@ -1981,41 +1974,44 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
         )
     };
 
-    if keys_present && !broker_signs {
-        match probe.agent_identities {
-            Some(0) => {
-                problems += 1;
-                out.push(Finding {
-                    level: Level::Warn,
-                    title: "Git over SSH fails inside the sandbox: the SSH agent holds no key"
-                        .into(),
-                    detail: format!(
-                        "One thing to do: run `{add_cmd}` in a terminal on the host.\n\n\
-                         {needs_agent}. On the host ssh reads the key file directly, which is \
-                         why this was invisible until now."
-                    ),
-                    fix: None,
-                });
-            }
-            None => {
-                problems += 1;
-                out.push(Finding {
-                    level: Level::Warn,
-                    title: "Git over SSH fails inside the sandbox: no SSH agent answered".into(),
-                    detail: format!(
-                        "One thing to do: start an agent and load your key — `eval \"$(ssh-agent \
-                         -s)\" && {add_cmd}` — then launch your editor or ahma from that shell so \
-                         `SSH_AUTH_SOCK` is inherited.\n\n{needs_agent}."
-                    ),
-                    fix: None,
-                });
-            }
-            Some(_) => {}
+    match probe.agent_identities {
+        Some(0) => {
+            out.push(Finding {
+                level: Level::Warn,
+                title: "Git over SSH fails inside the sandbox: the SSH agent holds no key".into(),
+                detail: format!(
+                    "One thing to do: run `{add_cmd}` in a terminal on the host.\n\n\
+                     {needs_agent}. On the host ssh reads the key file directly, which is \
+                     why this was invisible until now."
+                ),
+                fix: None,
+            });
+            1
         }
+        None => {
+            out.push(Finding {
+                level: Level::Warn,
+                title: "Git over SSH fails inside the sandbox: no SSH agent answered".into(),
+                detail: format!(
+                    "One thing to do: start an agent and load your key — `eval \"$(ssh-agent \
+                     -s)\" && {add_cmd}` — then launch your editor or ahma from that shell so \
+                     `SSH_AUTH_SOCK` is inherited.\n\n{needs_agent}."
+                ),
+                fix: None,
+            });
+            1
+        }
+        Some(_) => 0,
     }
+}
 
+fn check_git_https_auth(
+    helpers: &[String],
+    settings: &AhmaSettings,
+    out: &mut Vec<Finding>,
+) -> usize {
+    let keychain_helper = helpers.iter().any(|h| h.contains("osxkeychain"));
     if keychain_helper && !settings.sandbox.allow_keychain {
-        problems += 1;
         out.push(Finding {
             level: Level::Warn,
             title: "Git over HTTPS fails inside the sandbox: the keychain helper is blocked".into(),
@@ -2027,8 +2023,15 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
                 .into(),
             fix: None,
         });
-    } else if gh_helper && gh_denied {
-        problems += 1;
+        return 1;
+    }
+
+    let gh_helper = helpers.iter().any(|h| h.contains("gh"));
+    let gh_denied = settings.sandbox.deny_credential_reads.iter().any(|p| {
+        let s = p.to_string_lossy();
+        s.ends_with(".config/gh") || s.ends_with(".config/gh/")
+    });
+    if gh_helper && gh_denied {
         out.push(Finding {
             level: Level::Warn,
             title: "Git over HTTPS fails inside the sandbox: the `gh` helper cannot read its token"
@@ -2042,7 +2045,40 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
                     .into(),
             fix: None,
         });
-    } else if helpers.is_empty() && !keys_present {
+        return 1;
+    }
+
+    0
+}
+
+fn git_ssh_summary(probe: &GitAuthProbe, keys_present: bool) -> String {
+    match (
+        probe.broker_keys.first(),
+        keys_present,
+        probe.agent_identities,
+    ) {
+        (Some(key), _, _) => format!(
+            "SSH via ahma's key broker, which signs with `{}` once a human allows it for \
+             each server (SPEC R-CRED.3)",
+            key.display()
+        ),
+        (None, true, Some(n)) => format!(
+            "SSH via the agent ({n} identit{})",
+            if n == 1 { "y" } else { "ies" }
+        ),
+        (None, true, None) => "SSH: agent state unknown".to_string(),
+        (None, false, _) => "SSH: no key under ~/.ssh".to_string(),
+    }
+}
+
+fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<Finding>) {
+    let keys_present = !probe.ssh_keys.is_empty() || !probe.broker_keys.is_empty();
+    let helpers = &probe.credential_helpers;
+
+    let mut problems = check_git_ssh_auth(probe, keys_present, out);
+    problems += check_git_https_auth(helpers, settings, out);
+
+    if problems == 0 && helpers.is_empty() && !keys_present {
         // An SSH key works with every git host, and the broker signs with a
         // new ed25519 key with no further setup; a host's own CLI is second.
         let new_key = if cfg!(unix) {
@@ -2073,23 +2109,7 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
         } else {
             format!("HTTPS via {}", helpers.join(", "))
         };
-        let ssh = match (
-            probe.broker_keys.first(),
-            keys_present,
-            probe.agent_identities,
-        ) {
-            (Some(key), _, _) => format!(
-                "SSH via ahma's key broker, which signs with `{}` once a human allows it for \
-                 each server (SPEC R-CRED.3)",
-                key.display()
-            ),
-            (None, true, Some(n)) => format!(
-                "SSH via the agent ({n} identit{})",
-                if n == 1 { "y" } else { "ies" }
-            ),
-            (None, true, None) => "SSH: agent state unknown".to_string(),
-            (None, false, _) => "SSH: no key under ~/.ssh".to_string(),
-        };
+        let ssh = git_ssh_summary(probe, keys_present);
         out.push(Finding {
             level: Level::Info,
             title: "Git can authenticate from inside the sandbox".into(),

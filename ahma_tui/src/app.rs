@@ -390,27 +390,8 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         }
         Action::ToggleHelp => state.toggle_help(),
         Action::ToggleChat => toggle_chat_pane(state),
-        Action::FocusChat => {
-            // Esc backs out one level: restore a zoomed pane first, then
-            // return to the work view — which is where the TUI lives, and is
-            // somewhere that always exists (the chat pane may be closed).
-            if state.zoomed.is_some() {
-                state.zoomed = None;
-            } else if state.focus == crate::state::Focus::Work && state.chat_open {
-                state.focus = crate::state::Focus::Chat;
-            } else {
-                state.focus = crate::state::Focus::Work;
-            }
-        }
-        Action::Enter if state.focus == crate::state::Focus::Work => {
-            if let Some(key) = selected_instance_header_key(state) {
-                activate_window_chat(&key, state);
-            } else {
-                // Drill in: open the full-screen detail view for an operation
-                // (or open the accordion section for an instance/session header).
-                state.open_selected_tree_detail(crate::ui::wall_ms());
-            }
-        }
+        Action::FocusChat => focus_chat_or_unzoom(state),
+        Action::Enter if state.focus == crate::state::Focus::Work => enter_work_selection(state),
         Action::ToggleNode if state.focus == crate::state::Focus::Work => {
             // Space: inline accordion-expand the selected task into its
             // live/historic output view (or fold a header) without leaving
@@ -423,6 +404,29 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         }
         Action::Unknown | Action::Enter => {}
         _ => {}
+    }
+}
+
+fn focus_chat_or_unzoom(state: &mut crate::state::AppState) {
+    // Esc backs out one level: restore a zoomed pane first, then
+    // return to the work view — which is where the TUI lives, and is
+    // somewhere that always exists (the chat pane may be closed).
+    if state.zoomed.is_some() {
+        state.zoomed = None;
+    } else if state.focus == crate::state::Focus::Work && state.chat_open {
+        state.focus = crate::state::Focus::Chat;
+    } else {
+        state.focus = crate::state::Focus::Work;
+    }
+}
+
+fn enter_work_selection(state: &mut crate::state::AppState) {
+    if let Some(key) = selected_instance_header_key(state) {
+        activate_window_chat(&key, state);
+    } else {
+        // Drill in: open the full-screen detail view for an operation
+        // (or open the accordion section for an instance/session header).
+        state.open_selected_tree_detail(crate::ui::wall_ms());
     }
 }
 
@@ -466,7 +470,7 @@ fn submit_log_switcher(state: &mut crate::state::AppState) {
 ///
 /// Blocking ledger write on a key press, like "Trust this folder?".
 fn approve_symlink(state: &mut crate::state::AppState) {
-    use crate::state::{LogEntry, LogLevel};
+    use crate::state::LogEntry;
 
     let Some(active_file) = state.active_log_file.clone() else {
         return;
@@ -482,56 +486,64 @@ fn approve_symlink(state: &mut crate::state::AppState) {
     if info.is_approved {
         return;
     }
-    let (level, message) = if state.workspace.is_empty() {
-        (
-            LogLevel::Warn,
-            format!(
-                "Could not approve {}: this TUI has no workspace to record it for.",
-                info.name
-            ),
-        )
-    } else {
-        let workspace = std::path::PathBuf::from(&state.workspace);
-        match ahma_mcp::sandbox::approve_log_link(
-            &workspace,
-            std::path::Path::new(&info.path),
-            info.symlink_target.as_deref().map(std::path::Path::new),
-            "ahma tui",
-            "tui",
-        ) {
-            Ok((target, _newly)) => {
-                if let Some(pos) = state.log_files.iter().position(|f| f.name == active_file) {
-                    state.log_files[pos].is_approved = true;
-                }
-                if let Some(ref src_tx) = state.mcp_source_tx {
-                    let _ = src_tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(
-                        Some(active_file.clone()),
-                    ));
-                }
-                (
-                    LogLevel::Info,
-                    format!(
-                        "Approved reading {target} for this workspace (saved to \
-                         ~/.ahma/settings.toml; sandboxed log monitors read it from the next \
-                         session). Undo: ahma permissions revoke log-target {target} \
-                         --workspace {workspace}",
-                        target = target.display(),
-                        workspace = workspace.display()
-                    ),
-                )
-            }
-            Err(why) => (
-                LogLevel::Warn,
-                format!("Could not approve {}: {why}", info.name),
-            ),
-        }
-    };
+    let (level, message) = try_approve_log_link(state, &active_file, &info);
     set_footer_hint(state, message.clone());
     state.push_log(LogEntry {
         timestamp: chrono::Local::now(),
         level,
         message,
     });
+}
+
+fn try_approve_log_link(
+    state: &mut crate::state::AppState,
+    active_file: &str,
+    info: &crate::state::LogFileInfo,
+) -> (crate::state::LogLevel, String) {
+    use crate::state::LogLevel;
+    if state.workspace.is_empty() {
+        return (
+            LogLevel::Warn,
+            format!(
+                "Could not approve {}: this TUI has no workspace to record it for.",
+                info.name
+            ),
+        );
+    }
+    let workspace = std::path::PathBuf::from(&state.workspace);
+    match ahma_mcp::sandbox::approve_log_link(
+        &workspace,
+        std::path::Path::new(&info.path),
+        info.symlink_target.as_deref().map(std::path::Path::new),
+        "ahma tui",
+        "tui",
+    ) {
+        Ok((target, _newly)) => {
+            if let Some(pos) = state.log_files.iter().position(|f| f.name == active_file) {
+                state.log_files[pos].is_approved = true;
+            }
+            if let Some(ref src_tx) = state.mcp_source_tx {
+                let _ = src_tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
+                    active_file.to_string(),
+                )));
+            }
+            (
+                LogLevel::Info,
+                format!(
+                    "Approved reading {target} for this workspace (saved to \
+                     ~/.ahma/settings.toml; sandboxed log monitors read it from the next \
+                     session). Undo: ahma permissions revoke log-target {target} \
+                     --workspace {workspace}",
+                    target = target.display(),
+                    workspace = workspace.display()
+                ),
+            )
+        }
+        Err(why) => (
+            LogLevel::Warn,
+            format!("Could not approve {}: {why}", info.name),
+        ),
+    }
 }
 
 /// Maximise/restore the focused pane. Enter on the log pane and `z` on any
@@ -2641,11 +2653,7 @@ fn handle_scope_grant_key(
     use ahma_common::scope_grant::GrantDecision;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.scope_grant.is_none()
-        || state.text_entry_modal_open()
-        || state.log_filter_active
-        || state.typing_in_chat()
-    {
+    if !is_scope_grant_key_target(state) {
         return false;
     }
 
@@ -2658,13 +2666,7 @@ fn handle_scope_grant_key(
     // lower-case is this session, upper-case is always, `o`/`w` once, `l`/`L`
     // 24 hours, `?` detail.
     if let (KeyCode::Char('?'), _) = (key.code, key.modifiers) {
-        if let Some(gate) = state.scope_grant.as_mut() {
-            gate.show_detail = !gate.show_detail;
-            gate.scroll = 0;
-            gate.reveal_save_line = false;
-            // A different body: nothing on it has been seen yet.
-            gate.view.set(crate::state::GateView::default());
-        }
+        toggle_scope_grant_detail(state);
         return true;
     }
     match (key.code, key.modifiers) {
@@ -2673,52 +2675,80 @@ fn handle_scope_grant_key(
             true
         }
         (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
-            // `s` stays an alias of `y` (read-write, this session) for the
-            // fingers that learned it.
-            let c = if c == 's' { 'y' } else { c };
-            // Only the keys this question offers: the `--tmp` question has no
-            // `always` or 24-hour answer (GrantReason::offers_saved_tiers).
-            let Some(reason) = state.scope_grant.as_ref().map(|g| g.request.reason) else {
-                return false;
-            };
-            match ahma_common::grant_prompt::options_for(reason)
-                .into_iter()
-                .find(|o| o.key == c)
-            {
-                Some(o) => {
-                    let Some(gate) = state.scope_grant.as_mut() else {
-                        return false;
-                    };
-                    // Typed ahead, not read: swallow it (deny never waits).
-                    if o.decision != GrantDecision::Deny && !gate.armed() {
-                        return true;
-                    }
-                    // A grant that is saved to settings is never given without
-                    // the exact line it writes on screen (SPEC R-PERM.2): the
-                    // first press scrolls that line into view, and a second
-                    // saves only if the last frame showed it whole (R-PERM.3.5).
-                    if o.decision.tier().is_persistent()
-                        && !(gate.show_detail && gate.view.get().save_line_visible)
-                    {
-                        let already_shown = gate.show_detail && gate.reveal_save_line;
-                        gate.show_detail = true;
-                        gate.reveal_save_line = true;
-                        if already_shown {
-                            set_footer_hint(
-                                state,
-                                "The settings line this answer writes does not fit on screen: \
-                                 enlarge the terminal to save it, or answer for this session",
-                            );
-                        }
-                        return true;
-                    }
-                    resolve_scope_grant(state, o.decision);
-                    true
-                }
-                None => false,
-            }
+            try_select_scope_grant_option(c, state)
         }
         _ => false,
+    }
+}
+
+fn is_scope_grant_key_target(state: &crate::state::AppState) -> bool {
+    state.scope_grant.is_some()
+        && !state.text_entry_modal_open()
+        && !state.log_filter_active
+        && !state.typing_in_chat()
+}
+
+fn toggle_scope_grant_detail(state: &mut crate::state::AppState) {
+    if let Some(gate) = state.scope_grant.as_mut() {
+        gate.show_detail = !gate.show_detail;
+        gate.scroll = 0;
+        gate.reveal_save_line = false;
+        // A different body: nothing on it has been seen yet.
+        gate.view.set(crate::state::GateView::default());
+    }
+}
+
+fn try_select_scope_grant_option(c: char, state: &mut crate::state::AppState) -> bool {
+    use ahma_common::scope_grant::GrantDecision;
+
+    // `s` stays an alias of `y` (read-write, this session) for the
+    // fingers that learned it.
+    let key = if c == 's' { 'y' } else { c };
+    // Only the keys this question offers: the `--tmp` question has no
+    // `always` or 24-hour answer (GrantReason::offers_saved_tiers).
+    let Some(reason) = state.scope_grant.as_ref().map(|g| g.request.reason) else {
+        return false;
+    };
+    let Some(option) = ahma_common::grant_prompt::options_for(reason)
+        .into_iter()
+        .find(|o| o.key == key)
+    else {
+        return false;
+    };
+    let Some(gate) = state.scope_grant.as_mut() else {
+        return false;
+    };
+    // Typed ahead, not read: swallow it (deny never waits).
+    if option.decision != GrantDecision::Deny && !gate.armed() {
+        return true;
+    }
+    // A grant that is saved to settings is never given without
+    // the exact line it writes on screen (SPEC R-PERM.2): the
+    // first press scrolls that line into view, and a second
+    // saves only if the last frame showed it whole (R-PERM.3.5).
+    if option.decision.tier().is_persistent()
+        && !(gate.show_detail && gate.view.get().save_line_visible)
+    {
+        reveal_scope_grant_save_line(state);
+        return true;
+    }
+    resolve_scope_grant(state, option.decision);
+    true
+}
+
+fn reveal_scope_grant_save_line(state: &mut crate::state::AppState) {
+    let already_shown = state.scope_grant.as_mut().is_some_and(|gate| {
+        let shown = gate.show_detail && gate.reveal_save_line;
+        gate.show_detail = true;
+        gate.reveal_save_line = true;
+        shown
+    });
+    if already_shown {
+        set_footer_hint(
+            state,
+            "The settings line this answer writes does not fit on screen: \
+             enlarge the terminal to save it, or answer for this session",
+        );
     }
 }
 
@@ -5780,69 +5810,85 @@ fn handle_source_gate_event(
             tool,
             args,
             workspace,
-        } => {
-            request_tool_approval(state, id, tool, args, workspace, None);
-        }
-        SourceEvent::ScopeGrantRequested { request } => {
-            let known = state
-                .scope_grant
-                .iter()
-                .chain(state.scope_grant_queue.iter())
-                .any(|g| g.decision_id == request.decision_id);
-            if !known {
-                let gate = crate::state::ScopeGrantGate::from_request(request.clone());
-                if state.scope_grant.is_none() {
-                    state.scope_grant = Some(gate);
-                } else {
-                    state.scope_grant_queue.push_back(gate);
-                }
-                spawn_grant_advisor(state, request);
-            }
-        }
-        SourceEvent::ScopeGrantDismiss { decision_id } => {
-            if state
-                .scope_grant
-                .as_ref()
-                .is_some_and(|g| g.decision_id == decision_id)
-            {
-                show_next_scope_grant(state);
-            } else {
-                state
-                    .scope_grant_queue
-                    .retain(|g| g.decision_id != decision_id);
-            }
-        }
-        SourceEvent::WebApprovalRequested { request } => {
-            // Same queue rule as scope grants: a repeat is ignored, and a new
-            // question waits behind the open one instead of replacing it.
-            let known = state
-                .web_approval
-                .iter()
-                .chain(state.web_approval_queue.iter())
-                .any(|g| g.decision_id == request.decision_id);
-            if !known {
-                let gate = crate::state::WebApprovalGate::from_request(request);
-                if state.web_approval.is_none() {
-                    state.web_approval = Some(gate);
-                } else {
-                    state.web_approval_queue.push_back(gate);
-                }
-            }
-        }
+        } => request_tool_approval(state, id, tool, args, workspace, None),
+        SourceEvent::ScopeGrantRequested { request } => enqueue_scope_grant(state, request),
+        SourceEvent::ScopeGrantDismiss { decision_id } => dismiss_scope_grant(state, &decision_id),
+        SourceEvent::WebApprovalRequested { request } => enqueue_web_approval(state, request),
         SourceEvent::WebApprovalDismiss { decision_id } => {
-            if state
-                .web_approval
-                .as_ref()
-                .is_some_and(|g| g.decision_id == decision_id)
-            {
-                show_next_web_approval(state);
-            } else {
-                state
-                    .web_approval_queue
-                    .retain(|g| g.decision_id != decision_id);
-            }
+            dismiss_web_approval(state, &decision_id)
         }
         _ => {}
+    }
+}
+
+fn enqueue_scope_grant(
+    state: &mut crate::state::AppState,
+    request: ahma_common::scope_grant::ScopeGrantRequest,
+) {
+    let known = state
+        .scope_grant
+        .iter()
+        .chain(state.scope_grant_queue.iter())
+        .any(|g| g.decision_id == request.decision_id);
+    if known {
+        return;
+    }
+    let gate = crate::state::ScopeGrantGate::from_request(request.clone());
+    if state.scope_grant.is_none() {
+        state.scope_grant = Some(gate);
+    } else {
+        state.scope_grant_queue.push_back(gate);
+    }
+    spawn_grant_advisor(state, request);
+}
+
+fn dismiss_scope_grant(state: &mut crate::state::AppState, decision_id: &str) {
+    if state
+        .scope_grant
+        .as_ref()
+        .is_some_and(|g| g.decision_id == decision_id)
+    {
+        show_next_scope_grant(state);
+    } else {
+        state
+            .scope_grant_queue
+            .retain(|g| g.decision_id != decision_id);
+    }
+}
+
+fn enqueue_web_approval(
+    state: &mut crate::state::AppState,
+    request: ahma_common::web_approval::WebApprovalRequest,
+) {
+    // Same queue rule as scope grants: a repeat is ignored, and a new
+    // question waits behind the open one instead of replacing it.
+    let known = state
+        .web_approval
+        .iter()
+        .chain(state.web_approval_queue.iter())
+        .any(|g| g.decision_id == request.decision_id);
+    if known {
+        return;
+    }
+    let gate = crate::state::WebApprovalGate::from_request(request);
+    if state.web_approval.is_none() {
+        state.web_approval = Some(gate);
+    } else {
+        state.web_approval_queue.push_back(gate);
+    }
+}
+
+fn dismiss_web_approval(state: &mut crate::state::AppState, decision_id: &str) {
+    if state
+        .web_approval
+        .as_ref()
+        .is_some_and(|g| g.decision_id == decision_id)
+    {
+        show_next_web_approval(state);
+    } else {
+        state
+            .web_approval_queue
+            .retain(|g| g.decision_id != decision_id);
     }
 }
 
@@ -5949,31 +5995,9 @@ fn handle_source_chat_event(
     };
     turn.last_event = std::time::Instant::now();
     match event {
-        SourceEvent::ChatToken { token } => {
-            if let Some(turn) = state.turn.as_mut() {
-                turn.note_token(&token);
-            }
-            state.chat.append_token(&token);
-            state.mark_stream_activity(crate::state::LivenessState::Streaming);
-            state.chat_scroll = 0;
-        }
-        SourceEvent::ChatThinking { token } => {
-            if let Some(turn) = state.turn.as_mut() {
-                turn.enter(crate::state::TurnPhase::Thinking);
-            }
-            state.chat.append_thinking(&token);
-            state.mark_stream_activity(crate::state::LivenessState::Thinking);
-            state.chat_scroll = 0;
-        }
-        SourceEvent::AgentDone => {
-            state.turn_retries = 0;
-            if let Some(text) = turn_summary(state) {
-                state.chat.push(crate::state::ChatEntry::Notice { text });
-            }
-            end_turn(state);
-            append_profile_transcript(state);
-            save_transcript(state);
-        }
+        SourceEvent::ChatToken { token } => apply_chat_token(state, &token),
+        SourceEvent::ChatThinking { token } => apply_chat_thinking(state, &token),
+        SourceEvent::AgentDone => complete_agent_turn(state),
         SourceEvent::AgentError { error, transient } => {
             end_turn_with_error(state, &error, transient)
         }
@@ -5981,79 +6005,137 @@ fn handle_source_chat_event(
             prompt_tokens,
             completion_tokens,
             total_tokens,
-        } => {
-            state.token_usage.prompt_tokens += prompt_tokens;
-            state.token_usage.completion_tokens += completion_tokens;
-            state.token_usage.total_tokens += total_tokens;
-            if prompt_tokens > 0 {
-                state.last_prompt_tokens = prompt_tokens;
-            }
-            record_read_rate(state, prompt_tokens);
-            let key = crate::state::AppState::usage_key(
-                state
-                    .turn
-                    .as_ref()
-                    .and_then(|t| t.target_instance.as_deref()),
-            );
-            let usage = state.window_usage.entry(key).or_default();
-            usage.prompt_tokens += prompt_tokens;
-            usage.completion_tokens += completion_tokens;
-            if prompt_tokens > 0 {
-                usage.last_prompt_tokens = prompt_tokens;
-            }
-            state.mark_stream_activity(state.liveness_state);
-        }
+        } => apply_usage_event(state, prompt_tokens, completion_tokens, total_tokens),
         SourceEvent::ToolCallStarted { id, name, args } => {
-            if let Some(turn) = state.turn.as_mut() {
-                turn.enter(crate::state::TurnPhase::Tool { name: name.clone() });
-            }
-            state.mark_stream_activity(crate::state::LivenessState::ToolWait);
-            state.chat.start_tool_call(id, name, args);
-            state.chat_scroll = 0;
+            apply_tool_call_started(state, id, name, args)
         }
         SourceEvent::ToolCallFinished { id, result, failed } => {
-            // The result goes back to the model, which reads it all again.
-            if let Some(turn) = state.turn.as_mut() {
-                turn.enter(crate::state::TurnPhase::Reading);
-            }
-            state.mark_stream_activity(crate::state::LivenessState::Thinking);
-            state.chat.finish_tool_call(&id, result, failed);
-            state.chat_scroll = 0;
+            apply_tool_call_finished(state, &id, result, failed)
         }
-        SourceEvent::ChatStatus { phase, detail } => {
-            // The size the model's server reported, for the provider in use.
-            if phase == "context"
-                && let (Some(url), Ok(n)) = (state.current_provider_url.clone(), detail.parse())
-            {
-                state.server_context = Some((url, n));
-            }
-            if let Some(turn) = state.turn.as_mut() {
-                // Loading and reading only ever come before output; a late one
-                // must not pull a turn that is already writing back.
-                let before_output = matches!(
-                    turn.phase,
-                    crate::state::TurnPhase::Loading | crate::state::TurnPhase::Reading
-                );
-                match phase.as_str() {
-                    "loading" if before_output => turn.enter(crate::state::TurnPhase::Loading),
-                    "reading" if before_output => turn.enter(crate::state::TurnPhase::Reading),
-                    "tools" => turn.tools = Some(detail),
-                    _ => {}
-                }
-            }
-        }
-        SourceEvent::Truncated { reason } => {
-            // Same rendering as the in-process BridgeEvent::Truncated: a
-            // visible note in the transcript, not silently folded into the
-            // model's own output.
-            state.chat.push(crate::state::ChatEntry::Assistant {
-                content: format!("[{reason}]"),
-                streaming: false,
-            });
-            state.chat_scroll = 0;
-        }
+        SourceEvent::ChatStatus { phase, detail } => apply_chat_status(state, &phase, detail),
+        SourceEvent::Truncated { reason } => apply_chat_truncated(state, &reason),
         _ => {}
     }
+}
+
+fn apply_chat_token(state: &mut crate::state::AppState, token: &str) {
+    if let Some(turn) = state.turn.as_mut() {
+        turn.note_token(token);
+    }
+    state.chat.append_token(token);
+    state.mark_stream_activity(crate::state::LivenessState::Streaming);
+    state.chat_scroll = 0;
+}
+
+fn apply_chat_thinking(state: &mut crate::state::AppState, token: &str) {
+    if let Some(turn) = state.turn.as_mut() {
+        turn.enter(crate::state::TurnPhase::Thinking);
+    }
+    state.chat.append_thinking(token);
+    state.mark_stream_activity(crate::state::LivenessState::Thinking);
+    state.chat_scroll = 0;
+}
+
+fn complete_agent_turn(state: &mut crate::state::AppState) {
+    state.turn_retries = 0;
+    if let Some(text) = turn_summary(state) {
+        state.chat.push(crate::state::ChatEntry::Notice { text });
+    }
+    end_turn(state);
+    append_profile_transcript(state);
+    save_transcript(state);
+}
+
+fn apply_usage_event(
+    state: &mut crate::state::AppState,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+) {
+    state.token_usage.prompt_tokens += prompt_tokens;
+    state.token_usage.completion_tokens += completion_tokens;
+    state.token_usage.total_tokens += total_tokens;
+    if prompt_tokens > 0 {
+        state.last_prompt_tokens = prompt_tokens;
+    }
+    record_read_rate(state, prompt_tokens);
+    let key = crate::state::AppState::usage_key(
+        state
+            .turn
+            .as_ref()
+            .and_then(|t| t.target_instance.as_deref()),
+    );
+    let usage = state.window_usage.entry(key).or_default();
+    usage.prompt_tokens += prompt_tokens;
+    usage.completion_tokens += completion_tokens;
+    if prompt_tokens > 0 {
+        usage.last_prompt_tokens = prompt_tokens;
+    }
+    state.mark_stream_activity(state.liveness_state);
+}
+
+fn apply_tool_call_started(
+    state: &mut crate::state::AppState,
+    id: String,
+    name: String,
+    args: String,
+) {
+    if let Some(turn) = state.turn.as_mut() {
+        turn.enter(crate::state::TurnPhase::Tool { name: name.clone() });
+    }
+    state.mark_stream_activity(crate::state::LivenessState::ToolWait);
+    state.chat.start_tool_call(id, name, args);
+    state.chat_scroll = 0;
+}
+
+fn apply_tool_call_finished(
+    state: &mut crate::state::AppState,
+    id: &str,
+    result: String,
+    failed: bool,
+) {
+    // The result goes back to the model, which reads it all again.
+    if let Some(turn) = state.turn.as_mut() {
+        turn.enter(crate::state::TurnPhase::Reading);
+    }
+    state.mark_stream_activity(crate::state::LivenessState::Thinking);
+    state.chat.finish_tool_call(id, result, failed);
+    state.chat_scroll = 0;
+}
+
+fn apply_chat_status(state: &mut crate::state::AppState, phase: &str, detail: String) {
+    // The size the model's server reported, for the provider in use.
+    if phase == "context"
+        && let (Some(url), Ok(n)) = (state.current_provider_url.clone(), detail.parse())
+    {
+        state.server_context = Some((url, n));
+    }
+    let Some(turn) = state.turn.as_mut() else {
+        return;
+    };
+    // Loading and reading only ever come before output; a late one
+    // must not pull a turn that is already writing back.
+    let before_output = matches!(
+        turn.phase,
+        crate::state::TurnPhase::Loading | crate::state::TurnPhase::Reading
+    );
+    match phase {
+        "loading" if before_output => turn.enter(crate::state::TurnPhase::Loading),
+        "reading" if before_output => turn.enter(crate::state::TurnPhase::Reading),
+        "tools" => turn.tools = Some(detail),
+        _ => {}
+    }
+}
+
+fn apply_chat_truncated(state: &mut crate::state::AppState, reason: &str) {
+    // Same rendering as the in-process BridgeEvent::Truncated: a
+    // visible note in the transcript, not silently folded into the
+    // model's own output.
+    state.chat.push(crate::state::ChatEntry::Assistant {
+        content: format!("[{reason}]"),
+        streaming: false,
+    });
+    state.chat_scroll = 0;
 }
 
 /// Turn the model's last reading time and the prompt size its provider just
@@ -6626,19 +6708,18 @@ fn is_close_button_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> boo
 }
 
 fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
-    let click_targets = state.click_targets.borrow().clone();
-    for (target, rect) in click_targets {
-        if inside_rect(col, row, rect) {
-            handle_click_target(target, state);
-            return;
-        }
-    }
-
-    if state.settings_editor.open {
+    let hit_target = state
+        .click_targets
+        .borrow()
+        .iter()
+        .find(|(_, rect)| inside_rect(col, row, *rect))
+        .map(|(target, _)| target.clone());
+    if let Some(target) = hit_target {
+        handle_click_target(target, state);
         return;
     }
 
-    if handle_window_rect_click(col, row, state) {
+    if state.settings_editor.open || handle_window_rect_click(col, row, state) {
         return;
     }
 
@@ -6648,21 +6729,23 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
     }
     if inside_rect(col, row, state.chat_area.get()) {
         state.focus = crate::state::Focus::Chat;
-        // A tool-call line is clipped to one row; clicking it opens the whole
-        // call — arguments and result — full-screen (SPEC R24.8.4).
-        if let Some(detail) =
-            crate::ui::chat_entry_at(state, col, row).and_then(|idx| state.tool_call_detail(idx))
-        {
-            state.open_log_line_detail(detail);
-        }
+        open_clicked_tool_call_detail(col, row, state);
         return;
     }
     if inside_rect(col, row, state.log_area.get()) {
         state.focus = crate::state::Focus::Log;
-        return;
-    }
-    if inside_rect(col, row, state.work_area.get()) {
+    } else if inside_rect(col, row, state.work_area.get()) {
         state.focus = crate::state::Focus::Work;
+    }
+}
+
+fn open_clicked_tool_call_detail(col: u16, row: u16, state: &mut crate::state::AppState) {
+    // A tool-call line is clipped to one row; clicking it opens the whole
+    // call — arguments and result — full-screen (SPEC R24.8.4).
+    if let Some(detail) =
+        crate::ui::chat_entry_at(state, col, row).and_then(|idx| state.tool_call_detail(idx))
+    {
+        state.open_log_line_detail(detail);
     }
 }
 

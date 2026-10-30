@@ -398,26 +398,25 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     loop {
-        match recv_msg::<_, HubMsg>(reader).await {
-            Ok(msg) => match handle_incoming(state, tx, msg).await {
-                Some(true) => {
-                    *prune_counter += 1;
-                    if *prune_counter >= 10 {
-                        state.prune_terminal();
-                        *prune_counter = 0;
-                    }
-                }
-                Some(false) => {}
-                None => return false, // Channel closed — TUI exited.
-            },
-            Err(e) => {
-                debug!("hub_source: connection lost ({e})");
-                let _ = tx
-                    .send(SourceEvent::HubHealthChanged { healthy: false })
-                    .await;
-                return true;
-            }
+        let Ok(msg) = recv_msg::<_, HubMsg>(reader).await else {
+            let _ = tx
+                .send(SourceEvent::HubHealthChanged { healthy: false })
+                .await;
+            return true;
+        };
+        match handle_incoming(state, tx, msg).await {
+            Some(true) => maybe_prune_terminal(state, prune_counter),
+            Some(false) => {}
+            None => return false, // Channel closed — TUI exited.
         }
+    }
+}
+
+fn maybe_prune_terminal(state: &mut HubState, prune_counter: &mut u8) {
+    *prune_counter += 1;
+    if *prune_counter >= 10 {
+        state.prune_terminal();
+        *prune_counter = 0;
     }
 }
 
@@ -470,42 +469,75 @@ fn apply_msg(state: &mut HubState, msg: HubMsg) -> Applied {
         HubMsg::Event {
             instance_id,
             payload,
-        } => match payload {
-            HubEvent::OpStarted {
+        } => apply_hub_event(state, instance_id, payload),
+        // Hub-to-instance messages; no state change for subscribers.
+        HubMsg::Ping { .. }
+        | HubMsg::Viewers { .. }
+        | HubMsg::ReRaiseScopeGrant { .. }
+        | HubMsg::RunPrompt { .. }
+        | HubMsg::CancelPrompt
+        | HubMsg::CancelOperation { .. }
+        | HubMsg::SubmitApproval { .. }
+        | HubMsg::SubmitScopeGrant { .. }
+        | HubMsg::SubmitWebApproval { .. } => Applied::None,
+        HubMsg::ScopeGrantDismiss { decision_id } => {
+            Applied::Event(SourceEvent::ScopeGrantDismiss { decision_id })
+        }
+        HubMsg::WebApprovalDismiss { decision_id } => {
+            Applied::Event(SourceEvent::WebApprovalDismiss { decision_id })
+        }
+        HubMsg::Relay(relay) => Applied::Event(relay_to_source_event(relay)),
+    }
+}
+
+fn apply_hub_event(state: &mut HubState, instance_id: String, payload: HubEvent) -> Applied {
+    match payload {
+        HubEvent::OpStarted {
+            id,
+            tool_name,
+            description,
+            scope,
+            parent_id,
+            started_epoch_ms,
+            title,
+            cwd,
+            command,
+            origin,
+            partial,
+            unsandboxed,
+        } => {
+            state.on_op_started(
+                &instance_id,
                 id,
                 tool_name,
                 description,
-                scope,
+                Some(scope),
                 parent_id,
                 started_epoch_ms,
-                title,
-                cwd,
-                command,
-                origin,
-                partial,
-                unsandboxed,
-            } => {
-                state.on_op_started(
-                    &instance_id,
-                    id,
-                    tool_name,
-                    description,
-                    Some(scope),
-                    parent_id,
-                    started_epoch_ms,
-                    OpWireIdentity {
-                        title,
-                        cwd,
-                        command,
-                        origin,
-                        partial,
-                        unsandboxed,
-                    },
-                );
-                Applied::ListChanged
-            }
-            HubEvent::OpFinished {
-                id,
+                OpWireIdentity {
+                    title,
+                    cwd,
+                    command,
+                    origin,
+                    partial,
+                    unsandboxed,
+                },
+            );
+            Applied::ListChanged
+        }
+        HubEvent::OpFinished {
+            id,
+            status,
+            result_summary,
+            duration_ms,
+            ended_epoch_ms,
+            exit_code,
+            denial,
+            interrupted,
+        } => {
+            state.on_op_finished(
+                &instance_id,
+                &id,
                 status,
                 result_summary,
                 duration_ms,
@@ -513,99 +545,66 @@ fn apply_msg(state: &mut HubState, msg: HubMsg) -> Applied {
                 exit_code,
                 denial,
                 interrupted,
-            } => {
-                state.on_op_finished(
-                    &instance_id,
-                    &id,
-                    status,
-                    result_summary,
-                    duration_ms,
-                    ended_epoch_ms,
-                    exit_code,
-                    denial,
-                    interrupted,
-                );
-                Applied::ListChanged
-            }
-            // Output lines are forwarded incrementally to the TUI and are NOT
-            // accumulated in HubState: the merged-list snapshot would be
-            // re-appended by `upsert_operation` on every re-emit, duplicating
-            // lines.  The TUI app state owns the per-operation tail buffer.
-            HubEvent::OpOutput {
-                id,
-                line,
-                is_stderr,
-            } => Applied::Event(SourceEvent::OperationOutput {
-                instance_id: Some(instance_id),
-                op_id: id,
-                line,
-                is_stderr,
-            }),
-            HubEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
-        },
-        // Hub-to-instance messages; no state change for subscribers.
-        HubMsg::Ping { .. } | HubMsg::Viewers { .. } => Applied::None,
-        // Instance-directed: the hub routes a TUI's re-raise request to the
-        // instance that owns the path. A subscriber seeing it has nothing to do
-        // — the re-raised question arrives as a normal ScopeGrantRequested.
-        HubMsg::ReRaiseScopeGrant { .. } => Applied::None,
-        HubMsg::RunPrompt { .. } | HubMsg::CancelPrompt | HubMsg::CancelOperation { .. } => {
-            Applied::None
+            );
+            Applied::ListChanged
         }
-        HubMsg::SubmitApproval { .. } => Applied::None,
-        HubMsg::ScopeGrantDismiss { decision_id } => {
-            Applied::Event(SourceEvent::ScopeGrantDismiss { decision_id })
-        }
-        HubMsg::WebApprovalDismiss { decision_id } => {
-            Applied::Event(SourceEvent::WebApprovalDismiss { decision_id })
-        }
-        // Everything the hub forwards untouched. Kept as one nested match so
-        // the relayed set reads as a set: a message added to `HubRelay` shows
-        // up here as a missing arm rather than falling through to a default.
-        HubMsg::Relay(relay) => Applied::Event(match relay {
-            HubRelay::ChatToken { token } => SourceEvent::ChatToken { token },
-            HubRelay::ChatThinking { token } => SourceEvent::ChatThinking { token },
-            HubRelay::ApprovalRequested {
-                id,
-                tool,
-                args,
-                workspace,
-            } => SourceEvent::ApprovalRequested {
-                id,
-                tool,
-                args,
-                workspace,
-            },
-            HubRelay::AgentDone => SourceEvent::AgentDone,
-            HubRelay::AgentError { error, transient } => {
-                SourceEvent::AgentError { error, transient }
-            }
-            HubRelay::Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            } => SourceEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            },
-            HubRelay::ToolCallStarted { id, name, args } => {
-                SourceEvent::ToolCallStarted { id, name, args }
-            }
-            HubRelay::ToolCallFinished { id, result, failed } => {
-                SourceEvent::ToolCallFinished { id, result, failed }
-            }
-            HubRelay::ScopeGrantRequested { request } => {
-                SourceEvent::ScopeGrantRequested { request }
-            }
-            HubRelay::WebApprovalRequested { request } => {
-                SourceEvent::WebApprovalRequested { request }
-            }
-            HubRelay::Truncated { reason } => SourceEvent::Truncated { reason },
-            HubRelay::ChatStatus { phase, detail } => SourceEvent::ChatStatus { phase, detail },
+        // Output lines are forwarded incrementally to the TUI and are NOT
+        // accumulated in HubState: the merged-list snapshot would be
+        // re-appended by `upsert_operation` on every re-emit, duplicating
+        // lines.  The TUI app state owns the per-operation tail buffer.
+        HubEvent::OpOutput {
+            id,
+            line,
+            is_stderr,
+        } => Applied::Event(SourceEvent::OperationOutput {
+            instance_id: Some(instance_id),
+            op_id: id,
+            line,
+            is_stderr,
         }),
-        // Instance-bound; a subscriber never receives it.
-        HubMsg::SubmitScopeGrant { .. } | HubMsg::SubmitWebApproval { .. } => Applied::None,
+        HubEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
+    }
+}
+
+/// Everything the hub forwards untouched. Kept as one exhaustive match so the
+/// relayed set reads as a set: a message added to `HubRelay` shows up here as
+/// a missing arm rather than falling through to a default.
+fn relay_to_source_event(relay: HubRelay) -> SourceEvent {
+    match relay {
+        HubRelay::ChatToken { token } => SourceEvent::ChatToken { token },
+        HubRelay::ChatThinking { token } => SourceEvent::ChatThinking { token },
+        HubRelay::ApprovalRequested {
+            id,
+            tool,
+            args,
+            workspace,
+        } => SourceEvent::ApprovalRequested {
+            id,
+            tool,
+            args,
+            workspace,
+        },
+        HubRelay::AgentDone => SourceEvent::AgentDone,
+        HubRelay::AgentError { error, transient } => SourceEvent::AgentError { error, transient },
+        HubRelay::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => SourceEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        },
+        HubRelay::ToolCallStarted { id, name, args } => {
+            SourceEvent::ToolCallStarted { id, name, args }
+        }
+        HubRelay::ToolCallFinished { id, result, failed } => {
+            SourceEvent::ToolCallFinished { id, result, failed }
+        }
+        HubRelay::ScopeGrantRequested { request } => SourceEvent::ScopeGrantRequested { request },
+        HubRelay::WebApprovalRequested { request } => SourceEvent::WebApprovalRequested { request },
+        HubRelay::Truncated { reason } => SourceEvent::Truncated { reason },
+        HubRelay::ChatStatus { phase, detail } => SourceEvent::ChatStatus { phase, detail },
     }
 }
 
@@ -1513,6 +1512,31 @@ mod tests {
         assert!(matches!(a, Applied::None));
     }
 
+    async fn feed_incoming(st: &mut HubState, tx: &mpsc::Sender<SourceEvent>, msg: HubMsg) {
+        handle_incoming(st, tx, msg)
+            .await
+            .expect("TUI channel stays open");
+    }
+
+    async fn feed_and_next(
+        st: &mut HubState,
+        tx: &mpsc::Sender<SourceEvent>,
+        rx: &mut mpsc::Receiver<SourceEvent>,
+        msg: HubMsg,
+    ) -> SourceEvent {
+        feed_incoming(st, tx, msg).await;
+        next_ev(rx).await
+    }
+
+    async fn send_and_next<W: tokio::io::AsyncWrite + Unpin>(
+        w: &mut W,
+        rx: &mut mpsc::Receiver<SourceEvent>,
+        msg: ClientMsg,
+    ) -> SourceEvent {
+        send_msg(w, &msg).await.unwrap();
+        next_ev(rx).await
+    }
+
     /// Every hub message maps to the UI event the TUI expects.
     ///
     /// Drives `handle_incoming` — the fan-out both the socket task and the
@@ -1522,30 +1546,56 @@ mod tests {
     async fn handle_incoming_maps_every_event() {
         let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
         let mut st = HubState::new();
-        let feed = async |st: &mut HubState, msg: HubMsg| {
-            handle_incoming(st, &tx_s, msg)
-                .await
-                .expect("TUI channel stays open");
-        };
 
-        feed(
+        assert_incoming_instance_and_op_events(&mut st, &tx_s, &mut rx_s).await;
+        assert_incoming_relay_and_gate_events(&mut st, &tx_s, &mut rx_s).await;
+
+        match feed_and_next(
             &mut st,
-            HubMsg::InstanceList {
-                instances: vec![inst("i1", "IDE")],
+            &tx_s,
+            &mut rx_s,
+            HubMsg::InstanceUnregistered {
+                id: "i1".to_string(),
             },
         )
-        .await;
-        match next_ev(&mut rx_s).await {
-            SourceEvent::InstancesUpdated { instances } => assert_eq!(instances.len(), 1),
+        .await
+        {
+            SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
             other => panic!("expected InstancesUpdated, got {other:?}"),
         }
         match next_ev(&mut rx_s).await {
             SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
             other => panic!("expected OperationsUpdated, got {other:?}"),
         }
+    }
 
-        feed(
-            &mut st,
+    async fn assert_incoming_instance_and_op_events(
+        st: &mut HubState,
+        tx_s: &mpsc::Sender<SourceEvent>,
+        rx_s: &mut mpsc::Receiver<SourceEvent>,
+    ) {
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
+            HubMsg::InstanceList {
+                instances: vec![inst("i1", "IDE")],
+            },
+        )
+        .await
+        {
+            SourceEvent::InstancesUpdated { instances } => assert_eq!(instances.len(), 1),
+            other => panic!("expected InstancesUpdated, got {other:?}"),
+        }
+        match next_ev(rx_s).await {
+            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
             HubMsg::Event {
                 instance_id: "i1".to_string(),
                 payload: HubEvent::OpStarted {
@@ -1564,8 +1614,8 @@ mod tests {
                 },
             },
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::OperationsUpdated { ops } => {
                 assert_eq!(ops.len(), 1);
                 assert_eq!(ops[0].id, "op1");
@@ -1574,8 +1624,10 @@ mod tests {
             other => panic!("expected OperationsUpdated, got {other:?}"),
         }
 
-        feed(
-            &mut st,
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
             HubMsg::Event {
                 instance_id: "i1".to_string(),
                 payload: HubEvent::OpOutput {
@@ -1585,8 +1637,8 @@ mod tests {
                 },
             },
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::OperationOutput {
                 instance_id,
                 op_id,
@@ -1600,22 +1652,32 @@ mod tests {
             }
             other => panic!("expected OperationOutput, got {other:?}"),
         }
+    }
 
-        feed(
-            &mut st,
+    async fn assert_incoming_relay_and_gate_events(
+        st: &mut HubState,
+        tx_s: &mpsc::Sender<SourceEvent>,
+        rx_s: &mut mpsc::Receiver<SourceEvent>,
+    ) {
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
             HubMsg::Relay(HubRelay::ChatToken {
                 token: "tok".to_string(),
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::ChatToken { token } => assert_eq!(token, "tok"),
             other => panic!("expected ChatToken, got {other:?}"),
         }
 
-        feed(&mut st, HubMsg::Ping { seq: 3 }).await;
-        feed(
-            &mut st,
+        feed_incoming(st, tx_s, HubMsg::Ping { seq: 3 }).await;
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
             HubMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".to_string(),
                 tool: "tool".to_string(),
@@ -1623,8 +1685,8 @@ mod tests {
                 workspace: None,
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::ApprovalRequested { id, tool, args, .. } => {
                 assert_eq!(id, "a1");
                 assert_eq!(tool, "tool");
@@ -1633,65 +1695,54 @@ mod tests {
             other => panic!("Ping must be a no-op; got {other:?}"),
         }
 
-        feed(
-            &mut st,
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
             HubMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: sample_scope_grant(),
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::ScopeGrantRequested { request } => {
                 assert_eq!(request.decision_id, "d1");
             }
             other => panic!("expected ScopeGrantRequested, got {other:?}"),
         }
 
-        feed(
-            &mut st,
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
             HubMsg::ScopeGrantDismiss {
                 decision_id: "d1".to_string(),
             },
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d1"),
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
         }
 
-        feed(&mut st, HubMsg::Relay(HubRelay::AgentDone)).await;
-        match next_ev(&mut rx_s).await {
+        match feed_and_next(st, tx_s, rx_s, HubMsg::Relay(HubRelay::AgentDone)).await {
             SourceEvent::AgentDone => {}
             other => panic!("expected AgentDone, got {other:?}"),
         }
 
-        feed(
-            &mut st,
+        match feed_and_next(
+            st,
+            tx_s,
+            rx_s,
             HubMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
                 transient: false,
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::AgentError { error, .. } => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
-        }
-
-        feed(
-            &mut st,
-            HubMsg::InstanceUnregistered {
-                id: "i1".to_string(),
-            },
-        )
-        .await;
-        match next_ev(&mut rx_s).await {
-            SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
-            other => panic!("expected InstancesUpdated, got {other:?}"),
-        }
-        match next_ev(&mut rx_s).await {
-            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
-            other => panic!("expected OperationsUpdated, got {other:?}"),
         }
     }
 
@@ -1779,60 +1830,63 @@ mod tests {
     async fn handle_incoming_maps_remaining_events() {
         let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
         let mut st = HubState::new();
-        let feed = async |st: &mut HubState, msg: HubMsg| {
-            handle_incoming(st, &tx_s, msg)
-                .await
-                .expect("TUI channel stays open");
-        };
 
-        feed(
+        match feed_and_next(
             &mut st,
+            &tx_s,
+            &mut rx_s,
             HubMsg::Relay(HubRelay::ChatThinking {
                 token: "pondering".to_string(),
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::ChatThinking { token } => assert_eq!(token, "pondering"),
             other => panic!("expected ChatThinking, got {other:?}"),
         }
 
-        feed(
+        match feed_and_next(
             &mut st,
+            &tx_s,
+            &mut rx_s,
             HubMsg::Relay(HubRelay::WebApprovalRequested {
                 request: sample_web_approval(),
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::WebApprovalRequested { request } => {
                 assert_eq!(request.decision_id, "w1");
             }
             other => panic!("expected WebApprovalRequested, got {other:?}"),
         }
 
-        feed(
+        match feed_and_next(
             &mut st,
+            &tx_s,
+            &mut rx_s,
             HubMsg::WebApprovalDismiss {
                 decision_id: "w1".to_string(),
             },
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::WebApprovalDismiss { decision_id } => assert_eq!(decision_id, "w1"),
             other => panic!("expected WebApprovalDismiss, got {other:?}"),
         }
 
-        feed(
+        match feed_and_next(
             &mut st,
+            &tx_s,
+            &mut rx_s,
             HubMsg::Relay(HubRelay::ToolCallStarted {
                 id: "t1".to_string(),
                 name: "read_file".to_string(),
                 args: "{}".to_string(),
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::ToolCallStarted { id, name, .. } => {
                 assert_eq!(id, "t1");
                 assert_eq!(name, "read_file");
@@ -1840,16 +1894,18 @@ mod tests {
             other => panic!("expected ToolCallStarted, got {other:?}"),
         }
 
-        feed(
+        match feed_and_next(
             &mut st,
+            &tx_s,
+            &mut rx_s,
             HubMsg::Relay(HubRelay::ToolCallFinished {
                 id: "t1".to_string(),
                 result: "ok".to_string(),
                 failed: true,
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::ToolCallFinished { id, failed, .. } => {
                 assert_eq!(id, "t1");
                 assert!(failed);
@@ -1857,16 +1913,18 @@ mod tests {
             other => panic!("expected ToolCallFinished, got {other:?}"),
         }
 
-        feed(
+        match feed_and_next(
             &mut st,
+            &tx_s,
+            &mut rx_s,
             HubMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
             }),
         )
-        .await;
-        match next_ev(&mut rx_s).await {
+        .await
+        {
             SourceEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -1900,19 +1958,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SourceEvent>(64);
         let task = tokio::spawn(hub_source_task(tx));
 
-        // Connect succeeds → health true, then the initial (empty) snapshot.
-        match next_ev(&mut rx).await {
-            SourceEvent::HubHealthChanged { healthy } => assert!(healthy),
-            other => panic!("expected HubHealthChanged, got {other:?}"),
-        }
-        match next_ev(&mut rx).await {
-            SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
-            other => panic!("expected InstancesUpdated, got {other:?}"),
-        }
-        match next_ev(&mut rx).await {
-            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
-            other => panic!("expected OperationsUpdated, got {other:?}"),
-        }
+        assert_socket_initial_handshake(&mut rx).await;
 
         // Give the server a beat to finish `hub.broadcast.subscribe()` (it runs
         // immediately after writing the InstanceList snapshot, with no other
@@ -1925,9 +1971,40 @@ mod tests {
             .await
             .expect("instance connect");
         let (_inst_r, mut inst_w) = tokio::io::split(inst_stream);
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Register {
+
+        assert_socket_instance_and_op_round_trip(&mut inst_w, &mut rx).await;
+        assert_socket_relay_and_gate_round_trip(&mut inst_w, &mut rx).await;
+
+        // Clean up: stop the subscriber task, then the hub's accept loop. The
+        // socket file lives in this test's isolated directory.
+        task.abort();
+        hub.abort();
+    }
+
+    async fn assert_socket_initial_handshake(rx: &mut mpsc::Receiver<SourceEvent>) {
+        // Connect succeeds → health true, then the initial (empty) snapshot.
+        match next_ev(rx).await {
+            SourceEvent::HubHealthChanged { healthy } => assert!(healthy),
+            other => panic!("expected HubHealthChanged, got {other:?}"),
+        }
+        match next_ev(rx).await {
+            SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
+            other => panic!("expected InstancesUpdated, got {other:?}"),
+        }
+        match next_ev(rx).await {
+            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+    }
+
+    async fn assert_socket_instance_and_op_round_trip<W: tokio::io::AsyncWrite + Unpin>(
+        inst_w: &mut W,
+        rx: &mut mpsc::Receiver<SourceEvent>,
+    ) {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Register {
                 pid: 42,
                 mode: "stdio".to_string(),
                 scope: "/test".to_string(),
@@ -1945,21 +2022,20 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::InstancesUpdated { instances } => assert_eq!(instances.len(), 1),
             other => panic!("expected InstancesUpdated, got {other:?}"),
         }
-        match next_ev(&mut rx).await {
+        match next_ev(rx).await {
             SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
             other => panic!("expected OperationsUpdated, got {other:?}"),
         }
 
         // OpStarted → ListChanged → OperationsUpdated with one running op.
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Event {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Event {
                 payload: HubEvent::OpStarted {
                     id: "op-1".to_string(),
                     tool_name: "cargo_build".to_string(),
@@ -1977,8 +2053,7 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::OperationsUpdated { ops } => {
                 assert_eq!(ops.len(), 1);
                 assert_eq!(ops[0].status, OpStatus::Running);
@@ -1988,9 +2063,10 @@ mod tests {
         }
 
         // OpOutput → forwarded incrementally as OperationOutput.
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Event {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Event {
                 payload: HubEvent::OpOutput {
                     id: "op-1".to_string(),
                     line: "compiling".to_string(),
@@ -1999,8 +2075,7 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::OperationOutput {
                 op_id,
                 line,
@@ -2015,9 +2090,10 @@ mod tests {
         }
 
         // OpFinished → ListChanged → OperationsUpdated with the terminal status.
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Event {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Event {
                 payload: HubEvent::OpFinished {
                     id: "op-1".to_string(),
                     status: ahma_common::hub::OpStatus::Completed,
@@ -2031,20 +2107,24 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::OperationsUpdated { ops } => {
                 assert_eq!(ops[0].status, OpStatus::Succeeded);
                 assert_eq!(ops[0].result_summary, Some("ok".to_string()));
             }
             other => panic!("expected OperationsUpdated, got {other:?}"),
         }
+    }
 
+    async fn assert_socket_relay_and_gate_round_trip<W: tokio::io::AsyncWrite + Unpin>(
+        inst_w: &mut W,
+        rx: &mut mpsc::Receiver<SourceEvent>,
+    ) {
         // A LogLine event is a documented no-op (not yet surfaced in the TUI) —
         // sending one here proves it does NOT produce a spurious SourceEvent by
         // checking the *next* observable event still lines up with what follows.
         send_msg(
-            &mut inst_w,
+            inst_w,
             &ClientMsg::Event {
                 payload: HubEvent::LogLine {
                     level: "info".to_string(),
@@ -2055,35 +2135,36 @@ mod tests {
         .await
         .unwrap();
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::ChatToken {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::ChatToken {
                 token: "hi".to_string(),
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::ChatToken { token } => assert_eq!(token, "hi"),
             other => panic!("LogLine must be a no-op; expected ChatToken, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::ChatThinking {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::ChatThinking {
                 token: "pondering".to_string(),
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::ChatThinking { token } => assert_eq!(token, "pondering"),
             other => panic!("expected ChatThinking, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::ApprovalRequested {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::ApprovalRequested {
                 id: "a1".to_string(),
                 tool: "shell".to_string(),
                 args: "ls".to_string(),
@@ -2091,8 +2172,7 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::ApprovalRequested { id, tool, args, .. } => {
                 assert_eq!(id, "a1");
                 assert_eq!(tool, "shell");
@@ -2101,73 +2181,80 @@ mod tests {
             other => panic!("expected ApprovalRequested, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::ScopeGrantRequested {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::ScopeGrantRequested {
                 request: sample_scope_grant(),
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::ScopeGrantRequested { request } => {
                 assert_eq!(request.decision_id, "d1");
             }
             other => panic!("expected ScopeGrantRequested, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::ScopeGrantResolved {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::ScopeGrantResolved {
                 decision_id: "d1".to_string(),
             },
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d1"),
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::WebApprovalRequested {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::WebApprovalRequested {
                 request: sample_web_approval(),
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::WebApprovalRequested { request } => {
                 assert_eq!(request.decision_id, "w1");
             }
             other => panic!("expected WebApprovalRequested, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::WebApprovalResolved {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::WebApprovalResolved {
                 decision_id: "w1".to_string(),
             },
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::WebApprovalDismiss { decision_id } => assert_eq!(decision_id, "w1"),
             other => panic!("expected WebApprovalDismiss, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::ToolCallStarted {
+        assert_socket_tool_and_agent_relays(inst_w, rx).await;
+    }
+
+    async fn assert_socket_tool_and_agent_relays<W: tokio::io::AsyncWrite + Unpin>(
+        inst_w: &mut W,
+        rx: &mut mpsc::Receiver<SourceEvent>,
+    ) {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::ToolCallStarted {
                 id: "t1".to_string(),
                 name: "read_file".to_string(),
                 args: "{}".to_string(),
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::ToolCallStarted { id, name, .. } => {
                 assert_eq!(id, "t1");
                 assert_eq!(name, "read_file");
@@ -2175,17 +2262,17 @@ mod tests {
             other => panic!("expected ToolCallStarted, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::ToolCallFinished {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::ToolCallFinished {
                 id: "t1".to_string(),
                 result: "ok".to_string(),
                 failed: false,
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::ToolCallFinished { id, failed, .. } => {
                 assert_eq!(id, "t1");
                 assert!(!failed);
@@ -2193,17 +2280,17 @@ mod tests {
             other => panic!("expected ToolCallFinished, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::Usage {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -2217,31 +2304,23 @@ mod tests {
             other => panic!("expected Usage, got {other:?}"),
         }
 
-        send_msg(&mut inst_w, &ClientMsg::Relay(HubRelay::AgentDone))
-            .await
-            .unwrap();
-        match next_ev(&mut rx).await {
+        match send_and_next(inst_w, rx, ClientMsg::Relay(HubRelay::AgentDone)).await {
             SourceEvent::AgentDone => {}
             other => panic!("expected AgentDone, got {other:?}"),
         }
 
-        send_msg(
-            &mut inst_w,
-            &ClientMsg::Relay(HubRelay::AgentError {
+        match send_and_next(
+            inst_w,
+            rx,
+            ClientMsg::Relay(HubRelay::AgentError {
                 error: "boom".to_string(),
                 transient: false,
             }),
         )
         .await
-        .unwrap();
-        match next_ev(&mut rx).await {
+        {
             SourceEvent::AgentError { error, .. } => assert_eq!(error, "boom"),
             other => panic!("expected AgentError, got {other:?}"),
         }
-
-        // Clean up: stop the subscriber task, then the hub's accept loop. The
-        // socket file lives in this test's isolated directory.
-        task.abort();
-        hub.abort();
     }
 }

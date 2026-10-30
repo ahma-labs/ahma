@@ -131,37 +131,50 @@ fn draw_hit_row(
                 .push((ClickTarget::SectionHeader(key), row_area));
         }
         Hit::Row { key, inner } => {
-            let Some(section) = sections.iter().find(|s| s.key == key) else {
-                return;
-            };
-            let Some(row) = section.rows.get(inner) else {
-                return;
-            };
-            let nav = nav_index_of_row(sections, slots, &key, inner);
-            let selected = nav == Some(state.ops_selected);
-            let nav_idx = nav.unwrap_or(usize::MAX);
-            match &row.kind {
-                RowKind::Op { op_index, expanded } => super::draw_op_tree_row(
-                    frame, state, theme, nav_idx, row_area, row.depth, *op_index, *expanded,
-                    selected,
-                ),
-                RowKind::Output { text, .. } => {
-                    draw_output_tree_row(frame, state, theme, nav_idx, row_area, row.depth, text)
-                }
-                RowKind::Group {
-                    key: group_key,
-                    label,
-                    collapsed,
-                } => {
-                    let _ = group_key;
-                    draw_group_tree_row(
-                        frame, state, theme, nav_idx, row_area, selected, label, *collapsed,
-                    )
-                }
-                // A nested header cannot occur inside a section's rows.
-                RowKind::Instance { .. } => {}
-            }
+            draw_section_body_row(frame, state, theme, row_area, sections, slots, &key, inner);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_section_body_row(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    row_area: Rect,
+    sections: &[Section],
+    slots: &[work_view::Slot],
+    key: &str,
+    inner: usize,
+) {
+    let Some(section) = sections.iter().find(|s| s.key == key) else {
+        return;
+    };
+    let Some(row) = section.rows.get(inner) else {
+        return;
+    };
+    let nav = nav_index_of_row(sections, slots, key, inner);
+    let selected = nav == Some(state.ops_selected);
+    let nav_idx = nav.unwrap_or(usize::MAX);
+    match &row.kind {
+        RowKind::Op { op_index, expanded } => super::draw_op_tree_row(
+            frame, state, theme, nav_idx, row_area, row.depth, *op_index, *expanded, selected,
+        ),
+        RowKind::Output { text, .. } => {
+            draw_output_tree_row(frame, state, theme, nav_idx, row_area, row.depth, text)
+        }
+        RowKind::Group {
+            key: group_key,
+            label,
+            collapsed,
+        } => {
+            let _ = group_key;
+            draw_group_tree_row(
+                frame, state, theme, nav_idx, row_area, selected, label, *collapsed,
+            )
+        }
+        // A nested header cannot occur inside a section's rows.
+        RowKind::Instance { .. } => {}
     }
 }
 
@@ -215,6 +228,41 @@ fn draw_section_rule(
 ) {
     let unicode = state.unicode;
     let dash = if unicode { "─" } else { "-" };
+    let mut spans = build_section_rule_prefix(state, theme, section, selected, now_ms);
+
+    let tallies = instance_tally_spans(&section.header.counts, unicode, theme);
+    let tally_width: usize = tallies.iter().map(|s| s.content.chars().count()).sum();
+
+    // Fill to the right edge so the rule is a rule and not a ragged line.
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let width = area.width as usize;
+    let fill = width.saturating_sub(used + tally_width + 4);
+    let rule_style = if section.header.running {
+        theme.section_rule_live()
+    } else {
+        theme.section_rule()
+    };
+    spans.push(Span::styled(format!(" {}", dash.repeat(fill)), rule_style));
+    spans.extend(tallies);
+    spans.push(Span::styled(format!(" {dash}{dash}"), rule_style));
+
+    super::truncate_row_spans_to_width(&mut spans, width);
+    let mut paragraph = Paragraph::new(Line::from(spans));
+    if selected {
+        paragraph = paragraph.style(Style::default());
+    }
+    frame.render_widget(paragraph, area);
+}
+
+fn build_section_rule_prefix(
+    state: &AppState,
+    theme: &Theme,
+    section: &Section,
+    selected: bool,
+    now_ms: u64,
+) -> Vec<Span<'static>> {
+    let unicode = state.unicode;
+    let dash = if unicode { "─" } else { "-" };
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     // Left edge: the selection marker replaces the first rule character, so a
@@ -253,6 +301,18 @@ fn draw_section_rule(
         spans.push(Span::styled(llm, theme.dim()));
     }
 
+    append_section_status_spans(&mut spans, section, theme, now_ms, unicode, dash);
+    spans
+}
+
+fn append_section_status_spans(
+    spans: &mut Vec<Span<'static>>,
+    section: &Section,
+    theme: &Theme,
+    now_ms: u64,
+    unicode: bool,
+    dash: &str,
+) {
     // A liveness glyph beside a section that is running something, so "which of
     // these is actually doing anything" is answerable at a glance.
     if section.header.running {
@@ -281,29 +341,6 @@ fn draw_section_rule(
             theme.dim(),
         ));
     }
-
-    let tallies = instance_tally_spans(&section.header.counts, unicode, theme);
-    let tally_width: usize = tallies.iter().map(|s| s.content.chars().count()).sum();
-
-    // Fill to the right edge so the rule is a rule and not a ragged line.
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let width = area.width as usize;
-    let fill = width.saturating_sub(used + tally_width + 4);
-    let rule_style = if section.header.running {
-        theme.section_rule_live()
-    } else {
-        theme.section_rule()
-    };
-    spans.push(Span::styled(format!(" {}", dash.repeat(fill)), rule_style));
-    spans.extend(tallies);
-    spans.push(Span::styled(format!(" {dash}{dash}"), rule_style));
-
-    super::truncate_row_spans_to_width(&mut spans, width);
-    let mut paragraph = Paragraph::new(Line::from(spans));
-    if selected {
-        paragraph = paragraph.style(Style::default());
-    }
-    frame.render_widget(paragraph, area);
 }
 
 fn draw_empty_state(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {

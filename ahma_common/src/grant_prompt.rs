@@ -85,111 +85,97 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// Render `req` into the body every surface shows.
-pub fn render(req: &ScopeGrantRequest) -> PromptBody {
-    let ctx = &req.context;
-    let path = req.path.display().to_string();
-    let workspace = ctx
-        .requester
-        .as_ref()
-        .and_then(|r| r.workspace.as_deref())
-        .map(|w| w.display().to_string());
-    let want_write = ctx.write_denied || req.access.is_write();
-    // `--tmp` asks for exactly the access the flag means; nothing was refused,
-    // so "minimum that would work" is the request itself.
-    let startup = req.reason == GrantReason::StartupFlag;
-    // `logs_approve`: nothing was refused either, and the answer is a
-    // read-only `log-target` grant, never an `fs-scope` one (SPEC R9.2).
-    let log_target = req.reason == GrantReason::LogTarget;
-    // A terminal-hook refusal answered ahead of the harness dialog
-    // (R-PERM.10(e)): the session is the harness's, and there is no once.
-    let harness = req.reason == GrantReason::HarnessRefusal;
-    let saved_tiers = req.reason.offers_saved_tiers();
-    let minimum_access = if ctx.write_denied || (startup && req.access.is_write()) {
-        ScopeAccess::Rw
+fn render_who(
+    requester: Option<&crate::scope_grant::GrantRequester>,
+    workspace: Option<&str>,
+) -> String {
+    let Some(r) = requester else {
+        return "unknown session (a terminal hook, or an older ahma)".to_string();
+    };
+    let pid_suffix = if r.pid != 0 {
+        format!(" · pid {}", r.pid)
     } else {
-        ScopeAccess::Ro
+        String::new()
     };
+    format!(
+        "{} · workspace {} · session {}{}",
+        r.client.clone().unwrap_or_else(unknown),
+        workspace.map(str::to_string).unwrap_or_else(unknown),
+        r.session_id
+            .as_deref()
+            .map(short_id)
+            .unwrap_or_else(unknown),
+        pid_suffix
+    )
+}
 
-    // 1. Who is asking
-    let who = match &ctx.requester {
-        Some(r) => format!(
-            "{} · workspace {} · session {}{}",
-            r.client.clone().unwrap_or_else(unknown),
-            workspace.clone().unwrap_or_else(unknown),
-            r.session_id
-                .as_deref()
-                .map(short_id)
-                .unwrap_or_else(unknown),
-            if r.pid != 0 {
-                format!(" · pid {}", r.pid)
-            } else {
-                String::new()
-            }
-        ),
-        None => "unknown session (a terminal hook, or an older ahma)".to_string(),
-    };
+fn reason_provenance_note(reason: GrantReason) -> &'static str {
+    match reason {
+        GrantReason::PreExecViolation => "\nblocked before it ran: the path is exact",
+        GrantReason::StderrHeuristic => {
+            "\nread from the command's error output: double-check the path"
+        }
+        GrantReason::KernelRecord => {
+            "\nthe path and the access are exact: the kernel's own record of the refusal"
+        }
+        GrantReason::StartupFlag => {
+            "\nthe path is exact: this machine's temp directory, shared by every program you \
+             run, and part of no project"
+        }
+        GrantReason::LogTarget => {
+            "\nthe path is exact: where the link resolves now. The agent can create links in \
+             .ahma/logs itself, so check this is a log you expect it to read"
+        }
+        GrantReason::HarnessRefusal => {
+            "\nthe path is exact: the kernel refused it and ahma's terminal hook recorded it. \
+             Unless you answer here, the agent's harness asks you in its own dialog before its \
+             next command"
+        }
+        GrantReason::Unknown => {
+            "\nsent by a newer ahma for a reason this version does not recognise: double-check \
+             the path"
+        }
+    }
+}
 
-    // 2. What was blocked
-    let mut blocked = if log_target {
-        format!(
+fn render_blocked(req: &ScopeGrantRequest, path: &str, minimum_access: ScopeAccess) -> String {
+    let ctx = &req.context;
+    let want_write = ctx.write_denied || req.access.is_write();
+    let mut blocked = match req.reason {
+        GrantReason::LogTarget => format!(
             "nothing was blocked: a log file in .ahma/logs links to this file outside the \
              workspace; approving lets ahma's log tools read it: {path}"
-        )
-    } else if startup {
-        format!(
+        ),
+        GrantReason::StartupFlag => format!(
             "nothing was blocked: this server was started with --tmp (or [sandbox] tmp_access \
              = true), which asks for {} access to the system temp directory {}",
             minimum_access.label(),
             path
-        )
-    } else {
-        format!(
-            "{} {} {}",
-            req.tool.as_deref().unwrap_or("a sandboxed command"),
-            if want_write {
-                "tried to write"
-            } else {
-                "tried to read"
-            },
-            ctx.evidence
+        ),
+        _ => {
+            let target = ctx
+                .evidence
                 .as_ref()
                 .and_then(|e| e.raw_path.as_deref())
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| path.clone())
-        )
+                .unwrap_or_else(|| path.to_string());
+            let action = if want_write {
+                "tried to write"
+            } else {
+                "tried to read"
+            };
+            format!(
+                "{} {} {}",
+                req.tool.as_deref().unwrap_or("a sandboxed command"),
+                action,
+                target
+            )
+        }
     };
     if let Some(cmd) = &ctx.command {
         blocked.push_str(&format!("\ncommand: {cmd}"));
     }
-    match req.reason {
-        GrantReason::PreExecViolation => {
-            blocked.push_str("\nblocked before it ran: the path is exact")
-        }
-        GrantReason::StderrHeuristic => {
-            blocked.push_str("\nread from the command's error output: double-check the path")
-        }
-        GrantReason::KernelRecord => blocked.push_str(
-            "\nthe path and the access are exact: the kernel's own record of the refusal",
-        ),
-        GrantReason::StartupFlag => blocked.push_str(
-            "\nthe path is exact: this machine's temp directory, shared by every program you \
-             run, and part of no project",
-        ),
-        GrantReason::LogTarget => blocked.push_str(
-            "\nthe path is exact: where the link resolves now. The agent can create links in \
-             .ahma/logs itself, so check this is a log you expect it to read",
-        ),
-        GrantReason::HarnessRefusal => blocked.push_str(
-            "\nthe path is exact: the kernel refused it and ahma's terminal hook recorded it. \
-             Unless you answer here, the agent's harness asks you in its own dialog before its \
-             next command",
-        ),
-        GrantReason::Unknown => blocked.push_str(
-            "\nsent by a newer ahma for a reason this version does not recognise: double-check \
-             the path",
-        ),
-    }
+    blocked.push_str(reason_provenance_note(req.reason));
     if let Some(e) = &ctx.evidence
         && let Some(line) = &e.line
     {
@@ -204,55 +190,52 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
                 .unwrap_or_else(unknown)
         ));
     }
+    blocked
+}
 
-    // 3. What the agent says it needs
-    let claim = match &ctx.agent_claim {
-        Some(c) => format!(
-            "\"{}\"\n(the agent's claim, in the agent's own words — it is the party asking, not a \
-             witness)",
-            c.trim()
-        ),
-        None => "nothing — the agent gave no reason".to_string(),
+fn render_minimum(
+    reason: GrantReason,
+    write_denied: bool,
+    minimum_access: ScopeAccess,
+    path: &str,
+) -> String {
+    let note = if reason == GrantReason::StartupFlag {
+        " (what --tmp asks for; deny and it stays out of this session's scope)"
+    } else if reason == GrantReason::LogTarget {
+        " (a log target is only ever read, never written)"
+    } else if write_denied {
+        " (a write was refused, so read-only would not fix it)"
+    } else {
+        " (no write was refused; read-only is enough until one is)"
     };
+    format!("{} on {path}{note}", minimum_access.label())
+}
 
-    // 4. Minimum that would work
-    let minimum = format!(
-        "{} on {}{}",
-        minimum_access.label(),
-        path,
-        if startup {
-            " (what --tmp asks for; deny and it stays out of this session's scope)"
-        } else if log_target {
-            " (a log target is only ever read, never written)"
-        } else if ctx.write_denied {
-            " (a write was refused, so read-only would not fix it)"
-        } else {
-            " (no write was refused; read-only is enough until one is)"
-        }
-    );
-
-    // 5. What a grant allows
-    let workspace_label = workspace
-        .clone()
-        .unwrap_or_else(|| "this workspace".to_string());
+fn render_allows(
+    reason: GrantReason,
+    minimum_access: ScopeAccess,
+    workspace: Option<&str>,
+    path: &str,
+) -> String {
+    let workspace_label = workspace.unwrap_or("this workspace");
     let verb = if minimum_access.is_write() {
         "read and write"
     } else {
         "read"
     };
-    let allows = if log_target {
+    if reason == GrantReason::LogTarget {
         format!(
             "ahma's log tools, and every command in {workspace_label}, may read {path} — until \
              this session ends (session), or until you revoke it (always). It is never writable, \
              and nothing else outside the workspace changes."
         )
-    } else if harness {
+    } else if reason == GrantReason::HarnessRefusal {
         format!(
             "every command in {workspace_label} may {verb} {path} — until the agent's harness \
              exits (session: its hooked commands and edits, at most 12 hours), for 24 hours \
              (lease), or until you revoke it (always). Nothing else outside the workspace changes."
         )
-    } else if saved_tiers {
+    } else if reason.offers_saved_tiers() {
         format!(
             "every command in {workspace_label} may {verb} {path} — for the next command \
              (once), until this session ends (session), for 24 hours (lease), or until you \
@@ -264,37 +247,41 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
              (once) or until this session ends (session). It is never saved. Nothing else \
              outside the workspace changes."
         )
-    };
+    }
+}
 
-    // 6. Risk
-    let risk = match &ctx.risk {
-        Some(r) => {
-            let mut s = r.class.to_uppercase();
-            for w in &r.warnings {
-                s.push_str(&format!("\n! {w}"));
-            }
-            for f in &r.facts {
-                s.push_str(&format!("\n- {f}"));
-            }
-            s
-        }
-        None => "not assessed (no live scope to compare against)".to_string(),
+fn render_risk(risk: Option<&crate::scope_grant::GrantRiskSummary>) -> String {
+    let Some(r) = risk else {
+        return "not assessed (no live scope to compare against)".to_string();
     };
+    let mut s = r.class.to_uppercase();
+    for w in &r.warnings {
+        s.push_str(&format!("\n! {w}"));
+    }
+    for f in &r.facts {
+        s.push_str(&format!("\n- {f}"));
+    }
+    s
+}
 
-    // 7. The exact line `always` writes — or, for a session-only question,
-    // that there is none.
-    let always = if log_target {
+fn render_always(
+    reason: GrantReason,
+    minimum_access: ScopeAccess,
+    workspace: Option<&str>,
+    path: &str,
+) -> String {
+    if reason == GrantReason::LogTarget {
         // A command to paste never carries a placeholder: with the workspace
         // unknown, the revoke runs from it (its default) instead.
-        let (ws, revoke) = match workspace.clone() {
+        let (ws, revoke) = match workspace {
             Some(ws) => (
-                ws.clone(),
+                ws,
                 format!(
                     "Revoke any time with: ahma permissions revoke log-target {path} --workspace {ws}"
                 ),
             ),
             None => (
-                "<this workspace>".to_string(),
+                "<this workspace>",
                 format!(
                     "Revoke any time, from that workspace, with: ahma permissions revoke log-target {path}"
                 ),
@@ -303,17 +290,15 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         format!(
             "~/.ahma/settings.toml gets:\n[[log_targets.approvals]]\nworkspace = \"{ws}\"\ntargets = [\"{path}\"]\n{revoke}"
         )
-    } else if saved_tiers {
+    } else if reason.offers_saved_tiers() {
         format!(
             "~/.ahma/settings.toml gets:\n[[sandbox.persistent_scopes]]\npath = \"{}\"\naccess = \"{}\"\nworkspace = \"{}\"\nRevoke any time with: ahma sandbox revoke {}",
             path,
             minimum_access.short(),
-            workspace
-                .clone()
-                .unwrap_or_else(|| "<this workspace>".to_string()),
+            workspace.unwrap_or("<this workspace>"),
             path
         )
-    } else if startup {
+    } else if reason == GrantReason::StartupFlag {
         "not offered: the temp directory is shared by the whole machine, so this answer is \
          never written to ~/.ahma/settings.toml. To stop being asked, start ahma without --tmp \
          and remove tmp_access from [sandbox] in ~/.ahma/settings.toml."
@@ -322,16 +307,44 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         "not offered for a question this version of ahma does not recognise: nothing is \
          written to ~/.ahma/settings.toml."
             .to_string()
+    }
+}
+
+/// Render `req` into the body every surface shows.
+pub fn render(req: &ScopeGrantRequest) -> PromptBody {
+    let ctx = &req.context;
+    let path = req.path.display().to_string();
+    let workspace = ctx
+        .requester
+        .as_ref()
+        .and_then(|r| r.workspace.as_deref())
+        .map(|w| w.display().to_string());
+    // `--tmp` asks for exactly the access the flag means; nothing was refused,
+    // so "minimum that would work" is the request itself.
+    let startup = req.reason == GrantReason::StartupFlag;
+    let minimum_access = if ctx.write_denied || (startup && req.access.is_write()) {
+        ScopeAccess::Rw
+    } else {
+        ScopeAccess::Ro
+    };
+
+    let claim = match &ctx.agent_claim {
+        Some(c) => format!(
+            "\"{}\"\n(the agent's claim, in the agent's own words — it is the party asking, not a \
+             witness)",
+            c.trim()
+        ),
+        None => "nothing — the agent gave no reason".to_string(),
     };
 
     let sections = vec![
         PromptSection {
             heading: "Who is asking".into(),
-            body: who,
+            body: render_who(ctx.requester.as_ref(), workspace.as_deref()),
         },
         PromptSection {
             heading: "What was blocked".into(),
-            body: blocked,
+            body: render_blocked(req, &path, minimum_access),
         },
         PromptSection {
             heading: "What the agent says it needs".into(),
@@ -339,19 +352,19 @@ pub fn render(req: &ScopeGrantRequest) -> PromptBody {
         },
         PromptSection {
             heading: "Minimum that would work".into(),
-            body: minimum,
+            body: render_minimum(req.reason, ctx.write_denied, minimum_access, &path),
         },
         PromptSection {
             heading: "What a grant allows".into(),
-            body: allows,
+            body: render_allows(req.reason, minimum_access, workspace.as_deref(), &path),
         },
         PromptSection {
             heading: "Risk".into(),
-            body: risk,
+            body: render_risk(ctx.risk.as_ref()),
         },
         PromptSection {
             heading: "If you choose always".into(),
-            body: always,
+            body: render_always(req.reason, minimum_access, workspace.as_deref(), &path),
         },
     ];
 
@@ -1207,6 +1220,21 @@ Choices (deny is the default):
         );
     }
 
+    fn assert_no_key_leak_and_unique_keys(what: &str, body: &PromptBody) {
+        let all_opts = options();
+        for text in [body.to_message(), body.to_text()] {
+            for o in &all_opts {
+                let key = format!("[{}]", o.key);
+                assert!(!text.contains(&key), "{what}: {key} leaked into:\n{text}");
+            }
+        }
+        let mut keys: Vec<char> = body.options.iter().map(|o| o.key).collect();
+        let n = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "{what}: duplicate TUI keys");
+    }
+
     /// SPEC R-PERM.3.4 "Only the TUI shows key letters": the text every
     /// non-TUI surface sends — the elicitation message, the hook body, the
     /// relayed tool result — names choices by value, never by a key nobody
@@ -1224,20 +1252,7 @@ Choices (deny is the default):
             ("harness refusal", render(&harness_refusal_request())),
         ];
         for (what, body) in &bodies {
-            for text in [body.to_message(), body.to_text()] {
-                for o in options() {
-                    let key = format!("[{}]", o.key);
-                    assert!(!text.contains(&key), "{what}: {key} leaked into:\n{text}");
-                }
-            }
-        }
-        // ...while the TUI still has a distinct key for every choice it binds.
-        for (what, body) in &bodies {
-            let mut keys: Vec<char> = body.options.iter().map(|o| o.key).collect();
-            let n = keys.len();
-            keys.sort_unstable();
-            keys.dedup();
-            assert_eq!(keys.len(), n, "{what}: duplicate TUI keys");
+            assert_no_key_leak_and_unique_keys(what, body);
         }
     }
 

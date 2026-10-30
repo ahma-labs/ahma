@@ -38,6 +38,7 @@
 //! - `env | grep PATH`: Tests environment access
 //! - `cat /etc/hosts | head -5`: Tests file reading (non-repo)
 
+use ahma_common::sse::{event_data_to_json, pop_next_sse_event};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use futures::StreamExt;
@@ -64,22 +65,21 @@ const SANDBOX_INITIALIZING_MESSAGE: &str = "Sandbox initializing from client roo
 /// sites that used to retype it.
 const BOX_BORDER: &str = "═══════════════════════════════════════════════════════════";
 
+fn emit_line(s: &str, to_stderr: bool) {
+    if to_stderr {
+        eprintln!("{s}");
+    } else {
+        println!("{s}");
+    }
+}
+
 /// Print a boxed banner: a top border, one or more centered/left-aligned
 /// content lines (each already padded by the caller to line up inside the
 /// box), and a bottom border — via `println!` or `eprintln!` per `to_stderr`.
 fn print_boxed(lines: &[&str], to_stderr: bool) {
-    let emit = |s: String| {
-        if to_stderr {
-            eprintln!("{s}");
-        } else {
-            println!("{s}");
-        }
-    };
-    emit(format!("╔{BOX_BORDER}╗"));
-    for line in lines {
-        emit((*line).to_string());
-    }
-    emit(format!("╚{BOX_BORDER}╝"));
+    let body = lines.join("\n");
+    let boxed = format!("╔{BOX_BORDER}╗\n{body}\n╚{BOX_BORDER}╝");
+    emit_line(&boxed, to_stderr);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +358,18 @@ impl StressClient {
 
     // -- Command execution loop --------------------------------------------
 
+    async fn execute_and_record(&mut self, cmd: &[String]) {
+        match self.send_tool_call(cmd).await {
+            Ok(()) => {
+                self.success_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                eprintln!("Request error: {}", e);
+                self.error_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     async fn run_commands(
         &mut self,
         mut commands: Vec<Vec<String>>,
@@ -370,17 +382,7 @@ impl StressClient {
         while !stop_flag.load(Ordering::Relaxed) {
             let cmd = &commands[command_idx % commands.len()];
             command_idx += 1;
-
-            match self.send_tool_call(cmd).await {
-                Ok(_) => {
-                    self.success_count.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    eprintln!("Request error: {}", e);
-                    self.error_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-
+            self.execute_and_record(cmd).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -448,7 +450,6 @@ impl StressClient {
             match body {
                 ToolCallResult::Retry if Instant::now() < retry_deadline => {
                     tokio::time::sleep(Duration::from_millis(TOOL_CALL_RETRY_BACKOFF_MS)).await;
-                    continue;
                 }
                 ToolCallResult::Retry => {
                     self.clear_pending_token(progress_token).await;
@@ -459,12 +460,7 @@ impl StressClient {
                     return Err(anyhow!("{}", msg));
                 }
                 ToolCallResult::Success(value) => {
-                    if attempt > 1 {
-                        println!(
-                            "Recovered tools/call after {} retry attempt(s) due to sandbox initialization race",
-                            attempt - 1
-                        );
-                    }
+                    log_retry_recovery(attempt);
                     return Ok(value);
                 }
             }
@@ -515,6 +511,15 @@ impl StressClient {
         {
             state.pending_tokens.lock().await.remove(token);
         }
+    }
+}
+
+fn log_retry_recovery(attempt: u32) {
+    if attempt > 1 {
+        println!(
+            "Recovered tools/call after {} retry attempt(s) due to sandbox initialization race",
+            attempt - 1
+        );
     }
 }
 
@@ -637,26 +642,9 @@ async fn run_sse_loop(
     loop {
         ctx.check_timeouts(roots_deadline, sandbox_deadline)?;
 
-        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
-            Ok(Some(Ok(chunk))) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
-            Ok(Some(Err(e))) => {
-                return ctx.signal_error(anyhow!("Failed to read SSE chunk: {}", e));
-            }
-            Ok(None) => return ctx.signal_error(anyhow!("SSE stream ended")),
-            Err(_) => continue,
-        }
-
-        while let Some(event_end) = buffer.find("\n\n") {
-            // `drain` shifts only the remaining tail down in place, rather
-            // than reallocating and copying it into a fresh `String` (as
-            // `buffer[event_end + 2..].to_string()` did) on every event.
-            // The trailing blank line `parse_sse_event`'s `.lines()` sees is
-            // harmless: it yields no `data:`-prefixed line to join in.
-            let event_block: String = buffer.drain(..event_end + 2).collect();
-
-            if let Some(msg) = parse_sse_event(&event_block) {
-                ctx.handle_message(&msg).await?;
-            }
+        let next_chunk = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+        if ctx.append_sse_chunk(&mut buffer, next_chunk)? {
+            ctx.drain_sse_buffer(&mut buffer).await?;
         }
     }
 }
@@ -674,18 +662,73 @@ struct SseLoopContext<'a> {
 }
 
 impl<'a> SseLoopContext<'a> {
-    fn check_timeouts(&mut self, roots_deadline: Instant, sandbox_deadline: Instant) -> Result<()> {
-        if !self.answered_roots && Instant::now() > roots_deadline {
-            return self.signal_error(anyhow!(
-                "Timeout waiting for roots/list request from server ({}s)",
-                ROOTS_LIST_TIMEOUT_SECS
-            ));
+    fn append_sse_chunk(
+        &mut self,
+        buffer: &mut String,
+        next_chunk: Result<
+            Option<Result<bytes::Bytes, reqwest::Error>>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> Result<bool> {
+        match next_chunk {
+            Ok(Some(Ok(chunk))) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                Ok(true)
+            }
+            Ok(Some(Err(e))) => {
+                self.signal_error(anyhow!("Failed to read SSE chunk: {}", e))?;
+                Ok(false)
+            }
+            Ok(None) => {
+                self.signal_error(anyhow!("SSE stream ended"))?;
+                Ok(false)
+            }
+            Err(_) => Ok(false),
         }
-        if !self.handshake_completed && self.answered_roots && Instant::now() > sandbox_deadline {
-            return self.signal_error(anyhow!(
-                "Timeout waiting for sandbox/configured notification ({}s)",
-                SANDBOX_CONFIG_TIMEOUT_SECS
-            ));
+    }
+
+    async fn drain_sse_buffer(&mut self, buffer: &mut String) -> Result<()> {
+        while let Some(raw_event) = pop_next_sse_event(buffer) {
+            self.process_event_block(&raw_event).await?;
+        }
+        Ok(())
+    }
+
+    async fn process_event_block(&mut self, raw_event: &str) -> Result<()> {
+        if let Some(msg) = event_data_to_json(raw_event) {
+            self.handle_message(&msg).await?;
+        }
+        Ok(())
+    }
+
+    fn active_handshake_deadline(
+        &self,
+        roots_deadline: Instant,
+        sandbox_deadline: Instant,
+    ) -> Option<(Instant, &'static str, u64)> {
+        match (self.handshake_completed, self.answered_roots) {
+            (true, _) => None,
+            (false, false) => Some((
+                roots_deadline,
+                "Timeout waiting for roots/list request from server",
+                ROOTS_LIST_TIMEOUT_SECS,
+            )),
+            (false, true) => Some((
+                sandbox_deadline,
+                "Timeout waiting for sandbox/configured notification",
+                SANDBOX_CONFIG_TIMEOUT_SECS,
+            )),
+        }
+    }
+
+    fn check_timeouts(&mut self, roots_deadline: Instant, sandbox_deadline: Instant) -> Result<()> {
+        let Some((deadline, label, secs)) =
+            self.active_handshake_deadline(roots_deadline, sandbox_deadline)
+        else {
+            return Ok(());
+        };
+        if Instant::now() > deadline {
+            return self.signal_error(anyhow!("{label} ({secs}s)"));
         }
         Ok(())
     }
@@ -697,12 +740,17 @@ impl<'a> SseLoopContext<'a> {
         Err(err)
     }
 
+    fn is_handshake_ready(&self) -> bool {
+        !self.handshake_completed && self.answered_roots && self.saw_sandbox_configured
+    }
+
     fn signal_ready(&mut self) {
-        if !self.handshake_completed && self.answered_roots && self.saw_sandbox_configured {
-            self.handshake_completed = true;
-            if let Some(tx) = self.ready_tx.take() {
-                let _ = tx.send(Ok(()));
-            }
+        if !self.is_handshake_ready() {
+            return;
+        }
+        self.handshake_completed = true;
+        if let Some(tx) = self.ready_tx.take() {
+            let _ = tx.send(Ok(()));
         }
     }
 
@@ -773,20 +821,6 @@ impl<'a> SseLoopContext<'a> {
             state.track_completion(token, message).await;
         }
     }
-}
-
-fn parse_sse_event(event_block: &str) -> Option<Value> {
-    let data: String = event_block
-        .lines()
-        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-        .map(|content| content.trim_start())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_str(&data).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -892,9 +926,13 @@ fn push_bounded(lines: &mut Vec<String>, line: String, max: usize) {
     }
 }
 
+fn has_error_token(line: &str) -> bool {
+    line.contains("ERROR") && !line.contains("0 errors")
+}
+
 fn is_fatal_server_error(line: &str) -> bool {
     line.starts_with("error:")
-        || (line.contains("ERROR") && !line.contains("0 errors"))
+        || has_error_token(line)
         || line.contains("panicked at")
         || line.contains("fatal error")
 }
@@ -905,12 +943,11 @@ async fn collect_trailing_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for _ in 0..max {
-        if let Ok(Some(line)) = reader.next_line().await {
-            println!("[SERVER] {}", line);
-            lines.push(line);
-        } else {
+        let Ok(Some(line)) = reader.next_line().await else {
             break;
-        }
+        };
+        println!("[SERVER] {}", line);
+        lines.push(line);
     }
     lines
 }
@@ -922,34 +959,43 @@ async fn store_error_context(
 ) {
     let mut ctx = error_context.lock().await;
 
-    ctx.push(format!("╔{BOX_BORDER}╗"));
-    ctx.push("║  ERROR CONTEXT (recent server output before error)       ║".to_string());
-    ctx.push(format!("╠{BOX_BORDER}╣"));
+    ctx.extend([
+        format!("╔{BOX_BORDER}╗"),
+        "║  ERROR CONTEXT (recent server output before error)       ║".to_string(),
+        format!("╠{BOX_BORDER}╣"),
+    ]);
     push_marked_last(&mut ctx, recent_lines);
 
-    ctx.push(format!("╠{BOX_BORDER}╣"));
-    ctx.push("║  FOLLOWING OUTPUT                                         ║".to_string());
-    ctx.push(format!("╠{BOX_BORDER}╣"));
-    for line in trailing_lines {
-        ctx.push(format!("    {}", line));
-    }
-
+    ctx.extend([
+        format!("╠{BOX_BORDER}╣"),
+        "║  FOLLOWING OUTPUT                                         ║".to_string(),
+        format!("╠{BOX_BORDER}╣"),
+    ]);
+    ctx.extend(trailing_lines.iter().map(|line| format!("    {line}")));
     ctx.push(format!("╚{BOX_BORDER}╝"));
 }
 
 /// Appends `lines` to `ctx`, marking the final entry with a `>>>` pointer so the
 /// line that immediately preceded the error stands out from its context.
 fn push_marked_last(ctx: &mut Vec<String>, lines: &[String]) {
-    let last_index = lines.len().saturating_sub(1);
-    for (i, line) in lines.iter().enumerate() {
-        let prefix = if i == last_index { ">>> " } else { "    " };
-        ctx.push(format!("{}{}", prefix, line));
-    }
+    let Some((last, init)) = lines.split_last() else {
+        return;
+    };
+    ctx.extend(init.iter().map(|line| format!("    {line}")));
+    ctx.push(format!(">>> {last}"));
 }
 
 // ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
+
+async fn is_server_healthy(client: &Client, health_url: &str) -> bool {
+    client
+        .get(health_url)
+        .send()
+        .await
+        .is_ok_and(|resp| resp.status().is_success())
+}
 
 async fn wait_for_health(base_url: &str, timeout_secs: u64) -> Result<()> {
     let client = Client::new();
@@ -963,13 +1009,11 @@ async fn wait_for_health(base_url: &str, timeout_secs: u64) -> Result<()> {
                 timeout_secs
             ));
         }
-        match client.get(&health_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                println!("OK Server is healthy");
-                return Ok(());
-            }
-            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        if is_server_healthy(&client, &health_url).await {
+            println!("OK Server is healthy");
+            return Ok(());
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -1042,6 +1086,56 @@ enum TestOutcome {
     DurationElapsed,
 }
 
+fn has_excessive_initial_errors(success: u64, errors: u64) -> bool {
+    errors >= 10 && success == 0
+}
+
+fn evaluate_termination(
+    server_has_error: bool,
+    elapsed: Duration,
+    duration: Duration,
+    success: u64,
+    errors: u64,
+) -> Option<TestOutcome> {
+    if server_has_error {
+        return Some(TestOutcome::ServerError);
+    }
+    if elapsed >= duration {
+        println!("\nOK Test duration completed");
+        return Some(TestOutcome::DurationElapsed);
+    }
+    if has_excessive_initial_errors(success, errors) {
+        return Some(TestOutcome::ExcessiveClientErrors);
+    }
+    None
+}
+
+fn check_monitoring_step(
+    server: &ServerManager,
+    counters: &SharedCounters,
+    stop_flag: &AtomicBool,
+    elapsed: Duration,
+    duration: Duration,
+) -> Option<TestOutcome> {
+    let success = counters.success.load(Ordering::Relaxed);
+    let errors = counters.error.load(Ordering::Relaxed);
+
+    if let Some(outcome) =
+        evaluate_termination(server.has_error(), elapsed, duration, success, errors)
+    {
+        if !matches!(outcome, TestOutcome::DurationElapsed) {
+            stop_flag.store(true, Ordering::SeqCst);
+        }
+        return Some(outcome);
+    }
+
+    if elapsed.as_secs().is_multiple_of(5) {
+        print_progress(elapsed.as_secs(), success, errors);
+    }
+
+    None
+}
+
 async fn run_monitoring_loop(
     server: &ServerManager,
     counters: &SharedCounters,
@@ -1051,28 +1145,11 @@ async fn run_monitoring_loop(
     let start = Instant::now();
 
     loop {
-        if server.has_error() {
-            stop_flag.store(true, Ordering::SeqCst);
-            return TestOutcome::ServerError;
+        if let Some(outcome) =
+            check_monitoring_step(server, counters, stop_flag, start.elapsed(), duration)
+        {
+            return outcome;
         }
-
-        if start.elapsed() >= duration {
-            println!("\nOK Test duration completed");
-            return TestOutcome::DurationElapsed;
-        }
-
-        let success = counters.success.load(Ordering::Relaxed);
-        let errors = counters.error.load(Ordering::Relaxed);
-
-        if errors >= 10 && success == 0 {
-            stop_flag.store(true, Ordering::SeqCst);
-            return TestOutcome::ExcessiveClientErrors;
-        }
-
-        if start.elapsed().as_secs().is_multiple_of(5) {
-            print_progress(start.elapsed().as_secs(), success, errors);
-        }
-
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -1086,33 +1163,31 @@ fn print_progress(elapsed_secs: u64, success: u64, errors: u64) {
     );
 }
 
+fn compute_success_rate(success: u64, total: u64) -> f64 {
+    if total > 0 {
+        (success as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
 fn print_final_report(counters: &SharedCounters, elapsed: f64) {
     let success = counters.success.load(Ordering::Relaxed);
     let errors = counters.error.load(Ordering::Relaxed);
     let async_ok = counters.async_success.load(Ordering::Relaxed);
     let async_err = counters.async_error.load(Ordering::Relaxed);
     let total = success + errors;
-    let success_rate = if total > 0 {
-        (success as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
+    let success_rate = compute_success_rate(success, total);
+    let avg_rate = total as f64 / elapsed;
 
     println!();
     print_boxed(
         &["║                     Test Results                          ║"],
         false,
     );
-    println!("  Total requests: {}", total);
-    println!("  Successful: {} ({:.1}%)", success, success_rate);
-    println!("  Errors: {}", errors);
     println!(
-        "  Async completions observed: {} ok / {} failed",
-        async_ok, async_err
+        "  Total requests: {total}\n  Successful: {success} ({success_rate:.1}%)\n  Errors: {errors}\n  Async completions observed: {async_ok} ok / {async_err} failed\n  Duration: {elapsed:.1}s\n  Average rate: {avg_rate:.1} req/s\n"
     );
-    println!("  Duration: {:.1}s", elapsed);
-    println!("  Average rate: {:.1} req/s", total as f64 / elapsed);
-    println!();
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,8 +1199,7 @@ fn print_final_report(counters: &SharedCounters, elapsed: f64) {
 /// to the caller once it is confirmed healthy.
 async fn ensure_server_healthy_or_exit(base_url: &str, server: ServerManager) -> ServerManager {
     if let Err(e) = wait_for_health(base_url, 120).await {
-        eprintln!("\nFAIL Failed to start server: {}", e);
-        eprintln!("Cleaning up server process...");
+        eprintln!("\nFAIL Failed to start server: {e}\nCleaning up server process...");
         let _ = server.kill().await;
         std::process::exit(1);
     }
@@ -1141,28 +1215,22 @@ fn spawn_all_clients(
     counters: &SharedCounters,
     stop_flag: &Arc<AtomicBool>,
 ) {
-    spawn_client(
-        join_set,
-        base_url,
-        SpawnConfig {
-            is_sync: true,
-            seed: 12345,
-            label: "Sync client".to_string(),
-        },
-        commands.to_vec(),
-        counters,
-        stop_flag.clone(),
-    );
+    let configs = std::iter::once(SpawnConfig {
+        is_sync: true,
+        seed: 12345,
+        label: "Sync client".to_string(),
+    })
+    .chain((0..async_clients).map(|i| SpawnConfig {
+        is_sync: false,
+        seed: 67890 + i as u64,
+        label: format!("Async client {}", i + 1),
+    }));
 
-    for i in 0..async_clients {
+    for config in configs {
         spawn_client(
             join_set,
             base_url,
-            SpawnConfig {
-                is_sync: false,
-                seed: 67890 + i as u64,
-                label: format!("Async client {}", i + 1),
-            },
+            config,
             commands.to_vec(),
             counters,
             stop_flag.clone(),
@@ -1182,31 +1250,29 @@ async fn drain_clients(join_set: &mut JoinSet<Result<()>>) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-
+fn print_banner_and_config(args: &Args) {
     print_boxed(
         &["║       AHMA HTTP Bridge Stress Test                        ║"],
         false,
     );
-    println!();
-    println!("Configuration:");
-    println!("  Port: {}", args.port);
-    println!("  Duration: {}s", args.duration);
-    println!("  Async clients: {}", args.async_clients);
-    println!("  Sync clients: 1");
-    println!();
+    println!(
+        "\nConfiguration:\n  Port: {}\n  Duration: {}s\n  Async clients: {}\n  Sync clients: 1\n",
+        args.port, args.duration, args.async_clients
+    );
+}
 
-    // Start server
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    print_banner_and_config(&args);
+
     println!("Starting server...");
     let server = ServerManager::spawn(args.port, args.binary).await?;
 
     let base_url = format!("http://127.0.0.1:{}", args.port);
     let server = ensure_server_healthy_or_exit(&base_url, server).await;
 
-    println!();
-    println!("Starting {} client(s)...", args.async_clients + 1);
+    println!("\nStarting {} client(s)...", args.async_clients + 1);
 
     let counters = SharedCounters::new();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1222,9 +1288,7 @@ async fn main() -> Result<()> {
         &stop_flag,
     );
 
-    println!();
-    println!("Running stress test...");
-    println!();
+    println!("\nRunning stress test...\n");
 
     let start = Instant::now();
     let duration = Duration::from_secs(args.duration);
@@ -1243,11 +1307,8 @@ async fn main() -> Result<()> {
         TestOutcome::DurationElapsed => {}
     }
 
-    // Graceful shutdown
     stop_flag.store(true, Ordering::Relaxed);
-    println!();
-    println!("Stopping clients...");
-
+    println!("\nStopping clients...");
     drain_clients(&mut join_set).await;
 
     let had_server_error = server.has_error();
@@ -1271,13 +1332,8 @@ async fn print_server_error(server: &ServerManager) {
         &["║             FAIL SERVER ERROR DETECTED                       ║"],
         true,
     );
-    eprintln!();
-    for line in server.get_error_context().await {
-        eprintln!("{}", line);
-    }
-    eprintln!();
-    eprintln!("ABORTING: Stress test terminated due to server error.");
-    eprintln!();
+    let context = server.get_error_context().await.join("\n");
+    eprintln!("\n{context}\n\nABORTING: Stress test terminated due to server error.\n");
 }
 
 fn print_excessive_errors(counters: &SharedCounters) {
@@ -1287,13 +1343,7 @@ fn print_excessive_errors(counters: &SharedCounters) {
         &["║       FAIL TOO MANY CLIENT ERRORS - ABORTING                 ║"],
         true,
     );
-    eprintln!();
-    eprintln!("  Errors: {} with 0 successes", errors);
-    eprintln!("  This indicates a fundamental problem with the server or protocol.");
-    eprintln!();
-    eprintln!("  Common causes:");
-    eprintln!("    - 409 Conflict: Sandbox not initialized (missing roots/list response)");
-    eprintln!("    - 401/403: Authentication issues");
-    eprintln!("    - 404: Wrong endpoint URL");
-    eprintln!();
+    eprintln!(
+        "\n  Errors: {errors} with 0 successes\n  This indicates a fundamental problem with the server or protocol.\n\n  Common causes:\n    - 409 Conflict: Sandbox not initialized (missing roots/list response)\n    - 401/403: Authentication issues\n    - 404: Wrong endpoint URL\n"
+    );
 }

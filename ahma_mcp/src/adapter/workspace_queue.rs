@@ -499,10 +499,6 @@ impl WorkspaceQueue {
         }
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     fn lock_path(&self, key: &Path) -> Option<PathBuf> {
         self.lock_dir
             .as_ref()

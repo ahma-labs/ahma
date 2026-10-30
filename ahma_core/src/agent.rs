@@ -52,13 +52,19 @@ impl AgentError {
 
 impl From<String> for AgentError {
     fn from(message: String) -> Self {
-        Self::permanent(message)
+        Self {
+            message,
+            transient: false,
+        }
     }
 }
 
 impl From<&str> for AgentError {
     fn from(message: &str) -> Self {
-        Self::permanent(message)
+        Self {
+            message: message.to_owned(),
+            transient: false,
+        }
     }
 }
 
@@ -799,6 +805,63 @@ fn tool_call_arguments(
     })
 }
 
+async fn finish_tool_call_error(
+    tx: &Sender<AgentEvent>,
+    call: ahma_llm_monitor::client::ChatToolCall,
+    err_text: String,
+) -> (String, String, serde_json::Value, bool) {
+    let _ = tx
+        .send(AgentEvent::ToolCallFinished {
+            id: call.id.clone(),
+            result: err_text.clone(),
+            failed: true,
+        })
+        .await;
+    (
+        call.id,
+        call.name,
+        serde_json::json!({ "error": err_text }),
+        true,
+    )
+}
+
+async fn try_handle_menu_tool_call(
+    call: &ahma_llm_monitor::client::ChatToolCall,
+    args_value: &serde_json::Value,
+    args_str: &str,
+    cfg: &McpChatConfig,
+    tx: &Sender<AgentEvent>,
+) -> Option<(serde_json::Value, bool)> {
+    // The menu answers `more_tools` itself and refuses a tool the model was
+    // never offered (SPEC R24.12.8) — before approval: neither runs anything.
+    let menu = cfg.tool_menu.as_ref()?;
+    let (text, failed) = if call.name == crate::tool_menu::MORE_TOOLS {
+        menu.open(args_value)
+    } else {
+        menu.refusal_for(&call.name).map(|text| (text, true))?
+    };
+    let _ = tx
+        .send(AgentEvent::ToolCallStarted {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            args: args_str.to_string(),
+        })
+        .await;
+    let _ = tx
+        .send(AgentEvent::ToolCallFinished {
+            id: call.id.clone(),
+            result: text.clone(),
+            failed,
+        })
+        .await;
+    let payload = if failed {
+        serde_json::json!({"error": text})
+    } else {
+        serde_json::json!({"output": text})
+    };
+    Some((payload, failed))
+}
+
 async fn execute_single_tool_call(
     call: ahma_llm_monitor::client::ChatToolCall,
     cfg: &McpChatConfig,
@@ -807,73 +870,23 @@ async fn execute_single_tool_call(
 ) -> (String, String, serde_json::Value, bool) {
     let args_value = match tool_call_arguments(&call) {
         Ok(v) => v,
-        Err(text) => {
-            let _ = tx
-                .send(AgentEvent::ToolCallFinished {
-                    id: call.id.clone(),
-                    result: text.clone(),
-                    failed: true,
-                })
-                .await;
-            return (
-                call.id,
-                call.name,
-                serde_json::json!({ "error": text }),
-                true,
-            );
-        }
+        Err(text) => return finish_tool_call_error(&tx, call, text).await,
     };
     let args_str = serde_json::to_string(&args_value).unwrap_or_default();
 
-    // The menu answers `more_tools` itself and refuses a tool the model was
-    // never offered (SPEC R24.12.8) — before approval: neither runs anything.
-    if let Some(menu) = &cfg.tool_menu {
-        let answer = if call.name == crate::tool_menu::MORE_TOOLS {
-            Some(menu.open(&args_value))
-        } else {
-            menu.refusal_for(&call.name).map(|text| (text, true))
-        };
-        if let Some((text, failed)) = answer {
-            let _ = tx
-                .send(AgentEvent::ToolCallStarted {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    args: args_str,
-                })
-                .await;
-            let _ = tx
-                .send(AgentEvent::ToolCallFinished {
-                    id: call.id.clone(),
-                    result: text.clone(),
-                    failed,
-                })
-                .await;
-            let payload = if failed {
-                serde_json::json!({"error": text})
-            } else {
-                serde_json::json!({"output": text})
-            };
-            return (call.id, call.name, payload, failed);
-        }
+    if let Some((payload, failed)) =
+        try_handle_menu_tool_call(&call, &args_value, &args_str, cfg, &tx).await
+    {
+        return (call.id, call.name, payload, failed);
     }
 
-    let approved = resolve_tool_approval(&call.id, &call.name, cfg, &args_str, gate.as_ref()).await;
-
-    if !approved {
-        let err_text = "Error: Tool execution rejected by user".to_string();
-        let _ = tx
-            .send(AgentEvent::ToolCallFinished {
-                id: call.id.clone(),
-                result: err_text.clone(),
-                failed: true,
-            })
-            .await;
-        return (
-            call.id,
-            call.name,
-            serde_json::json!({"error": err_text}),
-            true,
-        );
+    if !resolve_tool_approval(&call.id, &call.name, cfg, &args_str, gate.as_ref()).await {
+        return finish_tool_call_error(
+            &tx,
+            call,
+            "Error: Tool execution rejected by user".to_string(),
+        )
+        .await;
     }
 
     let _ = tx
@@ -884,8 +897,7 @@ async fn execute_single_tool_call(
         })
         .await;
 
-    let result = dispatch_tool_execution(&call.name, args_value, cfg).await;
-    match result {
+    match dispatch_tool_execution(&call.name, args_value, cfg).await {
         Ok((text, failed)) => {
             let _ = tx
                 .send(AgentEvent::ToolCallFinished {
@@ -901,22 +913,7 @@ async fn execute_single_tool_call(
                 failed,
             )
         }
-        Err(e) => {
-            let err_text = format!("Error: {e}");
-            let _ = tx
-                .send(AgentEvent::ToolCallFinished {
-                    id: call.id.clone(),
-                    result: err_text.clone(),
-                    failed: true,
-                })
-                .await;
-            (
-                call.id,
-                call.name,
-                serde_json::json!({"error": err_text}),
-                true,
-            )
-        }
+        Err(e) => finish_tool_call_error(&tx, call, format!("Error: {e}")).await,
     }
 }
 
@@ -1533,6 +1530,42 @@ fn initial_msg_json(
     msg_json
 }
 
+fn init_tool_menu(
+    mcp: &mut Option<McpChatConfig>,
+    available_tools: Vec<ahma_mcp::mcp_client::ToolInfo>,
+) -> Option<Arc<crate::tool_menu::ToolMenu>> {
+    let cfg = mcp.as_mut()?;
+    let menu = Arc::new(crate::tool_menu::ToolMenu::new(
+        available_tools,
+        cfg.small_model_harness,
+        &cfg.workspace_root,
+    ));
+    cfg.tool_menu = Some(menu.clone());
+    Some(menu)
+}
+
+async fn tools_for_turn(
+    menu: &Option<Arc<crate::tool_menu::ToolMenu>>,
+    all_tool_defs: &[serde_json::Value],
+    offered_label: &mut String,
+    tx: &Sender<AgentEvent>,
+) -> Vec<serde_json::Value> {
+    let Some(menu) = menu else {
+        return all_tool_defs.to_vec();
+    };
+    let label = menu.label();
+    if menu.is_lean() && label != *offered_label {
+        let _ = tx
+            .send(AgentEvent::Status {
+                phase: "tools".to_string(),
+                detail: label.clone(),
+            })
+            .await;
+        *offered_label = label;
+    }
+    menu.definitions()
+}
+
 pub fn spawn_agent_task(
     client: LlmClient,
     messages: Vec<ChatMessage>,
@@ -1556,21 +1589,11 @@ pub fn spawn_agent_task(
         if let Some(cfg) = mcp.as_mut().filter(|_| auto_context) {
             context_known = fit_to_server(&client, cfg, &tx).await;
         }
-        let menu = mcp.as_ref().map(|cfg| {
-            Arc::new(crate::tool_menu::ToolMenu::new(
-                available_tools.clone(),
-                cfg.small_model_harness,
-                &cfg.workspace_root,
-            ))
-        });
-        if let (Some(cfg), Some(menu)) = (mcp.as_mut(), &menu) {
-            cfg.tool_menu = Some(menu.clone());
-        }
+        let menu = init_tool_menu(&mut mcp, available_tools.clone());
         let all_tool_defs = prepare_tool_definitions(available_tools);
         let mut offered_label = String::new();
 
         let max_turns = mcp.as_ref().map(|c| c.max_turns).unwrap_or(8);
-        let mut completed = false;
         let mut read_file_hinted = false;
         let mut error_hinted = false;
         let mut last_prompt_tokens: u32 = 0;
@@ -1590,22 +1613,7 @@ pub fn spawn_agent_task(
             {
                 context_known = fit_to_server(&client, cfg, &tx).await;
             }
-            let tool_defs = match &menu {
-                Some(menu) => {
-                    let label = menu.label();
-                    if menu.is_lean() && label != offered_label {
-                        let _ = tx
-                            .send(AgentEvent::Status {
-                                phase: "tools".to_string(),
-                                detail: label.clone(),
-                            })
-                            .await;
-                        offered_label = label;
-                    }
-                    menu.definitions()
-                }
-                None => all_tool_defs.clone(),
-            };
+            let tool_defs = tools_for_turn(&menu, &all_tool_defs, &mut offered_label, &tx).await;
             info!(
                 offered = tool_defs.len(),
                 schema_tokens = schema_tokens(&tool_defs),
@@ -1626,13 +1634,8 @@ pub fn spawn_agent_task(
             )
             .await
             {
-                completed = true;
-                break;
+                return;
             }
-        }
-
-        if completed {
-            return;
         }
 
         // Turn budget exhausted without the model ending its own run.
@@ -1889,17 +1892,14 @@ fn parse_error_message(err: &serde_json::Value) -> String {
 }
 
 fn extract_content_text(res: &serde_json::Value) -> String {
-    if let Some(content_array) = res.get("content").and_then(|c| c.as_array()) {
-        let mut texts = Vec::new();
-        for item in content_array {
-            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                texts.push(t.to_string());
-            }
-        }
-        texts.join("\n")
-    } else {
-        serde_json::to_string_pretty(res).unwrap_or_default()
-    }
+    let Some(content_array) = res.get("content").and_then(|c| c.as_array()) else {
+        return serde_json::to_string_pretty(res).unwrap_or_default();
+    };
+    content_array
+        .iter()
+        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// POST a `tools/call` to the local MCP bridge and parse the response.
@@ -2081,6 +2081,44 @@ impl LlmConnection {
 /// second, blocking `~/.ahma/config.toml` read — `AhmaConfig::load()` is
 /// synchronous `std::fs` I/O, which AGENTS.md forbids on an async path, and
 /// this function used to call it up to once per branch.
+fn resolve_url_provider(
+    p_name: String,
+    model: Option<String>,
+    config: &ahma_common::config::AhmaConfig,
+) -> Result<LlmConnection, String> {
+    // The TUI persists the selected provider by URL, so everything the
+    // matching config entry declares must still be recovered here
+    // (issue #484 — a lost `num_ctx` silently disables compaction, and
+    // a lost `kind` sends the wrong wire format to a proxied provider).
+    let entry = config.provider_for_base_url(&p_name);
+    // The key too: the TUI addresses cloud providers by URL, and a
+    // dropped key is a 401 on every turn. `${VAR}` references resolve
+    // in this process's environment; an unset one is an error worth
+    // stating rather than an anonymous request.
+    let api_key = match entry {
+        Some(e) => {
+            e.resolve()
+                .map_err(|err| {
+                    format!("Provider '{}' API key could not be resolved: {err}", e.name)
+                })?
+                .api_key
+        }
+        None => None,
+    };
+    let kind = entry.map(|e| e.kind);
+    // Only a configured size: it is sent to the server, so a guess
+    // here would override the server's own choice. An unconfigured
+    // size is learned from the server by the agent loop.
+    let num_ctx = entry.and_then(|e| e.num_ctx);
+    Ok(LlmConnection {
+        base_url: p_name,
+        model: model.unwrap_or_default(),
+        api_key,
+        num_ctx,
+        kind,
+    })
+}
+
 fn resolve_llm_connection(
     provider: Option<String>,
     model: Option<String>,
@@ -2088,37 +2126,7 @@ fn resolve_llm_connection(
 ) -> Result<LlmConnection, String> {
     if let Some(p_name) = provider {
         if provider_is_url(&p_name) {
-            // The TUI persists the selected provider by URL, so everything the
-            // matching config entry declares must still be recovered here
-            // (issue #484 — a lost `num_ctx` silently disables compaction, and
-            // a lost `kind` sends the wrong wire format to a proxied provider).
-            let entry = config.provider_for_base_url(&p_name);
-            // The key too: the TUI addresses cloud providers by URL, and a
-            // dropped key is a 401 on every turn. `${VAR}` references resolve
-            // in this process's environment; an unset one is an error worth
-            // stating rather than an anonymous request.
-            let api_key = match entry {
-                Some(e) => {
-                    e.resolve()
-                        .map_err(|err| {
-                            format!("Provider '{}' API key could not be resolved: {err}", e.name)
-                        })?
-                        .api_key
-                }
-                None => None,
-            };
-            let kind = entry.map(|e| e.kind);
-            // Only a configured size: it is sent to the server, so a guess
-            // here would override the server's own choice. An unconfigured
-            // size is learned from the server by the agent loop.
-            let num_ctx = entry.and_then(|e| e.num_ctx);
-            return Ok(LlmConnection {
-                base_url: p_name,
-                model: model.unwrap_or_default(),
-                api_key,
-                num_ctx,
-                kind,
-            });
+            return resolve_url_provider(p_name, model, config);
         }
         let resolved = config
             .resolve_provider(&p_name)
@@ -2532,6 +2540,22 @@ mod tests {
         }
     }
 
+    fn test_hub_chat_config(
+        settings: &ahma_common::config::AhmaSettings,
+        provider_num_ctx: Option<u32>,
+    ) -> McpChatConfig {
+        assemble_hub_chat_config(
+            "http://localhost:3000".to_string(),
+            PathBuf::from("/tmp"),
+            ahma_mcp::mcp_client::McpConnectionManager::default(),
+            settings,
+            None,
+            provider_num_ctx,
+            true,
+            Arc::new(std::collections::HashSet::new()),
+        )
+    }
+
     /// Regression for issue #484: the hub `SubmitPrompt` path hardcoded
     /// `context_length: None`, silently disabling proactive compaction and the
     /// context budgets. The provider's resolved `num_ctx` must flow through to
@@ -2539,16 +2563,7 @@ mod tests {
     #[test]
     fn hub_chat_config_carries_provider_num_ctx_as_context_length() {
         let settings = ahma_common::config::AhmaSettings::default();
-        let cfg = assemble_hub_chat_config(
-            "http://localhost:3000".to_string(),
-            PathBuf::from("/tmp"),
-            ahma_mcp::mcp_client::McpConnectionManager::default(),
-            &settings,
-            None,
-            Some(16_384),
-            true,
-            Arc::new(std::collections::HashSet::new()),
-        );
+        let cfg = test_hub_chat_config(&settings, Some(16_384));
         assert_eq!(cfg.context_length, Some(16_384));
         // And the compaction trigger actually engages with that denominator.
         assert!(
@@ -2557,16 +2572,7 @@ mod tests {
         );
 
         // Unknown window stays None (compaction correctly stays inert).
-        let cfg = assemble_hub_chat_config(
-            "http://localhost:3000".to_string(),
-            PathBuf::from("/tmp"),
-            ahma_mcp::mcp_client::McpConnectionManager::default(),
-            &settings,
-            None,
-            None,
-            true,
-            Arc::new(std::collections::HashSet::new()),
-        );
+        let cfg = test_hub_chat_config(&settings, None);
         assert_eq!(cfg.context_length, None);
     }
 
@@ -2574,16 +2580,7 @@ mod tests {
     fn hub_chat_config_respects_settings_tools_context_length() {
         let mut settings = ahma_common::config::AhmaSettings::default();
         settings.tools.context_length = Some(32_768);
-        let cfg = assemble_hub_chat_config(
-            "http://localhost:3000".to_string(),
-            PathBuf::from("/tmp"),
-            ahma_mcp::mcp_client::McpConnectionManager::default(),
-            &settings,
-            None,
-            None,
-            true,
-            Arc::new(std::collections::HashSet::new()),
-        );
+        let cfg = test_hub_chat_config(&settings, None);
         assert_eq!(cfg.context_length, Some(32_768));
         assert!(cfg.compaction_threshold().is_some());
     }
@@ -2672,6 +2669,22 @@ mod tests {
         }
     }
 
+    fn assert_no_orphaned_tool_results(m: &[serde_json::Value], budget: usize) {
+        let mut calls = std::collections::HashSet::new();
+        for msg in m {
+            if let Some(tc) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                calls.extend(tc.iter().filter_map(|c| c["id"].as_str().map(String::from)));
+            }
+            if msg["role"] == "tool" {
+                let id = msg["tool_call_id"].as_str().unwrap();
+                assert!(
+                    calls.contains(id),
+                    "budget {budget}: tool result {id} has no call before it: {m:#?}"
+                );
+            }
+        }
+    }
+
     /// A tool result is never left without the assistant call it answers:
     /// both OpenAI and Anthropic reject an orphaned `role: tool` message with
     /// a 400, which ended the turn.
@@ -2692,21 +2705,7 @@ mod tests {
         for budget in (600..4_000).step_by(37) {
             let mut m = msgs.clone();
             trim_conversation(&mut m, budget);
-            let mut calls = std::collections::HashSet::new();
-            for msg in &m {
-                if let Some(tc) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                    for c in tc {
-                        calls.insert(c["id"].as_str().unwrap().to_string());
-                    }
-                }
-                if msg["role"] == "tool" {
-                    let id = msg["tool_call_id"].as_str().unwrap();
-                    assert!(
-                        calls.contains(id),
-                        "budget {budget}: tool result {id} has no call before it: {m:#?}"
-                    );
-                }
-            }
+            assert_no_orphaned_tool_results(&m, budget);
         }
     }
 
@@ -3098,48 +3097,11 @@ mod tests {
         assert_eq!(labels, ["core", "core + git"], "{events:?}");
     }
 
-    #[tokio::test]
-    async fn test_agent_task_tool_call_loop() {
-        let llm_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let llm_router = axum::Router::new().route(
-            "/chat/completions",
-            axum::routing::post(move || {
-                let counter = llm_counter.clone();
-                async move {
-                    // The tool-calling path streams; reply with SSE. Turn 1 emits a
-                    // tool call, turn 2 emits the final answer as one content delta.
-                    let count = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let body = if count == 0 {
-                        concat!(
-                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"function\":{\"name\":\"test_tool\",\"arguments\":\"{\\\"arg\\\":\\\"value\\\"}\"}}]}}]}\n",
-                            "data: [DONE]\n",
-                        )
-                        .to_string()
-                    } else {
-                        concat!(
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"Tool call was successful.\"}}]}\n",
-                            "data: [DONE]\n",
-                        )
-                        .to_string()
-                    };
-                    axum::response::Response::builder()
-                        .header("content-type", "text/event-stream")
-                        .body(body)
-                        .unwrap()
-                }
-            }),
-        );
-
-        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let llm_addr = llm_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(llm_listener, llm_router).await.unwrap();
-        });
-
+    async fn spawn_mock_mcp_bridge(session_id: &'static str) -> String {
         let mcp_router = axum::Router::new().route(
             "/mcp",
             axum::routing::post(
-                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
                     use axum::response::IntoResponse;
                     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     match method {
@@ -3147,7 +3109,7 @@ mod tests {
                             let mut headers = axum::http::HeaderMap::new();
                             headers.insert(
                                 "mcp-session-id",
-                                axum::http::HeaderValue::from_static("test-session-123"),
+                                axum::http::HeaderValue::from_static(session_id),
                             );
                             (headers, axum::Json(serde_json::json!({}))).into_response()
                         }
@@ -3172,68 +3134,30 @@ mod tests {
                 let head = futures::stream::once(async move {
                     Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(body))
                 });
-                let tail = futures::stream::pending::<Result<axum::body::Bytes, std::convert::Infallible>>();
-                let stream = head.chain(tail);
+                let tail =
+                    futures::stream::pending::<Result<axum::body::Bytes, std::convert::Infallible>>();
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                    axum::body::Body::from_stream(stream),
+                    axum::body::Body::from_stream(head.chain(tail)),
                 )
                     .into_response()
             }),
         );
+        serve_router(mcp_router).await
+    }
 
-        let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mcp_addr = mcp_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(mcp_listener, mcp_router).await.unwrap();
-        });
+    fn mock_test_tool_info() -> Vec<ahma_mcp::mcp_client::ToolInfo> {
+        vec![ahma_mcp::mcp_client::ToolInfo {
+            name: "test_tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+        }]
+    }
 
-        let client = LlmClient::new(format!("http://{}", llm_addr), "test-model", None);
-        let mcp = McpChatConfig {
-            base_url: format!("http://{}", mcp_addr),
-            workspace_root: PathBuf::from("/tmp"),
-            session_id: None,
-            external_http_servers: BTreeMap::new(),
-            max_turns: 2,
-            tool_approval: false,
-            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
-            minimize_tokens: false,
-            small_model_harness: false,
-            // A configured size, so the mock server on localhost is not asked
-            // and taken for a small local model: this test is about the tool loop.
-            context_length: Some(100_000),
-            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
-            tool_menu: None,
-        };
-
-        let (tx, mut rx) = mpsc::channel(100);
-        let messages = vec![ChatMessage::user("Do something")];
-
-        spawn_agent_task(
-            client,
-            messages,
-            None,
-            Some(mcp),
-            vec![ahma_mcp::mcp_client::ToolInfo {
-                name: "test_tool".to_string(),
-                description: None,
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "additionalProperties": true
-                }),
-            }],
-            tx,
-            Arc::new(AutoApproveGate),
-        );
-
-        let mut events = Vec::new();
-        while let Some(evt) = rx.recv().await {
-            events.push(evt);
-            if events.len() > 10 {
-                break;
-            }
-        }
-
+    fn assert_tool_loop_events(events: Vec<AgentEvent>) {
         let mut got_start = false;
         let mut got_finish = false;
         let mut got_token = false;
@@ -3266,6 +3190,67 @@ mod tests {
         assert!(got_finish, "Missing ToolCallFinished");
         assert!(got_token, "Missing Token");
         assert!(got_done, "Missing Done");
+    }
+
+    #[tokio::test]
+    async fn test_agent_task_tool_call_loop() {
+        let llm_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let llm_router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                let counter = llm_counter.clone();
+                async move {
+                    // The tool-calling path streams; reply with SSE. Turn 1 emits a
+                    // tool call, turn 2 emits the final answer as one content delta.
+                    let count = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = if count == 0 {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"function\":{\"name\":\"test_tool\",\"arguments\":\"{\\\"arg\\\":\\\"value\\\"}\"}}]}}]}\n",
+                            "data: [DONE]\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Tool call was successful.\"}}]}\n",
+                            "data: [DONE]\n",
+                        )
+                    };
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body.to_string())
+                        .unwrap()
+                }
+            }),
+        );
+
+        let llm_base = serve_router(llm_router).await;
+        let mcp_base = spawn_mock_mcp_bridge("test-session-123").await;
+        let client = LlmClient::new(llm_base, "test-model", None);
+        let mcp = McpChatConfig {
+            // A configured size, so the mock server on localhost is not asked
+            // and taken for a small local model: this test is about the tool loop.
+            context_length: Some(100_000),
+            ..empty_mcp_config(&mcp_base)
+        };
+
+        let (tx, mut rx) = mpsc::channel(100);
+        spawn_agent_task(
+            client,
+            vec![ChatMessage::user("Do something")],
+            None,
+            Some(mcp),
+            mock_test_tool_info(),
+            tx,
+            Arc::new(AutoApproveGate),
+        );
+
+        let mut events = Vec::new();
+        while let Some(evt) = rx.recv().await {
+            events.push(evt);
+            if events.len() > 10 {
+                break;
+            }
+        }
+        assert_tool_loop_events(events);
     }
 
     /// When the model never stops requesting tools and the turn budget is
@@ -3307,72 +3292,12 @@ mod tests {
             ),
         );
 
-        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let llm_addr = llm_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(llm_listener, llm_router).await.unwrap();
-        });
-
-        let mcp_router = axum::Router::new().route(
-            "/mcp",
-            axum::routing::post(
-                |axum::Json(body): axum::Json<serde_json::Value>| async move {
-                    use axum::response::IntoResponse;
-                    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                    match method {
-                        "initialize" => {
-                            let mut headers = axum::http::HeaderMap::new();
-                            headers.insert(
-                                "mcp-session-id",
-                                axum::http::HeaderValue::from_static("sess-limit"),
-                            );
-                            (headers, axum::Json(serde_json::json!({}))).into_response()
-                        }
-                        "tools/call" => axum::Json(serde_json::json!({
-                            "result": { "content": [{"type": "text", "text": "Tool executed"}] }
-                        }))
-                        .into_response(),
-                        _ => axum::http::StatusCode::OK.into_response(),
-                    }
-                },
-            )
-            .get(|| async {
-                use axum::response::IntoResponse;
-                use futures::StreamExt;
-                let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/sandbox/configured\"}\n\n";
-                let head = futures::stream::once(async move {
-                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(body))
-                });
-                let tail =
-                    futures::stream::pending::<Result<axum::body::Bytes, std::convert::Infallible>>();
-                (
-                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                    axum::body::Body::from_stream(head.chain(tail)),
-                )
-                    .into_response()
-            }),
-        );
-
-        let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mcp_addr = mcp_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(mcp_listener, mcp_router).await.unwrap();
-        });
-
-        let client = LlmClient::new(format!("http://{}", llm_addr), "test-model", None);
+        let llm_base = serve_router(llm_router).await;
+        let mcp_base = spawn_mock_mcp_bridge("sess-limit").await;
+        let client = LlmClient::new(llm_base, "test-model", None);
         let mcp = McpChatConfig {
-            base_url: format!("http://{}", mcp_addr),
-            workspace_root: PathBuf::from("/tmp"),
-            session_id: None,
-            external_http_servers: BTreeMap::new(),
             max_turns: 1,
-            tool_approval: false,
-            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
-            minimize_tokens: false,
-            small_model_harness: false,
-            context_length: None,
-            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
-            tool_menu: None,
+            ..empty_mcp_config(&mcp_base)
         };
 
         let (tx, mut rx) = mpsc::channel(100);
@@ -3381,11 +3306,7 @@ mod tests {
             vec![ChatMessage::user("Fix the build")],
             None,
             Some(mcp),
-            vec![ahma_mcp::mcp_client::ToolInfo {
-                name: "test_tool".to_string(),
-                description: None,
-                input_schema: serde_json::json!({"type": "object", "additionalProperties": true}),
-            }],
+            mock_test_tool_info(),
             tx,
             Arc::new(AutoApproveGate),
         );
@@ -3470,85 +3391,84 @@ mod tests {
         }
     }
 
+    fn handle_handshake_post(
+        body: serde_json::Value,
+        ra: &std::sync::atomic::AtomicBool,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+        let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+        // A client roots/list *response* carries result.roots and no method.
+        if method.is_empty() && body.pointer("/result/roots").is_some() {
+            ra.store(true, Ordering::SeqCst);
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        }
+
+        match method {
+            "initialize" => {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    "mcp-session-id",
+                    axum::http::HeaderValue::from_static("sess-handshake"),
+                );
+                (headers, axum::Json(serde_json::json!({}))).into_response()
+            }
+            "notifications/initialized" => axum::http::StatusCode::ACCEPTED.into_response(),
+            "tools/call" if ra.load(Ordering::SeqCst) => axum::Json(serde_json::json!({
+                "result": { "content": [{"type": "text", "text": "ok"}] }
+            }))
+            .into_response(),
+            "tools/call" => {
+                // Per-session gate: not locked yet.
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32001, "message": "Sandbox initializing" }
+                    })),
+                )
+                    .into_response()
+            }
+            _ => axum::http::StatusCode::OK.into_response(),
+        }
+    }
+
+    fn handle_handshake_sse() -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use futures::StreamExt;
+        // Server → client roots/list request, then sandbox/configured once
+        // the client has had a chance to answer; then hold the stream open.
+        let roots_req = "data: {\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"roots/list\"}\n\n";
+        let configured =
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/sandbox/configured\"}\n\n";
+        let s1 = futures::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(roots_req))
+        });
+        let s2 = futures::stream::once(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(configured))
+        });
+        let tail =
+            futures::stream::pending::<Result<axum::body::Bytes, std::convert::Infallible>>();
+        let stream = s1.chain(s2).chain(tail);
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response()
+    }
+
     /// A bridge that gates `tools/call` on the client having answered
     /// `roots/list`, which it asks for over the SSE stream.
     fn handshake_router(roots_answered: Arc<std::sync::atomic::AtomicBool>) -> axum::Router {
-        use std::sync::atomic::Ordering;
-        let ra_post = roots_answered;
-
         axum::Router::new().route(
             "/mcp",
             axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-                let ra = ra_post.clone();
-                async move {
-                    use axum::response::IntoResponse;
-                    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
-
-                    // A client roots/list *response* carries result.roots and no method.
-                    if method.is_empty() && body.pointer("/result/roots").is_some() {
-                        ra.store(true, Ordering::SeqCst);
-                        return axum::http::StatusCode::ACCEPTED.into_response();
-                    }
-
-                    match method {
-                        "initialize" => {
-                            let mut headers = axum::http::HeaderMap::new();
-                            headers.insert(
-                                "mcp-session-id",
-                                axum::http::HeaderValue::from_static("sess-handshake"),
-                            );
-                            (headers, axum::Json(serde_json::json!({}))).into_response()
-                        }
-                        "notifications/initialized" => {
-                            axum::http::StatusCode::ACCEPTED.into_response()
-                        }
-                        "tools/call" => {
-                            if ra.load(Ordering::SeqCst) {
-                                axum::Json(serde_json::json!({
-                                    "result": { "content": [{"type": "text", "text": "ok"}] }
-                                }))
-                                .into_response()
-                            } else {
-                                // Per-session gate: not locked yet.
-                                (
-                                    axum::http::StatusCode::CONFLICT,
-                                    axum::Json(serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "error": { "code": -32001, "message": "Sandbox initializing" }
-                                    })),
-                                )
-                                    .into_response()
-                            }
-                        }
-                        _ => axum::http::StatusCode::OK.into_response(),
-                    }
-                }
+                let ra = roots_answered.clone();
+                async move { handle_handshake_post(body, &ra) }
             })
-            .get(|| async {
-                use axum::response::IntoResponse;
-                use futures::StreamExt;
-                // Server → client roots/list request, then sandbox/configured once
-                // the client has had a chance to answer; then hold the stream open.
-                let roots_req = "data: {\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"roots/list\"}\n\n";
-                let configured =
-                    "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/sandbox/configured\"}\n\n";
-                let s1 = futures::stream::once(async move {
-                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(roots_req))
-                });
-                let s2 = futures::stream::once(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(configured))
-                });
-                let tail = futures::stream::pending::<
-                    Result<axum::body::Bytes, std::convert::Infallible>,
-                >();
-                let stream = s1.chain(s2).chain(tail);
-                (
-                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                    axum::body::Body::from_stream(stream),
-                )
-                    .into_response()
-            }),
+            .get(|| async { handle_handshake_sse() }),
         )
     }
 
@@ -3559,20 +3479,7 @@ mod tests {
         roots_answered: &std::sync::atomic::AtomicBool,
     ) {
         use std::sync::atomic::Ordering;
-        let mcp = McpChatConfig {
-            base_url: base_url.to_string(),
-            workspace_root: PathBuf::from("/tmp"),
-            session_id: None,
-            external_http_servers: BTreeMap::new(),
-            max_turns: 2,
-            tool_approval: false,
-            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
-            minimize_tokens: false,
-            small_model_harness: false,
-            context_length: None,
-            non_mutating_tool_names: Arc::new(std::collections::HashSet::new()),
-            tool_menu: None,
-        };
+        let mcp = empty_mcp_config(base_url);
 
         let (request_base_url, client) = cached_http_client(base_url).unwrap();
         let url = format!("{request_base_url}/mcp");
@@ -3944,22 +3851,41 @@ mod tests {
 
     // ── push_tool_message_with_hints ──
 
-    #[test]
-    fn push_tool_message_injects_error_hint_into_error_key() {
+    fn run_push_tool_message(
+        call_id: &str,
+        name: &str,
+        payload: serde_json::Value,
+        failed: bool,
+        inject_error_hint: bool,
+        inject_read_hint: bool,
+    ) -> (Vec<serde_json::Value>, bool, bool) {
         let mut msgs = Vec::new();
         let mut error_hinted = false;
         let mut read_hinted = false;
         push_tool_message_with_hints(
             &mut msgs,
-            "call1".to_string(),
-            "build",
-            serde_json::json!({"error": "boom"}),
-            true, // failed
-            true, // inject_error_hint
-            false,
+            call_id.to_string(),
+            name,
+            payload,
+            failed,
+            inject_error_hint,
+            inject_read_hint,
             &mut error_hinted,
             &mut read_hinted,
             100_000,
+        );
+        (msgs, error_hinted, read_hinted)
+    }
+
+    #[test]
+    fn push_tool_message_injects_error_hint_into_error_key() {
+        let (msgs, error_hinted, _) = run_push_tool_message(
+            "call1",
+            "build",
+            serde_json::json!({"error": "boom"}),
+            true,
+            true,
+            false,
         );
         assert!(error_hinted, "error_hinted latch flips");
         assert_eq!(msgs[0]["role"], "tool");
@@ -3971,20 +3897,13 @@ mod tests {
 
     #[test]
     fn push_tool_message_error_hint_uses_output_key_when_no_error_key() {
-        let mut msgs = Vec::new();
-        let mut error_hinted = false;
-        let mut read_hinted = false;
-        push_tool_message_with_hints(
-            &mut msgs,
-            "c".to_string(),
+        let (msgs, error_hinted, _) = run_push_tool_message(
+            "c",
             "build",
             serde_json::json!({"output": "stuff"}),
             true,
             true,
             false,
-            &mut error_hinted,
-            &mut read_hinted,
-            100_000,
         );
         assert!(error_hinted);
         let content = msgs[0]["content"].as_str().unwrap();
@@ -3995,20 +3914,13 @@ mod tests {
     #[test]
     fn push_tool_message_injects_read_hint_for_read_tools() {
         for tool in ["read_file", "list_dir"] {
-            let mut msgs = Vec::new();
-            let mut error_hinted = false;
-            let mut read_hinted = false;
-            push_tool_message_with_hints(
-                &mut msgs,
-                "c".to_string(),
+            let (msgs, _, read_hinted) = run_push_tool_message(
+                "c",
                 tool,
                 serde_json::json!({"output": "file contents"}),
                 false,
                 false,
                 true,
-                &mut error_hinted,
-                &mut read_hinted,
-                100_000,
             );
             assert!(read_hinted, "read latch flips for {tool}");
             let content = msgs[0]["content"].as_str().unwrap();
@@ -4021,23 +3933,17 @@ mod tests {
 
     #[test]
     fn push_tool_message_no_hints_when_flags_off() {
-        let mut msgs = Vec::new();
-        let mut error_hinted = false;
-        let mut read_hinted = false;
-        push_tool_message_with_hints(
-            &mut msgs,
-            "c".to_string(),
+        let (msgs, error_hinted, read_hinted) = run_push_tool_message(
+            "c",
             "build",
             serde_json::json!({"output": "ok"}),
             false,
             false,
             false,
-            &mut error_hinted,
-            &mut read_hinted,
-            100_000,
         );
         assert!(!error_hinted);
         assert!(!read_hinted);
+        let _ = msgs;
         let content = msgs[0]["content"].as_str().unwrap();
         assert!(!content.contains("Harness Hint"));
     }
@@ -4945,27 +4851,28 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn execute_agent_turn_tools_without_mcp_errors() {
-        // The tool-calling path streams now, so serve an SSE body that carries a
-        // tool call (split id/name vs arguments across chunks, like real servers).
+    async fn run_sse_turn_without_mcp(
+        body: String,
+    ) -> (
+        bool,
+        Vec<serde_json::Value>,
+        tokio::sync::mpsc::Receiver<AgentEvent>,
+    ) {
         let router = axum::Router::new().route(
             "/chat/completions",
-            axum::routing::post(|| async {
-                let body = concat!(
-                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"t\"}}]}}]}\n",
-                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n",
-                    "data: [DONE]\n",
-                );
-                axum::response::Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(body.to_string())
-                    .unwrap()
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
             }),
         );
         let base = serve_router(router).await;
         let client = LlmClient::new(base, "m", None);
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(16);
         let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
         let mut read_hinted = false;
         let mut error_hinted = false;
@@ -4975,7 +4882,7 @@ mod tests {
             &client,
             &mut msg_json,
             &[],
-            &None, // model wants tools but MCP is not configured
+            &None,
             &tx,
             &[],
             &None,
@@ -4985,12 +4892,41 @@ mod tests {
             &mut last_prompt_tokens,
         )
         .await;
+        (cont, msg_json, rx)
+    }
+
+    #[tokio::test]
+    async fn execute_agent_turn_tools_without_mcp_errors() {
+        // The tool-calling path streams now, so serve an SSE body that carries a
+        // tool call (split id/name vs arguments across chunks, like real servers).
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"t\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n",
+            "data: [DONE]\n",
+        )
+        .to_string();
+        let (cont, _, mut rx) = run_sse_turn_without_mcp(body).await;
 
         assert!(!cont);
         match rx.recv().await.unwrap() {
             AgentEvent::Error(e) => assert!(e.message.contains("MCP is not configured"), "{e}"),
             o => panic!("unexpected {o:?}"),
         }
+    }
+
+    async fn run_truncated_turn(
+        first_sse_line: &'static str,
+    ) -> (
+        bool,
+        Vec<serde_json::Value>,
+        tokio::sync::mpsc::Receiver<AgentEvent>,
+    ) {
+        let body = format!(
+            "{first_sse_line}\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\
+             data: [DONE]\n"
+        );
+        run_sse_turn_without_mcp(body).await
     }
 
     #[tokio::test]
@@ -5000,40 +4936,8 @@ mod tests {
         // "length"), with no tool calls. The turn must not treat that as a
         // final answer — it should surface it loudly and signal "loop again"
         // so the caller's existing turn loop drives one continuation.
-        let router = axum::Router::new().route(
-            "/chat/completions",
-            axum::routing::post(|| async {
-                let body = concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial thin\"}}]}\n",
-                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n",
-                    "data: [DONE]\n",
-                );
-                axum::response::Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(body.to_string())
-                    .unwrap()
-            }),
-        );
-        let base = serve_router(router).await;
-        let client = LlmClient::new(base, "m", None);
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
-        let mut read_hinted = false;
-        let mut error_hinted = false;
-        let mut last_prompt_tokens: u32 = 0;
-
-        let cont = execute_agent_turn(
-            &client,
-            &mut msg_json,
-            &[],
-            &None,
-            &tx,
-            &[],
-            &None,
-            &mut read_hinted,
-            &mut error_hinted,
-            Arc::new(AutoApproveGate),
-            &mut last_prompt_tokens,
+        let (cont, msg_json, mut rx) = run_truncated_turn(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial thin\"}}]}\n",
         )
         .await;
 
@@ -5073,42 +4977,8 @@ mod tests {
         // Rarer: cut off mid tool-call. Not auto-recoverable the same way, but
         // must still proceed with whatever was parsed rather than silently
         // discarding it — existing tool-call handling takes over normally.
-        let router = axum::Router::new().route(
-            "/chat/completions",
-            axum::routing::post(|| async {
-                let body = concat!(
-                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"t\",\"arguments\":\"{}\"}}]}}]}\n",
-                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n",
-                    "data: [DONE]\n",
-                );
-                axum::response::Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(body.to_string())
-                    .unwrap()
-            }),
-        );
-        let base = serve_router(router).await;
-        let client = LlmClient::new(base, "m", None);
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
-        let mut read_hinted = false;
-        let mut error_hinted = false;
-        let mut last_prompt_tokens: u32 = 0;
-
-        let cont = execute_agent_turn(
-            &client,
-            &mut msg_json,
-            &[],
-            &None, // MCP not configured → tool dispatch reports an error, but the
-            // turn must still proceed through the tool-call path, not the
-            // truncation-continuation path.
-            &tx,
-            &[],
-            &None,
-            &mut read_hinted,
-            &mut error_hinted,
-            Arc::new(AutoApproveGate),
-            &mut last_prompt_tokens,
+        let (cont, msg_json, mut rx) = run_truncated_turn(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"t\",\"arguments\":\"{}\"}}]}}]}\n",
         )
         .await;
 
@@ -5167,17 +5037,24 @@ mod tests {
         ]
     }
 
+    fn compact_test_setup(
+        base: &str,
+        context_length: Option<u32>,
+    ) -> (LlmClient, McpChatConfig, Vec<serde_json::Value>) {
+        let client = LlmClient::new(base, "m", None);
+        let cfg = McpChatConfig {
+            context_length,
+            small_model_harness: true, // threshold 0.70
+            ..empty_mcp_config(base)
+        };
+        (client, cfg, long_conversation())
+    }
+
     #[tokio::test]
     async fn maybe_compact_conversation_below_threshold_is_a_noop() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
-        let client = LlmClient::new(&base, "m", None);
-        let cfg = McpChatConfig {
-            context_length: Some(10_000),
-            small_model_harness: true, // threshold 0.70
-            ..empty_mcp_config(&base)
-        };
-        let mut msg_json = long_conversation();
+        let (client, cfg, mut msg_json) = compact_test_setup(&base, Some(10_000));
         let before = msg_json.clone();
 
         // 1_000 / 10_000 = 10% full, well under the 70% threshold.
@@ -5197,13 +5074,7 @@ mod tests {
         // trigger" — it means "we don't know yet", so skip.
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
-        let client = LlmClient::new(&base, "m", None);
-        let cfg = McpChatConfig {
-            context_length: Some(10_000),
-            small_model_harness: true,
-            ..empty_mcp_config(&base)
-        };
-        let mut msg_json = long_conversation();
+        let (client, cfg, mut msg_json) = compact_test_setup(&base, Some(10_000));
         let before = msg_json.clone();
 
         maybe_compact_conversation(&client, &mut msg_json, &cfg, 0).await;
@@ -5216,13 +5087,8 @@ mod tests {
     async fn maybe_compact_conversation_unknown_context_length_is_a_noop() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
-        let client = LlmClient::new(&base, "m", None);
-        let cfg = McpChatConfig {
-            context_length: None, // unknown window → no denominator, no trigger
-            small_model_harness: true,
-            ..empty_mcp_config(&base)
-        };
-        let mut msg_json = long_conversation();
+        // unknown window → no denominator, no trigger
+        let (client, cfg, mut msg_json) = compact_test_setup(&base, None);
         let before = msg_json.clone();
 
         maybe_compact_conversation(&client, &mut msg_json, &cfg, 999_999).await;
@@ -5239,13 +5105,7 @@ mod tests {
             calls.clone(),
         )
         .await;
-        let client = LlmClient::new(&base, "m", None);
-        let cfg = McpChatConfig {
-            context_length: Some(10_000),
-            small_model_harness: true, // threshold 0.70
-            ..empty_mcp_config(&base)
-        };
-        let mut msg_json = long_conversation();
+        let (client, cfg, mut msg_json) = compact_test_setup(&base, Some(10_000));
         let original_len = msg_json.len();
 
         // 8_000 / 10_000 = 80% full, over the 70% threshold.
@@ -5292,13 +5152,7 @@ mod tests {
             }),
         );
         let base = serve_router(router).await;
-        let client = LlmClient::new(&base, "m", None);
-        let cfg = McpChatConfig {
-            context_length: Some(10_000),
-            small_model_harness: true,
-            ..empty_mcp_config(&base)
-        };
-        let mut msg_json = long_conversation();
+        let (client, cfg, mut msg_json) = compact_test_setup(&base, Some(10_000));
         let before = msg_json.clone();
 
         // Must not panic, and must leave history exactly as it was —
@@ -5316,12 +5170,7 @@ mod tests {
     async fn maybe_compact_conversation_too_short_to_compact_is_a_noop() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
-        let client = LlmClient::new(&base, "m", None);
-        let cfg = McpChatConfig {
-            context_length: Some(10_000),
-            small_model_harness: true,
-            ..empty_mcp_config(&base)
-        };
+        let (client, cfg, _) = compact_test_setup(&base, Some(10_000));
         // Only the protected head plus a couple of recent messages — nothing
         // left in the "middle" once both are excluded.
         let mut msg_json = vec![
@@ -5358,6 +5207,32 @@ mod tests {
     }
 
     // ── fetch_completion branches ─────────────────────────────────────────────
+
+    async fn run_failing_completion(
+        status: axum::http::StatusCode,
+        body: &'static str,
+        msgs: Vec<serde_json::Value>,
+    ) -> tokio::sync::mpsc::Receiver<AgentEvent> {
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || async move { (status, body) }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(base, "m", None);
+        let (tx, rx) = mpsc::channel(16);
+        let res = fetch_completion(
+            &client,
+            &msgs,
+            &[],
+            &None,
+            &tx,
+            &[ChatMessage::user("hi")],
+            &None,
+        )
+        .await;
+        assert!(res.is_none());
+        rx
+    }
 
     #[tokio::test]
     async fn fetch_completion_mcp_missing_config_errors() {
@@ -5401,30 +5276,12 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_completion_tool_unsupported_triggers_fallback() {
-        let router = axum::Router::new().route(
-            "/chat/completions",
-            axum::routing::post(|| async {
-                (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "tools are not supported by this model",
-                )
-            }),
-        );
-        let base = serve_router(router).await;
-        let client = LlmClient::new(base, "m", None);
-        let (tx, mut rx) = mpsc::channel(16);
-        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let res = fetch_completion(
-            &client,
-            &msgs,
-            &[],
-            &None,
-            &tx,
-            &[ChatMessage::user("hi")],
-            &None,
+        let mut rx = run_failing_completion(
+            axum::http::StatusCode::BAD_REQUEST,
+            "tools are not supported by this model",
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
         )
         .await;
-        assert!(res.is_none());
         // The fallback emits an explanatory error before re-dispatching as chat.
         match rx.recv().await.unwrap() {
             AgentEvent::Error(e) => assert!(e.message.contains("does not support tools"), "{e}"),
@@ -5438,36 +5295,18 @@ mod tests {
     /// results.
     #[tokio::test]
     async fn no_fallback_to_plain_chat_after_tools_have_been_used() {
-        let router = axum::Router::new().route(
-            "/chat/completions",
-            axum::routing::post(|| async {
-                (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "tools are not supported by this model",
-                )
-            }),
-        );
-        let base = serve_router(router).await;
-        let client = LlmClient::new(base, "m", None);
-        let (tx, mut rx) = mpsc::channel(16);
-        let msgs = vec![
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "status", "arguments": "{}"}}
-            ]}),
-            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
-        ];
-        let res = fetch_completion(
-            &client,
-            &msgs,
-            &[],
-            &None,
-            &tx,
-            &[ChatMessage::user("hi")],
-            &None,
+        let mut rx = run_failing_completion(
+            axum::http::StatusCode::BAD_REQUEST,
+            "tools are not supported by this model",
+            vec![
+                serde_json::json!({"role": "user", "content": "hi"}),
+                serde_json::json!({"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "status", "arguments": "{}"}}
+                ]}),
+                serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+            ],
         )
         .await;
-        assert!(res.is_none());
         match rx.recv().await.unwrap() {
             AgentEvent::Error(e) => {
                 assert!(!e.message.contains("Falling back"), "{e}");
@@ -5488,30 +5327,12 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_completion_other_error_no_fallback() {
-        let router = axum::Router::new().route(
-            "/chat/completions",
-            axum::routing::post(|| async {
-                (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "server exploded",
-                )
-            }),
-        );
-        let base = serve_router(router).await;
-        let client = LlmClient::new(base, "m", None);
-        let (tx, mut rx) = mpsc::channel(16);
-        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let res = fetch_completion(
-            &client,
-            &msgs,
-            &[],
-            &None,
-            &tx,
-            &[ChatMessage::user("hi")],
-            &None,
+        let mut rx = run_failing_completion(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "server exploded",
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
         )
         .await;
-        assert!(res.is_none());
         match rx.recv().await.unwrap() {
             AgentEvent::Error(e) => {
                 let first = e.message.lines().next().unwrap_or_default();
@@ -5528,6 +5349,19 @@ mod tests {
             }
             o => panic!("unexpected {o:?}"),
         }
+    }
+
+    #[test]
+    fn invalidate_cached_session_evicts_entry() {
+        let key = (
+            "http://127.0.0.1:9999/mcp".to_string(),
+            PathBuf::from("/tmp/ws-evict"),
+        );
+        SESSION_CACHE
+            .lock()
+            .insert(key.clone(), "sess-old".to_string());
+        invalidate_cached_session(&key.0, &key.1);
+        assert!(SESSION_CACHE.lock().get(&key).is_none());
     }
 
     /// The failure a person actually hits most: the local model server is not

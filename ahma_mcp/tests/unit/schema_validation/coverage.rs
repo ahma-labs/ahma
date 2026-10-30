@@ -129,21 +129,32 @@ fn test_validate_tool_config_missing_required_fields() {
     assert!(result.is_err());
 }
 
-#[test]
-fn test_validate_tool_config_empty_name() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "",
+fn base_test_config_with(extra: serde_json::Value) -> serde_json::Value {
+    let mut base = json!({
+        "name": "test",
         "description": "Test tool",
         "command": "test"
-    })
-    .to_string();
+    });
+    if let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra_obj {
+            base_obj.insert(k.clone(), v.clone());
+        }
+    }
+    base
+}
 
-    let result = validator.validate_tool_config(&PathBuf::from("empty_name.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+fn validate_with_base(
+    file: &str,
+    extra: serde_json::Value,
+) -> Result<ahma_mcp::config::ToolConfig, Vec<SchemaValidationError>> {
+    init_test_logging();
+    let config = base_test_config_with(extra).to_string();
+    MtdfValidator::new().validate_tool_config(&PathBuf::from(file), &config)
+}
+
+#[test]
+fn test_validate_tool_config_empty_name() {
+    let errors = validate_with_base("empty_name.json", json!({ "name": "" })).unwrap_err();
     assert!(errors.iter().any(
         |e| e.error_type == ValidationErrorType::MissingRequiredField
             && e.field_path == "name"
@@ -153,19 +164,7 @@ fn test_validate_tool_config_empty_name() {
 
 #[test]
 fn test_validate_tool_config_empty_command() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": ""
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("empty_command.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+    let errors = validate_with_base("empty_command.json", json!({ "command": "" })).unwrap_err();
     assert!(
         errors
             .iter()
@@ -177,19 +176,7 @@ fn test_validate_tool_config_empty_command() {
 
 #[test]
 fn test_validate_tool_config_empty_description() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "",
-        "command": "test"
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("empty_desc.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+    let errors = validate_with_base("empty_desc.json", json!({ "description": "" })).unwrap_err();
     assert!(errors.iter().any(
         |e| e.error_type == ValidationErrorType::MissingRequiredField
             && e.field_path == "description"
@@ -199,20 +186,11 @@ fn test_validate_tool_config_empty_description() {
 
 #[test]
 fn test_validate_tool_config_timeout_too_large() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "timeout_seconds": 7200  // 2 hours - exceeds 3600 limit
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("big_timeout.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+    let errors = validate_with_base(
+        "big_timeout.json",
+        json!({ "timeout_seconds": 7200 }), // 2 hours - exceeds 3600 limit
+    )
+    .unwrap_err();
     assert!(
         errors
             .iter()
@@ -226,20 +204,8 @@ fn test_validate_tool_config_timeout_too_large() {
 
 #[test]
 fn test_validate_tool_config_timeout_zero() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "timeout_seconds": 0
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("zero_timeout.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+    let errors =
+        validate_with_base("zero_timeout.json", json!({ "timeout_seconds": 0 })).unwrap_err();
     assert!(
         errors
             .iter()
@@ -251,18 +217,7 @@ fn test_validate_tool_config_timeout_zero() {
 
 #[test]
 fn test_validate_tool_config_valid_timeout() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "timeout_seconds": 300
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("valid_timeout.json"), &config);
+    let result = validate_with_base("valid_timeout.json", json!({ "timeout_seconds": 300 }));
     assert!(result.is_ok());
 }
 
@@ -272,23 +227,16 @@ fn test_validate_tool_config_valid_timeout() {
 
 #[test]
 fn test_validate_subcommand_empty_name() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "",
-            "description": "Empty name subcommand"
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("empty_sub_name.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+    let errors = validate_with_base(
+        "empty_sub_name.json",
+        json!({
+            "subcommand": [{
+                "name": "",
+                "description": "Empty name subcommand"
+            }]
+        }),
+    )
+    .unwrap_err();
     assert!(errors.iter().any(|e| e.field_path.contains("subcommand")
         && e.field_path.contains("name")
         && e.message.contains("cannot be empty")));
@@ -296,23 +244,16 @@ fn test_validate_subcommand_empty_name() {
 
 #[test]
 fn test_validate_subcommand_empty_description() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "sub1",
-            "description": ""
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("empty_sub_desc.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+    let errors = validate_with_base(
+        "empty_sub_desc.json",
+        json!({
+            "subcommand": [{
+                "name": "sub1",
+                "description": ""
+            }]
+        }),
+    )
+    .unwrap_err();
     assert!(errors.iter().any(|e| e.field_path.contains("subcommand")
         && e.field_path.contains("description")
         && e.message.contains("cannot be empty")));
@@ -320,25 +261,18 @@ fn test_validate_subcommand_empty_description() {
 
 #[test]
 fn test_validate_subcommand_async_keywords_in_sync_command() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
     // force_synchronous=true but description mentions async behavior
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "force_synchronous": true,
-        "subcommand": [{
-            "name": "build",
-            "description": "Build project - async operation returns id immediately"
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("async_in_sync.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+    let errors = validate_with_base(
+        "async_in_sync.json",
+        json!({
+            "force_synchronous": true,
+            "subcommand": [{
+                "name": "build",
+                "description": "Build project - async operation returns id immediately"
+            }]
+        }),
+    )
+    .unwrap_err();
     assert!(errors.iter().any(
         |e| e.error_type == ValidationErrorType::LogicalInconsistency
             && e.message.contains("async behavior")
@@ -347,98 +281,73 @@ fn test_validate_subcommand_async_keywords_in_sync_command() {
 
 #[test]
 fn test_validate_subcommand_force_sync_inheritance() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
     // Tool is force_synchronous=true, subcommand inherits it
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "force_synchronous": true,
-        "subcommand": [{
-            "name": "run",
-            "description": "Run the tool synchronously"
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("inherited_sync.json"), &config);
+    let result = validate_with_base(
+        "inherited_sync.json",
+        json!({
+            "force_synchronous": true,
+            "subcommand": [{
+                "name": "run",
+                "description": "Run the tool synchronously"
+            }]
+        }),
+    );
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_validate_subcommand_override_tool_sync() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
     // Tool is force_synchronous=true, but subcommand overrides to false
     // Description with async keywords should be allowed
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "force_synchronous": true,
-        "subcommand": [{
-            "name": "build",
-            "description": "Build project - async operation returns id immediately",
-            "force_synchronous": false
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("override_sync.json"), &config);
+    let result = validate_with_base(
+        "override_sync.json",
+        json!({
+            "force_synchronous": true,
+            "subcommand": [{
+                "name": "build",
+                "description": "Build project - async operation returns id immediately",
+                "force_synchronous": false
+            }]
+        }),
+    );
     // Should pass because subcommand overrides tool-level force_synchronous
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_validate_nested_subcommands() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "parent",
-            "description": "Parent subcommand",
+    let result = validate_with_base(
+        "nested.json",
+        json!({
             "subcommand": [{
-                "name": "child",
-                "description": "Child subcommand"
+                "name": "parent",
+                "description": "Parent subcommand",
+                "subcommand": [{
+                    "name": "child",
+                    "description": "Child subcommand"
+                }]
             }]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("nested.json"), &config);
+        }),
+    );
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_validate_nested_subcommand_with_error() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "parent",
-            "description": "Parent subcommand",
+    let errors = validate_with_base(
+        "nested_error.json",
+        json!({
             "subcommand": [{
-                "name": "",  // Empty name - should trigger error
-                "description": "Child subcommand"
+                "name": "parent",
+                "description": "Parent subcommand",
+                "subcommand": [{
+                    "name": "",  // Empty name - should trigger error
+                    "description": "Child subcommand"
+                }]
             }]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("nested_error.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+        }),
+    )
+    .unwrap_err();
     // Should find error in nested path
     assert!(
         errors
@@ -453,28 +362,21 @@ fn test_validate_nested_subcommand_with_error() {
 
 #[test]
 fn test_validate_option_empty_name() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "sub",
-            "description": "Subcommand",
-            "options": [{
-                "name": "",
-                "type": "string",
-                "description": "Option with empty name"
+    let errors = validate_with_base(
+        "empty_opt_name.json",
+        json!({
+            "subcommand": [{
+                "name": "sub",
+                "description": "Subcommand",
+                "options": [{
+                    "name": "",
+                    "type": "string",
+                    "description": "Option with empty name"
+                }]
             }]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("empty_opt_name.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+        }),
+    )
+    .unwrap_err();
     assert!(errors.iter().any(|e| e.field_path.contains("options")
         && e.field_path.contains("name")
         && e.message.contains("cannot be empty")));
@@ -482,28 +384,21 @@ fn test_validate_option_empty_name() {
 
 #[test]
 fn test_validate_option_invalid_type() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "sub",
-            "description": "Subcommand",
-            "options": [{
-                "name": "opt1",
-                "type": "invalid_type",
-                "description": "Option with invalid type"
+    let errors = validate_with_base(
+        "invalid_opt_type.json",
+        json!({
+            "subcommand": [{
+                "name": "sub",
+                "description": "Subcommand",
+                "options": [{
+                    "name": "opt1",
+                    "type": "invalid_type",
+                    "description": "Option with invalid type"
+                }]
             }]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("invalid_opt_type.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+        }),
+    )
+    .unwrap_err();
     assert!(
         errors
             .iter()
@@ -514,28 +409,21 @@ fn test_validate_option_invalid_type() {
 
 #[test]
 fn test_validate_option_bool_instead_of_boolean() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "sub",
-            "description": "Subcommand",
-            "options": [{
-                "name": "opt1",
-                "type": "bool",  // Should be "boolean"
-                "description": "Option"
+    let errors = validate_with_base(
+        "bool_type.json",
+        json!({
+            "subcommand": [{
+                "name": "sub",
+                "description": "Subcommand",
+                "options": [{
+                    "name": "opt1",
+                    "type": "bool",  // Should be "boolean"
+                    "description": "Option"
+                }]
             }]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("bool_type.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+        }),
+    )
+    .unwrap_err();
     assert!(errors.iter().any(|e| {
         e.error_type == ValidationErrorType::InvalidValue
             && e.suggestion
@@ -547,28 +435,21 @@ fn test_validate_option_bool_instead_of_boolean() {
 
 #[test]
 fn test_validate_option_int_instead_of_integer() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "sub",
-            "description": "Subcommand",
-            "options": [{
-                "name": "opt1",
-                "type": "int",  // Should be "integer"
-                "description": "Option"
+    let errors = validate_with_base(
+        "int_type.json",
+        json!({
+            "subcommand": [{
+                "name": "sub",
+                "description": "Subcommand",
+                "options": [{
+                    "name": "opt1",
+                    "type": "int",  // Should be "integer"
+                    "description": "Option"
+                }]
             }]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("int_type.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+        }),
+    )
+    .unwrap_err();
     assert!(errors.iter().any(|e| {
         e.suggestion
             .as_ref()
@@ -579,28 +460,21 @@ fn test_validate_option_int_instead_of_integer() {
 
 #[test]
 fn test_validate_option_str_instead_of_string() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "sub",
-            "description": "Subcommand",
-            "options": [{
-                "name": "opt1",
-                "type": "str",  // Should be "string"
-                "description": "Option"
+    let errors = validate_with_base(
+        "str_type.json",
+        json!({
+            "subcommand": [{
+                "name": "sub",
+                "description": "Subcommand",
+                "options": [{
+                    "name": "opt1",
+                    "type": "str",  // Should be "string"
+                    "description": "Option"
+                }]
             }]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("str_type.json"), &config);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
+        }),
+    )
+    .unwrap_err();
     assert!(errors.iter().any(|e| {
         e.suggestion
             .as_ref()
@@ -611,27 +485,21 @@ fn test_validate_option_str_instead_of_string() {
 
 #[test]
 fn test_validate_option_valid_types() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "subcommand": [{
-            "name": "sub",
-            "description": "Subcommand",
-            "options": [
-                {"name": "str_opt", "type": "string", "description": "String option"},
-                {"name": "bool_opt", "type": "boolean", "description": "Boolean option"},
-                {"name": "int_opt", "type": "integer", "description": "Integer option"},
-                {"name": "arr_opt", "type": "array", "description": "Array option"}
-            ]
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("valid_types.json"), &config);
+    let result = validate_with_base(
+        "valid_types.json",
+        json!({
+            "subcommand": [{
+                "name": "sub",
+                "description": "Subcommand",
+                "options": [
+                    {"name": "str_opt", "type": "string", "description": "String option"},
+                    {"name": "bool_opt", "type": "boolean", "description": "Boolean option"},
+                    {"name": "int_opt", "type": "integer", "description": "Integer option"},
+                    {"name": "arr_opt", "type": "array", "description": "Array option"}
+                ]
+            }]
+        }),
+    );
     assert!(result.is_ok());
 }
 
@@ -719,85 +587,61 @@ fn test_format_errors_multiple_errors() {
 
 #[test]
 fn test_validate_async_keyword_id() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "force_synchronous": true,
-        "subcommand": [{
-            "name": "sub",
-            "description": "This runs async and returns immediately"
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("op_id.json"), &config);
+    let result = validate_with_base(
+        "op_id.json",
+        json!({
+            "force_synchronous": true,
+            "subcommand": [{
+                "name": "sub",
+                "description": "This runs async and returns immediately"
+            }]
+        }),
+    );
     assert!(result.is_err());
 }
 
 #[test]
 fn test_validate_async_keyword_notification() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "force_synchronous": true,
-        "subcommand": [{
-            "name": "sub",
-            "description": "Results are sent via notification"
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("notification.json"), &config);
+    let result = validate_with_base(
+        "notification.json",
+        json!({
+            "force_synchronous": true,
+            "subcommand": [{
+                "name": "sub",
+                "description": "Results are sent via notification"
+            }]
+        }),
+    );
     assert!(result.is_err());
 }
 
 #[test]
 fn test_validate_async_keyword_background() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "force_synchronous": true,
-        "subcommand": [{
-            "name": "sub",
-            "description": "Runs in the background"
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("background.json"), &config);
+    let result = validate_with_base(
+        "background.json",
+        json!({
+            "force_synchronous": true,
+            "subcommand": [{
+                "name": "sub",
+                "description": "Runs in the background"
+            }]
+        }),
+    );
     assert!(result.is_err());
 }
 
 #[test]
 fn test_validate_async_keyword_asynchronously() {
-    init_test_logging();
-
-    let validator = MtdfValidator::new();
-    let config = json!({
-        "name": "test",
-        "description": "Test tool",
-        "command": "test",
-        "force_synchronous": true,
-        "subcommand": [{
-            "name": "sub",
-            "description": "Executes asynchronously"
-        }]
-    })
-    .to_string();
-
-    let result = validator.validate_tool_config(&PathBuf::from("asynchronously.json"), &config);
+    let result = validate_with_base(
+        "asynchronously.json",
+        json!({
+            "force_synchronous": true,
+            "subcommand": [{
+                "name": "sub",
+                "description": "Executes asynchronously"
+            }]
+        }),
+    );
     assert!(result.is_err());
 }
 

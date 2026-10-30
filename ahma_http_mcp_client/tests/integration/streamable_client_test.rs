@@ -43,68 +43,79 @@ struct MockState {
     tool_call_ids: Arc<Mutex<Vec<Value>>>,
 }
 
+fn is_roots_response(method: &str, body: &Value) -> bool {
+    method.is_empty() && body.pointer("/result/roots").is_some()
+}
+
+fn mock_initialize_response(id: Value, session_id: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert("mcp-session-id", session_id.parse().expect("header"));
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
+    )
+        .into_response()
+}
+
+fn mock_initialized_response(st: &MockState) -> Response {
+    let connected = st.sse_connected.load(Ordering::SeqCst);
+    st.sse_ready_at_initialized.lock().get_or_insert(connected);
+    StatusCode::ACCEPTED.into_response()
+}
+
+fn mock_tools_call_response(st: &MockState, id: Value) -> Response {
+    st.tool_calls.fetch_add(1, Ordering::SeqCst);
+    st.tool_call_ids.lock().push(id.clone());
+    let remaining = st.conflicts_before_success.load(Ordering::SeqCst);
+    if remaining > 0 {
+        st.conflicts_before_success.fetch_sub(1, Ordering::SeqCst);
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32001, "message": "Sandbox initializing" }
+            })),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "content": [{ "type": "text", "text": "tool-ok" }] }
+    }))
+    .into_response()
+}
+
+fn mock_tools_list_response(id: Value) -> Response {
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "tools": [
+            { "name": "alpha", "description": "d", "inputSchema": { "type": "object" } },
+            { "name": "beta" },
+            { "description": "nameless — must be skipped" }
+        ] }
+    }))
+    .into_response()
+}
+
 async fn mock_post(State(st): State<MockState>, Json(body): Json<Value>) -> Response {
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = body.get("id").cloned().unwrap_or(Value::Null);
 
     // A client roots/list *response* carries result.roots and no method.
-    if method.is_empty() && body.pointer("/result/roots").is_some() {
+    if is_roots_response(method, &body) {
         *st.roots_answer.lock() = Some(body);
         return StatusCode::ACCEPTED.into_response();
     }
 
     match method {
-        "initialize" => {
-            let mut headers = HeaderMap::new();
-            headers.insert("mcp-session-id", "mock-session".parse().expect("header"));
-            (
-                StatusCode::OK,
-                headers,
-                Json(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
-            )
-                .into_response()
-        }
-        "notifications/initialized" => {
-            let connected = st.sse_connected.load(Ordering::SeqCst);
-            let mut guard = st.sse_ready_at_initialized.lock();
-            if guard.is_none() {
-                *guard = Some(connected);
-            }
-            StatusCode::ACCEPTED.into_response()
-        }
-        "tools/call" => {
-            st.tool_calls.fetch_add(1, Ordering::SeqCst);
-            st.tool_call_ids.lock().push(id.clone());
-            let remaining = st.conflicts_before_success.load(Ordering::SeqCst);
-            if remaining > 0 {
-                st.conflicts_before_success.fetch_sub(1, Ordering::SeqCst);
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32001, "message": "Sandbox initializing" }
-                    })),
-                )
-                    .into_response();
-            }
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "content": [{ "type": "text", "text": "tool-ok" }] }
-            }))
-            .into_response()
-        }
-        "tools/list" => Json(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": { "tools": [
-                { "name": "alpha", "description": "d", "inputSchema": { "type": "object" } },
-                { "name": "beta" },
-                { "description": "nameless — must be skipped" }
-            ] }
-        }))
-        .into_response(),
+        "initialize" => mock_initialize_response(id, "mock-session"),
+        "notifications/initialized" => mock_initialized_response(&st),
+        "tools/call" => mock_tools_call_response(&st, id),
+        "tools/list" => mock_tools_list_response(id),
         _ => Json(json!({ "jsonrpc": "2.0", "id": id, "result": null })).into_response(),
     }
 }
@@ -150,10 +161,7 @@ async fn mock_delete(State(st): State<MockState>, headers: HeaderMap) -> StatusC
     StatusCode::OK
 }
 
-async fn spawn_mock(state: MockState) -> (String, tokio::task::JoinHandle<()>) {
-    let router = Router::new()
-        .route("/mcp", post(mock_post).get(mock_sse).delete(mock_delete))
-        .with_state(state);
+async fn spawn_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock server");
@@ -162,6 +170,22 @@ async fn spawn_mock(state: MockState) -> (String, tokio::task::JoinHandle<()>) {
         let _ = axum::serve(listener, router).await;
     });
     (format!("http://127.0.0.1:{port}/mcp"), handle)
+}
+
+async fn spawn_mock(state: MockState) -> (String, tokio::task::JoinHandle<()>) {
+    let router = Router::new()
+        .route("/mcp", post(mock_post).get(mock_sse).delete(mock_delete))
+        .with_state(state);
+    spawn_router(router).await
+}
+
+fn attach_client(mcp_url: &str, session_id: &str) -> StreamableHttpMcpClient {
+    StreamableHttpMcpClient::attach(
+        reqwest::Client::new(),
+        mcp_url,
+        session_id,
+        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    )
 }
 
 fn connector(mcp_url: &str) -> Connector {
@@ -237,13 +261,7 @@ async fn handshake_missing_session_id_is_diagnostic_error() {
     async fn no_header(Json(_b): Json<Value>) -> Response {
         (StatusCode::UNAUTHORIZED, "denied").into_response()
     }
-    let router = Router::new().route("/mcp", post(no_header));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    let mcp_url = format!("http://127.0.0.1:{port}/mcp");
+    let (mcp_url, server) = spawn_router(Router::new().route("/mcp", post(no_header))).await;
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let err = StreamableHttpMcpClient::connect(connector(&mcp_url), connect_opts(tmp.path()))
@@ -268,9 +286,7 @@ async fn handshake_sse_failure_aborts() {
     async fn init_only(Json(body): Json<Value>) -> Response {
         let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
         if method == "initialize" {
-            let mut headers = HeaderMap::new();
-            headers.insert("mcp-session-id", "sse-fail".parse().unwrap());
-            (StatusCode::OK, headers, Json(json!({ "result": {} }))).into_response()
+            mock_initialize_response(Value::Null, "sse-fail")
         } else {
             StatusCode::OK.into_response()
         }
@@ -279,12 +295,7 @@ async fn handshake_sse_failure_aborts() {
         "/mcp",
         post(init_only).get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    let mcp_url = format!("http://127.0.0.1:{port}/mcp");
+    let (mcp_url, server) = spawn_router(router).await;
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let err = StreamableHttpMcpClient::connect(connector(&mcp_url), connect_opts(tmp.path()))
@@ -323,6 +334,27 @@ async fn connect_minimal_skips_sse_and_roots() {
 
 // ─── Notifications ───────────────────────────────────────────────────────────
 
+async fn collect_notification_methods(
+    rx: &mut tokio::sync::mpsc::Receiver<Value>,
+    until_method: &str,
+) -> Vec<String> {
+    let mut methods = Vec::new();
+    let deadline = TestTimeouts::scale_secs(10);
+    let _ = tokio::time::timeout(deadline, async {
+        while let Some(v) = rx.recv().await {
+            let Some(m) = v.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            methods.push(m.to_string());
+            if m == until_method {
+                break;
+            }
+        }
+    })
+    .await;
+    methods
+}
+
 #[tokio::test]
 async fn notifications_are_forwarded_to_channel() {
     let state = MockState::default();
@@ -338,19 +370,7 @@ async fn notifications_are_forwarded_to_channel() {
 
     // The stream carries roots/list, sandbox/configured, and a custom
     // notification — all must be forwarded.
-    let mut methods = Vec::new();
-    let deadline = TestTimeouts::scale_secs(10);
-    let _ = tokio::time::timeout(deadline, async {
-        while let Some(v) = rx.recv().await {
-            if let Some(m) = v.get("method").and_then(Value::as_str) {
-                methods.push(m.to_string());
-            }
-            if methods.iter().any(|m| m == "notifications/custom") {
-                break;
-            }
-        }
-    })
-    .await;
+    let methods = collect_notification_methods(&mut rx, "notifications/custom").await;
 
     assert!(
         methods.iter().any(|m| m == "roots/list"),
@@ -378,12 +398,7 @@ async fn call_tool_no_retry_surfaces_sandbox_initializing() {
     state.conflicts_before_success.store(100, Ordering::SeqCst);
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(
-        reqwest::Client::new(),
-        &mcp_url,
-        "s1",
-        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-    );
+    let client = attach_client(&mcp_url, "s1");
     let outcome = client
         .call_tool("status", json!({}), ConflictRetryPolicy::NONE)
         .await
@@ -416,15 +431,10 @@ async fn attached_clients_in_one_process_never_reuse_a_request_id() {
     let state = MockState::default();
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let attach = || {
-        StreamableHttpMcpClient::attach(
-            reqwest::Client::new(),
-            &mcp_url,
-            "shared-session",
-            ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-        )
-    };
-    let (first, second) = (attach(), attach());
+    let (first, second) = (
+        attach_client(&mcp_url, "shared-session"),
+        attach_client(&mcp_url, "shared-session"),
+    );
     let (a, b) = tokio::join!(
         first.call_tool("read_file", json!({}), ConflictRetryPolicy::NONE),
         second.call_tool("list_dir", json!({}), ConflictRetryPolicy::NONE),
@@ -448,12 +458,7 @@ async fn call_tool_retries_through_transient_409() {
     state.conflicts_before_success.store(2, Ordering::SeqCst);
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(
-        reqwest::Client::new(),
-        &mcp_url,
-        "s2",
-        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-    );
+    let client = attach_client(&mcp_url, "s2");
     let policy = ConflictRetryPolicy {
         max_retries: 5,
         delay: TestTimeouts::scale_millis(20),
@@ -486,19 +491,9 @@ async fn call_tool_non_409_http_error_is_reported() {
         "/mcp",
         post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    let mcp_url = format!("http://127.0.0.1:{port}/mcp");
+    let (mcp_url, server) = spawn_router(router).await;
 
-    let client = StreamableHttpMcpClient::attach(
-        reqwest::Client::new(),
-        &mcp_url,
-        "s3",
-        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-    );
+    let client = attach_client(&mcp_url, "s3");
     let outcome = client
         .call_tool("x", json!({}), ConflictRetryPolicy::NONE)
         .await
@@ -521,12 +516,7 @@ async fn tools_list_parses_and_skips_nameless() {
     let state = MockState::default();
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(
-        reqwest::Client::new(),
-        &mcp_url,
-        "s4",
-        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-    );
+    let client = attach_client(&mcp_url, "s4");
     let tools = client.tools_list().await.expect("tools/list ok");
     assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].name, "alpha");
@@ -549,20 +539,10 @@ fn parse_tools_list_tolerates_odd_shapes() {
 
 #[tokio::test]
 async fn tools_list_non_2xx_errors() {
-    let router = Router::new().route("/mcp", post(|| async { StatusCode::FORBIDDEN }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    let mcp_url = format!("http://127.0.0.1:{port}/mcp");
+    let (mcp_url, server) =
+        spawn_router(Router::new().route("/mcp", post(|| async { StatusCode::FORBIDDEN }))).await;
 
-    let client = StreamableHttpMcpClient::attach(
-        reqwest::Client::new(),
-        &mcp_url,
-        "s5",
-        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-    );
+    let client = attach_client(&mcp_url, "s5");
     let err = client
         .tools_list()
         .await
@@ -579,12 +559,7 @@ async fn delete_session_sends_delete_with_session_header() {
     let state = MockState::default();
     let (mcp_url, server) = spawn_mock(state.clone()).await;
 
-    let client = StreamableHttpMcpClient::attach(
-        reqwest::Client::new(),
-        &mcp_url,
-        "to-delete",
-        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-    );
+    let client = attach_client(&mcp_url, "to-delete");
     client.delete_session(TestTimeouts::scale_secs(2)).await;
 
     assert_eq!(
@@ -628,22 +603,12 @@ async fn spawn_scripted(
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    (format!("http://127.0.0.1:{port}/mcp"), posts, server)
+    let (mcp_url, server) = spawn_router(router).await;
+    (mcp_url, posts, server)
 }
 
 fn attach_fast(mcp_url: &str) -> StreamableHttpMcpClient {
-    StreamableHttpMcpClient::attach(
-        reqwest::Client::new(),
-        mcp_url,
-        "retry-session",
-        ahma_common::mcp_protocol::DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
-    )
-    .with_retry_policy(FAST_RETRY)
+    attach_client(mcp_url, "retry-session").with_retry_policy(FAST_RETRY)
 }
 
 /// A tool may already have run when the server answers 500, so `tools/call`

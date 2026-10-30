@@ -176,34 +176,7 @@ pub fn turn_status_text(
             (format!("{model} is loading into memory · {clock}"), hint)
         }
         TurnPhase::Reading => {
-            let mut text = if prompt_tokens > 0 {
-                format!(
-                    "{model} is reading {} tokens of context · {clock}",
-                    fmt_tokens_short(prompt_tokens)
-                )
-            } else {
-                format!("waiting for {model} · {clock}")
-            };
-            let expected = read_rate
-                .filter(|r| *r > 0.0 && prompt_tokens > 0)
-                .map(|r| std::time::Duration::from_secs_f64(f64::from(prompt_tokens) / r));
-            if let Some(expected) = expected {
-                match expected.checked_sub(in_phase) {
-                    Some(left) if left.as_secs() >= 1 => {
-                        text.push_str(&format!(" · ~{} left", fmt_duration_short(left)));
-                    }
-                    _ => text.push_str(" · taking longer than last time"),
-                }
-            }
-            if let Some(tools) = turn.tools.as_deref().filter(|t| *t != "all") {
-                text.push_str(&format!(" · tools: {tools}"));
-            }
-            let slow = read_rate.is_some_and(|r| r < 200.0) || in_phase.as_secs() >= 60;
-            let hint = (slow && prompt_tokens >= 20_000).then(|| {
-                "large context for this model — /compact to shrink it, or /model for a faster one"
-                    .to_string()
-            });
-            (text, hint)
+            reading_status_text(turn, in_phase, &clock, model, prompt_tokens, read_rate)
         }
         TurnPhase::Thinking => (format!("{model} is thinking · {clock}"), None),
         TurnPhase::Writing => {
@@ -215,6 +188,49 @@ pub fn turn_status_text(
         }
         TurnPhase::Tool { name } => (format!("running {name} · {clock}"), None),
         TurnPhase::AwaitingYou => (format!("waiting for your answer above · {clock}"), None),
+    }
+}
+
+fn reading_status_text(
+    turn: &ChatTurn,
+    in_phase: Duration,
+    clock: &str,
+    model: &str,
+    prompt_tokens: u32,
+    read_rate: Option<f64>,
+) -> (String, Option<String>) {
+    let mut text = if prompt_tokens > 0 {
+        format!(
+            "{model} is reading {} tokens of context · {clock}",
+            fmt_tokens_short(prompt_tokens)
+        )
+    } else {
+        format!("waiting for {model} · {clock}")
+    };
+    if let Some(suffix) = reading_eta_suffix(in_phase, prompt_tokens, read_rate) {
+        text.push_str(&suffix);
+    }
+    if let Some(tools) = turn.tools.as_deref().filter(|t| *t != "all") {
+        text.push_str(&format!(" · tools: {tools}"));
+    }
+    let slow = read_rate.is_some_and(|r| r < 200.0) || in_phase.as_secs() >= 60;
+    let hint = (slow && prompt_tokens >= 20_000).then(|| {
+        "large context for this model — /compact to shrink it, or /model for a faster one"
+            .to_string()
+    });
+    (text, hint)
+}
+
+fn reading_eta_suffix(
+    in_phase: Duration,
+    prompt_tokens: u32,
+    read_rate: Option<f64>,
+) -> Option<String> {
+    let rate = read_rate.filter(|r| *r > 0.0 && prompt_tokens > 0)?;
+    let expected = std::time::Duration::from_secs_f64(f64::from(prompt_tokens) / rate);
+    match expected.checked_sub(in_phase) {
+        Some(left) if left.as_secs() >= 1 => Some(format!(" · ~{} left", fmt_duration_short(left))),
+        _ => Some(" · taking longer than last time".to_string()),
     }
 }
 
@@ -921,21 +937,13 @@ pub enum ActivityStatus {
 
 impl ActivityStatus {
     pub fn glyph(&self, unicode: bool) -> &'static str {
-        if unicode {
-            match self {
-                Self::Running => "⟳",
-                Self::Success => "✓",
-                Self::Failed => "✗",
-                Self::Cancelled => "⊘",
-            }
-        } else {
-            match self {
-                Self::Running => ">",
-                Self::Success => "v",
-                Self::Failed => "x",
-                Self::Cancelled => "-",
-            }
-        }
+        let (uni, ascii) = match self {
+            Self::Running => ("⟳", ">"),
+            Self::Success => ("✓", "v"),
+            Self::Failed => ("✗", "x"),
+            Self::Cancelled => ("⊘", "-"),
+        };
+        if unicode { uni } else { ascii }
     }
 }
 
@@ -1029,30 +1037,18 @@ impl OpStatus {
     }
 
     pub fn glyph(&self, unicode: bool) -> &'static str {
-        if unicode {
-            match self {
-                Self::Running => "⟳",
-                Self::Pending => "◷",
-                Self::Succeeded => "✓",
-                Self::Failed => "✗",
-                Self::Cancelled => "⊘",
-                Self::Waiting => "⏸",
-                Self::Denied => "✗",
-                // Not a cross: nobody established that this failed.
-                Self::Interrupted => "⁉",
-            }
-        } else {
-            match self {
-                Self::Running => ">",
-                Self::Pending => ".",
-                Self::Succeeded => "v",
-                Self::Failed => "x",
-                Self::Cancelled => "-",
-                Self::Waiting => "|",
-                Self::Denied => "x",
-                Self::Interrupted => "?",
-            }
-        }
+        let (uni, ascii) = match self {
+            Self::Running => ("⟳", ">"),
+            Self::Pending => ("◷", "."),
+            Self::Succeeded => ("✓", "v"),
+            Self::Failed => ("✗", "x"),
+            Self::Cancelled => ("⊘", "-"),
+            Self::Waiting => ("⏸", "|"),
+            Self::Denied => ("✗", "x"),
+            // Not a cross: nobody established that this failed.
+            Self::Interrupted => ("⁉", "?"),
+        };
+        if unicode { uni } else { ascii }
     }
 }
 
@@ -3449,25 +3445,8 @@ impl AppState {
     /// `Space` on that header performs (docs/tui.md: "Enter / click a
     /// header ... open"). A nested group header still folds in place.
     pub fn open_selected_tree_detail(&mut self, now_ms: u64) {
-        use crate::task_tree::RowKind;
-        let action = {
-            let rows = self.task_rows.borrow();
-            rows.get(self.ops_selected).map(|r| match &r.kind {
-                RowKind::Instance { group_id, .. } => TreeToggle::Fold(format!("inst:{group_id}")),
-                RowKind::Group { key, .. } => TreeToggle::Fold(key.clone()),
-                RowKind::Op { op_index, .. } | RowKind::Output { op_index, .. } => {
-                    TreeToggle::Expand(*op_index)
-                }
-            })
-        };
-        match action {
-            Some(TreeToggle::Fold(key)) => match key.strip_prefix("inst:") {
-                Some(section) => {
-                    let section = section.to_string();
-                    self.toggle_section(&section, now_ms);
-                }
-                None => self.toggle_collapse_key(key),
-            },
+        match self.selected_tree_toggle() {
+            Some(TreeToggle::Fold(key)) => self.fold_tree_key(key, now_ms),
             Some(TreeToggle::Expand(op_index)) => {
                 if let Some(op) = self.operations.get(op_index) {
                     let key = OpKey::of(op);
@@ -3482,29 +3461,34 @@ impl AppState {
     /// operation (collapsing the previously expanded one), or fold/unfold an
     /// instance or session header.
     pub fn toggle_selected_tree_node(&mut self, now_ms: u64) {
-        use crate::task_tree::RowKind;
-        let action = {
-            let rows = self.task_rows.borrow();
-            rows.get(self.ops_selected).map(|r| match &r.kind {
-                RowKind::Instance { group_id, .. } => TreeToggle::Fold(format!("inst:{group_id}")),
-                RowKind::Group { key, .. } => TreeToggle::Fold(key.clone()),
-                RowKind::Op { op_index, .. } | RowKind::Output { op_index, .. } => {
-                    TreeToggle::Expand(*op_index)
-                }
-            })
-        };
-        match action {
-            Some(TreeToggle::Fold(key)) => match key.strip_prefix("inst:") {
-                // A section header opens the accordion; a group header inside a
-                // section still folds in place.
-                Some(section) => {
-                    let section = section.to_string();
-                    self.toggle_section(&section, now_ms);
-                }
-                None => self.toggle_collapse_key(key),
-            },
+        match self.selected_tree_toggle() {
+            Some(TreeToggle::Fold(key)) => self.fold_tree_key(key, now_ms),
             Some(TreeToggle::Expand(op_index)) => self.toggle_expanded_op(op_index),
             None => {}
+        }
+    }
+
+    fn selected_tree_toggle(&self) -> Option<TreeToggle> {
+        use crate::task_tree::RowKind;
+        let rows = self.task_rows.borrow();
+        rows.get(self.ops_selected).map(|r| match &r.kind {
+            RowKind::Instance { group_id, .. } => TreeToggle::Fold(format!("inst:{group_id}")),
+            RowKind::Group { key, .. } => TreeToggle::Fold(key.clone()),
+            RowKind::Op { op_index, .. } | RowKind::Output { op_index, .. } => {
+                TreeToggle::Expand(*op_index)
+            }
+        })
+    }
+
+    fn fold_tree_key(&mut self, key: String, now_ms: u64) {
+        match key.strip_prefix("inst:") {
+            // A section header opens the accordion; a group header inside a
+            // section still folds in place.
+            Some(section) => {
+                let section = section.to_string();
+                self.toggle_section(&section, now_ms);
+            }
+            None => self.toggle_collapse_key(key),
         }
     }
 

@@ -189,159 +189,182 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     line.writes.is_empty().then_some(line.segs)
 }
 
+/// A tokenized word and whether any `<` or `>` inside it was quoted.
+type TokenWord = (String, bool);
+
+#[derive(Default)]
+struct LineTokenizer {
+    segs: Vec<Vec<TokenWord>>,
+    cur: String,
+    quoted_angle: bool,
+    in_word: bool,
+    quote: Option<char>,
+}
+
+impl LineTokenizer {
+    fn new() -> Self {
+        Self {
+            segs: vec![Vec::new()],
+            ..Self::default()
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.in_word {
+            self.segs.last_mut().unwrap().push((
+                std::mem::take(&mut self.cur),
+                std::mem::take(&mut self.quoted_angle),
+            ));
+            self.in_word = false;
+        }
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.cur.push(c);
+        self.in_word = true;
+    }
+
+    fn consume_operator(&mut self, c: char, next: Option<char>) -> Option<usize> {
+        let op_len = match (c, next) {
+            ('|', Some('|')) | ('&', Some('&')) => 2,
+            ('|', _) | (';', _) => 1,
+            // A bare `&`: background or a redirection we do not model.
+            ('&', _) => return None,
+            _ => 1,
+        };
+        self.flush();
+        if self.segs.last().is_some_and(Vec::is_empty) {
+            return None; // `| cmd`, `cmd ||  | cmd`: not a command line we read
+        }
+        self.segs.push(Vec::new());
+        Some(op_len)
+    }
+
+    fn step_unquoted(&mut self, chars: &[char], i: usize) -> Option<usize> {
+        let c = chars[i];
+        match c {
+            // `!` standing alone negates the command after it: a word of
+            // its own, which the classifier skips like a loop keyword.
+            '!' if !self.in_word && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {
+                self.push_char('!');
+            }
+            // An operator this module does not model, outside quotes only:
+            // a `}` inside a sed script is just a character.
+            c if SHELL_OPERATORS.contains(&c) => return None,
+            '\'' | '"' => {
+                self.quote = Some(c);
+                self.in_word = true;
+            }
+            '&' if self.cur.ends_with('>') || self.cur.ends_with('<') => {
+                // `2>&1`, `>&2`: part of a redirection word, not an operator.
+                self.push_char(c);
+            }
+            '|' if self.cur.ends_with('>') => {
+                // `>|file`: write even under `noclobber`, not a pipe.
+                self.push_char(c);
+            }
+            '&' if chars.get(i + 1) == Some(&'>') => {
+                // `&>file`, `&>>file`: a redirection word of its own.
+                self.flush();
+                self.push_char(c);
+            }
+            '|' | ';' | '&' => return self.consume_operator(c, chars.get(i + 1).copied()),
+            c if c.is_whitespace() => self.flush(),
+            _ => self.push_char(c),
+        }
+        Some(1)
+    }
+}
+
+/// Tokenize words, quoted strings, and the operators `|`, `||`, `&&`, `;`.
+/// Any other `&` (background, `>&2` outside a redirection) is unknown.
+/// Each word carries whether a `<` or `>` in it was *quoted*: that is an
+/// argument (`grep '>' f`), never a redirection.
+fn tokenize_line(command: &str) -> Option<Vec<Vec<TokenWord>>> {
+    if command.contains("<<") {
+        return None;
+    }
+    let mut tok = LineTokenizer::new();
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match tok.quote {
+            Some(q) if c == q => {
+                tok.quote = None;
+                i += 1;
+            }
+            Some(_) => {
+                tok.quoted_angle |= c == '<' || c == '>';
+                tok.cur.push(c);
+                i += 1;
+            }
+            None => i += tok.step_unquoted(&chars, i)?,
+        }
+    }
+    if tok.quote.is_some() {
+        return None;
+    }
+    tok.flush();
+    if tok.segs.last().is_some_and(Vec::is_empty) {
+        return None; // trailing operator
+    }
+    Some(tok.segs)
+}
+
+/// Redirections: drop the ones that open no file, collect the files the
+/// writing ones open, refuse anything else with `<`/`>`.
+fn extract_segment_redirections(seg: Vec<TokenWord>, writes: &mut Vec<String>) -> Option<Segment> {
+    let mut cleaned = Vec::new();
+    let mut words = seg.into_iter();
+    while let Some((w, quoted_angle)) = words.next() {
+        if !w.contains(['<', '>']) {
+            // `$(…)` is a substitution; a plain `$VAR` reference only reads
+            // the environment and is left to the shell.
+            if w.contains("$(") {
+                return None;
+            }
+            cleaned.push(w);
+            continue;
+        }
+        if quoted_angle {
+            return None;
+        }
+        let (writing, target) = match redirection(&w)? {
+            Redirection::Stream => continue,
+            Redirection::Write(target) => (true, target),
+            Redirection::Read(target) => (false, target),
+        };
+        // `> file`: the file is the next word, which must be a plain one.
+        let target = match target {
+            Some(target) => target,
+            None => match words.next() {
+                Some((next, _)) if !next.is_empty() && !next.contains(['<', '>']) => next,
+                _ => return None,
+            },
+        };
+        if target == "/dev/null" {
+            continue;
+        }
+        if !writing {
+            return None;
+        }
+        writes.push(target);
+    }
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 /// [`segments`], with writing redirections parsed out into [`Line::writes`]
 /// instead of refused. Input redirections other than `< /dev/null` are still
 /// refused: they are reads, but not ones this module models.
 fn parse_line(command: &str) -> Option<Line> {
-    if command.contains("<<") {
-        return None;
-    }
-    // Tokenize: words, quoted strings, and the operators `|`, `||`, `&&`, `;`.
-    // Any other `&` (background, `>&2` outside a redirection) is unknown.
-    // Each word carries whether a `<` or `>` in it was *quoted*: that is an
-    // argument (`grep '>' f`), never a redirection.
-    type Word = (String, bool);
-    let mut segs: Vec<Vec<Word>> = vec![Vec::new()];
-    let mut cur = String::new();
-    let mut quoted_angle = false;
-    let mut in_word = false;
-    let mut quote: Option<char> = None;
-    let chars: Vec<char> = command.chars().collect();
-    let mut i = 0;
-    let flush = |cur: &mut String,
-                 quoted_angle: &mut bool,
-                 in_word: &mut bool,
-                 segs: &mut Vec<Vec<Word>>| {
-        if *in_word {
-            segs.last_mut()
-                .unwrap()
-                .push((std::mem::take(cur), std::mem::take(quoted_angle)));
-            *in_word = false;
-        }
-    };
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {
-                quoted_angle |= c == '<' || c == '>';
-                cur.push(c);
-            }
-            None => match c {
-                // `!` standing alone negates the command after it: a word of
-                // its own, which the classifier skips like a loop keyword.
-                '!' if !in_word && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {
-                    cur.push('!');
-                    in_word = true;
-                }
-                // An operator this module does not model, outside quotes only:
-                // a `}` inside a sed script is just a character.
-                c if SHELL_OPERATORS.contains(&c) => return None,
-                '\'' | '"' => {
-                    quote = Some(c);
-                    in_word = true;
-                }
-                '&' if cur.ends_with('>') || cur.ends_with('<') => {
-                    // `2>&1`, `>&2`: part of a redirection word, not an operator.
-                    cur.push(c);
-                    in_word = true;
-                }
-                '|' if cur.ends_with('>') => {
-                    // `>|file`: write even under `noclobber`, not a pipe.
-                    cur.push(c);
-                    in_word = true;
-                }
-                '&' if chars.get(i + 1) == Some(&'>') => {
-                    // `&>file`, `&>>file`: a redirection word of its own.
-                    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs);
-                    cur.push(c);
-                    in_word = true;
-                }
-                '|' | ';' | '&' => {
-                    let next = chars.get(i + 1).copied();
-                    let op_len = match (c, next) {
-                        ('|', Some('|')) | ('&', Some('&')) => 2,
-                        ('|', _) | (';', _) => 1,
-                        // A bare `&`: background or a redirection we do not model.
-                        ('&', _) => return None,
-                        _ => 1,
-                    };
-                    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs);
-                    if segs.last().is_some_and(Vec::is_empty) {
-                        return None; // `| cmd`, `cmd ||  | cmd`: not a command line we read
-                    }
-                    segs.push(Vec::new());
-                    i += op_len;
-                    continue;
-                }
-                c if c.is_whitespace() => {
-                    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs)
-                }
-                _ => {
-                    cur.push(c);
-                    in_word = true;
-                }
-            },
-        }
-        i += 1;
-    }
-    if quote.is_some() {
-        return None;
-    }
-    flush(&mut cur, &mut quoted_angle, &mut in_word, &mut segs);
-    if segs.last().is_some_and(Vec::is_empty) {
-        return None; // trailing operator
-    }
-    // Redirections: drop the ones that open no file, collect the files the
-    // writing ones open, refuse anything else with `<`/`>`.
+    let raw_segs = tokenize_line(command)?;
     let mut writes = Vec::new();
-    let mut cleaned_segs = Vec::with_capacity(segs.len());
-    for seg in segs {
-        let mut cleaned = Vec::new();
-        let mut words = seg.into_iter();
-        while let Some((w, quoted_angle)) = words.next() {
-            if !w.contains(['<', '>']) {
-                // `$(…)` is a substitution; a plain `$VAR` reference only reads
-                // the environment and is left to the shell.
-                if w.contains("$(") {
-                    return None;
-                }
-                cleaned.push(w);
-                continue;
-            }
-            if quoted_angle {
-                return None;
-            }
-            let (writing, target) = match redirection(&w)? {
-                Redirection::Stream => continue,
-                Redirection::Write(target) => (true, target),
-                Redirection::Read(target) => (false, target),
-            };
-            // `> file`: the file is the next word, which must be a plain one.
-            let target = match target {
-                Some(target) => target,
-                None => match words.next() {
-                    Some((next, _)) if !next.is_empty() && !next.contains(['<', '>']) => next,
-                    _ => return None,
-                },
-            };
-            if target == "/dev/null" {
-                continue;
-            }
-            if !writing {
-                return None;
-            }
-            writes.push(target);
-        }
-        if cleaned.is_empty() {
-            return None;
-        }
-        cleaned_segs.push(cleaned);
+    let mut segs = Vec::with_capacity(raw_segs.len());
+    for seg in raw_segs {
+        segs.push(extract_segment_redirections(seg, &mut writes)?);
     }
-    Some(Line {
-        segs: cleaned_segs,
-        writes,
-    })
+    Some(Line { segs, writes })
 }
 
 /// Programs that only read, beyond [`READ_ONLY_PROGRAMS`], whose arguments
@@ -631,34 +654,37 @@ pub fn classify_shell_command_at(command: &str, site: &RunSite<'_>) -> Lane {
     // pre-push hook, a line that also writes a file, or one that changes
     // directory first still takes its turn.
     if let Some(push) = reading.syncs {
-        let hook = push && push_runs_hook(site.cwd);
-        return if targets.peek().is_none()
-            && !reading.writes_through_args
-            && !reading.changes_dir
-            && !hook
-        {
-            Lane::Service
-        } else {
-            Lane::Exclusive
-        };
+        return classify_sync_command(&reading, site.cwd, push, targets.peek().is_some());
     }
     if targets.peek().is_none() {
-        return if site.read_only_enforced {
-            Lane::ReadOnly
-        } else if reading.watches && !reading.writes_through_args {
-            Lane::Service
-        } else {
-            Lane::Exclusive
-        };
+        return classify_targetless_reader(&reading, site.read_only_enforced);
     }
     if reading.writes_through_args {
         return Lane::Exclusive;
     }
-    let all_outside = targets.all(|word| {
+    if targets.all(|word| {
         redirection_target(word, site.cwd, reading.changes_dir)
             .is_some_and(|path| !(site.writes_workspace)(&path))
-    });
-    if all_outside {
+    }) {
+        Lane::Service
+    } else {
+        Lane::Exclusive
+    }
+}
+
+fn classify_sync_command(reading: &Reading, cwd: &Path, push: bool, has_targets: bool) -> Lane {
+    let hook = push && push_runs_hook(cwd);
+    if !has_targets && !reading.writes_through_args && !reading.changes_dir && !hook {
+        Lane::Service
+    } else {
+        Lane::Exclusive
+    }
+}
+
+fn classify_targetless_reader(reading: &Reading, read_only_enforced: bool) -> Lane {
+    if read_only_enforced {
+        Lane::ReadOnly
+    } else if reading.watches && !reading.writes_through_args {
         Lane::Service
     } else {
         Lane::Exclusive
@@ -727,66 +753,94 @@ pub fn writes_inside(path: &Path, workspace: &Path, scopes: &[PathBuf]) -> bool 
 fn read_segments(segs: &[Segment]) -> Option<Reading> {
     let mut reading = Reading::default();
     for seg in segs {
-        // Loop and conditional keywords, and `NAME=value` assignments, only
-        // frame the command that follows; the command decides. The read lane
-        // is still the kernel's word: an assignment such as `LD_PRELOAD` that
-        // makes a reader try to write fails, it cannot write.
-        let words: Vec<&String> = seg
-            .iter()
-            .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
-            .collect();
-        if matches!(words.as_slice(), [w] if matches!(w.as_str(), "done" | "fi")) {
-            continue;
-        }
-        // `S=/path;` on its own sets a shell variable and nothing else.
-        if words.is_empty() && seg.iter().all(|w| is_assignment(w)) {
-            continue;
-        }
-        // `for f in a b` only names what the loop body reads; the body decides.
-        if let [first, name, rest @ ..] = words.as_slice()
-            && first.as_str() == "for"
-            && is_assignment(&format!("{name}=x"))
-            && rest.first().is_none_or(|w| w.as_str() == "in")
-        {
-            continue;
-        }
-        let (program, args) = words.split_first()?;
-        let program = program.as_str();
-        let args: Vec<String> = args.iter().map(|a| (*a).clone()).collect();
-        let args = args.as_slice();
-        // A path to a program: not worth guessing.
-        if program.contains('=') || program.contains('/') {
-            return None;
-        }
-        // `cd <dir>` changes nothing on disk; the segment after it decides.
-        if program == "cd" && args.len() <= 1 {
-            reading.changes_dir = true;
-            continue;
-        }
-        // `tee` copies its input to its output and to its files, which the
-        // caller places like a redirection's.
-        if program == "tee" {
-            reading.tee_files.extend(tee_files(args)?);
-            continue;
-        }
-        if let Some(push) = git_sync(program, args) {
-            reading.syncs = Some(reading.syncs.unwrap_or(false) || push);
-            continue;
-        }
-        if !program_is_read_only(program, args) {
-            return None;
-        }
-        // An environment assignment before a program (`LD_PRELOAD=…`) can
-        // make a reader do anything; only the kernel's read-only lane makes
-        // that harmless, so it rules out a service verdict.
-        let assigns = seg
-            .iter()
-            .take_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
-            .any(|w| is_assignment(w));
-        reading.writes_through_args |= assigns || writes_through_args(program, args);
-        reading.watches |= is_watcher(program, args);
+        read_one_segment(seg, &mut reading)?;
     }
     Some(reading)
+}
+
+fn is_for_header(words: &[&String]) -> bool {
+    matches!(words, [first, name, rest @ ..]
+        if first.as_str() == "for"
+            && is_assignment(&format!("{name}=x"))
+            && rest.first().is_none_or(|w| w.as_str() == "in"))
+}
+
+fn is_framing_only_segment(seg: &Segment, words: &[&String]) -> bool {
+    matches!(words, [w] if matches!(w.as_str(), "done" | "fi"))
+        // `S=/path;` on its own sets a shell variable and nothing else.
+        || (words.is_empty() && seg.iter().all(|w| is_assignment(w)))
+        // `for f in a b` only names what the loop body reads; the body decides.
+        || is_for_header(words)
+}
+
+fn read_one_segment(seg: &Segment, reading: &mut Reading) -> Option<()> {
+    // Loop and conditional keywords, and `NAME=value` assignments, only
+    // frame the command that follows; the command decides. The read lane
+    // is still the kernel's word: an assignment such as `LD_PRELOAD` that
+    // makes a reader try to write fails, it cannot write.
+    let words: Vec<&String> = seg
+        .iter()
+        .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+        .collect();
+    if is_framing_only_segment(seg, &words) {
+        return Some(());
+    }
+    let (program, args) = words.split_first()?;
+    let program = program.as_str();
+    let args: Vec<String> = args.iter().map(|a| (*a).clone()).collect();
+    let args = args.as_slice();
+    // A path to a program: not worth guessing.
+    if program.contains('=') || program.contains('/') {
+        return None;
+    }
+    // `cd <dir>` changes nothing on disk; the segment after it decides.
+    if program == "cd" && args.len() <= 1 {
+        reading.changes_dir = true;
+        return Some(());
+    }
+    // `tee` copies its input to its output and to its files, which the
+    // caller places like a redirection's.
+    if program == "tee" {
+        reading.tee_files.extend(tee_files(args)?);
+        return Some(());
+    }
+    if let Some(push) = git_sync(program, args) {
+        reading.syncs = Some(reading.syncs.unwrap_or(false) || push);
+        return Some(());
+    }
+    if !program_is_read_only(program, args) {
+        return None;
+    }
+    // An environment assignment before a program (`LD_PRELOAD=…`) can
+    // make a reader do anything; only the kernel's read-only lane makes
+    // that harmless, so it rules out a service verdict.
+    let assigns = seg
+        .iter()
+        .take_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+        .any(|w| is_assignment(w));
+    reading.writes_through_args |= assigns || writes_through_args(program, args);
+    reading.watches |= is_watcher(program, args);
+    Some(())
+}
+
+/// Find the index of the closing `)` matching the `$(` whose body starts at `start`.
+fn find_substitution_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 1;
+    let mut quoted = false;
+    for (offset, &ch) in chars[start..].iter().enumerate() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Replace every `$(…)` outside single quotes with a plain word, returning
@@ -808,29 +862,10 @@ fn lift_substitutions(command: &str) -> Option<(String, Vec<String>)> {
         }
         if !in_single && c == '$' && chars.get(i + 1) == Some(&'(') {
             let start = i + 2;
-            let mut depth = 1;
-            let mut j = start;
-            let mut quoted = false;
-            while j < chars.len() {
-                match chars[j] {
-                    '\'' => quoted = !quoted,
-                    '(' if !quoted => depth += 1,
-                    ')' if !quoted => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            if depth != 0 {
-                return None;
-            }
-            inner.push(chars[start..j].iter().collect());
+            let end = find_substitution_end(&chars, start)?;
+            inner.push(chars[start..end].iter().collect());
             out.push_str("SUBSTITUTION");
-            i = j + 1;
+            i = end + 1;
             continue;
         }
         out.push(c);
@@ -882,6 +917,136 @@ fn subcommand(args: &[String]) -> Option<&str> {
         .find(|a| !a.starts_with('-') && !a.starts_with('+'))
 }
 
+fn has_flag_or_eq(args: &[String], flag: &str) -> bool {
+    args.iter()
+        .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+}
+
+fn cargo_source_effect(sub: Option<&str>, args: &[String]) -> SourceEffect {
+    use SourceEffect::*;
+    match sub {
+        Some("fmt") if has_flag_or_eq(args, "--check") => ReadsSources,
+        Some("clippy") if has_flag_or_eq(args, "--fix") => RewritesSources,
+        Some(
+            "build" | "b" | "test" | "t" | "nextest" | "check" | "c" | "clippy" | "doc" | "bench"
+            | "tree" | "metadata" | "audit" | "deny" | "llvm-cov",
+        ) => ReadsSources,
+        Some("fmt" | "fix" | "update" | "add" | "remove" | "rm" | "upgrade") => RewritesSources,
+        _ => Unknown,
+    }
+}
+
+fn node_pm_source_effect(sub: Option<&str>, args: &[String]) -> SourceEffect {
+    use SourceEffect::*;
+    match sub {
+        Some("test" | "t") => ReadsSources,
+        Some("run") if args.iter().any(|a| a == "test") => ReadsSources,
+        Some("install" | "i" | "ci" | "add" | "remove" | "update" | "upgrade") => RewritesSources,
+        _ => Unknown,
+    }
+}
+
+fn jvm_build_source_effect(args: &[String]) -> SourceEffect {
+    if args.iter().any(|a| {
+        let a = a.to_ascii_lowercase();
+        a.contains("spotlessapply") || a.contains("format") || a.contains("ktlintformat")
+    }) {
+        SourceEffect::RewritesSources
+    } else {
+        SourceEffect::ReadsSources
+    }
+}
+
+fn linter_formatter_source_effect(
+    program: &str,
+    sub: Option<&str>,
+    args: &[String],
+) -> SourceEffect {
+    use SourceEffect::*;
+    match program {
+        "eslint" => {
+            if has_flag_or_eq(args, "--fix") {
+                RewritesSources
+            } else {
+                ReadsSources
+            }
+        }
+        "ruff" => match sub {
+            Some("check") if !has_flag_or_eq(args, "--fix") => ReadsSources,
+            Some("check" | "format") => RewritesSources,
+            _ => Unknown,
+        },
+        "black" | "isort" | "gofmt" | "rustfmt" => {
+            if has_flag_or_eq(args, "--check") {
+                ReadsSources
+            } else {
+                RewritesSources
+            }
+        }
+        "prettier" => {
+            if has_flag_or_eq(args, "--write") || has_flag_or_eq(args, "-w") {
+                RewritesSources
+            } else if has_flag_or_eq(args, "--check") || has_flag_or_eq(args, "-c") {
+                ReadsSources
+            } else {
+                Unknown
+            }
+        }
+        _ => Unknown,
+    }
+}
+
+fn git_source_effect(sub: Option<&str>) -> SourceEffect {
+    use SourceEffect::*;
+    match sub {
+        Some("commit" | "add" | "push" | "fetch" | "tag") => ReadsSources,
+        Some(
+            "checkout" | "switch" | "stash" | "reset" | "rebase" | "merge" | "pull" | "restore"
+            | "apply" | "am" | "cherry-pick" | "revert" | "clean" | "mv" | "rm",
+        ) => RewritesSources,
+        _ => Unknown,
+    }
+}
+
+fn program_source_effect(program: &str, args: &[String]) -> SourceEffect {
+    use SourceEffect::*;
+    let sub = subcommand(args);
+    match program {
+        "cargo" => cargo_source_effect(sub, args),
+        "npm" | "pnpm" | "yarn" | "bun" => node_pm_source_effect(sub, args),
+        "go" => match sub {
+            Some("build" | "test" | "vet" | "list") => ReadsSources,
+            Some("fmt" | "generate" | "get" | "mod") => RewritesSources,
+            _ => Unknown,
+        },
+        "python" | "python3" => {
+            if args.first().map(String::as_str) == Some("-m")
+                && matches!(
+                    args.get(1).map(String::as_str),
+                    Some("pytest" | "mypy" | "unittest")
+                )
+            {
+                ReadsSources
+            } else {
+                Unknown
+            }
+        }
+        "pytest" | "mypy" | "tsc" | "jest" | "vitest" | "tox" | "xcodebuild" => ReadsSources,
+        "swift" => match sub {
+            Some("build" | "test") => ReadsSources,
+            _ => Unknown,
+        },
+        "gradle" | "gradlew" | "mvn" | "mvnw" => jvm_build_source_effect(args),
+        "eslint" | "ruff" | "black" | "isort" | "gofmt" | "rustfmt" | "prettier" => {
+            linter_formatter_source_effect(program, sub, args)
+        }
+        "git" => git_source_effect(sub),
+        "sed" | "gsed" | "perl" | "rm" | "mv" | "cp" | "touch" | "mkdir" | "ln" | "truncate"
+        | "patch" => RewritesSources,
+        _ => Unknown,
+    }
+}
+
 fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
     use SourceEffect::*;
     // `VAR=value cmd`: the assignment only sets the command's environment.
@@ -910,102 +1075,7 @@ fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
     if program_is_read_only(program, args) {
         return ReadsSources;
     }
-    let has = |flag: &str| {
-        args.iter()
-            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
-    };
-    let sub = subcommand(args);
-    match program {
-        "cargo" => match sub {
-            Some("fmt") if has("--check") => ReadsSources,
-            Some("clippy") if has("--fix") => RewritesSources,
-            Some(
-                "build" | "b" | "test" | "t" | "nextest" | "check" | "c" | "clippy" | "doc"
-                | "bench" | "tree" | "metadata" | "audit" | "deny" | "llvm-cov",
-            ) => ReadsSources,
-            Some("fmt" | "fix" | "update" | "add" | "remove" | "rm" | "upgrade") => RewritesSources,
-            _ => Unknown,
-        },
-        "npm" | "pnpm" | "yarn" | "bun" => match sub {
-            Some("test" | "t") => ReadsSources,
-            Some("run") if args.iter().any(|a| a == "test") => ReadsSources,
-            Some("install" | "i" | "ci" | "add" | "remove" | "update" | "upgrade") => {
-                RewritesSources
-            }
-            _ => Unknown,
-        },
-        "go" => match sub {
-            Some("build" | "test" | "vet" | "list") => ReadsSources,
-            Some("fmt" | "generate" | "get" | "mod") => RewritesSources,
-            _ => Unknown,
-        },
-        "python" | "python3" => {
-            if args.first().map(String::as_str) == Some("-m")
-                && matches!(
-                    args.get(1).map(String::as_str),
-                    Some("pytest" | "mypy" | "unittest")
-                )
-            {
-                ReadsSources
-            } else {
-                Unknown
-            }
-        }
-        "pytest" | "mypy" | "tsc" | "jest" | "vitest" | "tox" | "xcodebuild" => ReadsSources,
-        "swift" => match sub {
-            Some("build" | "test") => ReadsSources,
-            _ => Unknown,
-        },
-        "gradle" | "gradlew" | "mvn" | "mvnw" => {
-            if args.iter().any(|a| {
-                let a = a.to_ascii_lowercase();
-                a.contains("spotlessapply") || a.contains("format") || a.contains("ktlintformat")
-            }) {
-                RewritesSources
-            } else {
-                ReadsSources
-            }
-        }
-        "eslint" => {
-            if has("--fix") {
-                RewritesSources
-            } else {
-                ReadsSources
-            }
-        }
-        "ruff" => match sub {
-            Some("check") if !has("--fix") => ReadsSources,
-            Some("check" | "format") => RewritesSources,
-            _ => Unknown,
-        },
-        "black" | "isort" | "gofmt" | "rustfmt" => {
-            if has("--check") {
-                ReadsSources
-            } else {
-                RewritesSources
-            }
-        }
-        "prettier" => {
-            if has("--write") || has("-w") {
-                RewritesSources
-            } else if has("--check") || has("-c") {
-                ReadsSources
-            } else {
-                Unknown
-            }
-        }
-        "git" => match sub {
-            Some("commit" | "add" | "push" | "fetch" | "tag") => ReadsSources,
-            Some(
-                "checkout" | "switch" | "stash" | "reset" | "rebase" | "merge" | "pull" | "restore"
-                | "apply" | "am" | "cherry-pick" | "revert" | "clean" | "mv" | "rm",
-            ) => RewritesSources,
-            _ => Unknown,
-        },
-        "sed" | "gsed" | "perl" | "rm" | "mv" | "cp" | "touch" | "mkdir" | "ln" | "truncate"
-        | "patch" => RewritesSources,
-        _ => Unknown,
-    }
+    program_source_effect(program, args)
 }
 
 fn git_is_read_only(args: &[String]) -> bool {

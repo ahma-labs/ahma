@@ -18,7 +18,7 @@ use ahma_common::hub::{
     connect_to_hub, recv_msg, send_msg,
 };
 use ahma_common::scope_grant::{
-    GrantCoordinator, GrantDecision, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
+    GrantCoordinator, GrantDecision, GrantResolveOutcome, ScopeGrantRequest,
 };
 use ahma_common::web_approval::{
     WebApprovalCoordinator, WebApprovalDecision, WebApprovalRequest, WebResolveOutcome,
@@ -357,116 +357,6 @@ fn persist_resolved_web_allow(domain: &str) {
             Err(e) => warn!("hub_reporter: failed to persist web allow for {domain}: {e:#}"),
         },
         None => warn!("hub_reporter: cannot persist web allow (home directory unknown)"),
-    }
-}
-
-/// Apply a grant the human approved at the TUI modal: write it through the one
-/// audited chokepoint at the `always` tier (bound to the session's workspace,
-/// SPEC R5.4.11), and apply it to the live session at either tier (R5.4.6).
-/// Best-effort: a write failure is logged, not fatal.
-#[allow(clippy::too_many_arguments)]
-fn persist_resolved_grant(
-    path: &std::path::Path,
-    access: ahma_common::config::ScopeAccess,
-    tool: Option<String>,
-    tier: ahma_common::permissions::GrantTier,
-    sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
-    decision_id: &str,
-    time_to_decision_ms: Option<u64>,
-    advice: (Option<String>, Option<bool>),
-) {
-    let live_scopes: Vec<std::path::PathBuf> =
-        sandbox.map(|sb| sb.scopes().to_vec()).unwrap_or_default();
-    let workspace = live_scopes.first().cloned();
-    if tier.is_persistent() {
-        let granted_at = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let granted_by = tool.or_else(|| Some("scope-grant prompt".to_string()));
-        match settings_path() {
-            Some(file) => {
-                match persist_grant(
-                    &file,
-                    ahma_common::scope_grant::NewGrant {
-                        path,
-                        access,
-                        granted_by,
-                        granted_at: Some(granted_at),
-                        note: None,
-                        surface: "tui",
-                        live_scopes: &live_scopes,
-                        workspace: workspace.as_deref(),
-                        expires_at: crate::sandbox::permission_broker::lease_end(tier),
-                    },
-                ) {
-                    Ok(_) => tracing::info!(
-                        path = %path.display(),
-                        access = access.label(),
-                        "scope grant approved at the TUI, persisted for workspace {} and applied \
-                         to this session",
-                        workspace
-                            .as_deref()
-                            .map(|w| w.display().to_string())
-                            .unwrap_or_else(|| "(none)".into())
-                    ),
-                    Err(e) => {
-                        warn!(
-                            "hub_reporter: failed to persist scope grant for {}: {e:#}",
-                            path.display()
-                        );
-                        return;
-                    }
-                }
-            }
-            None => {
-                warn!("hub_reporter: cannot persist scope grant (home directory unknown)");
-                return;
-            }
-        }
-    } else {
-        ahma_common::permissions::append_audit(
-            &ahma_common::permissions::audit_entry(
-                chrono::Local::now().to_rfc3339(),
-                ahma_common::permissions::AuditAction::Grant,
-                ahma_common::permissions::GrantKind::FsScope,
-                path.display().to_string(),
-                Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
-                tier,
-                Some("tui".to_string()),
-            )
-            .with_request(decision_id, time_to_decision_ms, None)
-            .with_advice(advice.0.clone(), advice.1),
-        );
-        tracing::info!(
-            path = %path.display(),
-            access = access.label(),
-            tier = tier.label(),
-            "scope granted at the TUI without writing settings"
-        );
-    }
-    if let Some(sb) = sandbox {
-        let applied = if tier == ahma_common::permissions::GrantTier::Once {
-            sb.add_once_grant(path, access)
-        } else {
-            sb.add_live_grant(path, access)
-        };
-        match applied {
-            Ok(()) => {
-                publish_committed_scope(sb);
-                if tier == ahma_common::permissions::GrantTier::Session {
-                    // R-PERM.4.4: a `[s]`/`[o]` answer at the TUI reaches hooked commands too.
-                    crate::sandbox::record_session_grant(
-                        path,
-                        access,
-                        workspace.as_deref(),
-                        std::process::id(),
-                        "tui",
-                    );
-                }
-            }
-            Err(why) => warn!(
-                path = %path.display(),
-                "hub_reporter: approved grant not applied: {why}"
-            ),
-        }
     }
 }
 
@@ -1092,15 +982,20 @@ async fn resolve_scope_grant(
             tier,
             time_to_decision_ms,
             reason: _,
-        } => persist_resolved_grant(
-            &path,
-            access,
-            tool,
-            tier,
-            sandbox,
-            &decision_id,
-            time_to_decision_ms,
-            advice.clone(),
+        } => crate::sandbox::permission_broker::apply_scope_grant_answer(
+            crate::sandbox::permission_broker::ScopeGrantAnswer {
+                sandbox,
+                path: &path,
+                access,
+                tier,
+                tool,
+                default_granted_by: "scope-grant prompt",
+                surface: "tui",
+                decision_id: &decision_id,
+                time_to_decision_ms,
+                risk_class: None,
+                advice: advice.clone(),
+            },
         ),
         GrantResolveOutcome::Denied {
             path,
@@ -2123,15 +2018,20 @@ mod tests {
         let settings = home.path().join(".ahma").join("settings.toml");
 
         with_home(home.path(), || {
-            persist_resolved_grant(
-                grant_dir.path(),
-                ScopeAccess::Rw,
-                Some("sccache".to_string()),
-                ahma_common::permissions::GrantTier::Always,
-                None,
-                "test-decision",
-                None,
-                (None, None),
+            crate::sandbox::permission_broker::apply_scope_grant_answer(
+                crate::sandbox::permission_broker::ScopeGrantAnswer {
+                    sandbox: None,
+                    path: grant_dir.path(),
+                    access: ScopeAccess::Rw,
+                    tier: ahma_common::permissions::GrantTier::Always,
+                    tool: Some("sccache".to_string()),
+                    default_granted_by: "scope-grant prompt",
+                    surface: "tui",
+                    decision_id: "test-decision",
+                    time_to_decision_ms: None,
+                    risk_class: None,
+                    advice: (None, None),
+                },
             );
         });
 
@@ -2156,15 +2056,20 @@ mod tests {
         let settings = home.path().join(".ahma").join("settings.toml");
 
         with_home(home.path(), || {
-            persist_resolved_grant(
-                grant_dir.path(),
-                ScopeAccess::Ro,
-                None,
-                ahma_common::permissions::GrantTier::Always,
-                None,
-                "test-decision",
-                None,
-                (None, None),
+            crate::sandbox::permission_broker::apply_scope_grant_answer(
+                crate::sandbox::permission_broker::ScopeGrantAnswer {
+                    sandbox: None,
+                    path: grant_dir.path(),
+                    access: ScopeAccess::Ro,
+                    tier: ahma_common::permissions::GrantTier::Always,
+                    tool: None,
+                    default_granted_by: "scope-grant prompt",
+                    surface: "tui",
+                    decision_id: "test-decision",
+                    time_to_decision_ms: None,
+                    risk_class: None,
+                    advice: (None, None),
+                },
             );
         });
 
@@ -2191,15 +2096,20 @@ mod tests {
 
         with_home(home.path(), || {
             // Must not panic even though persistence fails.
-            persist_resolved_grant(
-                grant_dir.path(),
-                ScopeAccess::Rw,
-                Some("t".to_string()),
-                ahma_common::permissions::GrantTier::Always,
-                None,
-                "test-decision",
-                None,
-                (None, None),
+            crate::sandbox::permission_broker::apply_scope_grant_answer(
+                crate::sandbox::permission_broker::ScopeGrantAnswer {
+                    sandbox: None,
+                    path: grant_dir.path(),
+                    access: ScopeAccess::Rw,
+                    tier: ahma_common::permissions::GrantTier::Always,
+                    tool: Some("t".to_string()),
+                    default_granted_by: "scope-grant prompt",
+                    surface: "tui",
+                    decision_id: "test-decision",
+                    time_to_decision_ms: None,
+                    risk_class: None,
+                    advice: (None, None),
+                },
             );
         });
 

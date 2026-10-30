@@ -134,19 +134,20 @@ async fn send_http_request(
 /// injects it after `initialize`.
 const RESERVED_HEADERS: &[&str] = &["accept", HEADER_SESSION_ID, HEADER_LAST_EVENT_ID];
 
+/// Whether `name` is a transport-owned header that callers may not override.
+fn is_reserved_header(name: &HeaderName) -> bool {
+    let s = name.as_str();
+    RESERVED_HEADERS.iter().any(|r| s.eq_ignore_ascii_case(r))
+        && !s.eq_ignore_ascii_case(HEADER_MCP_PROTOCOL_VERSION)
+}
+
 /// Add `custom_headers` to `builder`, refusing any the transport owns.
 fn apply_custom_headers(
     mut builder: http::request::Builder,
     custom_headers: HashMap<HeaderName, HeaderValue>,
 ) -> Result<http::request::Builder, StreamableHttpError<LocalSocketError>> {
     for (name, value) in custom_headers {
-        let reserved = RESERVED_HEADERS
-            .iter()
-            .any(|r| name.as_str().eq_ignore_ascii_case(r))
-            && !name
-                .as_str()
-                .eq_ignore_ascii_case(HEADER_MCP_PROTOCOL_VERSION);
-        if reserved {
+        if is_reserved_header(&name) {
             return Err(StreamableHttpError::ReservedHeaderConflict(
                 name.to_string(),
             ));
@@ -169,12 +170,23 @@ fn extract_scope_from_header(header: &str) -> Option<String> {
     (end > 0).then(|| value[..end].to_string())
 }
 
+fn build_auth_error(status: StatusCode, header: &str) -> StreamableHttpError<LocalSocketError> {
+    if status == StatusCode::UNAUTHORIZED {
+        StreamableHttpError::AuthRequired(AuthRequiredError::new(header.to_string()))
+    } else {
+        StreamableHttpError::InsufficientScope(InsufficientScopeError::new(
+            header.to_string(),
+            extract_scope_from_header(header),
+        ))
+    }
+}
+
 /// The `WWW-Authenticate` value of a 401 or 403, as the error rmcp expects.
 fn auth_error(
     response: &http::Response<Incoming>,
 ) -> Result<Option<StreamableHttpError<LocalSocketError>>, StreamableHttpError<LocalSocketError>> {
     let status = response.status();
-    if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+    if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return Ok(None);
     }
     let Some(header) = response.headers().get(WWW_AUTHENTICATE) else {
@@ -185,14 +197,170 @@ fn auth_error(
             "invalid www-authenticate header value",
         ))
     })?;
-    Ok(Some(if status == StatusCode::UNAUTHORIZED {
-        StreamableHttpError::AuthRequired(AuthRequiredError::new(header.to_string()))
-    } else {
-        StreamableHttpError::InsufficientScope(InsufficientScopeError::new(
-            header.to_string(),
-            extract_scope_from_header(header),
-        ))
-    }))
+    Ok(Some(build_auth_error(status, header)))
+}
+
+impl LocalSocketHttpClient {
+    fn base_request_builder(
+        &self,
+        method: Method,
+        uri: &str,
+        session_id: Option<&str>,
+        auth_token: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<http::request::Builder, StreamableHttpError<LocalSocketError>> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(http::header::HOST, self.host_header.clone());
+        if let Some(auth) = auth_token {
+            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {auth}"));
+        }
+        builder = apply_custom_headers(builder, custom_headers)?;
+        if let Some(sid) = session_id {
+            builder = builder.header(HEADER_SESSION_ID, sid);
+        }
+        Ok(builder)
+    }
+}
+
+fn is_empty_accepted_message(message: &ClientJsonRpcMessage, content_length: Option<u64>) -> bool {
+    content_length == Some(0)
+        && matches!(
+            message,
+            ClientJsonRpcMessage::Notification(_)
+                | ClientJsonRpcMessage::Response(_)
+                | ClientJsonRpcMessage::Error(_)
+        )
+}
+
+async fn non_success_post_error(
+    status: StatusCode,
+    response: http::Response<Incoming>,
+) -> StreamableHttpError<LocalSocketError> {
+    // The whole body, verbatim: the proxy recovers the bridge's
+    // JSON-RPC error from it.
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
+        .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+    StreamableHttpError::UnexpectedServerResponse(Cow::Owned(format!("HTTP {status}: {body}")))
+}
+
+async fn parse_json_post_response(
+    response: http::Response<Incoming>,
+    session_id: Option<String>,
+) -> Result<StreamableHttpPostResponse, StreamableHttpError<LocalSocketError>> {
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(LocalSocketError::Hyper)?
+        .to_bytes();
+    match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+        Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+        Err(e) => {
+            tracing::warn!(
+                "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"
+            );
+            Ok(StreamableHttpPostResponse::Accepted)
+        }
+    }
+}
+
+fn starts_with_mime(ct: &HeaderValue, mime: &str) -> bool {
+    ct.as_bytes().starts_with(mime.as_bytes())
+}
+
+fn unexpected_content_type(ct: Option<&HeaderValue>) -> StreamableHttpError<LocalSocketError> {
+    StreamableHttpError::UnexpectedContentType(
+        ct.map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
+    )
+}
+
+async fn decode_post_response(
+    response: http::Response<Incoming>,
+    content_type: Option<HeaderValue>,
+    session_id: Option<String>,
+) -> Result<StreamableHttpPostResponse, StreamableHttpError<LocalSocketError>> {
+    match content_type.as_ref() {
+        Some(ct) if starts_with_mime(ct, EVENT_STREAM_MIME_TYPE) => {
+            let sse_stream = SseStream::new(response.into_body()).boxed();
+            Ok(StreamableHttpPostResponse::Sse(sse_stream, session_id))
+        }
+        Some(ct) if starts_with_mime(ct, JSON_MIME_TYPE) => {
+            parse_json_post_response(response, session_id).await
+        }
+        other => Err(unexpected_content_type(other)),
+    }
+}
+
+fn response_content_length(headers: &http::HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+fn response_session_id(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(HEADER_SESSION_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+fn check_sse_content_type(
+    headers: &http::HeaderMap,
+) -> Result<(), StreamableHttpError<LocalSocketError>> {
+    let ct = headers.get(http::header::CONTENT_TYPE);
+    match ct {
+        Some(v) if starts_with_mime(v, EVENT_STREAM_MIME_TYPE) => Ok(()),
+        Some(v) if starts_with_mime(v, JSON_MIME_TYPE) => Ok(()),
+        other => Err(unexpected_content_type(other)),
+    }
+}
+
+fn validate_sse_stream_response(
+    response: &http::Response<Incoming>,
+) -> Result<(), StreamableHttpError<LocalSocketError>> {
+    let status = response.status();
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        return Err(StreamableHttpError::ServerDoesNotSupportSse);
+    }
+    if let Some(err) = auth_error(response)? {
+        return Err(err);
+    }
+    if !status.is_success() {
+        return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+            format!("get_stream returned {status}"),
+        )));
+    }
+    check_sse_content_type(response.headers())
+}
+
+async fn classify_post_status(
+    response: http::Response<Incoming>,
+    session_was_attached: bool,
+) -> Result<
+    Result<http::Response<Incoming>, StreamableHttpPostResponse>,
+    StreamableHttpError<LocalSocketError>,
+> {
+    if let Some(err) = auth_error(&response)? {
+        return Err(err);
+    }
+    let status = response.status();
+    if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+        return Ok(Err(StreamableHttpPostResponse::Accepted));
+    }
+    if status == StatusCode::NOT_FOUND && session_was_attached {
+        return Err(StreamableHttpError::SessionExpired);
+    }
+    if !status.is_success() {
+        return Err(non_success_post_error(status, response).await);
+    }
+    Ok(Ok(response))
 }
 
 impl StreamableHttpClient for LocalSocketHttpClient {
@@ -207,103 +375,40 @@ impl StreamableHttpClient for LocalSocketHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let json_body = serde_json::to_string(&message).map_err(LocalSocketError::Json)?;
-
-        let mut builder = Request::builder()
-            .method(Method::POST)
-            .uri(uri.as_ref())
-            .header(http::header::HOST, self.host_header.clone())
+        let session_was_attached = session_id.is_some();
+        let builder = self
+            .base_request_builder(
+                Method::POST,
+                uri.as_ref(),
+                session_id.as_deref(),
+                auth_token,
+                custom_headers,
+            )?
             .header(http::header::CONTENT_TYPE, JSON_MIME_TYPE)
             .header(
                 http::header::ACCEPT,
                 format!("{EVENT_STREAM_MIME_TYPE}, {JSON_MIME_TYPE}"),
             );
-        if let Some(auth) = auth_token {
-            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {auth}"));
-        }
-        builder = apply_custom_headers(builder, custom_headers)?;
-        let session_was_attached = session_id.is_some();
-        if let Some(sid) = session_id {
-            builder = builder.header(HEADER_SESSION_ID, sid.as_ref());
-        }
         let request = builder
             .body(Full::new(Bytes::from(json_body)))
             .map_err(LocalSocketError::Http)?;
 
-        let response = send_http_request(&self.socket_path, request).await?;
-        if let Some(err) = auth_error(&response)? {
-            return Err(err);
-        }
+        let raw_response = send_http_request(&self.socket_path, request).await?;
+        let response = match classify_post_status(raw_response, session_was_attached).await? {
+            Ok(resp) => resp,
+            Err(accepted) => return Ok(accepted),
+        };
 
-        let status = response.status();
-        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
-            return Ok(StreamableHttpPostResponse::Accepted);
-        }
-        if status == StatusCode::NOT_FOUND && session_was_attached {
-            return Err(StreamableHttpError::SessionExpired);
-        }
-        if !status.is_success() {
-            // The whole body, verbatim: the proxy recovers the bridge's
-            // JSON-RPC error from it.
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
-                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
-            )));
-        }
+        let headers = response.headers();
+        let content_type = headers.get(http::header::CONTENT_TYPE).cloned();
+        let content_length = response_content_length(headers);
+        let resp_session_id = response_session_id(headers);
 
-        let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
-        let content_length = response
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        let session_id = response
-            .headers()
-            .get(HEADER_SESSION_ID)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-
-        if content_length == Some(0)
-            && matches!(
-                message,
-                ClientJsonRpcMessage::Notification(_)
-                    | ClientJsonRpcMessage::Response(_)
-                    | ClientJsonRpcMessage::Error(_)
-            )
-        {
+        if is_empty_accepted_message(&message, content_length) {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
 
-        match content_type {
-            Some(ref ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
-                let sse_stream = SseStream::new(response.into_body()).boxed();
-                Ok(StreamableHttpPostResponse::Sse(sse_stream, session_id))
-            }
-            Some(ref ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
-                let body = response
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(LocalSocketError::Hyper)?
-                    .to_bytes();
-                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
-                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"
-                        );
-                        Ok(StreamableHttpPostResponse::Accepted)
-                    }
-                }
-            }
-            _ => Err(StreamableHttpError::UnexpectedContentType(
-                content_type.map(|ct| String::from_utf8_lossy(ct.as_bytes()).into_owned()),
-            )),
-        }
+        decode_post_response(response, content_type, resp_session_id).await
     }
 
     async fn delete_session(
@@ -313,27 +418,26 @@ impl StreamableHttpClient for LocalSocketHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let mut builder = Request::builder()
-            .method(Method::DELETE)
-            .uri(uri.as_ref())
-            .header(http::header::HOST, self.host_header.clone())
-            .header(HEADER_SESSION_ID, session_id.as_ref());
-        if let Some(auth) = auth_token {
-            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {auth}"));
-        }
-        builder = apply_custom_headers(builder, custom_headers)?;
+        let builder = self.base_request_builder(
+            Method::DELETE,
+            uri.as_ref(),
+            Some(session_id.as_ref()),
+            auth_token,
+            custom_headers,
+        )?;
         let request = builder
             .body(Full::new(Bytes::new()))
             .map_err(LocalSocketError::Http)?;
 
         let response = send_http_request(&self.socket_path, request).await?;
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        let status = response.status();
+        if status == StatusCode::METHOD_NOT_ALLOWED {
             tracing::debug!("this server doesn't support deleting session");
             return Ok(());
         }
-        if !response.status().is_success() {
+        if !status.is_success() {
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("delete_session returned {}", response.status()),
+                format!("delete_session returned {status}"),
             )));
         }
         Ok(())
@@ -348,48 +452,27 @@ impl StreamableHttpClient for LocalSocketHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, sse_stream::Error>>, StreamableHttpError<Self::Error>>
     {
-        let mut builder = Request::builder()
-            .method(Method::GET)
-            .uri(uri.as_ref())
-            .header(http::header::HOST, self.host_header.clone())
+        let mut builder = self
+            .base_request_builder(
+                Method::GET,
+                uri.as_ref(),
+                Some(session_id.as_ref()),
+                auth_token,
+                custom_headers,
+            )?
             .header(
                 http::header::ACCEPT,
                 format!("{EVENT_STREAM_MIME_TYPE}, {JSON_MIME_TYPE}"),
-            )
-            .header(HEADER_SESSION_ID, session_id.as_ref());
+            );
         if let Some(last_id) = last_event_id {
             builder = builder.header(HEADER_LAST_EVENT_ID, last_id);
         }
-        if let Some(auth) = auth_token {
-            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {auth}"));
-        }
-        builder = apply_custom_headers(builder, custom_headers)?;
         let request = builder
             .body(Full::new(Bytes::new()))
             .map_err(LocalSocketError::Http)?;
 
         let response = send_http_request(&self.socket_path, request).await?;
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-            return Err(StreamableHttpError::ServerDoesNotSupportSse);
-        }
-        if let Some(err) = auth_error(&response)? {
-            return Err(err);
-        }
-        if !response.status().is_success() {
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("get_stream returned {}", response.status()),
-            )));
-        }
-        match response.headers().get(http::header::CONTENT_TYPE) {
-            Some(ct)
-                if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
-                    || ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {}
-            other => {
-                return Err(StreamableHttpError::UnexpectedContentType(
-                    other.map(|ct| String::from_utf8_lossy(ct.as_bytes()).into_owned()),
-                ));
-            }
-        }
+        validate_sse_stream_response(&response)?;
         Ok(SseStream::new(response.into_body()).boxed())
     }
 }
@@ -412,13 +495,19 @@ mod tests {
         .expect("a ping request")
     }
 
+    fn spawn_socket_client(app: axum::Router) -> (tempfile::TempDir, LocalSocketHttpClient) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp.sock");
+        serve(LocalListener::bind(&sock).unwrap(), app);
+        let client = LocalSocketHttpClient::new(&sock.to_string_lossy(), "http://localhost/mcp");
+        (dir, client)
+    }
+
     /// The proxy reaches the hub's MCP endpoint through this client, so it
     /// must work where the hub now listens: an `AF_UNIX` socket on every OS,
     /// Windows included (SPEC R-HUB.2). rmcp's own client is Unix-only.
     #[tokio::test]
     async fn a_request_round_trips_over_the_local_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("mcp.sock");
         let app = axum::Router::new().route(
             "/mcp",
             axum::routing::post(|headers: axum::http::HeaderMap, body: String| async move {
@@ -438,9 +527,7 @@ mod tests {
                 )
             }),
         );
-        serve(LocalListener::bind(&sock).unwrap(), app);
-
-        let client = LocalSocketHttpClient::new(&sock.to_string_lossy(), "http://localhost/mcp");
+        let (_dir, client) = spawn_socket_client(app);
         let response = client
             .post_message(
                 "http://localhost/mcp".into(),
@@ -495,8 +582,6 @@ mod tests {
     /// act on rather than a generic failure.
     #[tokio::test]
     async fn a_non_success_status_carries_its_body() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("mcp.sock");
         let app = axum::Router::new().route(
             "/mcp",
             axum::routing::post(|| async {
@@ -506,9 +591,7 @@ mod tests {
                 )
             }),
         );
-        serve(LocalListener::bind(&sock).unwrap(), app);
-
-        let client = LocalSocketHttpClient::new(&sock.to_string_lossy(), "http://localhost/mcp");
+        let (_dir, client) = spawn_socket_client(app);
         let err = client
             .post_message(
                 "http://localhost/mcp".into(),

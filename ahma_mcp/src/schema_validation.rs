@@ -522,6 +522,51 @@ impl MtdfValidator {
         validate_non_empty_field(&option.name, "name", path, errors);
         validate_option_type(&option.option_type, path, errors);
     }
+
+    /// Load, validate, and print a summary for a tool configuration example,
+    /// exiting with status 1 if reading or validation fails.
+    pub fn run_example_validation(label: &str, config_path: &Path) {
+        println!(
+            "Loading {label} configuration from: {}",
+            config_path.display()
+        );
+        let content = std::fs::read_to_string(config_path).unwrap_or_else(|e| {
+            eprintln!("FAIL Failed to read config file: {e}");
+            std::process::exit(1);
+        });
+        let config = Self::new()
+            .validate_tool_config(config_path, &content)
+            .unwrap_or_else(|errors| {
+                print_example_validation_errors(&errors);
+                std::process::exit(1);
+            });
+        print_example_tool_details(&config);
+    }
+}
+
+fn print_example_tool_details(config: &crate::config::ToolConfig) {
+    println!("OK Configuration is valid!");
+    println!("\n📋 Tool Details:");
+    println!("   Name: {}", config.name);
+    println!("   Description: {}", config.description);
+    println!("   Command: {}", config.command);
+    println!("   Enabled: {}", config.enabled);
+    let subcommands = config.subcommand.as_ref().map(|s| s.len()).unwrap_or(0);
+    println!("   Subcommands: {subcommands}");
+    println!("\n🔧 Available Subcommands:");
+    for subcommand in config.subcommand.as_deref().unwrap_or_default() {
+        println!("   - {}: {}", subcommand.name, subcommand.description);
+    }
+}
+
+fn print_example_validation_errors(errors: &[SchemaValidationError]) {
+    eprintln!("FAIL Validation failed with {} error(s):", errors.len());
+    for error in errors {
+        eprintln!("   - {}: {}", error.field_path, error.message);
+        if let Some(suggestion) = &error.suggestion {
+            eprintln!("     Suggestion Suggestion: {suggestion}");
+        }
+    }
 }
 
 fn parse_config_json(file_path: &Path, content: &str) -> ValidationResult<Value> {

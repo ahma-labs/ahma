@@ -161,59 +161,57 @@ pub fn is_secret_env_name(name: &str) -> bool {
 /// (`PYTHONPATH=src pytest`, tox, monorepo layouts) set as a matter of course,
 /// and ahma synthesises Python workers, so stripping them would break the common
 /// case far more often than it blocks the rare one.
+const CODE_INJECTION_ENV_NAMES: [&str; 39] = [
+    // Shell startup / behaviour
+    "BASH_ENV",
+    "ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    // Dynamic linker
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    // Language runtimes
+    "NODE_OPTIONS",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PERL5OPT",
+    "RUBYOPT",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    // Git / helper-command hooks
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "PAGER",
+    "GIT_EDITOR",
+    "EDITOR",
+    "VISUAL",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_TEMPLATE_DIR",
+    // Execution delegated outside the sandbox
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+];
+
 pub fn is_code_injection_env_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     // Exported bash functions: the only prefix family here (see doc comment).
-    if upper.starts_with("BASH_FUNC_") {
-        return true;
-    }
-    const NAMES: [&str; 39] = [
-        // Shell startup / behaviour
-        "BASH_ENV",
-        "ENV",
-        "SHELLOPTS",
-        "BASHOPTS",
-        "PS4",
-        // Dynamic linker
-        "LD_PRELOAD",
-        "LD_AUDIT",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "DYLD_FALLBACK_LIBRARY_PATH",
-        "DYLD_FALLBACK_FRAMEWORK_PATH",
-        // Language runtimes
-        "NODE_OPTIONS",
-        "PYTHONHOME",
-        "PYTHONSTARTUP",
-        "PERL5OPT",
-        "RUBYOPT",
-        "JAVA_TOOL_OPTIONS",
-        "_JAVA_OPTIONS",
-        "JDK_JAVA_OPTIONS",
-        // Git / helper-command hooks
-        "GIT_SSH_COMMAND",
-        "GIT_SSH",
-        "GIT_PROXY_COMMAND",
-        "GIT_EXTERNAL_DIFF",
-        "GIT_PAGER",
-        "PAGER",
-        "GIT_EDITOR",
-        "EDITOR",
-        "VISUAL",
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "GIT_CONFIG",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_TEMPLATE_DIR",
-        // Execution delegated outside the sandbox
-        "DOCKER_HOST",
-        "DOCKER_CONTEXT",
-    ];
-    NAMES.contains(&upper.as_str())
+    upper.starts_with("BASH_FUNC_") || CODE_INJECTION_ENV_NAMES.contains(&upper.as_str())
 }
 
 /// Every reason to strip a variable from a tool subprocess environment, in one
@@ -816,49 +814,10 @@ mod tests {
     /// composes the two lists.
     #[test]
     fn code_injection_env_names_are_stripped() {
-        for name in [
-            "BASH_ENV",
-            "ENV",
-            "SHELLOPTS",
-            "BASHOPTS",
-            "PS4",
+        for name in CODE_INJECTION_ENV_NAMES.into_iter().chain([
             "BASH_FUNC_git%%", // exported shell function, shadows a real command
-            "LD_PRELOAD",
-            "LD_AUDIT",
-            "LD_LIBRARY_PATH",
-            "DYLD_INSERT_LIBRARIES",
-            "DYLD_LIBRARY_PATH",
-            "DYLD_FRAMEWORK_PATH",
-            "DYLD_FALLBACK_LIBRARY_PATH",
-            "DYLD_FALLBACK_FRAMEWORK_PATH",
-            "NODE_OPTIONS",
-            "PYTHONHOME",
-            "PYTHONSTARTUP",
-            "PERL5OPT",
-            "RUBYOPT",
-            "JAVA_TOOL_OPTIONS",
-            "_JAVA_OPTIONS",
-            "JDK_JAVA_OPTIONS",
-            "GIT_SSH_COMMAND",
-            "GIT_SSH",
-            "GIT_PROXY_COMMAND",
-            "GIT_EXTERNAL_DIFF",
-            "GIT_PAGER",
-            "PAGER",
-            "GIT_EDITOR",
-            "EDITOR",
-            "VISUAL",
-            "GIT_ASKPASS",
-            "SSH_ASKPASS",
-            "GIT_CONFIG",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_SYSTEM",
-            "GIT_TEMPLATE_DIR",
-            "DOCKER_HOST",
-            "DOCKER_CONTEXT",
-            "bash_env", // matching is case-insensitive
-        ] {
+            "bash_env",        // matching is case-insensitive
+        ]) {
             assert!(
                 is_code_injection_env_name(name),
                 "{name} executes attacker-chosen code and must be stripped"
