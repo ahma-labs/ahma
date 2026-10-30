@@ -284,6 +284,21 @@ pub fn forget_tool_approvals(workspace: &Path) -> std::io::Result<usize> {
     revoke_workspace_tools(workspace, |tool| tool != TRUSTED_WORKSPACE_TOOL)
 }
 
+fn matching_workspace_tools(
+    perms: &PermissionSettings,
+    key: &Path,
+    which: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    perms
+        .tool_approvals
+        .iter()
+        .filter(|a| a.workspace == key)
+        .flat_map(|a| a.tools.iter())
+        .filter(|t| which(t))
+        .cloned()
+        .collect()
+}
+
 /// Revoke the `workspace` entries `which` selects, auditing each.
 fn revoke_workspace_tools(
     workspace: &Path,
@@ -292,18 +307,12 @@ fn revoke_workspace_tools(
     let key = workspace_key(workspace);
     let mut removed: Vec<String> = Vec::new();
     AhmaSettings::update(|s| {
-        let tools: Vec<String> = s
-            .permissions
-            .tool_approvals
-            .iter()
-            .filter(|a| a.workspace == key)
-            .flat_map(|a| a.tools.iter().filter(|t| which(t)).cloned())
-            .collect();
-        for tool in tools {
-            if s.permissions.revoke_tool(&key, &tool) {
-                removed.push(tool);
-            }
-        }
+        let tools = matching_workspace_tools(&s.permissions, &key, &which);
+        removed.extend(
+            tools
+                .into_iter()
+                .filter(|tool| s.permissions.revoke_tool(&key, tool)),
+        );
     })
     .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
     let now = chrono::Local::now().to_rfc3339();
@@ -394,10 +403,11 @@ mod tests {
 
     fn perms(pairs: &[(&str, &[&str])]) -> PermissionSettings {
         let mut p = PermissionSettings::default();
-        for (ws, tools) in pairs {
-            for t in *tools {
-                p.approve_tool(&PathBuf::from(ws), t, None, None);
-            }
+        for (ws, t) in pairs
+            .iter()
+            .flat_map(|(ws, tools)| tools.iter().map(move |t| (*ws, *t)))
+        {
+            p.approve_tool(&PathBuf::from(ws), t, None, None);
         }
         p
     }

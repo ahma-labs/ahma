@@ -62,7 +62,7 @@ pub fn apply_edits(content: &str, edits: &[Edit]) -> Result<(String, usize, usiz
     Ok((text, total, first_change))
 }
 
-fn apply_one(content: &str, edit: &Edit) -> Result<(String, usize, usize)> {
+fn validate_edit_match(content: &str, edit: &Edit) -> Result<usize> {
     if edit.old_str.is_empty() {
         bail!("old_str is empty — to create or overwrite a whole file use write_file");
     }
@@ -70,22 +70,27 @@ fn apply_one(content: &str, edit: &Edit) -> Result<(String, usize, usize)> {
         bail!("old_str and new_str are identical — there is nothing to change");
     }
     let count = content.matches(edit.old_str.as_str()).count();
-    match count {
-        0 => bail!("old_str not found. {}", near_miss(content, &edit.old_str)),
-        1 => {}
-        n if !edit.replace_all => bail!(
-            "old_str matches {n} places. Include more of the surrounding lines so it \
-             names exactly one, or set replace_all to change all {n}."
-        ),
-        _ => {}
+    if count == 0 {
+        bail!("old_str not found. {}", near_miss(content, &edit.old_str));
     }
+    if count > 1 && !edit.replace_all {
+        bail!(
+            "old_str matches {count} places. Include more of the surrounding lines so it \
+             names exactly one, or set replace_all to change all {count}."
+        );
+    }
+    Ok(count)
+}
+
+fn apply_one(content: &str, edit: &Edit) -> Result<(String, usize, usize)> {
+    let count = validate_edit_match(content, edit)?;
     let at = content.find(edit.old_str.as_str()).unwrap_or(0);
-    let next = if edit.replace_all {
-        content.replace(edit.old_str.as_str(), &edit.new_str)
+    let (next, replaced) = if edit.replace_all {
+        (content.replace(edit.old_str.as_str(), &edit.new_str), count)
     } else {
-        content.replacen(edit.old_str.as_str(), &edit.new_str, 1)
+        (content.replacen(edit.old_str.as_str(), &edit.new_str, 1), 1)
     };
-    Ok((next, if edit.replace_all { count } else { 1 }, at))
+    Ok((next, replaced, at))
 }
 
 /// The closest thing to `needle` that is in `content`, as advice.
@@ -221,13 +226,9 @@ impl PatchOp {
     pub fn paths(&self) -> Vec<&Path> {
         match self {
             PatchOp::Add { path, .. } | PatchOp::Delete { path } => vec![path],
-            PatchOp::Update { path, move_to, .. } => {
-                let mut v = vec![path.as_path()];
-                if let Some(m) = move_to {
-                    v.push(m);
-                }
-                v
-            }
+            PatchOp::Update { path, move_to, .. } => std::iter::once(path.as_path())
+                .chain(move_to.as_deref())
+                .collect(),
         }
     }
 }
@@ -238,6 +239,116 @@ pub struct Hunk {
     pub anchor: Option<String>,
     /// `(' ' | '-' | '+', text)`.
     pub lines: Vec<(char, String)>,
+}
+
+fn push_if_non_empty(hunks: &mut Vec<Hunk>, hunk: Option<Hunk>) {
+    if let Some(h) = hunk
+        && !h.lines.is_empty()
+    {
+        hunks.push(h);
+    }
+}
+
+fn parse_add_file<'a>(
+    path: &str,
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+) -> Result<PatchOp> {
+    let mut content = String::new();
+    while let Some(l) = lines.next_if(|l| !l.starts_with("*** ")) {
+        let body = l.strip_prefix('+').ok_or_else(|| {
+            anyhow!("in Add File {path}: every line must start with `+`, got `{l}`")
+        })?;
+        content.push_str(body);
+        content.push('\n');
+    }
+    Ok(PatchOp::Add {
+        path: PathBuf::from(path.trim()),
+        content,
+    })
+}
+
+fn parse_hunk_line(path: &str, l: &str) -> Result<(char, String)> {
+    match l.chars().next() {
+        Some(c @ (' ' | '-' | '+')) => Ok((c, l[1..].to_string())),
+        // A bare empty line is an empty context line.
+        None => Ok((' ', String::new())),
+        Some(_) => {
+            bail!("in Update File {path}: a hunk line must start with ' ', '-' or '+', got `{l}`")
+        }
+    }
+}
+
+fn consume_hunk_entry(
+    path: &str,
+    l: &str,
+    hunks: &mut Vec<Hunk>,
+    current: &mut Option<Hunk>,
+) -> Result<()> {
+    if l.trim_end() == "*** End of File" {
+        return Ok(());
+    }
+    if let Some(anchor) = l.strip_prefix("@@") {
+        push_if_non_empty(hunks, current.take());
+        let anchor = anchor.trim();
+        *current = Some(Hunk {
+            anchor: (!anchor.is_empty()).then(|| anchor.to_string()),
+            lines: Vec::new(),
+        });
+        return Ok(());
+    }
+    let line = parse_hunk_line(path, l)?;
+    current
+        .get_or_insert_with(|| Hunk {
+            anchor: None,
+            lines: Vec::new(),
+        })
+        .lines
+        .push(line);
+    Ok(())
+}
+
+fn parse_update_file<'a>(
+    path: &str,
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+) -> Result<PatchOp> {
+    let move_to = lines
+        .next_if(|l| l.starts_with("*** Move to: "))
+        .map(|l| PathBuf::from(l["*** Move to: ".len()..].trim()));
+    let mut hunks = Vec::new();
+    let mut current: Option<Hunk> = None;
+    while let Some(l) =
+        lines.next_if(|l| !l.starts_with("*** ") || l.trim_end() == "*** End of File")
+    {
+        consume_hunk_entry(path, l, &mut hunks, &mut current)?;
+    }
+    push_if_non_empty(&mut hunks, current);
+    if hunks.is_empty() && move_to.is_none() {
+        bail!("Update File {path} has no changes");
+    }
+    Ok(PatchOp::Update {
+        path: PathBuf::from(path.trim()),
+        move_to,
+        hunks,
+    })
+}
+
+fn parse_patch_op<'a>(
+    line: &str,
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+) -> Result<Option<PatchOp>> {
+    if let Some(p) = line.strip_prefix("*** Add File: ") {
+        Ok(Some(parse_add_file(p, lines)?))
+    } else if let Some(p) = line.strip_prefix("*** Delete File: ") {
+        Ok(Some(PatchOp::Delete {
+            path: PathBuf::from(p.trim()),
+        }))
+    } else if let Some(p) = line.strip_prefix("*** Update File: ") {
+        Ok(Some(parse_update_file(p, lines)?))
+    } else if line.trim().is_empty() {
+        Ok(None)
+    } else {
+        bail!("unexpected line in patch: `{line}`")
+    }
 }
 
 /// Parse the `*** Begin Patch` … `*** End Patch` format (the one Codex models
@@ -262,79 +373,8 @@ pub fn parse_patch(patch: &str) -> Result<Vec<PatchOp>> {
         if line == "*** End Patch" {
             break;
         }
-        if let Some(p) = line.strip_prefix("*** Add File: ") {
-            let mut content = String::new();
-            while let Some(l) = lines.next_if(|l| !l.starts_with("*** ")) {
-                let body = l.strip_prefix('+').ok_or_else(|| {
-                    anyhow!("in Add File {p}: every line must start with `+`, got `{l}`")
-                })?;
-                content.push_str(body);
-                content.push('\n');
-            }
-            ops.push(PatchOp::Add {
-                path: PathBuf::from(p.trim()),
-                content,
-            });
-        } else if let Some(p) = line.strip_prefix("*** Delete File: ") {
-            ops.push(PatchOp::Delete {
-                path: PathBuf::from(p.trim()),
-            });
-        } else if let Some(p) = line.strip_prefix("*** Update File: ") {
-            let move_to = lines
-                .next_if(|l| l.starts_with("*** Move to: "))
-                .map(|l| PathBuf::from(l["*** Move to: ".len()..].trim()));
-            let mut hunks = Vec::new();
-            let mut current: Option<Hunk> = None;
-            while let Some(l) =
-                lines.next_if(|l| !l.starts_with("*** ") || l.trim_end() == "*** End of File")
-            {
-                if l.trim_end() == "*** End of File" {
-                    continue;
-                }
-                if let Some(anchor) = l.strip_prefix("@@") {
-                    if let Some(h) = current.take()
-                        && !h.lines.is_empty()
-                    {
-                        hunks.push(h);
-                    }
-                    let anchor = anchor.trim();
-                    current = Some(Hunk {
-                        anchor: (!anchor.is_empty()).then(|| anchor.to_string()),
-                        lines: Vec::new(),
-                    });
-                    continue;
-                }
-                let (kind, text) = match l.chars().next() {
-                    Some(c @ (' ' | '-' | '+')) => (c, &l[1..]),
-                    // A bare empty line is an empty context line.
-                    None => (' ', ""),
-                    Some(_) => bail!(
-                        "in Update File {p}: a hunk line must start with ' ', '-' or '+', got `{l}`"
-                    ),
-                };
-                current
-                    .get_or_insert_with(|| Hunk {
-                        anchor: None,
-                        lines: Vec::new(),
-                    })
-                    .lines
-                    .push((kind, text.to_string()));
-            }
-            if let Some(h) = current
-                && !h.lines.is_empty()
-            {
-                hunks.push(h);
-            }
-            if hunks.is_empty() && move_to.is_none() {
-                bail!("Update File {p} has no changes");
-            }
-            ops.push(PatchOp::Update {
-                path: PathBuf::from(p.trim()),
-                move_to,
-                hunks,
-            });
-        } else if !line.trim().is_empty() {
-            bail!("unexpected line in patch: `{line}`");
+        if let Some(op) = parse_patch_op(line, &mut lines)? {
+            ops.push(op);
         }
     }
     if ops.is_empty() {
@@ -358,6 +398,42 @@ fn seek(hay: &[&str], needle: &[&str], from: usize) -> Option<usize> {
         .or_else(|| fits(&|a, b| a.trim() == b.trim()))
 }
 
+fn locate_hunk(
+    lines: &[&str],
+    hunk: &Hunk,
+    cursor: usize,
+    hunk_num: usize,
+    path: &Path,
+) -> Result<(usize, usize)> {
+    let from = match &hunk.anchor {
+        Some(anchor) => seek(lines, &[anchor.as_str()], cursor).ok_or_else(|| {
+            anyhow!(
+                "{}: hunk {hunk_num} anchor `@@ {anchor}` not found",
+                path.display()
+            )
+        })?,
+        None => cursor,
+    };
+    let old: Vec<&str> = hunk
+        .lines
+        .iter()
+        .filter(|(k, _)| *k != '+')
+        .map(|(_, t)| t.as_str())
+        .collect();
+    let at = seek(lines, &old, from).ok_or_else(|| {
+        let first = old
+            .first()
+            .map(|l| format!(" (first: `{}`)", l.trim()))
+            .unwrap_or_default();
+        anyhow!(
+            "{}: hunk {hunk_num} does not match the file — its context/removed lines \
+             were not found{first}. Re-read the file and regenerate the patch.",
+            path.display()
+        )
+    })?;
+    Ok((at, old.len()))
+}
+
 /// Apply `hunks` to `content`, in order.
 pub fn apply_hunks(content: &str, hunks: &[Hunk], path: &Path) -> Result<String> {
     let (normalized, crlf) = split_line_endings(content);
@@ -365,44 +441,17 @@ pub fn apply_hunks(content: &str, hunks: &[Hunk], path: &Path) -> Result<String>
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut cursor = 0;
     for (n, hunk) in hunks.iter().enumerate() {
-        let mut from = cursor;
-        if let Some(anchor) = &hunk.anchor {
-            match seek(&lines, &[anchor.as_str()], from) {
-                Some(i) => from = i,
-                None => bail!(
-                    "{}: hunk {} anchor `@@ {anchor}` not found",
-                    path.display(),
-                    n + 1
-                ),
-            }
-        }
-        let old: Vec<&str> = hunk
-            .lines
-            .iter()
-            .filter(|(k, _)| *k != '+')
-            .map(|(_, t)| t.as_str())
-            .collect();
-        let Some(at) = seek(&lines, &old, from) else {
-            bail!(
-                "{}: hunk {} does not match the file — its context/removed lines \
-                 were not found{}. Re-read the file and regenerate the patch.",
-                path.display(),
-                n + 1,
-                old.first()
-                    .map(|l| format!(" (first: `{}`)", l.trim()))
-                    .unwrap_or_default()
-            );
-        };
-        out.extend(lines[cursor..at].iter().map(|s| s.to_string()));
+        let (at, old_len) = locate_hunk(&lines, hunk, cursor, n + 1, path)?;
+        out.extend(lines[cursor..at].iter().map(|s| (*s).to_string()));
         out.extend(
             hunk.lines
                 .iter()
                 .filter(|(k, _)| *k != '-')
                 .map(|(_, t)| t.clone()),
         );
-        cursor = at + old.len();
+        cursor = at + old_len;
     }
-    out.extend(lines[cursor..].iter().map(|s| s.to_string()));
+    out.extend(lines[cursor..].iter().map(|s| (*s).to_string()));
     let mut text = out.join("\n");
     if normalized.ends_with('\n') || normalized.is_empty() {
         text.push('\n');

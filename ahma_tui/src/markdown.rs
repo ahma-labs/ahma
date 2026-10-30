@@ -75,11 +75,15 @@ impl<'t> Renderer<'t> {
         self.lines.push(Line::from(spans));
     }
 
-    /// A blank line between blocks, never two in a row and never leading.
-    fn block_gap(&mut self) {
+    fn flush_current_line(&mut self) {
         if !self.current.is_empty() {
             self.end_line();
         }
+    }
+
+    /// A blank line between blocks, never two in a row and never leading.
+    fn block_gap(&mut self) {
+        self.flush_current_line();
         if self.lines.last().is_some_and(|l| !l.spans.is_empty()) {
             self.lines.push(Line::default());
         }
@@ -128,57 +132,15 @@ impl<'t> Renderer<'t> {
         match tag {
             // A paragraph inside a list item continues the item's line.
             Tag::Paragraph if self.lists.is_empty() => self.block_gap(),
-            Tag::Heading { level, .. } => {
-                self.block_gap();
-                let mut style = self.theme.md_heading();
-                if level == HeadingLevel::H1 {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-                self.styles.push(style);
-            }
+            Tag::Heading { level, .. } => self.start_heading(level),
             Tag::BlockQuote(_) => {
                 self.block_gap();
                 self.quote_depth += 1;
                 self.styles.push(self.theme.md_quote());
             }
-            Tag::CodeBlock(kind) => {
-                self.block_gap();
-                self.in_code_block = true;
-                if let CodeBlockKind::Fenced(lang) = kind
-                    && !lang.is_empty()
-                {
-                    self.current
-                        .push(Span::styled(format!("  {lang}"), self.theme.dim()));
-                    self.end_line();
-                }
-            }
-            Tag::List(start) => {
-                if self.lists.is_empty() {
-                    self.block_gap();
-                } else if !self.current.is_empty() {
-                    self.end_line();
-                }
-                self.lists.push(start);
-            }
-            Tag::Item => {
-                if !self.current.is_empty() {
-                    self.end_line();
-                }
-                let depth = self.lists.len().saturating_sub(1);
-                let indent = "  ".repeat(depth);
-                let bullet = match self.lists.last_mut() {
-                    Some(Some(n)) => {
-                        let s = format!("{indent}{n}. ");
-                        *n += 1;
-                        s
-                    }
-                    _ => {
-                        let b = if self.theme.unicode { "•" } else { "-" };
-                        format!("{indent}{b} ")
-                    }
-                };
-                self.current.push(Span::styled(bullet, self.theme.dim()));
-            }
+            Tag::CodeBlock(kind) => self.start_code_block(kind),
+            Tag::List(start) => self.start_list(start),
+            Tag::Item => self.start_item(),
             Tag::Emphasis => self
                 .styles
                 .push(Style::default().add_modifier(Modifier::ITALIC)),
@@ -201,6 +163,54 @@ impl<'t> Renderer<'t> {
         }
     }
 
+    fn start_heading(&mut self, level: HeadingLevel) {
+        self.block_gap();
+        let mut style = self.theme.md_heading();
+        if level == HeadingLevel::H1 {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        self.styles.push(style);
+    }
+
+    fn start_code_block(&mut self, kind: CodeBlockKind<'_>) {
+        self.block_gap();
+        self.in_code_block = true;
+        if let CodeBlockKind::Fenced(lang) = kind
+            && !lang.is_empty()
+        {
+            self.current
+                .push(Span::styled(format!("  {lang}"), self.theme.dim()));
+            self.end_line();
+        }
+    }
+
+    fn start_list(&mut self, start: Option<u64>) {
+        if self.lists.is_empty() {
+            self.block_gap();
+        } else {
+            self.flush_current_line();
+        }
+        self.lists.push(start);
+    }
+
+    fn start_item(&mut self) {
+        self.flush_current_line();
+        let depth = self.lists.len().saturating_sub(1);
+        let indent = "  ".repeat(depth);
+        let bullet = match self.lists.last_mut() {
+            Some(Some(n)) => {
+                let s = format!("{indent}{n}. ");
+                *n += 1;
+                s
+            }
+            _ => {
+                let b = if self.theme.unicode { "•" } else { "-" };
+                format!("{indent}{b} ")
+            }
+        };
+        self.current.push(Span::styled(bullet, self.theme.dim()));
+    }
+
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph if self.lists.is_empty() => self.end_line(),
@@ -210,24 +220,18 @@ impl<'t> Renderer<'t> {
             }
             TagEnd::BlockQuote(_) => {
                 self.styles.pop();
-                if !self.current.is_empty() {
-                    self.end_line();
-                }
+                self.flush_current_line();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
             }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
-                if !self.current.is_empty() {
-                    self.end_line();
-                }
+                self.flush_current_line();
             }
             TagEnd::List(_) => {
                 self.lists.pop();
-                if !self.current.is_empty() {
-                    self.end_line();
-                }
+                self.flush_current_line();
             }
-            TagEnd::Item if !self.current.is_empty() => self.end_line(),
+            TagEnd::Item => self.flush_current_line(),
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.styles.pop();
             }
@@ -259,9 +263,7 @@ impl<'t> Renderer<'t> {
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
-        if !self.current.is_empty() {
-            self.end_line();
-        }
+        self.flush_current_line();
         while self.lines.last().is_some_and(|l| l.spans.is_empty()) {
             self.lines.pop();
         }

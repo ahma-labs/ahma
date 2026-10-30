@@ -28,11 +28,9 @@ impl LoopDetector {
     /// Checks if this call is stuck in a failure loop.
     pub fn is_loop(&self, tool_name: &str, args: &str) -> bool {
         let hash = self.hash_call(tool_name, args);
-        if let Some(&count) = self.fail_counts.get(&hash) {
-            count >= self.max_retries
-        } else {
-            false
-        }
+        self.fail_counts
+            .get(&hash)
+            .is_some_and(|&count| count >= self.max_retries)
     }
 
     /// Records a failure for a specific tool call. Returns true if loop is detected.

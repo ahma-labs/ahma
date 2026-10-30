@@ -136,61 +136,62 @@ fn check_allowed(canonical: &Path, canonical_scopes: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn validate_path_in_scopes_sync(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
-    let canonical = if path.exists() {
-        std::fs::canonicalize(path)
-            .with_context(|| format!("Failed to canonicalize path: {}", path.display()))?
-    } else {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("Path has no parent: {}", path.display()))?;
-        let canonical_parent = std::fs::canonicalize(parent)
-            .with_context(|| format!("Failed to canonicalize parent path: {}", parent.display()))?;
-        canonical_parent.join(path.file_name().unwrap_or_default())
-    };
+fn parent_and_name(path: &Path) -> Result<(&Path, &std::ffi::OsStr)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Path has no parent: {}", path.display()))?;
+    Ok((parent, path.file_name().unwrap_or_default()))
+}
 
+fn canonicalize_target_sync(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to canonicalize path: {}", path.display()));
+    }
+    let (parent, name) = parent_and_name(path)?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("Failed to canonicalize parent path: {}", parent.display()))?;
+    Ok(canonical_parent.join(name))
+}
+
+async fn canonicalize_target_async(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return tokio::fs::canonicalize(path)
+            .await
+            .with_context(|| format!("Failed to canonicalize path: {}", path.display()));
+    }
+    let (parent, name) = parent_and_name(path)?;
+    let canonical_parent = tokio::fs::canonicalize(parent)
+        .await
+        .with_context(|| format!("Failed to canonicalize parent path: {}", parent.display()))?;
+    Ok(canonical_parent.join(name))
+}
+
+fn validate_path_in_scopes_sync(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
+    let canonical = canonicalize_target_sync(path)?;
     if scopes.is_empty() {
         return Ok(canonical);
     }
-
     let canonical_scopes: Vec<PathBuf> = scopes
         .iter()
         .filter_map(|s| std::fs::canonicalize(s).ok())
         .collect();
-
     check_allowed(&canonical, &canonical_scopes)?;
-
     Ok(canonical)
 }
 
 async fn validate_path_in_scopes_async(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
-    let canonical = if path.exists() {
-        tokio::fs::canonicalize(path)
-            .await
-            .with_context(|| format!("Failed to canonicalize path: {}", path.display()))?
-    } else {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("Path has no parent: {}", path.display()))?;
-        let canonical_parent = tokio::fs::canonicalize(parent)
-            .await
-            .with_context(|| format!("Failed to canonicalize parent path: {}", parent.display()))?;
-        canonical_parent.join(path.file_name().unwrap_or_default())
-    };
-
+    let canonical = canonicalize_target_async(path).await?;
     if scopes.is_empty() {
         return Ok(canonical);
     }
-
     let mut canonical_scopes = Vec::with_capacity(scopes.len());
     for s in scopes {
         if let Ok(scope) = tokio::fs::canonicalize(s).await {
             canonical_scopes.push(scope);
         }
     }
-
     check_allowed(&canonical, &canonical_scopes)?;
-
     Ok(canonical)
 }
 
@@ -198,6 +199,21 @@ async fn validate_path_in_scopes_async(path: &Path, scopes: &[PathBuf]) -> Resul
 pub const DEFAULT_READ_LINES: usize = 2000;
 /// Characters kept of any one line in [`read_file`] output.
 pub const MAX_LINE_CHARS: usize = 2000;
+
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8192).any(|&b| b == 0)
+}
+
+fn format_numbered_line(line_num: usize, raw_line: &str) -> String {
+    let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    let mut chars = line.chars();
+    let head: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{line_num:>6}\t{head}… [line truncated]")
+    } else {
+        format!("{line_num:>6}\t{line}")
+    }
+}
 
 /// Read a file as numbered lines (`     7\tline`, like `cat -n`), from
 /// `start_line` (1-based, default 1) to `end_line` (inclusive, default
@@ -218,7 +234,7 @@ pub async fn read_file(
     let bytes = tokio::fs::read(&safe_path)
         .await
         .with_context(|| format!("Failed to read file: {}", safe_path.display()))?;
-    if bytes.iter().take(8192).any(|&b| b == 0) {
+    if is_binary(&bytes) {
         bail!(
             "{} is a binary file ({} bytes); not shown",
             safe_path.display(),
@@ -232,28 +248,20 @@ pub async fn read_file(
 
     let start = start_line.unwrap_or(1).max(1);
     let end = end_line.unwrap_or(start.saturating_add(DEFAULT_READ_LINES - 1));
-    let mut out = Vec::new();
-    let mut total = 0;
-    for (idx, line) in content.lines().enumerate() {
-        total = idx + 1;
-        if total < start || total > end {
-            continue;
-        }
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let shown = if line.chars().count() > MAX_LINE_CHARS {
-            let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
-            format!("{cut}… [line truncated]")
-        } else {
-            line.to_string()
-        };
-        out.push(format!("{total:>6}\t{shown}"));
-    }
+    let total = content.lines().count();
     if start > total {
         bail!(
             "{} has {total} lines; start_line {start} is past the end",
             safe_path.display()
         );
     }
+    let mut out: Vec<String> = content
+        .lines()
+        .enumerate()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .map(|(idx, line)| format_numbered_line(idx + 1, line))
+        .collect();
     if total > end {
         out.push(format!(
             "… {} more lines (read on with start_line={})",
@@ -364,79 +372,103 @@ pub fn resolve_patch_path(scopes: &[PathBuf], base_dir: &Path, path: &Path) -> R
     Ok(resolved)
 }
 
+async fn plan_update_op(
+    scopes: &[PathBuf],
+    base_dir: &Path,
+    path: &Path,
+    move_to: Option<&Path>,
+    hunks: &[edit::Hunk],
+) -> Result<Vec<(PathBuf, Option<String>, String)>> {
+    let source = resolve_patch_path(scopes, base_dir, path)?;
+    let current = tokio::fs::read_to_string(&source)
+        .await
+        .with_context(|| format!("Update File {}: cannot read it", path.display()))?;
+    let updated = edit::apply_hunks(&current, hunks, path)?;
+    match move_to {
+        Some(dest) => {
+            let target = resolve_patch_path(scopes, base_dir, dest)?;
+            Ok(vec![
+                (
+                    target,
+                    Some(updated),
+                    format!("R {} -> {}", path.display(), dest.display()),
+                ),
+                (source, None, String::new()),
+            ])
+        }
+        None => Ok(vec![(
+            source,
+            Some(updated),
+            format!("M {}", path.display()),
+        )]),
+    }
+}
+
+async fn plan_patch_op(
+    scopes: &[PathBuf],
+    base_dir: &Path,
+    op: &edit::PatchOp,
+) -> Result<Vec<(PathBuf, Option<String>, String)>> {
+    match op {
+        edit::PatchOp::Add { path, content } => {
+            let target = resolve_patch_path(scopes, base_dir, path)?;
+            if target.exists() {
+                bail!(
+                    "Add File {}: it already exists — use Update File",
+                    path.display()
+                );
+            }
+            Ok(vec![(
+                target,
+                Some(content.clone()),
+                format!("A {}", path.display()),
+            )])
+        }
+        edit::PatchOp::Delete { path } => {
+            let target = resolve_patch_path(scopes, base_dir, path)?;
+            if !target.is_file() {
+                bail!("Delete File {}: no such file", path.display());
+            }
+            Ok(vec![(target, None, format!("D {}", path.display()))])
+        }
+        edit::PatchOp::Update {
+            path,
+            move_to,
+            hunks,
+        } => plan_update_op(scopes, base_dir, path, move_to.as_deref(), hunks).await,
+    }
+}
+
+async fn apply_planned_write(target: &Path, content: Option<&str>) -> Result<()> {
+    match content {
+        Some(text) => {
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            }
+            edit::atomic_write(target, text).await
+        }
+        None => tokio::fs::remove_file(target)
+            .await
+            .with_context(|| format!("Failed to delete {}", target.display())),
+    }
+}
+
 /// Apply a Codex-format patch (`*** Begin Patch` … `*** End Patch`) under
 /// `base_dir`. Every operation is computed before anything is written, so a
 /// patch that does not apply changes nothing; each file is then replaced
 /// atomically.
 pub async fn apply_patch(scopes: &[PathBuf], base_dir: &Path, patch: &str) -> Result<PatchOutcome> {
     let ops = edit::parse_patch(patch)?;
-
-    // Plan: (target path, new content or None to delete, summary line).
-    let mut plan: Vec<(PathBuf, Option<String>, String)> = Vec::new();
+    let mut plan = Vec::new();
     for op in &ops {
-        match op {
-            edit::PatchOp::Add { path, content } => {
-                let target = resolve_patch_path(scopes, base_dir, path)?;
-                if target.exists() {
-                    bail!(
-                        "Add File {}: it already exists — use Update File",
-                        path.display()
-                    );
-                }
-                plan.push((
-                    target,
-                    Some(content.clone()),
-                    format!("A {}", path.display()),
-                ));
-            }
-            edit::PatchOp::Delete { path } => {
-                let target = resolve_patch_path(scopes, base_dir, path)?;
-                if !target.is_file() {
-                    bail!("Delete File {}: no such file", path.display());
-                }
-                plan.push((target, None, format!("D {}", path.display())));
-            }
-            edit::PatchOp::Update {
-                path,
-                move_to,
-                hunks,
-            } => {
-                let source = resolve_patch_path(scopes, base_dir, path)?;
-                let current = tokio::fs::read_to_string(&source)
-                    .await
-                    .with_context(|| format!("Update File {}: cannot read it", path.display()))?;
-                let updated = edit::apply_hunks(&current, hunks, path)?;
-                match move_to {
-                    Some(dest) => {
-                        let target = resolve_patch_path(scopes, base_dir, dest)?;
-                        plan.push((
-                            target,
-                            Some(updated),
-                            format!("R {} -> {}", path.display(), dest.display()),
-                        ));
-                        plan.push((source, None, String::new()));
-                    }
-                    None => plan.push((source, Some(updated), format!("M {}", path.display()))),
-                }
-            }
-        }
+        plan.extend(plan_patch_op(scopes, base_dir, op).await?);
     }
 
     let mut changes = Vec::new();
     for (target, content, summary) in plan {
-        match content {
-            Some(text) => {
-                if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent).await.with_context(|| {
-                        format!("Failed to create directory {}", parent.display())
-                    })?;
-                }
-                edit::atomic_write(&target, &text).await?;
-            }
-            None => tokio::fs::remove_file(&target)
-                .await
-                .with_context(|| format!("Failed to delete {}", target.display()))?,
-        }
+        apply_planned_write(&target, content.as_deref()).await?;
         if !summary.is_empty() {
             changes.push(summary);
         }
@@ -493,87 +525,104 @@ pub fn file_search(scopes: &[PathBuf], base_dir: &Path, pattern: &str) -> Result
         .collect())
 }
 
-/// Search file contents under `base_dir` (see [`GrepOptions`]). Walks like
-/// ripgrep (`.gitignore` respected, hidden files skipped); skips binary files and files over 10 MB.
-pub fn grep_search(scopes: &[PathBuf], base_dir: &Path, opts: &GrepOptions) -> Result<GrepOutput> {
-    let safe_base = validate_path_in_scopes_sync(base_dir, scopes)?;
-    let max = opts.max_results.unwrap_or(200).max(1);
+fn build_grep_regex(opts: &GrepOptions) -> Result<regex::Regex> {
     let case_sensitive = opts.case_sensitive.unwrap_or(opts.is_regex);
     let source = if opts.is_regex {
         opts.query.clone()
     } else {
         regex::escape(&opts.query)
     };
-    let regex = regex::RegexBuilder::new(&source)
+    regex::RegexBuilder::new(&source)
         .case_insensitive(!case_sensitive)
         .build()
-        .with_context(|| format!("Invalid regex: {}", opts.query))?;
-    let include = include_matcher(opts.include_pattern.as_deref())?;
+        .with_context(|| format!("Invalid regex: {}", opts.query))
+}
 
-    let mut matches = Vec::new();
-    let mut files = Vec::new();
-    let mut counts = Vec::new();
-    for path in walk_files(&safe_base) {
-        let rel = path.strip_prefix(&safe_base).unwrap_or(&path);
-        if include.as_ref().is_some_and(|m| !m.is_match(rel)) {
-            continue;
-        }
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > GREP_MAX_FILE_BYTES) {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        if bytes.iter().take(8192).any(|&b| b == 0) {
-            continue;
-        }
-        let content = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = content.lines().collect();
-        let shown = path.to_string_lossy().to_string();
-        let mut in_file = 0;
-        for (idx, line) in lines.iter().enumerate() {
-            if !regex.is_match(line) {
-                continue;
-            }
-            in_file += 1;
-            if opts.output_mode != GrepOutputMode::Content {
-                if opts.output_mode == GrepOutputMode::Files {
-                    break;
-                }
-                continue;
-            }
-            let from = idx.saturating_sub(opts.context);
-            let to = (idx + 1 + opts.context).min(lines.len());
-            matches.push(GrepMatch {
-                path: shown.clone(),
-                line_number: idx + 1,
-                line: line.to_string(),
-                before: lines[from..idx].iter().map(|l| l.to_string()).collect(),
-                after: lines[idx + 1..to].iter().map(|l| l.to_string()).collect(),
-            });
-            if matches.len() >= max {
-                return Ok(GrepOutput::Matches(matches));
-            }
-        }
-        if in_file == 0 {
-            continue;
-        }
-        match opts.output_mode {
-            GrepOutputMode::Files => files.push(shown),
-            GrepOutputMode::Count => counts.push(FileCount {
-                path: shown,
-                count: in_file,
-            }),
-            GrepOutputMode::Content => {}
-        }
-        if files.len() >= max || counts.len() >= max {
-            break;
-        }
+fn read_searchable_file(
+    safe_base: &Path,
+    path: &Path,
+    include: Option<&globset::GlobMatcher>,
+) -> Option<(String, String)> {
+    let rel = path.strip_prefix(safe_base).unwrap_or(path);
+    if include.is_some_and(|m| !m.is_match(rel)) {
+        return None;
     }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > GREP_MAX_FILE_BYTES) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if is_binary(&bytes) {
+        return None;
+    }
+    Some((
+        path.to_string_lossy().to_string(),
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
+}
+
+fn collect_file_matches(
+    shown: &str,
+    content: &str,
+    regex: &regex::Regex,
+    context: usize,
+) -> Vec<GrepMatch> {
+    let lines: Vec<&str> = content.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| regex.is_match(line))
+        .map(|(idx, line)| {
+            let from = idx.saturating_sub(context);
+            let to = (idx + 1 + context).min(lines.len());
+            GrepMatch {
+                path: shown.to_string(),
+                line_number: idx + 1,
+                line: (*line).to_string(),
+                before: lines[from..idx].iter().map(|l| (*l).to_string()).collect(),
+                after: lines[idx + 1..to]
+                    .iter()
+                    .map(|l| (*l).to_string())
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// Search file contents under `base_dir` (see [`GrepOptions`]). Walks like
+/// ripgrep (`.gitignore` respected, hidden files skipped); skips binary files and files over 10 MB.
+pub fn grep_search(scopes: &[PathBuf], base_dir: &Path, opts: &GrepOptions) -> Result<GrepOutput> {
+    let safe_base = validate_path_in_scopes_sync(base_dir, scopes)?;
+    let max = opts.max_results.unwrap_or(200).max(1);
+    let regex = build_grep_regex(opts)?;
+    let include = include_matcher(opts.include_pattern.as_deref())?;
+    let files_iter = walk_files(&safe_base)
+        .filter_map(|p| read_searchable_file(&safe_base, &p, include.as_ref()));
+
     Ok(match opts.output_mode {
-        GrepOutputMode::Content => GrepOutput::Matches(matches),
-        GrepOutputMode::Files => GrepOutput::Files(files),
-        GrepOutputMode::Count => GrepOutput::Counts(counts),
+        GrepOutputMode::Content => GrepOutput::Matches(
+            files_iter
+                .flat_map(|(shown, content)| {
+                    collect_file_matches(&shown, &content, &regex, opts.context)
+                })
+                .take(max)
+                .collect(),
+        ),
+        GrepOutputMode::Files => GrepOutput::Files(
+            files_iter
+                .filter(|(_, content)| content.lines().any(|l| regex.is_match(l)))
+                .map(|(shown, _)| shown)
+                .take(max)
+                .collect(),
+        ),
+        GrepOutputMode::Count => GrepOutput::Counts(
+            files_iter
+                .filter_map(|(shown, content)| {
+                    let count = content.lines().filter(|l| regex.is_match(l)).count();
+                    (count > 0).then_some(FileCount { path: shown, count })
+                })
+                .take(max)
+                .collect(),
+        ),
     })
 }
 
@@ -667,6 +716,33 @@ fn egress_refusal(url: &str, message: String) -> anyhow::Error {
         .context(format!("Failed to fetch URL: {url}"))
 }
 
+fn classify_fetch_error(e: &reqwest::Error) -> Failure {
+    if egress_guard::is_egress_blocked(e) {
+        Failure::Permanent
+    } else {
+        classify_transport(e)
+    }
+}
+
+fn format_fetch_failure(
+    url: &str,
+    service: &str,
+    failure: ahma_common::http_retry::TransportFailure<reqwest::Error>,
+) -> anyhow::Error {
+    if egress_guard::is_egress_blocked(&failure.error) {
+        anyhow::Error::new(failure.error).context(format!("Failed to fetch URL: {url}"))
+    } else {
+        ServiceError::new(
+            service,
+            failure.failure,
+            anyhow::Error::new(failure.error).context(format!("fetching {url}")),
+        )
+        .with_attempts(failure.attempts)
+        .with_hint("Check the URL and your network connection, then try again.")
+        .into()
+    }
+}
+
 /// One GET of `url` on `client`, retried on transient failure (SPEC
 /// R-HTTP.1/2) — except a guard refusal, which is policy, not weather.
 async fn get_with_retry(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
@@ -676,30 +752,57 @@ async fn get_with_retry(client: &reqwest::Client, url: &str) -> Result<reqwest::
         &RetryPolicy::DEFAULT,
         Idempotency::Idempotent,
         || client.get(url),
-        |e| {
-            if egress_guard::is_egress_blocked(e) {
-                Failure::Permanent
-            } else {
-                classify_transport(e)
-            }
-        },
+        classify_fetch_error,
     )
     .await
-    .map_err(|failure| -> anyhow::Error {
-        if egress_guard::is_egress_blocked(&failure.error) {
-            anyhow::Error::new(failure.error).context(format!("Failed to fetch URL: {url}"))
-        } else {
-            ServiceError::new(
-                &service,
-                failure.failure,
-                anyhow::Error::new(failure.error).context(format!("fetching {url}")),
-            )
-            .with_attempts(failure.attempts)
-            .with_hint("Check the URL and your network connection, then try again.")
-            .into()
-        }
-    })?;
+    .map_err(|failure| format_fetch_failure(url, &service, failure))?;
     Ok(resp)
+}
+
+fn resolve_redirect_target(
+    url: &str,
+    current: &reqwest::Url,
+    location: &reqwest::header::HeaderValue,
+    block_private: bool,
+) -> Result<reqwest::Url> {
+    let location = location
+        .to_str()
+        .map_err(|_| anyhow!("redirect from {current} has a non-ASCII Location header"))?;
+    let next = current
+        .join(location)
+        .map_err(|e| anyhow!("redirect from {current} to invalid URL '{location}': {e}"))?;
+    // R-WEB.3 / R-WEB.8.4 on every hop: scheme and IP-literal check here,
+    // hostnames at connect time by the resolver.
+    egress_guard::check_url(next.as_str(), block_private)
+        .map_err(|e| egress_refusal(url, format!("{e:#}")))?;
+    Ok(next)
+}
+
+async fn authorize_redirect_hop(
+    url: &str,
+    guard: &egress_guard::RedirectDomainGuard,
+    origin_host: &str,
+    next: &reqwest::Url,
+    approved: &mut Vec<String>,
+) -> Result<()> {
+    use egress_guard::RedirectStep;
+
+    let next_host = next.host_str().unwrap_or_default().to_ascii_lowercase();
+    if approved.contains(&next_host) {
+        return Ok(());
+    }
+    match guard.decide(origin_host, next) {
+        RedirectStep::Follow => Ok(()),
+        RedirectStep::Refuse(message) => Err(egress_refusal(url, message)),
+        RedirectStep::Ask { domain } => {
+            guard
+                .ask(&domain, next.as_str())
+                .await
+                .map_err(|message| egress_refusal(url, message))?;
+            approved.push(next_host);
+            Ok(())
+        }
+    }
 }
 
 /// Implementation of [`fetch_webpage`] with the SSRF private-range block as a
@@ -720,8 +823,6 @@ async fn fetch_webpage_guarded(
     block_private: bool,
     domain_guard: Option<egress_guard::RedirectDomainGuard>,
 ) -> Result<WebFetchResult> {
-    use egress_guard::RedirectStep;
-
     egress_guard::check_url(url, block_private)?;
     let Some(guard) = domain_guard else {
         let client = egress_guard::guarded_client(block_private, true)
@@ -739,52 +840,27 @@ async fn fetch_webpage_guarded(
     // later hop back to one is not asked about twice in one chain.
     let mut approved: Vec<String> = Vec::new();
     let mut current = origin;
-    let mut hops = 0usize;
-    loop {
+    for _ in 0..=egress_guard::MAX_REDIRECTS {
         let resp = get_with_retry(&client, current.as_str()).await?;
-        let location = if resp.status().is_redirection() {
-            resp.headers().get(reqwest::header::LOCATION).cloned()
-        } else {
-            None
-        };
+        let location = resp
+            .status()
+            .is_redirection()
+            .then(|| resp.headers().get(reqwest::header::LOCATION))
+            .flatten()
+            .cloned();
         // Not a redirect (or a 3xx with nowhere to go, e.g. 304): this is the page.
         let Some(location) = location else {
             let body = resp.text().await.context("Failed to read response body")?;
             return render_webpage(url, &body, query);
         };
-        if hops >= egress_guard::MAX_REDIRECTS {
-            bail!(
-                "Failed to fetch URL: {url}: too many redirects (>{})",
-                egress_guard::MAX_REDIRECTS
-            );
-        }
-        hops += 1;
-        let location = location
-            .to_str()
-            .map_err(|_| anyhow!("redirect from {current} has a non-ASCII Location header"))?;
-        let next = current
-            .join(location)
-            .map_err(|e| anyhow!("redirect from {current} to invalid URL '{location}': {e}"))?;
-        // R-WEB.3 / R-WEB.8.4 on every hop: scheme and IP-literal check here,
-        // hostnames at connect time by the resolver.
-        egress_guard::check_url(next.as_str(), block_private)
-            .map_err(|e| egress_refusal(url, format!("{e:#}")))?;
-        let next_host = next.host_str().unwrap_or_default().to_ascii_lowercase();
-        if !approved.contains(&next_host) {
-            match guard.decide(&origin_host, &next) {
-                RedirectStep::Follow => {}
-                RedirectStep::Refuse(message) => return Err(egress_refusal(url, message)),
-                RedirectStep::Ask { domain } => {
-                    guard
-                        .ask(&domain, next.as_str())
-                        .await
-                        .map_err(|message| egress_refusal(url, message))?;
-                    approved.push(next_host);
-                }
-            }
-        }
+        let next = resolve_redirect_target(url, &current, &location, block_private)?;
+        authorize_redirect_hop(url, &guard, &origin_host, &next, &mut approved).await?;
         current = next;
     }
+    bail!(
+        "Failed to fetch URL: {url}: too many redirects (>{})",
+        egress_guard::MAX_REDIRECTS
+    )
 }
 
 #[cfg(test)]

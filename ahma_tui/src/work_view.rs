@@ -323,28 +323,31 @@ fn client_name(key: &str, info: Option<&InstanceInfo>) -> String {
         return "this terminal (you)".to_string();
     }
     match info {
-        Some(i) if i.mode == "tui" => {
-            if i.ended_epoch_ms.is_some() {
-                "ended session".to_string()
-            } else if i.pid == std::process::id() {
-                "this terminal (you)".to_string()
-            } else {
-                format!("terminal (pid {})", i.pid)
-            }
-        }
-        Some(i) => {
-            let name = i.client.as_deref().unwrap_or(&i.label);
-            if name == "modern-client" {
-                if i.scope.is_empty() {
-                    "agy".to_string()
-                } else {
-                    "Antigravity IDE".to_string()
-                }
-            } else {
-                name.to_string()
-            }
-        }
+        Some(i) if i.mode == "tui" => tui_client_name(i),
+        Some(i) => external_client_name(i),
         None => "ended session".to_string(),
+    }
+}
+
+fn tui_client_name(info: &InstanceInfo) -> String {
+    if info.ended_epoch_ms.is_some() {
+        "ended session".to_string()
+    } else if info.pid == std::process::id() {
+        "this terminal (you)".to_string()
+    } else {
+        format!("terminal (pid {})", info.pid)
+    }
+}
+
+fn external_client_name(info: &InstanceInfo) -> String {
+    let name = info.client.as_deref().unwrap_or(&info.label);
+    if name != "modern-client" {
+        return name.to_string();
+    }
+    if info.scope.is_empty() {
+        "agy".to_string()
+    } else {
+        "Antigravity IDE".to_string()
     }
 }
 
@@ -539,12 +542,11 @@ pub fn nav_row_y(slots: &[Slot], sections: &[Section], nav_index: usize) -> Opti
         }
         nav += 1;
         if section.open {
-            for inner in 0..section.rows.len() {
-                if nav == nav_index {
-                    return Some(slot.content_y + inner);
-                }
-                nav += 1;
+            let offset = nav_index.saturating_sub(nav);
+            if nav_index >= nav && offset < section.rows.len() {
+                return Some(slot.content_y + offset);
             }
+            nav += section.rows.len();
         }
     }
     None

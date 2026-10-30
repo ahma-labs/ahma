@@ -307,20 +307,16 @@ impl PermissionBroker {
         AskedAt::FailedClosed
     }
 
-    /// Resolve the decision and, on approval, persist it (never widening the live
-    /// session — R5.1). A decline resolves too, which is what stops the same
-    /// question coming back for the rest of the session.
-    fn apply(&self, req: &ScopeGrantRequest, decision: GrantDecision) {
-        let outcome = self.coordinator.resolve(&req.decision_id, decision);
-        // Close the disclosure loop (#485): a client that showed grant_pending
-        // can clear it. Emitted for real resolutions only — AlreadyResolved /
-        // Unknown are no-ops whose grant_decided was (or will be) sent by the
-        // surface that actually resolved first.
-        match &outcome {
+    /// Close the disclosure loop (#485): a client that showed grant_pending
+    /// can clear it. Emitted for real resolutions only — AlreadyResolved /
+    /// Unknown are no-ops whose grant_decided was (or will be) sent by the
+    /// surface that actually resolved first.
+    fn emit_grant_decided(&self, decision_id: &str, outcome: &GrantResolveOutcome) {
+        match outcome {
             GrantResolveOutcome::Persist { access, .. } => self.emit_event(
                 ahma_common::session_event::SessionEventKind::GrantDecided,
                 serde_json::json!({
-                    "grant_id": req.decision_id,
+                    "grant_id": decision_id,
                     "outcome": "granted",
                     // The serde form ("ro"/"rw") — a machine-stable wire value,
                     // not the human label (R8.8.5 / docs §7.1).
@@ -330,12 +326,20 @@ impl PermissionBroker {
             GrantResolveOutcome::Denied { .. } => self.emit_event(
                 ahma_common::session_event::SessionEventKind::GrantDecided,
                 serde_json::json!({
-                    "grant_id": req.decision_id,
+                    "grant_id": decision_id,
                     "outcome": "declined",
                 }),
             ),
             GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
         }
+    }
+
+    /// Resolve the decision and, on approval, persist it (never widening the live
+    /// session — R5.1). A decline resolves too, which is what stops the same
+    /// question coming back for the rest of the session.
+    fn apply(&self, req: &ScopeGrantRequest, decision: GrantDecision) {
+        let outcome = self.coordinator.resolve(&req.decision_id, decision);
+        self.emit_grant_decided(&req.decision_id, &outcome);
         match outcome {
             // `logs_approve`'s question: the answer is a `log-target` grant,
             // never an `fs-scope` one, so it must not reach `persist_grant`
@@ -374,105 +378,19 @@ impl PermissionBroker {
             } => {
                 let risk_class = req.context.risk.as_ref().map(|r| r.class.clone());
                 let sandbox = self.sandbox.read().clone();
-                let live_scopes: Vec<std::path::PathBuf> = sandbox
-                    .as_ref()
-                    .map(|sb| sb.scopes().to_vec())
-                    .unwrap_or_default();
-                let workspace = live_scopes.first().cloned();
-                let granted_at = chrono::Local::now();
-                if tier.is_persistent() {
-                    let Some(file) = settings_path() else {
-                        tracing::warn!("cannot persist scope grant: home directory unknown");
-                        return;
-                    };
-                    // The chokepoint applies the denylist and writes the audit
-                    // record (R-PERM.2, R-PERM.2.1).
-                    match persist_grant(
-                        &file,
-                        NewGrant {
-                            path: &path,
-                            access,
-                            granted_by: tool.or_else(|| Some("permission prompt".to_string())),
-                            granted_at: Some(granted_at.format("%Y-%m-%d").to_string()),
-                            note: None,
-                            surface: "harness",
-                            live_scopes: &live_scopes,
-                            workspace: workspace.as_deref(),
-                            expires_at: lease_end(tier),
-                        },
-                    ) {
-                        Ok(_) => tracing::info!(
-                            path = %path.display(),
-                            access = access.label(),
-                            "Scope granted for workspace {} and saved to {}; applied to this \
-                             session now, and a terminal hook picks it up on its next command.",
-                            workspace
-                                .as_deref()
-                                .map(|w| w.display().to_string())
-                                .unwrap_or_else(|| "(none)".into()),
-                            file.display(),
-                        ),
-                        Err(e) => {
-                            tracing::warn!(
-                                "failed to persist scope grant for {}: {e:#}",
-                                path.display()
-                            );
-                            return;
-                        }
-                    }
-                } else {
-                    append_audit(
-                        &audit_entry(
-                            granted_at.to_rfc3339(),
-                            AuditAction::Grant,
-                            GrantKind::FsScope,
-                            path.display().to_string(),
-                            Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
-                            tier,
-                            Some("harness".to_string()),
-                        )
-                        .with_request(
-                            &req.decision_id,
-                            time_to_decision_ms,
-                            risk_class.as_deref(),
-                        ),
-                    );
-                    tracing::info!(
-                        path = %path.display(),
-                        access = access.label(),
-                        tier = tier.label(),
-                        "Scope granted without writing settings."
-                    );
-                }
-                // R5.4.6: a human-approved grant takes effect in the live session —
-                // after the live gate (R-PERM.4.3), which is the only denylist the
-                // `session` tier ever meets.
-                if let Some(sb) = sandbox {
-                    let applied = if tier == GrantTier::Once {
-                        sb.add_once_grant(&path, access)
-                    } else {
-                        sb.add_live_grant(&path, access)
-                    };
-                    match applied {
-                        Ok(()) => {
-                            crate::hub_reporter::publish_committed_scope(&sb);
-                            if tier == GrantTier::Session {
-                                // R-PERM.4.4: a session answer reaches hooked commands too.
-                                crate::sandbox::record_session_grant(
-                                    &path,
-                                    access,
-                                    workspace.as_deref(),
-                                    std::process::id(),
-                                    "harness",
-                                );
-                            }
-                        }
-                        Err(why) => tracing::warn!(
-                            path = %path.display(),
-                            "approved grant not applied: {why}"
-                        ),
-                    }
-                }
+                apply_scope_grant_answer(ScopeGrantAnswer {
+                    sandbox: sandbox.as_ref(),
+                    path: &path,
+                    access,
+                    tier,
+                    tool,
+                    default_granted_by: "permission prompt",
+                    surface: "harness",
+                    decision_id: &req.decision_id,
+                    time_to_decision_ms,
+                    risk_class: risk_class.as_deref(),
+                    advice: (None, None),
+                });
             }
             GrantResolveOutcome::Denied {
                 path,
@@ -504,6 +422,158 @@ impl PermissionBroker {
             // design (first-answer-wins, R5.3.3).
             GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
         }
+    }
+}
+
+/// Inputs for applying an approved filesystem scope grant across either
+/// the harness prompt or the TUI modal.
+pub(crate) struct ScopeGrantAnswer<'a> {
+    pub sandbox: Option<&'a Arc<super::Sandbox>>,
+    pub path: &'a Path,
+    pub access: ScopeAccess,
+    pub tier: GrantTier,
+    pub tool: Option<String>,
+    pub default_granted_by: &'a str,
+    pub surface: &'a str,
+    pub decision_id: &'a str,
+    pub time_to_decision_ms: Option<u64>,
+    pub risk_class: Option<&'a str>,
+    pub advice: (Option<String>, Option<bool>),
+}
+
+/// Apply an approved filesystem scope grant: persist it through the one audited
+/// chokepoint at persistent tiers (bound to the session's workspace, SPEC
+/// R5.4.11) or audit the non-persistent grant, then apply it to the live
+/// session (R5.4.6). Shared by the harness broker and the hub reporter.
+pub(crate) fn apply_scope_grant_answer(ans: ScopeGrantAnswer<'_>) {
+    let live_scopes: Vec<std::path::PathBuf> = ans
+        .sandbox
+        .map(|sb| sb.scopes().to_vec())
+        .unwrap_or_default();
+    let workspace = live_scopes.first().cloned();
+    if !record_scope_grant_persistence(&ans, &live_scopes, workspace.as_deref()) {
+        return;
+    }
+    if let Some(sb) = ans.sandbox {
+        apply_live_scope_grant(
+            sb,
+            ans.path,
+            ans.access,
+            ans.tier,
+            workspace.as_deref(),
+            ans.surface,
+        );
+    }
+}
+
+fn record_scope_grant_persistence(
+    ans: &ScopeGrantAnswer<'_>,
+    live_scopes: &[std::path::PathBuf],
+    workspace: Option<&Path>,
+) -> bool {
+    let granted_at = chrono::Local::now();
+    if !ans.tier.is_persistent() {
+        append_audit(
+            &audit_entry(
+                granted_at.to_rfc3339(),
+                AuditAction::Grant,
+                GrantKind::FsScope,
+                ans.path.display().to_string(),
+                Some(if ans.access.is_write() { "rw" } else { "ro" }.to_string()),
+                ans.tier,
+                Some(ans.surface.to_string()),
+            )
+            .with_request(ans.decision_id, ans.time_to_decision_ms, ans.risk_class)
+            .with_advice(ans.advice.0.clone(), ans.advice.1),
+        );
+        tracing::info!(
+            path = %ans.path.display(),
+            access = ans.access.label(),
+            tier = ans.tier.label(),
+            "Scope granted without writing settings."
+        );
+        return true;
+    }
+    let Some(file) = settings_path() else {
+        tracing::warn!("cannot persist scope grant: home directory unknown");
+        return false;
+    };
+    // The chokepoint applies the denylist and writes the audit record (R-PERM.2, R-PERM.2.1).
+    let granted_by = ans
+        .tool
+        .clone()
+        .or_else(|| Some(ans.default_granted_by.to_string()));
+    match persist_grant(
+        &file,
+        NewGrant {
+            path: ans.path,
+            access: ans.access,
+            granted_by,
+            granted_at: Some(granted_at.format("%Y-%m-%d").to_string()),
+            note: None,
+            surface: ans.surface,
+            live_scopes,
+            workspace,
+            expires_at: lease_end(ans.tier),
+        },
+    ) {
+        Ok(_) => {
+            tracing::info!(
+                path = %ans.path.display(),
+                access = ans.access.label(),
+                "Scope granted for workspace {} and saved to {}; applied to this \
+                 session now, and a terminal hook picks it up on its next command.",
+                workspace
+                    .map(|w| w.display().to_string())
+                    .unwrap_or_else(|| "(none)".into()),
+                file.display(),
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                "failed to persist scope grant for {}: {e:#}",
+                ans.path.display()
+            );
+            false
+        }
+    }
+}
+
+fn apply_live_scope_grant(
+    sb: &Arc<super::Sandbox>,
+    path: &Path,
+    access: ScopeAccess,
+    tier: GrantTier,
+    workspace: Option<&Path>,
+    surface: &str,
+) {
+    // R5.4.6: a human-approved grant takes effect in the live session —
+    // after the live gate (R-PERM.4.3), which is the only denylist the
+    // `session` tier ever meets.
+    let applied = if tier == GrantTier::Once {
+        sb.add_once_grant(path, access)
+    } else {
+        sb.add_live_grant(path, access)
+    };
+    match applied {
+        Ok(()) => {
+            crate::hub_reporter::publish_committed_scope(sb);
+            if tier == GrantTier::Session {
+                // R-PERM.4.4: a session answer reaches hooked commands too.
+                crate::sandbox::record_session_grant(
+                    path,
+                    access,
+                    workspace,
+                    std::process::id(),
+                    surface,
+                );
+            }
+        }
+        Err(why) => tracing::warn!(
+            path = %path.display(),
+            "approved grant not applied: {why}"
+        ),
     }
 }
 

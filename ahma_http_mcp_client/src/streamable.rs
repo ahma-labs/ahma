@@ -209,38 +209,12 @@ impl StreamableHttpMcpClient {
             });
         }
 
-        // A dropped sender (Err) means the listener failed before the stream
-        // opened; a timeout means it never did. Either way abort the handshake
-        // so the caller retries rather than proceeding into a half-open
-        // session that can never receive roots/list (and thus always 409s).
-        match tokio::time::timeout(opts.sse_open_timeout, ready_rx).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                return Err(anyhow!("MCP SSE stream failed to open; aborting handshake"));
-            }
-            Err(_) => {
-                return Err(anyhow!(
-                    "timed out waiting for MCP SSE stream to open; aborting handshake"
-                ));
-            }
-        }
+        await_sse_ready(opts.sse_open_timeout, ready_rx).await?;
 
         // notifications/initialized — only now that the return stream is live.
         post_initialized(&connector, &session_id, &protocol_version, false).await;
 
-        // Optionally wait for the sandbox-lock confirmation. Non-fatal on
-        // timeout: the listener keeps running and tools/call retries on 409.
-        if let Some(lock_timeout) = opts.sandbox_lock_timeout {
-            match tokio::time::timeout(lock_timeout, locked_rx).await {
-                Ok(Ok(())) => {}
-                _ => {
-                    warn!(
-                        session_id = %session_id,
-                        "MCP sandbox lock not confirmed within timeout; proceeding (tools/call will retry on 409)"
-                    );
-                }
-            }
-        }
+        await_sandbox_lock(opts.sandbox_lock_timeout, locked_rx, &session_id).await;
 
         Ok(Self::attach(
             connector.post_client,
@@ -392,20 +366,7 @@ impl StreamableHttpMcpClient {
             break resp;
         };
 
-        let status = resp.status();
-        if status == reqwest::StatusCode::CONFLICT {
-            let body = resp.text().await.unwrap_or_default();
-            return Ok(ToolCallOutcome::SandboxInitializing { body });
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Ok(ToolCallOutcome::HttpError { status, body });
-        }
-        let value = resp
-            .json::<Value>()
-            .await
-            .with_context(|| format!("failed to parse tools/call response for {tool}"))?;
-        Ok(ToolCallOutcome::Success(value))
+        classify_tool_call_response(resp, tool).await
     }
 
     /// Fetch and parse `tools/list`. Tolerant of a missing/odd `result`
@@ -531,6 +492,84 @@ pub fn parse_tools_list(val: &Value) -> Vec<ToolDescriptor> {
 /// Step 1 of the handshake: POST `initialize` (no session header) and extract
 /// the `mcp-session-id` response header.
 ///
+async fn classify_tool_call_response(
+    resp: reqwest::Response,
+    tool: &str,
+) -> Result<ToolCallOutcome> {
+    let status = resp.status();
+    if status == reqwest::StatusCode::CONFLICT {
+        let body = resp.text().await.unwrap_or_default();
+        return Ok(ToolCallOutcome::SandboxInitializing { body });
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Ok(ToolCallOutcome::HttpError { status, body });
+    }
+    let value = resp
+        .json::<Value>()
+        .await
+        .with_context(|| format!("failed to parse tools/call response for {tool}"))?;
+    Ok(ToolCallOutcome::Success(value))
+}
+
+/// Wait for the SSE return stream to open, or abort the handshake so the
+/// caller retries rather than proceeding into a half-open session that can
+/// never receive `roots/list` (and thus always 409s).
+async fn await_sse_ready(
+    sse_open_timeout: Duration,
+    ready_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    match tokio::time::timeout(sse_open_timeout, ready_rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(anyhow!("MCP SSE stream failed to open; aborting handshake")),
+        Err(_) => Err(anyhow!(
+            "timed out waiting for MCP SSE stream to open; aborting handshake"
+        )),
+    }
+}
+
+/// Optionally wait for the sandbox-lock confirmation. Non-fatal on timeout:
+/// the listener keeps running and `tools/call` retries on 409.
+async fn await_sandbox_lock(
+    sandbox_lock_timeout: Option<Duration>,
+    locked_rx: tokio::sync::oneshot::Receiver<()>,
+    session_id: &str,
+) {
+    let Some(lock_timeout) = sandbox_lock_timeout else {
+        return;
+    };
+    if !matches!(
+        tokio::time::timeout(lock_timeout, locked_rx).await,
+        Ok(Ok(()))
+    ) {
+        warn!(
+            session_id = %session_id,
+            "MCP sandbox lock not confirmed within timeout; proceeding (tools/call will retry on 409)"
+        );
+    }
+}
+
+async fn missing_session_id_error(service: &str, resp: reqwest::Response) -> anyhow::Error {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(500).collect();
+    let body_note = if snippet.trim().is_empty() {
+        "<empty body>".to_string()
+    } else {
+        snippet
+    };
+    let diagnostic = anyhow!(
+        "No {SESSION_ID_HEADER} header in initialize response (HTTP {status}). \
+         This usually means the request reached something other than an MCP \
+         Streamable-HTTP server — check auth, session limits, and that the URL \
+         is correct. Response body: {body_note}"
+    );
+    match classify_status(status) {
+        Some(failure) => ServiceError::new(service, failure, diagnostic).into(),
+        None => diagnostic,
+    }
+}
+
 /// The error path is deliberately diagnostic: the header is absent for auth
 /// failures (401), session limits (429), init-forward errors (500), and for
 /// requests that reached something that is not an MCP bridge at all — a bare
@@ -581,24 +620,7 @@ async fn initialize_session(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
     else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(500).collect();
-        let body_note = if snippet.trim().is_empty() {
-            "<empty body>".to_string()
-        } else {
-            snippet
-        };
-        let diagnostic = anyhow!(
-            "No {SESSION_ID_HEADER} header in initialize response (HTTP {status}). \
-             This usually means the request reached something other than an MCP \
-             Streamable-HTTP server — check auth, session limits, and that the URL \
-             is correct. Response body: {body_note}"
-        );
-        return Err(match classify_status(status) {
-            Some(failure) => ServiceError::new(&service, failure, diagnostic).into(),
-            None => diagnostic,
-        });
+        return Err(missing_session_id_error(&service, resp).await);
     };
 
     // The negotiated version is in the `initialize` result body, not a
@@ -635,6 +657,49 @@ async fn post_initialized(
     let _ = connector.post_client.send(req).await;
 }
 
+async fn open_sse_response(connector: &Connector, session_id: &str) -> Result<reqwest::Response> {
+    let sse = &connector.sse_client;
+    let response = sse
+        .send(
+            sse.get(&connector.mcp_url)
+                .header("Accept", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header(SESSION_ID_HEADER, session_id),
+        )
+        .await
+        .context("SSE GET failed")?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("SSE stream failed with HTTP {}", response.status()));
+    }
+    Ok(response)
+}
+
+async fn drain_sse_events(
+    buffer: &mut String,
+    connector: &Connector,
+    session_id: &str,
+    protocol_version: &str,
+    roots: &[PathBuf],
+    notifications: &Option<mpsc::Sender<Value>>,
+    locked_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    while let Some(raw_event) = pop_next_sse_event(buffer) {
+        if let Some(value) = event_data_to_json(&raw_event) {
+            handle_sse_event(
+                connector,
+                session_id,
+                protocol_version,
+                roots,
+                notifications,
+                locked_tx,
+                value,
+            )
+            .await;
+        }
+    }
+}
+
 /// Long-lived SSE listener for a session: opens the GET stream, signals
 /// `ready_tx` once it is established (2xx), answers `roots/list` with the
 /// supplied roots, signals `locked_tx` on `notifications/sandbox/configured`,
@@ -649,52 +714,48 @@ async fn run_sse_listener(
     ready_tx: tokio::sync::oneshot::Sender<()>,
     mut locked_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    let sse = &connector.sse_client;
-    let response = sse
-        .send(
-            sse.get(&connector.mcp_url)
-                .header("Accept", "text/event-stream")
-                .header("Cache-Control", "no-cache")
-                .header(SESSION_ID_HEADER, &session_id),
-        )
-        .await
-        .context("SSE GET failed")?;
-
-    if !response.status().is_success() {
-        // `ready_tx` is dropped here, which the caller observes as a failed
-        // handshake (the SSE return stream never opened).
-        return Err(anyhow!("SSE stream failed with HTTP {}", response.status()));
-    }
+    // `ready_tx` is dropped on error here, which the caller observes as a
+    // failed handshake (the SSE return stream never opened).
+    let mut resp = open_sse_response(&connector, &session_id).await?;
 
     // The stream is established server-side, so the server has a channel to
     // deliver roots/list: it is now safe to send notifications/initialized.
     let _ = ready_tx.send(());
 
-    let mut resp = response;
     let mut buffer = String::new();
     while let Ok(Some(bytes)) = resp.chunk().await {
         let Ok(chunk_str) = std::str::from_utf8(&bytes) else {
             continue;
         };
         buffer.push_str(chunk_str);
-        while let Some(raw_event) = pop_next_sse_event(&mut buffer) {
-            let Some(value) = event_data_to_json(&raw_event) else {
-                continue;
-            };
-            handle_sse_event(
-                &connector,
-                &session_id,
-                &protocol_version,
-                &roots,
-                &notifications,
-                &mut locked_tx,
-                value,
-            )
-            .await;
-        }
+        drain_sse_events(
+            &mut buffer,
+            &connector,
+            &session_id,
+            &protocol_version,
+            &roots,
+            &notifications,
+            &mut locked_tx,
+        )
+        .await;
     }
     debug!(session_id = %session_id, "MCP SSE stream closed");
     Ok(())
+}
+
+async fn maybe_answer_roots_list(
+    connector: &Connector,
+    session_id: &str,
+    protocol_version: &str,
+    roots: &[PathBuf],
+    value: &Value,
+) {
+    match value.get("id").cloned() {
+        Some(request_id) => {
+            respond_to_roots_list(connector, session_id, protocol_version, request_id, roots).await;
+        }
+        None => debug!("roots/list request without id; cannot answer"),
+    }
 }
 
 /// Dispatch one decoded SSE event: answer `roots/list`, signal the sandbox
@@ -708,22 +769,16 @@ async fn handle_sse_event(
     locked_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     value: Value,
 ) {
-    let method = value.get("method").and_then(Value::as_str);
-
-    if method == Some(SANDBOX_CONFIGURED_METHOD)
-        && let Some(tx) = locked_tx.take()
-    {
-        let _ = tx.send(());
-    }
-
-    if method == Some(ROOTS_LIST_METHOD) {
-        match value.get("id").cloned() {
-            Some(request_id) => {
-                respond_to_roots_list(connector, session_id, protocol_version, request_id, roots)
-                    .await;
+    match value.get("method").and_then(Value::as_str) {
+        Some(SANDBOX_CONFIGURED_METHOD) => {
+            if let Some(tx) = locked_tx.take() {
+                let _ = tx.send(());
             }
-            None => debug!("roots/list request without id; cannot answer"),
         }
+        Some(ROOTS_LIST_METHOD) => {
+            maybe_answer_roots_list(connector, session_id, protocol_version, roots, &value).await;
+        }
+        _ => {}
     }
 
     if let Some(tx) = notifications {

@@ -2,29 +2,15 @@ use serde_json::Value;
 
 /// Resolves trailing commas in a JSON string.
 pub fn clean_json_trailing_commas(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == ',' {
-            let mut temp = chars.clone();
-            let mut is_trailing = false;
-            while let Some(&next) = temp.peek() {
-                if next.is_whitespace() {
-                    temp.next();
-                } else if next == '}' || next == ']' {
-                    is_trailing = true;
-                    break;
-                } else {
-                    break;
-                }
-            }
-            if is_trailing {
-                continue;
-            }
-        }
-        out.push(c);
-    }
-    out
+    input
+        .char_indices()
+        .filter(|&(i, c)| !is_trailing_comma(c, &input[i + 1..]))
+        .map(|(_, c)| c)
+        .collect()
+}
+
+fn is_trailing_comma(c: char, rest: &str) -> bool {
+    c == ',' && matches!(rest.trim_start().as_bytes().first(), Some(b'}' | b']'))
 }
 
 /// Other harnesses' names for ahma's tools. Models are trained on Claude
@@ -53,60 +39,83 @@ const TOOL_ALIASES: &[(&str, &str)] = &[
     ("patch", "apply_patch"),
 ];
 
-/// Argument names those harnesses use, renamed to ahma's for each tool. Only
-/// fills a name the call did not already give.
-fn rename_args(tool_name: &str, args: &mut serde_json::Map<String, Value>) {
-    let renames: &[(&str, &str)] = match tool_name {
-        "read_file" | "write_file" | "list_dir" => &[("file_path", "path")],
-        "replace_in_file" => &[
+const TOOL_ARG_RENAMES: &[(&str, &[(&str, &str)])] = &[
+    ("read_file", &[("file_path", "path")]),
+    ("write_file", &[("file_path", "path")]),
+    ("list_dir", &[("file_path", "path")]),
+    ("multi_edit", &[("file_path", "path")]),
+    (
+        "replace_in_file",
+        &[
             ("file_path", "path"),
             ("old_string", "old_str"),
             ("new_string", "new_str"),
         ],
-        "multi_edit" => &[("file_path", "path")],
-        "grep_search" => &[
+    ),
+    (
+        "grep_search",
+        &[
             ("path", "base_dir"),
             ("glob", "include_pattern"),
             ("-C", "context"),
         ],
-        "file_search" => &[("path", "base_dir")],
-        "apply_patch" => &[("input", "patch")],
-        "fetch_webpage" => &[("prompt", "query")],
-        _ => &[],
-    };
-    for (from, to) in renames {
-        if !args.contains_key(*to)
-            && let Some(v) = args.remove(*from)
+    ),
+    ("file_search", &[("path", "base_dir")]),
+    ("apply_patch", &[("input", "patch")]),
+    ("fetch_webpage", &[("prompt", "query")]),
+];
+
+fn tool_arg_renames(tool_name: &str) -> &'static [(&'static str, &'static str)] {
+    TOOL_ARG_RENAMES
+        .iter()
+        .find_map(|&(name, renames)| (name == tool_name).then_some(renames))
+        .unwrap_or(&[])
+}
+
+fn rename_keys(map: &mut serde_json::Map<String, Value>, renames: &[(&str, &str)]) {
+    for &(from, to) in renames {
+        if !map.contains_key(to)
+            && let Some(v) = map.remove(from)
         {
-            args.insert((*to).to_string(), v);
+            map.insert(to.to_string(), v);
         }
     }
+}
+
+fn heal_grep_search_args(args: &mut serde_json::Map<String, Value>) {
     // Claude Code's Grep takes a ripgrep regex in `pattern`.
-    if tool_name == "grep_search"
-        && !args.contains_key("query")
+    if !args.contains_key("query")
         && let Some(p) = args.remove("pattern")
     {
         args.insert("query".into(), p);
         args.entry("is_regex").or_insert(Value::Bool(true));
     }
-    if tool_name == "grep_search"
-        && let Some(Value::Bool(insensitive)) = args.remove("-i")
-    {
+    if let Some(Value::Bool(insensitive)) = args.remove("-i") {
         args.entry("case_sensitive")
             .or_insert(Value::Bool(!insensitive));
     }
-    if tool_name == "multi_edit"
-        && let Some(Value::Array(edits)) = args.get_mut("edits")
-    {
-        for edit in edits.iter_mut().filter_map(Value::as_object_mut) {
-            for (from, to) in [("old_string", "old_str"), ("new_string", "new_str")] {
-                if !edit.contains_key(to)
-                    && let Some(v) = edit.remove(from)
-                {
-                    edit.insert(to.to_string(), v);
-                }
-            }
-        }
+}
+
+fn heal_multi_edit_args(args: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Array(edits)) = args.get_mut("edits") else {
+        return;
+    };
+    for edit in edits.iter_mut().filter_map(Value::as_object_mut) {
+        rename_keys(
+            edit,
+            &[("old_string", "old_str"), ("new_string", "new_str")],
+        );
+    }
+}
+
+/// Argument names those harnesses use, renamed to ahma's for each tool. Only
+/// fills a name the call did not already give.
+fn rename_args(tool_name: &str, args: &mut serde_json::Map<String, Value>) {
+    rename_keys(args, tool_arg_renames(tool_name));
+    match tool_name {
+        "grep_search" => heal_grep_search_args(args),
+        "multi_edit" => heal_multi_edit_args(args),
+        _ => {}
     }
 }
 
@@ -124,29 +133,39 @@ pub fn heal_tool_arguments(tool_name: &str, args: &mut serde_json::Map<String, V
 
 /// Levenshtein distance implementation for string fuzzy matching.
 pub fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
-    let mut dp = vec![vec![0; b_chars.len() + 1]; a_chars.len() + 1];
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0; b_chars.len() + 1];
 
-    for (i, row) in dp.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, val) in dp[0].iter_mut().enumerate() {
-        *val = j;
-    }
-
-    for i in 1..=a_chars.len() {
-        for j in 1..=b_chars.len() {
-            if a_chars[i - 1] == b_chars[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1];
-            } else {
-                dp[i][j] =
-                    1 + std::cmp::min(dp[i - 1][j - 1], std::cmp::min(dp[i - 1][j], dp[i][j - 1]));
-            }
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
         }
+        std::mem::swap(&mut prev, &mut curr);
     }
 
-    dp[a_chars.len()][b_chars.len()]
+    prev[b_chars.len()]
+}
+
+fn resolve_tool_alias(requested_name: &str, known_names: &[&str]) -> Option<String> {
+    TOOL_ALIASES
+        .iter()
+        .find(|&&(alias, _)| alias == requested_name)
+        .map(|&(_, canonical)| canonical)
+        .filter(|canonical| known_names.contains(canonical))
+        .map(str::to_string)
+}
+
+fn closest_known_tool(requested_name: &str, known_names: &[&str]) -> Option<String> {
+    known_names
+        .iter()
+        .copied()
+        .map(|known| (known, levenshtein_distance(requested_name, known)))
+        .filter(|&(_, dist)| dist <= 2)
+        .min_by_key(|&(_, dist)| dist)
+        .map(|(name, _)| name.to_string())
 }
 
 /// Attempts to correct minor typos in tool names, and maps other harnesses'
@@ -156,25 +175,8 @@ pub fn heal_tool_name(requested_name: &str, known_names: &[&str]) -> Option<Stri
     if known_names.contains(&requested_name) {
         return Some(requested_name.to_string());
     }
-    if let Some((_, canonical)) = TOOL_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == requested_name)
-        .filter(|(_, canonical)| known_names.contains(canonical))
-    {
-        return Some((*canonical).to_string());
-    }
-    let mut best_match: Option<(&str, usize)> = None;
-    for &known in known_names {
-        let dist = levenshtein_distance(requested_name, known);
-        if dist <= 2 {
-            match best_match {
-                None => best_match = Some((known, dist)),
-                Some((_, best_dist)) if dist < best_dist => best_match = Some((known, dist)),
-                _ => {}
-            }
-        }
-    }
-    best_match.map(|(name, _)| name.to_string())
+    resolve_tool_alias(requested_name, known_names)
+        .or_else(|| closest_known_tool(requested_name, known_names))
 }
 
 #[cfg(test)]

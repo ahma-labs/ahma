@@ -75,11 +75,6 @@ pub fn init_test_logging() {
     let _ = crate::utils::logging::init_logging("trace", false);
 }
 
-/// Initialize the test sandbox environment (logging, etc).
-pub fn init_test_sandbox() {
-    init_test_logging();
-}
-
 /// Strip ANSI escape sequences
 #[allow(dead_code)]
 pub fn strip_ansi(input: &str) -> String {
@@ -222,11 +217,6 @@ mod tests {
     #[test]
     fn test_init_test_logging_does_not_panic() {
         init_test_logging();
-    }
-
-    #[test]
-    fn test_init_test_sandbox_does_not_panic() {
-        init_test_sandbox();
     }
 
     #[test]

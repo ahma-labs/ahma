@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::config::{AhmaSettings, ScopeAccess, ahma_home_dir};
+use crate::config::{AhmaSettings, ahma_home_dir};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The record shape (R-PERM.2)
@@ -210,64 +210,50 @@ pub struct GrantRecord {
     pub expires_at: Option<u64>,
 }
 
-/// Project every persisted permission in `settings` into one list (R-PERM.2.1).
-///
-/// Order is stable and grouped by kind so the output of `ahma permissions list`
-/// does not shuffle between runs.
-pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
-    let mut out = Vec::new();
-
-    for s in &settings.sandbox.persistent_scopes {
-        out.push(GrantRecord {
-            kind: GrantKind::FsScope,
-            subject: s.path.display().to_string(),
-            access: Some(
-                match s.access {
-                    ScopeAccess::Ro => "ro",
-                    ScopeAccess::Rw => "rw",
-                }
+fn fs_scope_record(s: &crate::config::PersistentScope) -> GrantRecord {
+    GrantRecord {
+        kind: GrantKind::FsScope,
+        subject: s.path.display().to_string(),
+        access: Some(s.access.short().to_string()),
+        tier: GrantTier::Always,
+        granted_by: s.granted_by.clone(),
+        granted_at: s.granted_at.clone(),
+        surface: None,
+        note: s.note.clone(),
+        scope_note: Some(match &s.workspace {
+            Some(ws) => format!("workspace {}", ws.display()),
+            None => "GLOBAL (legacy): applies to every workspace; re-grant with \
+                     `ahma sandbox grant <path>` from the project that needs it"
                 .to_string(),
-            ),
-            tier: GrantTier::Always,
-            granted_by: s.granted_by.clone(),
-            granted_at: s.granted_at.clone(),
-            surface: None,
-            note: s.note.clone(),
-            scope_note: Some(match &s.workspace {
-                Some(ws) => format!("workspace {}", ws.display()),
-                None => "GLOBAL (legacy): applies to every workspace; re-grant with \
-                         `ahma sandbox grant <path>` from the project that needs it"
-                    .to_string(),
-            }),
-            expires_at: s.expires_at,
-        });
+        }),
+        expires_at: s.expires_at,
     }
+}
 
-    for g in &settings.sandbox.ssh_sign {
-        out.push(GrantRecord {
-            kind: GrantKind::SshSign,
-            subject: format!("{} for {}", g.key, g.destination),
-            access: None,
-            tier: if g.expires_at.is_some() {
-                GrantTier::Lease
-            } else {
-                GrantTier::Always
-            },
-            granted_by: g.granted_by.clone(),
-            granted_at: Some(crate::config::fmt_utc_datetime(g.granted_at)),
-            surface: None,
-            note: (!g.label.is_empty()).then(|| g.label.clone()),
-            scope_note: Some(format!("workspace {}", g.workspace.display())),
-            expires_at: g.expires_at,
-        });
+fn ssh_sign_record(g: &crate::ssh_sign::SshSignGrant) -> GrantRecord {
+    GrantRecord {
+        kind: GrantKind::SshSign,
+        subject: format!("{} for {}", g.key, g.destination),
+        access: None,
+        tier: if g.expires_at.is_some() {
+            GrantTier::Lease
+        } else {
+            GrantTier::Always
+        },
+        granted_by: g.granted_by.clone(),
+        granted_at: Some(crate::config::fmt_utc_datetime(g.granted_at)),
+        surface: None,
+        note: (!g.label.is_empty()).then(|| g.label.clone()),
+        scope_note: Some(format!("workspace {}", g.workspace.display())),
+        expires_at: g.expires_at,
     }
+}
 
-    for (patterns, access) in [
-        (&settings.web.always_allow, "allow"),
-        (&settings.web.never_allow, "deny"),
-    ] {
-        for pattern in patterns {
-            out.push(GrantRecord {
+fn web_domain_records(web: &crate::config::WebSettings) -> impl Iterator<Item = GrantRecord> + '_ {
+    [(&web.always_allow, "allow"), (&web.never_allow, "deny")]
+        .into_iter()
+        .flat_map(|(patterns, access)| {
+            patterns.iter().map(move |pattern| GrantRecord {
                 kind: GrantKind::WebDomain,
                 subject: pattern.clone(),
                 access: Some(access.to_string()),
@@ -278,60 +264,76 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
                 note: None,
                 scope_note: None,
                 expires_at: None,
-            });
-        }
-    }
+            })
+        })
+}
 
-    for host in &settings.network.allow {
-        out.push(GrantRecord {
-            kind: GrantKind::NetHost,
-            subject: host.clone(),
+fn tool_approval_records(approvals: &[ToolApproval]) -> impl Iterator<Item = GrantRecord> + '_ {
+    approvals.iter().flat_map(|approval| {
+        let ws = approval.workspace.display().to_string();
+        approval.tools.iter().map(move |tool| GrantRecord {
+            kind: GrantKind::Tool,
+            subject: tool.clone(),
             access: None,
             tier: GrantTier::Always,
-            granted_by: None,
-            granted_at: None,
-            surface: None,
+            granted_by: approval.granted_by.clone(),
+            granted_at: approval.granted_at.clone(),
+            surface: approval.surface.clone(),
             note: None,
-            scope_note: None,
+            scope_note: Some(ws.clone()),
             expires_at: None,
-        });
-    }
+        })
+    })
+}
 
-    for approval in &settings.permissions.tool_approvals {
-        for tool in &approval.tools {
-            out.push(GrantRecord {
-                kind: GrantKind::Tool,
-                subject: tool.clone(),
-                access: None,
-                tier: GrantTier::Always,
-                granted_by: approval.granted_by.clone(),
-                granted_at: approval.granted_at.clone(),
-                surface: approval.surface.clone(),
-                note: None,
-                scope_note: Some(approval.workspace.display().to_string()),
-                expires_at: None,
-            });
-        }
-    }
+fn log_target_records(approvals: &[LogTargetApproval]) -> impl Iterator<Item = GrantRecord> + '_ {
+    approvals.iter().flat_map(|approval| {
+        let ws = approval.workspace.display().to_string();
+        approval.targets.iter().map(move |target| GrantRecord {
+            kind: GrantKind::LogTarget,
+            subject: target.display().to_string(),
+            // Live-log monitoring only ever reads a target.
+            access: Some("ro".to_string()),
+            tier: GrantTier::Always,
+            granted_by: approval.granted_by.clone(),
+            granted_at: approval.granted_at.clone(),
+            surface: approval.surface.clone(),
+            note: None,
+            scope_note: Some(ws.clone()),
+            expires_at: None,
+        })
+    })
+}
 
-    for approval in &settings.log_targets.approvals {
-        for target in &approval.targets {
-            out.push(GrantRecord {
-                kind: GrantKind::LogTarget,
-                subject: target.display().to_string(),
-                // Live-log monitoring only ever reads a target.
-                access: Some("ro".to_string()),
-                tier: GrantTier::Always,
-                granted_by: approval.granted_by.clone(),
-                granted_at: approval.granted_at.clone(),
-                surface: approval.surface.clone(),
-                note: None,
-                scope_note: Some(approval.workspace.display().to_string()),
-                expires_at: None,
-            });
-        }
-    }
-
+/// Project every persisted permission in `settings` into one list (R-PERM.2.1).
+///
+/// Order is stable and grouped by kind so the output of `ahma permissions list`
+/// does not shuffle between runs.
+pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
+    let mut out = Vec::new();
+    out.extend(
+        settings
+            .sandbox
+            .persistent_scopes
+            .iter()
+            .map(fs_scope_record),
+    );
+    out.extend(settings.sandbox.ssh_sign.iter().map(ssh_sign_record));
+    out.extend(web_domain_records(&settings.web));
+    out.extend(settings.network.allow.iter().map(|host| GrantRecord {
+        kind: GrantKind::NetHost,
+        subject: host.clone(),
+        access: None,
+        tier: GrantTier::Always,
+        granted_by: None,
+        granted_at: None,
+        surface: None,
+        note: None,
+        scope_note: None,
+        expires_at: None,
+    }));
+    out.extend(tool_approval_records(&settings.permissions.tool_approvals));
+    out.extend(log_target_records(&settings.log_targets.approvals));
     out
 }
 
@@ -583,6 +585,17 @@ impl LogTargetSettings {
             .collect()
     }
 
+    fn get_or_create_workspace(&mut self, key: &Path) -> &mut LogTargetApproval {
+        if let Some(i) = self.approvals.iter().position(|a| a.workspace == key) {
+            return &mut self.approvals[i];
+        }
+        self.approvals.push(LogTargetApproval {
+            workspace: key.to_path_buf(),
+            ..LogTargetApproval::default()
+        });
+        self.approvals.last_mut().expect("just pushed an entry")
+    }
+
     /// Approve `target` for the workspace `key`. Idempotent: re-approving
     /// refreshes provenance without duplicating the target. Returns `true` when
     /// this added a target that was not already approved.
@@ -594,24 +607,11 @@ impl LogTargetSettings {
         granted_by: Option<String>,
         surface: Option<String>,
     ) -> bool {
-        let entry = match self.approvals.iter().position(|a| a.workspace == key) {
-            Some(i) => &mut self.approvals[i],
-            None => {
-                self.approvals.push(LogTargetApproval {
-                    workspace: key.to_path_buf(),
-                    ..LogTargetApproval::default()
-                });
-                self.approvals.last_mut().expect("just pushed an entry")
-            }
-        };
+        let entry = self.get_or_create_workspace(key);
         entry.granted_at = granted_at.or_else(|| entry.granted_at.clone());
-        if granted_by.is_some() {
-            entry.granted_by = granted_by;
-        }
-        if surface.is_some() {
-            entry.surface = surface;
-        }
-        if entry.targets.iter().any(|t| t == target) {
+        entry.granted_by = granted_by.or_else(|| entry.granted_by.clone());
+        entry.surface = surface.or_else(|| entry.surface.clone());
+        if entry.targets.contains(&target.to_path_buf()) {
             return false;
         }
         entry.targets.push(target.to_path_buf());
@@ -978,18 +978,12 @@ pub fn migrate_legacy_approvals(settings_file: &Path) -> anyhow::Result<Migratio
     }
 }
 
-/// [`migrate_legacy_approvals`] from an explicit legacy file.
-pub fn migrate_legacy_approvals_from(
-    legacy: &Path,
-    settings_file: &Path,
-) -> anyhow::Result<MigrationOutcome> {
-    let Some(legacy_grants) = read_legacy_store(legacy) else {
-        return Ok(MigrationOutcome::NothingToDo);
-    };
-    let mut settings = load_ledger_for_migration(settings_file)?;
-
+fn apply_legacy_tool_approvals(
+    settings: &mut AhmaSettings,
+    legacy_grants: &BTreeMap<String, Vec<String>>,
+) -> usize {
     let mut moved = 0usize;
-    for (workspace, tools) in &legacy_grants {
+    for (workspace, tools) in legacy_grants {
         let key = workspace_key(Path::new(workspace));
         for tool in tools {
             if settings
@@ -1007,10 +1001,47 @@ pub fn migrate_legacy_approvals_from(
             entry.granted_by = Some("migrated".to_string());
         }
     }
+    moved
+}
+
+fn verify_tool_approvals_landed(
+    settings_file: &Path,
+    legacy: &Path,
+    moved: usize,
+) -> anyhow::Result<()> {
+    let reloaded = AhmaSettings::load_from_result(settings_file)
+        .map_err(|e| anyhow::anyhow!("could not re-read the ledger after migrating: {e}"))?;
+    let landed: usize = reloaded
+        .permissions
+        .tool_approvals
+        .iter()
+        .map(|a| a.tools.len())
+        .sum();
+    if landed == 0 {
+        anyhow::bail!(
+            "migrated {moved} grant(s) into {} but they are not there on re-read \
+             (another ahma process may have rewritten the file). Leaving {} in place \
+             so nothing is lost; it will be retried on the next run.",
+            settings_file.display(),
+            legacy.display()
+        );
+    }
+    Ok(())
+}
+
+/// [`migrate_legacy_approvals`] from an explicit legacy file.
+pub fn migrate_legacy_approvals_from(
+    legacy: &Path,
+    settings_file: &Path,
+) -> anyhow::Result<MigrationOutcome> {
+    let Some(legacy_grants) = read_legacy_store(legacy) else {
+        return Ok(MigrationOutcome::NothingToDo);
+    };
+    let mut settings = load_ledger_for_migration(settings_file)?;
+    let moved = apply_legacy_tool_approvals(&mut settings, &legacy_grants);
 
     if moved > 0 {
         settings.save_to(settings_file)?;
-
         // Read the grants back before archiving the only other copy of them.
         //
         // The write can fail to stick for reasons this function cannot see — a
@@ -1020,23 +1051,7 @@ pub fn migrate_legacy_approvals_from(
         // renamed out from under them. So: verify, then archive. If verification
         // fails, the legacy file stays exactly where it is and the next run tries
         // again.
-        let reloaded = AhmaSettings::load_from_result(settings_file)
-            .map_err(|e| anyhow::anyhow!("could not re-read the ledger after migrating: {e}"))?;
-        let landed: usize = reloaded
-            .permissions
-            .tool_approvals
-            .iter()
-            .map(|a| a.tools.len())
-            .sum();
-        if landed == 0 {
-            anyhow::bail!(
-                "migrated {moved} grant(s) into {} but they are not there on re-read \
-                 (another ahma process may have rewritten the file). Leaving {} in place \
-                 so nothing is lost; it will be retried on the next run.",
-                settings_file.display(),
-                legacy.display()
-            );
-        }
+        verify_tool_approvals_landed(settings_file, legacy, moved)?;
     }
 
     archive_legacy_store(legacy, moved, settings_file)
@@ -1055,19 +1070,13 @@ pub fn migrate_legacy_log_exceptions(settings_file: &Path) -> anyhow::Result<Mig
     }
 }
 
-/// [`migrate_legacy_log_exceptions`] from an explicit legacy file.
-pub fn migrate_legacy_log_exceptions_from(
-    legacy: &Path,
-    settings_file: &Path,
-) -> anyhow::Result<MigrationOutcome> {
-    let Some(legacy_targets) = read_legacy_store(legacy) else {
-        return Ok(MigrationOutcome::NothingToDo);
-    };
-    let mut settings = load_ledger_for_migration(settings_file)?;
-
+fn apply_legacy_log_targets(
+    settings: &mut AhmaSettings,
+    legacy_targets: &BTreeMap<String, Vec<String>>,
+) -> usize {
     let migrated = || Some("migrated".to_string());
     let mut moved = 0usize;
-    for (workspace, targets) in &legacy_targets {
+    for (workspace, targets) in legacy_targets {
         let key = workspace_key(Path::new(workspace));
         for target in targets {
             if settings.log_targets.approve_target(
@@ -1081,6 +1090,45 @@ pub fn migrate_legacy_log_exceptions_from(
             }
         }
     }
+    moved
+}
+
+fn verify_log_targets_landed(
+    settings_file: &Path,
+    legacy: &Path,
+    moved: usize,
+    legacy_targets: &BTreeMap<String, Vec<String>>,
+) -> anyhow::Result<()> {
+    let reloaded = AhmaSettings::load_from_result(settings_file)
+        .map_err(|e| anyhow::anyhow!("could not re-read the ledger after migrating: {e}"))?;
+    let all_landed = legacy_targets.iter().all(|(workspace, targets)| {
+        let key = workspace_key(Path::new(workspace));
+        targets
+            .iter()
+            .all(|t| reloaded.log_targets.is_target_approved(&key, Path::new(t)))
+    });
+    if !all_landed {
+        anyhow::bail!(
+            "migrated {moved} log target(s) into {} but not all of them are there on \
+             re-read (another ahma process may have rewritten the file). Leaving {} in \
+             place so nothing is lost; it will be retried on the next run.",
+            settings_file.display(),
+            legacy.display()
+        );
+    }
+    Ok(())
+}
+
+/// [`migrate_legacy_log_exceptions`] from an explicit legacy file.
+pub fn migrate_legacy_log_exceptions_from(
+    legacy: &Path,
+    settings_file: &Path,
+) -> anyhow::Result<MigrationOutcome> {
+    let Some(legacy_targets) = read_legacy_store(legacy) else {
+        return Ok(MigrationOutcome::NothingToDo);
+    };
+    let mut settings = load_ledger_for_migration(settings_file)?;
+    let moved = apply_legacy_log_targets(&mut settings, &legacy_targets);
 
     if moved > 0 {
         settings.save_to(settings_file)?;
@@ -1088,23 +1136,7 @@ pub fn migrate_legacy_log_exceptions_from(
         // Verify before archiving, as for tool approvals — and verify every
         // target, not just "something landed": a missing target here is a log
         // the user approved silently going dark.
-        let reloaded = AhmaSettings::load_from_result(settings_file)
-            .map_err(|e| anyhow::anyhow!("could not re-read the ledger after migrating: {e}"))?;
-        let all_landed = legacy_targets.iter().all(|(workspace, targets)| {
-            let key = workspace_key(Path::new(workspace));
-            targets
-                .iter()
-                .all(|t| reloaded.log_targets.is_target_approved(&key, Path::new(t)))
-        });
-        if !all_landed {
-            anyhow::bail!(
-                "migrated {moved} log target(s) into {} but not all of them are there on \
-                 re-read (another ahma process may have rewritten the file). Leaving {} in \
-                 place so nothing is lost; it will be retried on the next run.",
-                settings_file.display(),
-                legacy.display()
-            );
-        }
+        verify_log_targets_landed(settings_file, legacy, moved, &legacy_targets)?;
     }
 
     archive_legacy_store(legacy, moved, settings_file)
@@ -1321,6 +1353,7 @@ pub fn audit_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ScopeAccess;
     use tempfile::tempdir;
 
     fn key(p: &str) -> PathBuf {
@@ -1525,20 +1558,20 @@ mod tests {
         let home = tempdir().unwrap();
         let cfg = tempdir().unwrap();
         let settings_file = home.path().join(".ahma").join("settings.toml");
+        let legacy_dir = cfg.path().join("ahma");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
 
-        for name in ["approvals.json", "log_exceptions.json"] {
-            let legacy_dir = cfg.path().join("ahma");
-            std::fs::create_dir_all(&legacy_dir).unwrap();
+        type MigrateFn = fn(&Path, &Path) -> anyhow::Result<MigrationOutcome>;
+        let cases: [(&str, MigrateFn); 2] = [
+            ("approvals.json", migrate_legacy_approvals_from),
+            ("log_exceptions.json", migrate_legacy_log_exceptions_from),
+        ];
+
+        for (name, migrate) in cases {
             let legacy = legacy_dir.join(name);
             std::fs::write(&legacy, "{ this is not json").unwrap();
 
-            let migrated = if name == "approvals.json" {
-                migrate_legacy_approvals_from(&legacy, &settings_file)
-            } else {
-                migrate_legacy_log_exceptions_from(&legacy, &settings_file)
-            };
-            let outcome = migrated.unwrap();
-
+            let outcome = migrate(&legacy, &settings_file).unwrap();
             assert_eq!(outcome, MigrationOutcome::NothingToDo, "{name}");
             assert_eq!(
                 std::fs::read_to_string(&legacy).unwrap(),

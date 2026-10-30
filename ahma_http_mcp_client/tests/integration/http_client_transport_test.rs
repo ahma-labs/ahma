@@ -59,6 +59,52 @@ fn write_default_token(path: &std::path::Path) -> &'static str {
     access_token
 }
 
+fn setup_default_token_env(filename: &str) -> (tempfile::TempDir, TokenPathGuard) {
+    let tmp = tempdir().unwrap();
+    let token_path = tmp.path().join(filename);
+    write_default_token(&token_path);
+    let guard = TokenPathGuard::set(&token_path);
+    (tmp, guard)
+}
+
+fn transport_for_server(server: &MockServer) -> ahma_http_mcp_client::client::HttpMcpTransport {
+    let url = url::Url::parse(&format!("{}/mcp", server.uri())).unwrap();
+    ahma_http_mcp_client::client::HttpMcpTransport::new(url, None, None).unwrap()
+}
+
+async fn mock_mcp_post(
+    response: ResponseTemplate,
+    expected: u64,
+) -> (MockServer, ahma_http_mcp_client::client::HttpMcpTransport) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(response)
+        .expect(expected)
+        .mount(&server)
+        .await;
+    let transport = transport_for_server(&server);
+    (server, transport)
+}
+
+fn rpc_request(
+    id: i64,
+    method_name: &str,
+    params: serde_json::Value,
+) -> rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> {
+    serde_json::from_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method_name,
+        "params": params
+    }))
+    .unwrap()
+}
+
+fn default_test_request() -> rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> {
+    rpc_request(1, "test", serde_json::json!({}))
+}
+
 mod transport_construction {
     use super::*;
     use ahma_http_mcp_client::client::HttpMcpTransport;
@@ -180,10 +226,8 @@ mod token_persistence {
 
 mod http_transport_send {
     use super::*;
-    use ahma_http_mcp_client::client::HttpMcpTransport;
     use rmcp::transport::Transport;
     use serde_json::json;
-    use url::Url;
 
     #[tokio::test]
     async fn send_without_token_returns_missing_token_error() {
@@ -192,19 +236,8 @@ mod http_transport_send {
         let _guard = TokenPathGuard::set(&tmp.path().join("no_token.json"));
 
         let server = MockServer::start().await;
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        // Create a JSON-RPC request
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/list",
-                "params": {}
-            }))
-            .unwrap();
+        let mut transport = transport_for_server(&server);
+        let request = rpc_request(1, "tools/list", json!({}));
 
         let result = transport.send(request).await;
 
@@ -248,17 +281,8 @@ mod http_transport_send {
             .mount(&server)
             .await;
 
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/list",
-                "params": {}
-            }))
-            .unwrap();
+        let mut transport = transport_for_server(&server);
+        let request = rpc_request(1, "tools/list", json!({}));
 
         let result = transport.send(request).await;
         assert!(
@@ -270,34 +294,14 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_handles_http_error_response() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_for_error.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
+        let (_tmp, _guard) = setup_default_token_env("token_for_error.json");
+        let (_server, mut transport) = mock_mcp_post(
+            ResponseTemplate::new(500).set_body_string("Internal Server Error"),
+            1,
+        )
+        .await;
 
-        let server = MockServer::start().await;
-
-        // Server returns 500 error
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
+        let result = transport.send(default_test_request()).await;
         assert!(result.is_err(), "Send should fail on HTTP 500");
         assert!(
             result.unwrap_err().to_string().contains("HTTP Error"),
@@ -307,10 +311,7 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_handles_network_timeout() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_timeout.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
+        let (_tmp, _guard) = setup_default_token_env("token_timeout.json");
 
         let server = MockServer::start().await;
 
@@ -321,22 +322,12 @@ mod http_transport_send {
             .mount(&server)
             .await;
 
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
+        let mut transport = transport_for_server(&server);
 
         // Use a timeout to avoid hanging the test
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            transport.send(request),
+            transport.send(default_test_request()),
         )
         .await;
 
@@ -349,55 +340,21 @@ mod http_transport_send {
 
     #[tokio::test]
     async fn send_handles_invalid_json_response() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_invalid_resp.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
+        let (_tmp, _guard) = setup_default_token_env("token_invalid_resp.json");
+        let (_server, mut transport) = mock_mcp_post(
+            ResponseTemplate::new(200).set_body_string("not valid json"),
+            1,
+        )
+        .await;
 
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("not valid json"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        let result = transport.send(request).await;
+        let result = transport.send(default_test_request()).await;
         assert!(result.is_err(), "Send should fail on invalid JSON response");
     }
 
     #[tokio::test]
     async fn send_handles_empty_response_body() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_empty.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
-
-        let server = MockServer::start().await;
-
-        // Server returns 200 OK with empty body (e.g., for notifications)
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
+        let (_tmp, _guard) = setup_default_token_env("token_empty.json");
+        let (_server, mut transport) = mock_mcp_post(ResponseTemplate::new(200), 1).await;
 
         let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
             serde_json::from_value(json!({
@@ -419,10 +376,7 @@ mod http_transport_send {
     /// Consolidates the former per-status copies (400/401/403/404/502/503/504).
     #[tokio::test]
     async fn send_handles_http_error_statuses() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("token_error_statuses.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
+        let (_tmp, _guard) = setup_default_token_env("token_error_statuses.json");
 
         let cases: &[(u16, &str)] = &[
             (400, "Bad Request"),
@@ -435,28 +389,10 @@ mod http_transport_send {
         ];
 
         for &(status, body) in cases {
-            let server = MockServer::start().await;
+            let (_server, mut transport) =
+                mock_mcp_post(ResponseTemplate::new(status).set_body_string(body), 1).await;
 
-            Mock::given(method("POST"))
-                .and(path("/mcp"))
-                .respond_with(ResponseTemplate::new(status).set_body_string(body))
-                .expect(1)
-                .mount(&server)
-                .await;
-
-            let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-            let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-            let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-                serde_json::from_value(json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "test",
-                    "params": {}
-                }))
-                .unwrap();
-
-            let result = transport.send(request).await;
+            let result = transport.send(default_test_request()).await;
             assert!(result.is_err(), "Send should fail on {status}");
             let err = result.unwrap_err().to_string();
             assert!(
@@ -505,39 +441,18 @@ mod transport_lifecycle {
 
     #[tokio::test]
     async fn receive_gets_message_from_channel() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("receive_message.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
-
-        let server = MockServer::start().await;
-
-        // Mock server returns a response
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        let (_tmp, _guard) = setup_default_token_env("receive_message.json");
+        let (_server, mut transport) = mock_mcp_post(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": { "data": "test_response" }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
+            })),
+            1,
+        )
+        .await;
 
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
-
-        // Send a request which should put response in channel
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": {}
-            }))
-            .unwrap();
-
-        transport.send(request).await.unwrap();
+        transport.send(default_test_request()).await.unwrap();
 
         // Now receive should get the message
         let message = tokio::time::timeout(TestTimeouts::scale_millis(100), transport.receive())
@@ -553,47 +468,25 @@ mod transport_lifecycle {
 
 mod channel_error_tests {
     use super::*;
-    use ahma_http_mcp_client::client::HttpMcpTransport;
     use rmcp::transport::Transport;
     use serde_json::json;
-    use url::Url;
 
     #[tokio::test]
     async fn send_continues_when_response_channel_full() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("channel_full.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
-
-        let server = MockServer::start().await;
-
-        // Mock multiple responses
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        let (_tmp, _guard) = setup_default_token_env("channel_full.json");
+        let (_server, mut transport) = mock_mcp_post(
+            ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": { "data": "response" }
-            })))
-            .expect(5)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
+            })),
+            5,
+        )
+        .await;
 
         // Send multiple requests without draining receiver
         for i in 1..=5 {
-            let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-                serde_json::from_value(json!({
-                    "jsonrpc": "2.0",
-                    "id": i,
-                    "method": "test",
-                    "params": {}
-                }))
-                .unwrap();
-
-            let result = transport.send(request).await;
+            let result = transport.send(rpc_request(i, "test", json!({}))).await;
             assert!(result.is_ok(), "Send should succeed even if channel fills");
         }
     }
@@ -601,36 +494,24 @@ mod channel_error_tests {
 
 mod concurrency_tests {
     use super::*;
-    use ahma_http_mcp_client::client::HttpMcpTransport;
     use rmcp::transport::Transport;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use url::Url;
 
     #[tokio::test]
     async fn concurrent_sends_maintain_ordering() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("concurrent.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
-
-        let server = MockServer::start().await;
-
-        // Mock server responds to all requests
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        let (_tmp, _guard) = setup_default_token_env("concurrent.json");
+        let (_server, transport) = mock_mcp_post(
+            ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": { "success": true }
-            })))
-            .expect(10)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let transport = Arc::new(Mutex::new(HttpMcpTransport::new(url, None, None).unwrap()));
+            })),
+            10,
+        )
+        .await;
+        let transport = Arc::new(Mutex::new(transport));
 
         // Spawn multiple concurrent sends
         let mut handles = vec![];
@@ -638,15 +519,7 @@ mod concurrency_tests {
             let transport = Arc::clone(&transport);
             let handle = tokio::spawn(async move {
                 let mut transport = transport.lock().await;
-                let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-                    serde_json::from_value(json!({
-                        "jsonrpc": "2.0",
-                        "id": i,
-                        "method": "test",
-                        "params": { "index": i }
-                    }))
-                    .unwrap();
-
+                let request = rpc_request(i, "test", json!({ "index": i }));
                 transport.send(request).await
             });
             handles.push(handle);
@@ -661,39 +534,23 @@ mod concurrency_tests {
 
     #[tokio::test]
     async fn large_payload_send_succeeds() {
-        let tmp = tempdir().unwrap();
-        let token_path = tmp.path().join("large_payload.json");
-        write_default_token(&token_path);
-        let _guard = TokenPathGuard::set(&token_path);
-
-        let server = MockServer::start().await;
+        let (_tmp, _guard) = setup_default_token_env("large_payload.json");
 
         // Create large response payload (1MB)
         let large_data = "x".repeat(1024 * 1024);
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        let (_server, mut transport) = mock_mcp_post(
+            ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": { "data": large_data }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
-        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
+            })),
+            1,
+        )
+        .await;
 
         // Create large request payload
         let large_param = "y".repeat(1024 * 512);
-        let request: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient> =
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "test",
-                "params": { "large_field": large_param }
-            }))
-            .unwrap();
+        let request = rpc_request(1, "test", json!({ "large_field": large_param }));
 
         let result = transport.send(request).await;
         assert!(result.is_ok(), "Large payload send should succeed");

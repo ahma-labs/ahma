@@ -24,7 +24,7 @@
 //! silently-inert allowlist entry is how an operator ends up believing egress is
 //! permitted when it is not — or the reverse.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -132,11 +132,6 @@ impl EgressAllowlist {
             out.push('\n');
         }
         out
-    }
-
-    /// Return the path at which a vault's allowlist file should live.
-    pub fn vault_path(vault_root: &Path) -> PathBuf {
-        vault_root.join("egress.allowlist")
     }
 }
 

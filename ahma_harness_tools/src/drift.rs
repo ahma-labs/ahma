@@ -36,6 +36,25 @@ impl ChangedFiles {
 /// the same clock read as `SystemTime::now()`.
 const UNTIL_SLACK: Duration = Duration::from_secs(1);
 
+fn modified_in_window(
+    entry: &ignore::DirEntry,
+    root: &Path,
+    since: SystemTime,
+    until: SystemTime,
+    exclude: &[PathBuf],
+) -> Option<PathBuf> {
+    if !entry.file_type().is_some_and(|t| t.is_file()) {
+        return None;
+    }
+    let path = entry.path();
+    if exclude.iter().any(|x| path.starts_with(x)) {
+        return None;
+    }
+    let modified = entry.metadata().ok()?.modified().ok()?;
+    (modified >= since && modified <= until)
+        .then(|| path.strip_prefix(root).unwrap_or(path).to_path_buf())
+}
+
 /// List files under `root` whose mtime lies in `[since, until + 1s]`.
 ///
 /// `.gitignore`d paths (`target/`, `node_modules/`) and `.git/` are skipped —
@@ -67,22 +86,10 @@ pub fn files_modified_between(
             incomplete = true;
             break;
         }
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        if exclude.iter().any(|x| path.starts_with(x)) {
-            continue;
-        }
-        let Ok(modified) = entry
-            .metadata()
-            .and_then(|m| m.modified().map_err(Into::into))
-        else {
-            continue;
-        };
-        if modified >= since && modified <= until {
-            found.push(path.strip_prefix(root).unwrap_or(path).to_path_buf());
+        if let Ok(entry) = entry
+            && let Some(rel) = modified_in_window(&entry, root, since, until, exclude)
+        {
+            found.push(rel);
         }
     }
     found.sort();

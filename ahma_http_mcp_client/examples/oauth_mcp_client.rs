@@ -1,6 +1,10 @@
 use ahma_http_mcp_client::client::HttpMcpTransport;
 use clap::Parser;
-use rmcp::{ServiceExt, model::CallToolRequestParams};
+use rmcp::{
+    RoleClient, ServiceExt,
+    model::{CallToolRequestParams, CallToolResult, Tool},
+    service::RunningService,
+};
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -23,6 +27,53 @@ struct Args {
     query: String,
 }
 
+fn print_tools(tools: &[Tool]) {
+    println!("Found {} tools:", tools.len());
+    for tool in tools {
+        println!(
+            "- {}: {}",
+            tool.name,
+            tool.description.as_deref().unwrap_or("No description")
+        );
+    }
+}
+
+fn print_tool_result(result: CallToolResult) {
+    println!("Search result:");
+    for content in result.content {
+        match content.as_text() {
+            Some(text_content) => println!("{}", text_content.text),
+            None => println!("[Non-text content]"),
+        }
+    }
+}
+
+async fn run_search_if_available(
+    service: &RunningService<RoleClient, ()>,
+    tools: &[Tool],
+    query: &str,
+) {
+    let Some(tool) = tools.iter().find(|t| t.name.contains("search")) else {
+        println!("\nNo tool with 'search' in its name found.");
+        return;
+    };
+
+    println!("\nFound search tool: {}", tool.name);
+    println!("Searching for '{}'...", query);
+
+    let params = CallToolRequestParams::new(tool.name.clone()).with_arguments(
+        serde_json::json!({ "query": query })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+
+    match service.call_tool(params).await {
+        Ok(result) => print_tool_result(result),
+        Err(e) => println!("Error calling search tool: {}", e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -41,56 +92,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     transport.ensure_authenticated().await?;
     println!("Authentication successful!");
 
-    // Create the client service
     let service = ().serve(transport).await?;
 
     println!("Listing tools...");
     let tools_result = service.list_tools(None).await?;
+    print_tools(&tools_result.tools);
 
-    println!("Found {} tools:", tools_result.tools.len());
-    for tool in &tools_result.tools {
-        println!(
-            "- {}: {}",
-            tool.name,
-            tool.description.as_deref().unwrap_or("No description")
-        );
-    }
-
-    // Search for "MCP"
-    let search_tool = tools_result
-        .tools
-        .iter()
-        .find(|t| t.name.contains("search"));
-
-    if let Some(tool) = search_tool {
-        println!("\nFound search tool: {}", tool.name);
-        println!("Searching for '{}'...", args.query);
-
-        let params = CallToolRequestParams::new(tool.name.clone()).with_arguments(
-            serde_json::json!({ "query": args.query })
-                .as_object()
-                .unwrap()
-                .clone(),
-        );
-
-        match service.call_tool(params).await {
-            Ok(result) => {
-                println!("Search result:");
-                for content in result.content {
-                    if let Some(text_content) = content.as_text() {
-                        println!("{}", text_content.text);
-                    } else {
-                        println!("[Non-text content]");
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Error calling search tool: {}", e);
-            }
-        }
-    } else {
-        println!("\nNo tool with 'search' in its name found.");
-    }
+    run_search_if_available(&service, &tools_result.tools, &args.query).await;
 
     Ok(())
 }

@@ -320,16 +320,7 @@ impl GrantDecision {
     /// would be widened by any tier that can — becomes a deny.
     pub fn within_offer(self, reason: GrantReason) -> GrantDecision {
         if reason == GrantReason::LogTarget {
-            return match self {
-                GrantDecision::GrantRo | GrantDecision::GrantRw => GrantDecision::GrantRo,
-                GrantDecision::GrantRoSession
-                | GrantDecision::GrantRwSession
-                | GrantDecision::GrantRoLease
-                | GrantDecision::GrantRwLease => GrantDecision::GrantRoSession,
-                GrantDecision::Deny | GrantDecision::GrantRoOnce | GrantDecision::GrantRwOnce => {
-                    GrantDecision::Deny
-                }
-            };
+            return self.within_log_target_offer();
         }
         // A harness refusal has no once tier, and any tier that can honour
         // a once answer would widen it: it becomes a deny.
@@ -338,9 +329,26 @@ impl GrantDecision {
         {
             return GrantDecision::Deny;
         }
-        if reason.offers_saved_tiers() {
-            return self;
+        if !reason.offers_saved_tiers() {
+            return self.downgrade_saved_to_session();
         }
+        self
+    }
+
+    fn within_log_target_offer(self) -> GrantDecision {
+        match self {
+            GrantDecision::GrantRo | GrantDecision::GrantRw => GrantDecision::GrantRo,
+            GrantDecision::GrantRoSession
+            | GrantDecision::GrantRwSession
+            | GrantDecision::GrantRoLease
+            | GrantDecision::GrantRwLease => GrantDecision::GrantRoSession,
+            GrantDecision::Deny | GrantDecision::GrantRoOnce | GrantDecision::GrantRwOnce => {
+                GrantDecision::Deny
+            }
+        }
+    }
+
+    fn downgrade_saved_to_session(self) -> GrantDecision {
         match self {
             GrantDecision::GrantRo | GrantDecision::GrantRoLease => GrantDecision::GrantRoSession,
             GrantDecision::GrantRw | GrantDecision::GrantRwLease => GrantDecision::GrantRwSession,
@@ -508,6 +516,24 @@ impl GrantCoordinator {
             .count()
     }
 
+    fn try_consume_prompt_budget(inner: &mut Inner, now: u64, path: &Path) -> bool {
+        // SPEC R-PERM.4.5: past the budget, nothing is raised. The agent
+        // learns it from `budget_exhausted()` and asks in conversation.
+        inner
+            .raised_window
+            .retain(|t| now.saturating_sub(*t) < PROMPT_WINDOW_SECS);
+        if inner.raised_window.len() >= PROMPT_BUDGET {
+            tracing::warn!(
+                path = %path.display(),
+                "scope grant not raised: {PROMPT_BUDGET} prompts already in the last \
+                 {PROMPT_WINDOW_SECS}s; the agent must ask the human in conversation"
+            );
+            return false;
+        }
+        inner.raised_window.push(now);
+        true
+    }
+
     /// [`Self::begin`], given an already-canonicalized path — lets
     /// [`Self::reopen`] canonicalize once and reuse the result instead of
     /// canonicalizing again inside `begin`.
@@ -537,21 +563,8 @@ impl GrantCoordinator {
             return None;
         }
         let now = now_secs();
-        if budgeted {
-            // SPEC R-PERM.4.5: past the budget, nothing is raised. The agent
-            // learns it from `budget_exhausted()` and asks in conversation.
-            inner
-                .raised_window
-                .retain(|t| now.saturating_sub(*t) < PROMPT_WINDOW_SECS);
-            if inner.raised_window.len() >= PROMPT_BUDGET {
-                tracing::warn!(
-                    path = %canonical.display(),
-                    "scope grant not raised: {PROMPT_BUDGET} prompts already in the last \
-                     {PROMPT_WINDOW_SECS}s; the agent must ask the human in conversation"
-                );
-                return None;
-            }
-            inner.raised_window.push(now);
+        if budgeted && !Self::try_consume_prompt_budget(&mut inner, now, &canonical) {
+            return None;
         }
         let decision_id = uuid::Uuid::new_v4().to_string();
         if budgeted {
@@ -611,6 +624,23 @@ impl GrantCoordinator {
         )
     }
 
+    fn record_grant_dismissal(
+        inner: &mut Inner,
+        path: &Path,
+        access: ScopeAccess,
+        tier: crate::permissions::GrantTier,
+    ) {
+        if tier == crate::permissions::GrantTier::Once {
+            return;
+        }
+        inner.dismissed.insert((path.to_path_buf(), access));
+        if access.is_write() {
+            inner
+                .dismissed
+                .insert((path.to_path_buf(), ScopeAccess::Ro));
+        }
+    }
+
     /// Resolve a decision with the human's answer. First-answer-wins and idempotent:
     /// a second call for the same `decision_id` returns [`GrantResolveOutcome::AlreadyResolved`].
     ///
@@ -640,35 +670,27 @@ impl GrantCoordinator {
             .remove(decision_id)
             .map(|t| t.elapsed().as_millis() as u64);
 
-        match decision.access() {
-            None => {
-                // Deny: suppress re-asking exactly this (path, access).
-                inner.dismissed.insert((req.path.clone(), req.access));
-                GrantResolveOutcome::Denied {
-                    path: req.path,
-                    time_to_decision_ms,
-                    reason: req.reason,
-                }
-            }
-            Some(access) => {
-                // A grant settles what it covers, no more (R-PERM.4): read-write
-                // covers a read, a read does not cover a write, and a `once`
-                // grant covers its one command, so a later need is asked again.
-                if decision.tier() != crate::permissions::GrantTier::Once {
-                    inner.dismissed.insert((req.path.clone(), access));
-                    if access.is_write() {
-                        inner.dismissed.insert((req.path.clone(), ScopeAccess::Ro));
-                    }
-                }
-                GrantResolveOutcome::Persist {
-                    path: req.path,
-                    access,
-                    tool: req.tool,
-                    tier: decision.tier(),
-                    time_to_decision_ms,
-                    reason: req.reason,
-                }
-            }
+        let Some(access) = decision.access() else {
+            // Deny: suppress re-asking exactly this (path, access).
+            inner.dismissed.insert((req.path.clone(), req.access));
+            return GrantResolveOutcome::Denied {
+                path: req.path,
+                time_to_decision_ms,
+                reason: req.reason,
+            };
+        };
+
+        // A grant settles what it covers, no more (R-PERM.4): read-write
+        // covers a read, a read does not cover a write, and a `once`
+        // grant covers its one command, so a later need is asked again.
+        Self::record_grant_dismissal(&mut inner, &req.path, access, decision.tier());
+        GrantResolveOutcome::Persist {
+            path: req.path,
+            access,
+            tool: req.tool,
+            tier: decision.tier(),
+            time_to_decision_ms,
+            reason: req.reason,
         }
     }
 
@@ -832,6 +854,26 @@ fn auto_execution_warning(path: &Path, home: Option<&Path>) -> Option<String> {
     None
 }
 
+fn resolve_worktree_main_repo(dir: &Path, git_file: &Path) -> Option<PathBuf> {
+    if !git_file.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(git_file).ok()?;
+    let line = content
+        .lines()
+        .find(|l| l.trim_start().starts_with("gitdir:"))?;
+    let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
+    let gitdir_path = Path::new(raw_gitdir);
+    let resolved = if gitdir_path.is_relative() {
+        dir.join(gitdir_path)
+    } else {
+        gitdir_path.to_path_buf()
+    };
+    let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
+    let main = canon_gitdir.parent()?.parent()?.parent()?;
+    Some(dunce::canonicalize(main).unwrap_or_else(|_| main.to_path_buf()))
+}
+
 /// Check if `candidate_parent` is the enclosing git repository root (or main repo of a worktree)
 /// of `scope`. When true, granting `candidate_parent` is not widening above the workspace;
 /// it is granting the workspace root itself.
@@ -840,38 +882,15 @@ pub fn is_enclosing_git_repo(scope: &Path, candidate_parent: &Path) -> bool {
     let canon_parent =
         dunce::canonicalize(candidate_parent).unwrap_or_else(|_| candidate_parent.to_path_buf());
 
-    let mut dir = canon_scope.clone();
+    let mut dir = canon_scope;
     while dir.starts_with(&canon_parent) {
         let git = dir.join(".git");
         if git.exists() {
             if dir == canon_parent {
                 return true;
             }
-            if git.is_file()
-                && let Ok(content) = std::fs::read_to_string(&git)
-                && let Some(line) = content
-                    .lines()
-                    .find(|l| l.trim_start().starts_with("gitdir:"))
-            {
-                let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
-                let gitdir_path = Path::new(raw_gitdir);
-                let resolved = if gitdir_path.is_relative() {
-                    dir.join(gitdir_path)
-                } else {
-                    gitdir_path.to_path_buf()
-                };
-                let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
-                if let Some(main) = canon_gitdir
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|gp| gp.parent())
-                {
-                    let canon_main =
-                        dunce::canonicalize(main).unwrap_or_else(|_| main.to_path_buf());
-                    if canon_main == canon_parent {
-                        return true;
-                    }
-                }
+            if resolve_worktree_main_repo(&dir, &git).as_deref() == Some(canon_parent.as_path()) {
+                return true;
             }
         }
         if !dir.pop() {
@@ -881,34 +900,17 @@ pub fn is_enclosing_git_repo(scope: &Path, candidate_parent: &Path) -> bool {
     false
 }
 
-/// Classify the risk of granting `path` — the hard denylist every write path
-/// into the ledger is gated by (SPEC R5.4.5, R-PERM.2).
-///
-/// `path` is expected to arrive canonicalized (symlinks and `..` resolved as far as it exists).
-/// `home` is canonicalized **here**, on purpose: the caller passes
-/// `ahma_home_dir()`, which is whatever the OS reports and may contain a symlink
-/// component — `/home` → `/mnt/home` on many Linux setups, an automounted
-/// corporate home, or a macOS home relocated to another volume. Comparing a
-/// resolved path against an unresolved `$HOME` makes every equality rule below
-/// silently miss, and these rules are the *hard* denylist: `$HOME` itself,
-/// `~/.ssh`, `~/.aws`, `~/.ahma`. A denylist that quietly stops matching is worse
-/// than no denylist, because everything downstream assumes it held.
-pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> GrantRisk {
-    let home = home.map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
-    let home = home.as_deref();
-
+fn check_grant_refusal(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> Option<String> {
     // 1. A filesystem root has no parent — granting it exposes the whole drive.
     if path.parent().is_none() {
-        return GrantRisk::Refused(
+        return Some(
             "it is a filesystem root — granting it would expose the entire drive".to_string(),
         );
     }
 
     // 2. The exact home directory exposes every dotfile, key, and credential.
-    if let Some(home) = home
-        && path == home
-    {
-        return GrantRisk::Refused(
+    if home == Some(path) {
+        return Some(
             "it is your home directory — granting it would expose every dotfile, key, and \
              credential under $HOME"
                 .to_string(),
@@ -917,18 +919,14 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
 
     // 3. A strict ancestor of a live scope would widen the sandbox above the
     //    workspace. (Equality is merely redundant — handled as a High warning.)
-    for scope in scopes {
-        if scope != path && scope.starts_with(path) {
-            if is_enclosing_git_repo(scope, path) {
-                // Not widening above the workspace; it is the enclosing workspace/repo root itself!
-                continue;
-            }
-            return GrantRisk::Refused(format!(
-                "it is a parent of the active sandbox scope {} — granting it would widen the \
-                 sandbox above your workspace",
-                scope.display()
-            ));
-        }
+    if let Some(scope) = scopes.iter().find(|scope| {
+        *scope != path && scope.starts_with(path) && !is_enclosing_git_repo(scope, path)
+    }) {
+        return Some(format!(
+            "it is a parent of the active sandbox scope {} — granting it would widen the \
+             sandbox above your workspace",
+            scope.display()
+        ));
     }
 
     // 4. Credential directories and ahma's own settings directory — with
@@ -945,7 +943,7 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
         } else {
             String::new()
         };
-        return GrantRisk::Refused(format!(
+        return Some(format!(
             "'{}' is inside {}, which holds credentials/secrets (or ahma's own settings) and \
                  must never be exposed to a sandboxed tool.{hint}",
             path.display(),
@@ -955,14 +953,17 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
 
     // 5. OS system directories.
     if is_system_dir(path) {
-        return GrantRisk::Refused(format!(
+        return Some(format!(
             "'{}' is a system directory — granting it is never required for a build and risks \
              the OS",
             path.display()
         ));
     }
 
-    // ── Not refused: collect elevated-risk warnings. ──
+    None
+}
+
+fn collect_grant_warnings(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> Vec<String> {
     let mut warnings = Vec::new();
 
     if scopes.iter().any(|s| s == path) {
@@ -996,12 +997,7 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
     }
 
     // A hidden directory directly under home that is not a known build cache.
-    if let Some(home) = home
-        && path.parent() == Some(home)
-        && let Some(name) = path.file_name().and_then(|n| n.to_str())
-        && name.starts_with('.')
-        && !is_known_cache_dir(name)
-    {
+    if is_unrecognized_home_dotdir(path, home) {
         warnings.push(format!(
             "'{}' is a hidden directory in your home folder; make sure it does not hold private \
              data",
@@ -1009,6 +1005,40 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
         ));
     }
 
+    warnings
+}
+
+fn is_unrecognized_home_dotdir(path: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else { return false };
+    if path.parent() != Some(home) {
+        return false;
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with('.') && !is_known_cache_dir(name))
+}
+
+/// Classify the risk of granting `path` — the hard denylist every write path
+/// into the ledger is gated by (SPEC R5.4.5, R-PERM.2).
+///
+/// `path` is expected to arrive canonicalized (symlinks and `..` resolved as far as it exists).
+/// `home` is canonicalized **here**, on purpose: the caller passes
+/// `ahma_home_dir()`, which is whatever the OS reports and may contain a symlink
+/// component — `/home` → `/mnt/home` on many Linux setups, an automounted
+/// corporate home, or a macOS home relocated to another volume. Comparing a
+/// resolved path against an unresolved `$HOME` makes every equality rule below
+/// silently miss, and these rules are the *hard* denylist: `$HOME` itself,
+/// `~/.ssh`, `~/.aws`, `~/.ahma`. A denylist that quietly stops matching is worse
+/// than no denylist, because everything downstream assumes it held.
+pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> GrantRisk {
+    let home = home.map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    let home = home.as_deref();
+
+    if let Some(reason) = check_grant_refusal(path, home, scopes) {
+        return GrantRisk::Refused(reason);
+    }
+
+    let warnings = collect_grant_warnings(path, home, scopes);
     if warnings.is_empty() {
         GrantRisk::Normal
     } else {
