@@ -62,17 +62,25 @@ body to you unchanged. Ahma raises at most five such questions per ten minutes p
 session; past that the agent is told to ask you in conversation instead.
 
 **Commands run through Claude Code's Bash tool** (the terminal hook) are refused
-mid-command, where no prompt is possible. ahma remembers the refusal, and before
+mid-command, where no prompt is possible. When the command **failed**, ahma remembers
+the refusal, and before
 the refused command — or any later one running the same program, `xcodebuild` with
 different flags, say — runs again in that workspace, Claude Code shows its own
 permission dialog with ahma's question: which directory, which refused paths it
 covers, and what yes and no mean. The directory is the tool's own folder
-(`/Volumes/T7/caches/swiftpm`, not the deepest folder that was refused), never a
+(`/Volumes/T7/caches/swiftpm`, not the deepest folder that was refused; under
+`~/Library/Caches`, `~/.cache` and the like, the folder directly inside it, such as
+`~/Library/Caches/com.apple.python`, whatever the tool keeps beneath), never a
 folder many tools share (`~/.cache`, `~/Library`, a cache folder, a volume root, the
 system temp directory), your home folder, a folder of projects, or anything holding
 credentials. **Yes** grants it, runs the command, and is **remembered**: the dialog
 names the `ahma sandbox revoke` that undoes it. **No** runs nothing, and ahma does not
 ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).
+When the command **succeeded** despite the refusal — an optional cache, a lock or
+history file it can do without — ahma adds one line to its output naming the grant
+that would allow it, and asks nothing: a question about something that cost nothing
+is one you would answer again and again for no gain. Apple's `python3`, for example,
+is refused its bytecode cache and runs fine without it.
 If `ahma tui` is open, the same question appears there as soon as the refusal is
 recorded, and answering it in the TUI (deny, this session, 24 hours or always) means
 Claude Code never shows the dialog for it.

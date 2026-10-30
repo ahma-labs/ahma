@@ -772,6 +772,42 @@ mod tests {
         );
     }
 
+    /// SPEC R-PERM.10: a refusal the command shrugged off is said in one
+    /// line and never becomes a dialog. Apple's `python3` was refused its
+    /// bytecode cache, ran fine without it, and the next run asked the human
+    /// to approve a folder the command never needed.
+    #[test]
+    fn a_refusal_in_a_command_that_succeeded_is_noted_never_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let cache = tmp.path().join("pycache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = dunce::canonicalize(&cache).unwrap();
+        let who = crate::sandbox::grant_channel::HookRequester {
+            harness: Some("claude".into()),
+            session_id: Some("s1".into()),
+            scopes: vec![ws.clone()],
+            command: Some("python3 apply.py".into()),
+        };
+        let output = format!(
+            "applied\nerror: could not write {}: Operation not permitted",
+            cache.join("apply.pyc").display()
+        );
+        let shown = super::super::succeeded_output(&output, &who);
+        assert!(shown.starts_with(&output), "{shown}");
+        assert!(shown.contains("went on"), "the one-line note: {shown}");
+        let dir = harness_asks::default_dir().unwrap();
+        let now = ahma_common::session_grants::now_secs();
+        assert!(
+            harness_asks::load(&dir, &workspace_for(&ws), now)
+                .refusals
+                .is_empty(),
+            "nothing remembered, so no dialog for a refusal that cost nothing"
+        );
+    }
+
     #[test]
     fn pre_exec_path_outside_sandbox_is_recorded_and_asked_on_rerun() {
         use super::super::{
