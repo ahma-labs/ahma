@@ -89,28 +89,6 @@ enum AuthState {
     Authenticated(StoredToken),
 }
 
-fn build_atlassian_oauth_client(
-    atlassian_client_id: Option<String>,
-    atlassian_client_secret: Option<String>,
-) -> Result<Option<ConfiguredOAuthClient>> {
-    let (Some(client_id), Some(client_secret)) = (atlassian_client_id, atlassian_client_secret)
-    else {
-        return Ok(None);
-    };
-    let client = BasicClient::new(ClientId::new(client_id))
-        .set_client_secret(ClientSecret::new(client_secret))
-        .set_auth_uri(AuthUrl::new(
-            "https://auth.atlassian.com/authorize".to_string(),
-        )?)
-        .set_token_uri(TokenUrl::new(
-            "https://auth.atlassian.com/oauth/token".to_string(),
-        )?)
-        .set_redirect_uri(RedirectUrl::new(format!(
-            "http://localhost:{OAUTH_CALLBACK_PORT}"
-        ))?);
-    Ok(Some(client))
-}
-
 impl HttpMcpTransport {
     /// Creates a new `HttpMcpTransport`.
     ///
@@ -140,8 +118,24 @@ impl HttpMcpTransport {
         atlassian_client_id: Option<String>,
         atlassian_client_secret: Option<String>,
     ) -> Result<Self> {
-        let oauth_client =
-            build_atlassian_oauth_client(atlassian_client_id, atlassian_client_secret)?;
+        let oauth_client = if let (Some(atlassian_client_id), Some(atlassian_client_secret)) =
+            (atlassian_client_id, atlassian_client_secret)
+        {
+            let mut client = BasicClient::new(ClientId::new(atlassian_client_id))
+                .set_client_secret(ClientSecret::new(atlassian_client_secret))
+                .set_auth_uri(AuthUrl::new(
+                    "https://auth.atlassian.com/authorize".to_string(),
+                )?)
+                .set_token_uri(TokenUrl::new(
+                    "https://auth.atlassian.com/oauth/token".to_string(),
+                )?);
+            client = client.set_redirect_uri(RedirectUrl::new(format!(
+                "http://localhost:{OAUTH_CALLBACK_PORT}"
+            ))?);
+            Some(client)
+        } else {
+            None
+        };
         let (sender, receiver) = mpsc::channel(100);
         let initial_state = match load_token()? {
             Some(token) => AuthState::Authenticated(token),
