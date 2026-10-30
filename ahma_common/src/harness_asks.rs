@@ -226,6 +226,12 @@ pub fn refused_for(refusal: &Refusal, command: &str) -> bool {
 /// `/Volumes/T7/caches/swiftpm`: offering the deepest directory meant the next
 /// file elsewhere in the same cache was refused again, and asked again.
 pub fn tool_root(dir: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> PathBuf {
+    if let Some(folder) = home
+        .and_then(|home| folder_under_shared_root(dir, home))
+        .filter(|folder| widening_is_safe(folder, home, scopes))
+    {
+        return folder;
+    }
     let mut root = dir.to_path_buf();
     while let Some(parent) = root.parent() {
         if !widening_is_safe(parent, home, scopes) {
@@ -234,6 +240,21 @@ pub fn tool_root(dir: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> PathBuf
         root = parent.to_path_buf();
     }
     root
+}
+
+/// The direct child of the deepest folder in [`SHARED_ROOTS`] that holds
+/// `dir`: by convention one tool's own folder (`~/Library/Caches/<bundle id>`,
+/// `~/.cache/<tool>`). What lies beneath it is the tool's business — Apple's
+/// `python3` mirrors a script's whole path there — so its names say nothing
+/// about who else shares it. `None` outside those folders, or for one itself.
+fn folder_under_shared_root(dir: &Path, home: &Path) -> Option<PathBuf> {
+    let shared = SHARED_ROOTS
+        .iter()
+        .map(|parts| parts.iter().fold(home.to_path_buf(), |p, c| p.join(c)))
+        .filter(|root| dir.starts_with(root))
+        .max_by_key(|root| root.components().count())?;
+    let child = dir.strip_prefix(&shared).ok()?.components().next()?;
+    Some(shared.join(child))
 }
 
 /// Folder names that hold many tools' data by convention, wherever they are.
@@ -1565,5 +1586,29 @@ mod tests {
         );
         assert!(is_volume_root(Path::new("/Volumes/T7")));
         assert!(!is_volume_root(Path::new("/Volumes/T7/caches")));
+    }
+
+    /// SPEC R-PERM.10.1: under a per-user shared folder the tool's folder is
+    /// the shared folder's direct child, whatever lies beneath it. Apple's
+    /// `python3` mirrors a script's whole path into its bytecode cache, so a
+    /// script in `/private/tmp` put a `tmp` inside the tool's folder and the
+    /// question named `…/com.apple.python/private/tmp/claude-501`.
+    #[test]
+    fn a_mirrored_path_inside_a_tool_cache_offers_the_tool_folder() {
+        let home = Path::new("/Users/me");
+        let root = |p: &str| tool_root(Path::new(p), Some(home), &[]);
+        assert_eq!(
+            root("/Users/me/Library/Caches/com.apple.python/private/tmp/claude-501/x/__pycache__"),
+            Path::new("/Users/me/Library/Caches/com.apple.python")
+        );
+        assert_eq!(
+            root("/Users/me/.cache/tool/tmp/cache/a"),
+            Path::new("/Users/me/.cache/tool")
+        );
+        assert_eq!(
+            root("/Users/me/Library/Caches"),
+            Path::new("/Users/me/Library/Caches"),
+            "a shared folder itself is left to the climb, which never widens it"
+        );
     }
 }

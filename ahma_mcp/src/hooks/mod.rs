@@ -1981,22 +1981,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             // error 232, EPIPE on Unix) would kill the hook with a stack trace
             // instead of a log line. This is the same reasoning the file already
             // applies to `write_exec_output` a few hundred lines up.
-            crate::utils::stdio::emit_stdout_text(&format!("{output}\n"))?;
-            // A refusal the command shrugged off is said once, in one line,
-            // and remembered so a re-run of this command can ask (R-PERM.10).
-            if let Some((path, access)) =
-                crate::sandbox::grant_channel::hook_side_refusal(&output, &requester)
-            {
-                harness_ask::record_refusal(
-                    Path::new(&payload.cwd),
-                    &path,
-                    access,
-                    &payload.command,
-                );
-                let note =
-                    crate::sandbox::grant_channel::refusal_note(&path, access, &requester.scopes);
-                crate::utils::stdio::emit_stdout_text(&format!("{note}\n"))?;
-            }
+            crate::utils::stdio::emit_stdout_text(&succeeded_output(&output, &requester))?;
             Ok(())
         }
         // The sandbox initialized successfully (the `initialize_sandbox` arms
@@ -2089,6 +2074,22 @@ fn time_limit_message(
         msg.push_str(&stopped.output);
     }
     msg
+}
+
+/// What a hooked command that succeeded shows: its output, then one line for
+/// a refusal it shrugged off. That refusal is not remembered for the harness
+/// dialog (SPEC R-PERM.10): it cost the command nothing, and a question about
+/// it (an optional cache, a lock or history file) is one the human answers
+/// again and again for no gain. A refusal in a command that failed is asked
+/// about ([`report_shell_execution_error`]).
+fn succeeded_output(
+    output: &str,
+    requester: &crate::sandbox::grant_channel::HookRequester,
+) -> String {
+    match crate::sandbox::grant_channel::hook_side_refusal_note(output, requester) {
+        Some(note) => format!("{output}\n{note}\n"),
+        None => format!("{output}\n"),
+    }
 }
 
 fn report_shell_execution_error(
