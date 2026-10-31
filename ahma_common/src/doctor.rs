@@ -295,6 +295,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
     );
     check_grant_tools_auto_allowed(input.home_dir.as_deref(), &input.workspace, &mut findings);
     check_hook_coverage(input.home_dir.as_deref(), &mut findings);
+    check_subfolder_hooks(input.home_dir.as_deref(), &input.workspace, &mut findings);
     check_old_sccache_dir(&input.workspace, &mut findings);
     if let Some(probe) = &input.git_auth {
         let default_settings;
@@ -484,6 +485,75 @@ fn check_hook_coverage(home: Option<&Path>, out: &mut Vec<Finding>) {
             fix: None,
         });
     }
+}
+
+/// The shared project settings file. Claude Code reads it only from the folder
+/// a session starts in. The personal `settings.local.json` is the exception:
+/// from a git subfolder it is read at the repository root (Claude Code 2.1.211
+/// and later), so a hook there is loaded wherever the session starts.
+const SHARED_SETTINGS: &str = "settings.json";
+const LOCAL_SETTINGS: &str = "settings.local.json";
+
+/// The nearest ancestor of `start` (or `start` itself) holding a `.git` entry:
+/// a directory for a checkout, a file for a worktree or submodule.
+fn git_root_of(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// `folder`'s Claude Code settings file `name`, if it carries ahma's shell hook.
+fn ahma_hook_file(folder: &Path, name: &str) -> Option<PathBuf> {
+    let path = folder.join(".claude").join(name);
+    matches!(hook_file_coverage(&path), Some((true, _))).then_some(path)
+}
+
+/// SPEC R-DOCTOR.10: Claude Code reads a project's hooks from the folder the
+/// session was started in, not from the git root above it. A session started
+/// in `repo/rust/` therefore never ran the hook declared in
+/// `repo/.claude/settings.json`: commands ran outside ahma's sandbox and
+/// nothing said so. Warn when the git root carries ahma's shell hook, this
+/// folder is below it and carries none, and the user's own settings do not
+/// either.
+fn check_subfolder_hooks(home: Option<&Path>, workspace: &Path, out: &mut Vec<Finding>) {
+    let Some(root) = git_root_of(workspace) else {
+        return;
+    };
+    if root == workspace {
+        return;
+    }
+    let Some(root_file) = ahma_hook_file(&root, SHARED_SETTINGS) else {
+        return;
+    };
+    let loaded_here = ahma_hook_file(workspace, SHARED_SETTINGS).is_some()
+        || ahma_hook_file(workspace, LOCAL_SETTINGS).is_some()
+        || ahma_hook_file(&root, LOCAL_SETTINGS).is_some();
+    if loaded_here {
+        return;
+    }
+    let user_file = home.map(|h| h.join(".claude").join("settings.json"));
+    if user_file
+        .as_deref()
+        .is_some_and(|p| matches!(hook_file_coverage(p), Some((true, _))))
+    {
+        return;
+    }
+    out.push(Finding {
+        level: Level::Warn,
+        title: "Claude Code hooks are not loaded from this folder".into(),
+        detail: format!(
+            "{} declares ahma's shell hook, but Claude Code reads project hooks only from the \
+             folder a session is started in, and this folder ({}) has none. A session started \
+             here runs its shell commands without ahma's sandbox. Start the session in {}, \
+             or run `ahma hooks install` for a user-level hook that applies everywhere \
+             (SPEC R-DOCTOR.10).",
+            root_file.display(),
+            workspace.display(),
+            root.display()
+        ),
+        fix: None,
+    });
 }
 
 fn check_settings(input: &DoctorInput, out: &mut Vec<Finding>) -> Option<AhmaSettings> {
@@ -1623,6 +1693,139 @@ mod hook_and_grant_tool_tests {
             !findings
                 .iter()
                 .any(|f| f.title.contains("Native file edits are not confined"))
+        );
+    }
+
+    const AHMA_HOOK: &str = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"ahma hooks exec --platform claude"}]}]}}"#;
+
+    /// A git checkout `root` with a `sub` folder, returning `(root, sub)`.
+    fn checkout_with_subfolder(dir: &Path) -> (PathBuf, PathBuf) {
+        let root = dir.to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("rust");
+        std::fs::create_dir_all(&sub).unwrap();
+        (root, sub)
+    }
+
+    fn write_project_settings(folder: &Path, name: &str, body: &str) {
+        let claude = folder.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join(name), body).unwrap();
+    }
+
+    /// R-DOCTOR.10: Claude Code reads a project's hooks from the folder the
+    /// session started in, so a session started in `repo/rust/` never ran the
+    /// hook at `repo/.claude/settings.json` and nothing said so.
+    #[test]
+    fn doctor_warns_when_a_session_in_a_subfolder_misses_the_git_roots_hooks() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (root, sub) = checkout_with_subfolder(repo.path());
+        write_project_settings(&root, "settings.json", AHMA_HOOK);
+
+        let findings = run(&input(home.path(), &sub));
+        let f = findings
+            .iter()
+            .find(|f| f.title.contains("hooks are not loaded from this folder"))
+            .expect("a subfolder session that misses the root's hooks is reported");
+        assert_eq!(f.level, Level::Warn);
+        assert!(f.detail.contains("settings.json"), "{}", f.detail);
+        assert!(
+            f.detail.contains(&root.display().to_string()),
+            "names the folder to start the session in: {}",
+            f.detail
+        );
+        assert!(f.detail.contains("ahma hooks install"), "{}", f.detail);
+    }
+
+    /// Claude Code reads `settings.local.json` at the git root from a
+    /// subfolder (2.1.211+), so a hook there needs no warning, even beside a
+    /// shared root file it duplicates.
+    #[test]
+    fn the_local_settings_file_at_the_git_root_is_loaded_from_a_subfolder() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (root, sub) = checkout_with_subfolder(repo.path());
+        write_project_settings(&root, "settings.json", AHMA_HOOK);
+        write_project_settings(&root, "settings.local.json", AHMA_HOOK);
+        let findings = run(&input(home.path(), &sub));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("hooks are not loaded from this folder"))
+        );
+    }
+
+    #[test]
+    fn no_subfolder_warning_when_the_session_is_at_the_git_root() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (root, _sub) = checkout_with_subfolder(repo.path());
+        write_project_settings(&root, "settings.json", AHMA_HOOK);
+        let findings = run(&input(home.path(), &root));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("hooks are not loaded from this folder"))
+        );
+    }
+
+    #[test]
+    fn no_subfolder_warning_when_the_subfolder_has_its_own_ahma_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (root, sub) = checkout_with_subfolder(repo.path());
+        write_project_settings(&root, "settings.json", AHMA_HOOK);
+        write_project_settings(&sub, "settings.json", AHMA_HOOK);
+        let findings = run(&input(home.path(), &sub));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("hooks are not loaded from this folder"))
+        );
+    }
+
+    #[test]
+    fn no_subfolder_warning_when_the_users_own_settings_carry_the_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (root, sub) = checkout_with_subfolder(repo.path());
+        write_project_settings(&root, "settings.json", AHMA_HOOK);
+        write_project_settings(home.path(), "settings.json", AHMA_HOOK);
+        let findings = run(&input(home.path(), &sub));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("hooks are not loaded from this folder"))
+        );
+    }
+
+    #[test]
+    fn no_subfolder_warning_when_the_git_root_has_no_ahma_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (root, sub) = checkout_with_subfolder(repo.path());
+        write_project_settings(&root, "settings.json", r#"{"permissions":{"allow":[]}}"#);
+        let findings = run(&input(home.path(), &sub));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("hooks are not loaded from this folder"))
+        );
+    }
+
+    #[test]
+    fn no_subfolder_warning_outside_a_git_checkout() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("rust");
+        std::fs::create_dir_all(&sub).unwrap();
+        write_project_settings(dir.path(), "settings.json", AHMA_HOOK);
+        let findings = run(&input(home.path(), &sub));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("hooks are not loaded from this folder"))
         );
     }
 }
