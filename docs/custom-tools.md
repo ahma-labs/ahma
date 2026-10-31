@@ -13,10 +13,10 @@ If your main goal is to use ahma with existing tools such as cargo, git, Python,
 ## Two rules to know before you start
 
 - **A workspace's `.ahma/` directory is not agent-writable.** It defines the commands ahma will itself run, so an agent that could write it could define a tool and then call it. Writes there are denied (SPEC R-HANDOFF.7); you author these files yourself.
-- **Twenty names are reserved.** They are the tools ahma answers itself
-  (`run_terminal_command`, `await`, `status`, `cancel`, `restart`,
-  `sandbox_grant`, the four `logs_*`, the six file tools, `fetch_webpage`,
-  `agent`, `todo_write`, `log_monitor`). A config that takes one is refused at
+- **The names ahma answers itself are reserved.** (`run_terminal_command`, `await`,
+  `status`, `cancel`, `restart`, `sandbox_grant`, `network_grant`, the four
+  `logs_*`, the file tools, `fetch_webpage`, `agent`, `todo_write`,
+  `log_monitor`, `ahma_help`). A config that takes one is refused at
   load with a message naming the conflict — see
   [.ahma/README.md](../.ahma/README.md) for the full table.
 - **Say whether a tool writes.** A tool (or subcommand) that only reads can declare `"concurrency": "read_only"` and then runs at once even while a build holds the workspace — under a sandbox that cannot write the workspace, so a wrong declaration fails rather than writes. `"service"` marks a long-lived process that must not hold the workspace write queue for its whole life; the default is `"exclusive"`. A declaration on the tool applies to every subcommand that does not declare its own. See [workspace-queue.md](workspace-queue.md).

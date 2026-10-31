@@ -286,6 +286,14 @@ animation, and a task inside expands into its live output.
 
 See [docs/tui.md](docs/tui.md) and [docs/doctor.md](docs/doctor.md).
 
+### `ahma_help` — guidance for the AI, from ahma
+
+An agent that hits `Operation not permitted` can ask `ahma_help` what to do instead of
+retrying, copying caches into the project, or interrupting you. It says whether temp
+space is available and where, to look for the tool's own cache/temp option first, and
+to ask you for `ahma sandbox grant <dir>` only when nothing else works. See
+[docs/ahma-help.md](docs/ahma-help.md).
+
 ### One hub per user
 
 Whatever starts ahma — an editor, `ahma tui`, or a shell hook — there is one

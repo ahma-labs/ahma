@@ -243,6 +243,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Code complexity analysis (`simplify`) | [docs/simplify.md](docs/simplify.md) | `ahma_simplify/SPEC.md` |
 | Built-in file tools | [docs/file-tools.md](docs/file-tools.md) | R26 |
 | Doctor (`ahma doctor`, `/doctor`) | [docs/doctor.md](docs/doctor.md) | R-DOCTOR |
+| `ahma_help` (agent guidance inside the sandbox) | [docs/ahma-help.md](docs/ahma-help.md) | R-HELP |
 | Settings file, sync/async execution mode | [docs/settings.md](docs/settings.md) | R-CFG, R2.1, R2.4 |
 | Workspace write queue (safe async) | [docs/workspace-queue.md](docs/workspace-queue.md) | R2.7 |
 | Permissions and grants | [docs/permissions.md](docs/permissions.md) | R-PERM |

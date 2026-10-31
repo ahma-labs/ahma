@@ -64,11 +64,11 @@ product rules this crate implements; the list below is what this crate must guar
 **Built-in tools** (the full set is `BuiltinTool::ALL`)
 - Always present: `status`, `await`, `cancel`, `run_terminal_command`, `restart`,
   `sandbox_grant`, `logs_list`/`logs_read`/`logs_search`/`logs_approve`, `log_monitor`,
-  `fetch_webpage`, `agent`.
+  `fetch_webpage`, `agent`, `ahma_help` (R-HELP).
 - Harness file tools (R26) are withheld from clients that ship native equivalents
   (`client_type::has_native_file_tools`).
-- `status`, `await`, `cancel`, `sandbox_grant`, `restart` and `todo_write` may run before
-  the sandbox scope settles; every other tool waits for it (R5.1.2).
+- `status`, `await`, `cancel`, `sandbox_grant`, `restart`, `todo_write` and `ahma_help` may
+  run before the sandbox scope settles; every other tool waits for it (R5.1.2).
 - `agent` is not offered inside ahma's own agent loop, so a run cannot recurse into itself.
 - Tool-call self-correction (`ahma_harness_guard`: tool-name and argument healing,
   failure-loop detection) is always on.
