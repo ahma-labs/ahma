@@ -110,7 +110,9 @@ pub fn runtime_denial_remediation(path: &Path, access: ScopeAccess) -> String {
          to \"{target}\" and why (ask for the narrowest directory, and `ro` unless a write was \
          denied). They approve it in the ahma TUI or run `ahma sandbox grant {target}`. The \
          `sandbox_grant` tool with `confirm: true` only raises that prompt — it cannot grant. \
-         A human-approved grant applies to this session immediately; then re-run the command.",
+         A human-approved grant applies to this session immediately; then re-run the command. \
+         Before asking, try the tool's own cache/temp/output option, or the temp directory: \
+         `ahma_help topic=blocked` has the steps.",
         verb = verb,
         denied = path.display(),
         target = target.display(),
@@ -1045,6 +1047,14 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    /// A denial names the tool that holds the full ladder, so the first thing an
+    /// agent tries is the tool's own switch rather than a question to a human.
+    #[test]
+    fn a_runtime_denial_points_at_the_blocked_topic() {
+        let text = runtime_denial_remediation(Path::new("/opt/cache/x"), ScopeAccess::Rw);
+        assert!(text.contains("ahma_help topic=blocked"), "{text}");
     }
 
     #[tokio::test]

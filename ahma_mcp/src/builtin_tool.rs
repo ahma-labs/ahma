@@ -69,6 +69,7 @@ builtin_tools! {
     Agent => "agent",
     TodoWrite => "todo_write",
     LogMonitor => "log_monitor",
+    AhmaHelp => "ahma_help",
 }
 
 impl BuiltinTool {
@@ -100,7 +101,8 @@ impl BuiltinTool {
             | BuiltinTool::SandboxGrant
             | BuiltinTool::NetworkGrant
             | BuiltinTool::Restart
-            | BuiltinTool::TodoWrite => true,
+            | BuiltinTool::TodoWrite
+            | BuiltinTool::AhmaHelp => true,
             BuiltinTool::RunTerminalCommand
             | BuiltinTool::LogsList
             | BuiltinTool::LogsApprove
@@ -158,7 +160,8 @@ impl BuiltinTool {
             | BuiltinTool::NetworkGrant
             | BuiltinTool::FetchWebpage
             | BuiltinTool::Agent
-            | BuiltinTool::LogMonitor => false,
+            | BuiltinTool::LogMonitor
+            | BuiltinTool::AhmaHelp => false,
         }
     }
 
@@ -174,7 +177,8 @@ impl BuiltinTool {
             | BuiltinTool::LogsApprove
             | BuiltinTool::LogsRead
             | BuiltinTool::LogsSearch
-            | BuiltinTool::Restart => true,
+            | BuiltinTool::Restart
+            | BuiltinTool::AhmaHelp => true,
             BuiltinTool::RunTerminalCommand
             | BuiltinTool::SandboxGrant
             | BuiltinTool::NetworkGrant
@@ -240,7 +244,8 @@ impl BuiltinTool {
             | BuiltinTool::FetchWebpage
             | BuiltinTool::Agent
             | BuiltinTool::TodoWrite
-            | BuiltinTool::LogMonitor => false,
+            | BuiltinTool::LogMonitor
+            | BuiltinTool::AhmaHelp => false,
         }
     }
 }
@@ -295,9 +300,10 @@ impl BuiltinTool {
             | BuiltinTool::LogsRead
             | BuiltinTool::LogsSearch
             | BuiltinTool::LogMonitor => Some("logs"),
-            BuiltinTool::SandboxGrant | BuiltinTool::NetworkGrant | BuiltinTool::Restart => {
-                Some("sandbox")
-            }
+            BuiltinTool::SandboxGrant
+            | BuiltinTool::NetworkGrant
+            | BuiltinTool::Restart
+            | BuiltinTool::AhmaHelp => Some("sandbox"),
             BuiltinTool::Agent => Some("agent"),
         }
     }

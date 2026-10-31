@@ -108,15 +108,15 @@ await(id="op_abc123", timeout_seconds=60)
 Blocks until completion or timeout (default 1800s / `tools.await_timeout_secs`). The timeout is
 **soft** — it ends your wait, not the operation; call `await` again with the same `id`, or
 `cancel` to stop it. A wait can also end early if the liveness probe of your connection goes
-unanswered — treat that the same as a timeout and `await` again.
+unanswered — treat that the same as a timeout and `await` again. `cancel(id="op_abc123")` terminates the process and frees its resources.
 
-### `cancel` — Cancel a running operation
+### `ahma_help` — What to do when a command is blocked
 
 ```
-cancel(id="op_abc123")
+ahma_help(topic="blocked")   # also: start, temp, slow, readonly, roots; no topic = index
 ```
 
-Terminates the process and frees resources.
+Guidance generated for this session; read it before asking the human for anything. It says whether temp space is available and where (commands can usually write the system temp dir), to find the tool's own cache/temp/output option first (`<tool> --help`; `--cache-dir`, `CARGO_TARGET_DIR`, `XDG_CACHE_HOME`) and point it at temp or a gitignored workspace folder, never to copy caches into the workspace, and only then to ask for `ahma sandbox grant <dir>`. Works before the scope settles.
 
 ### `sandbox_grant` — Request persistent filesystem scope
 

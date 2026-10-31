@@ -558,6 +558,10 @@ impl AhmaMcpService {
                 "Record or update your task plan as a checklist. Pass the FULL list of steps each time — it replaces the current plan. Use this at the start of any multi-step task, then call it again to mark a step in_progress before you work on it and completed when it's done. Keeps you (and the user) oriented across turns.",
                 handlers::todo_tool::todo_write_schema(),
             ),
+            BuiltinTool::AhmaHelp => (
+                "Short, practical guidance for working inside ahma's sandbox, generated for THIS session: whether temp space is available and where, what to try when a command fails with 'Operation not permitted' (the tool's own flags and environment variables first, a human grant last), long-running commands, and the 'no sandbox scope' errors. Call it with no arguments for the index, or topic=temp|blocked|start|slow|readonly|roots. Works before the sandbox scope has settled.",
+                handlers::help_tool::ahma_help_schema(),
+            ),
             BuiltinTool::LogMonitor => (
                 "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
                 schema::object_input_schema(
@@ -1994,6 +1998,10 @@ impl AhmaMcpService {
                 self.handle_log_monitor(run_params.arguments.unwrap_or_default(), context)
                     .await
             }
+            BuiltinTool::AhmaHelp => {
+                self.handle_ahma_help(run_params.arguments.unwrap_or_default())
+                    .await
+            }
         }
     }
     /// Heals the tool name and arguments via the harness guard, and checks for
@@ -2106,7 +2114,7 @@ impl AhmaMcpService {
              \"~/github\"` in ~/.ahma/settings.toml, naming the directory that holds your \
              projects; or start ahma with `--sandbox-scope <project-dir>`. ahma does not pick \
              a directory for you — running in one nobody chose is what this refusal exists to \
-             prevent."
+             prevent. (`ahma_help topic=roots` explains this.)"
                 .to_string()
         };
         tracing::warn!("{}", error_message);

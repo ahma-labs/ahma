@@ -46,6 +46,7 @@ const EXEMPT: &[&str] = &[
     "network_grant",
     "restart",
     "todo_write",
+    "ahma_help",
 ];
 
 /// Tools that must be gated no matter what else changes. The wire-driven loop
