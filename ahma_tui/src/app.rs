@@ -115,6 +115,9 @@ pub async fn run(
     // intro so neither is skipped; the command is the one the user could type.
     if let Some(command) = initial_command {
         dispatch_nav_command(&command, &mut state);
+        // `ahma setup` is a task, not a session: when its view is done, so is
+        // the program. (`/setup` typed inside a running TUI just closes it.)
+        state.setup_exit_on_close = state.setup_view.open;
     }
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
@@ -3705,9 +3708,9 @@ fn handle_setup_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     let fixes = setup_doctor_fixes(state);
     let workspace = std::path::PathBuf::from(&state.workspace);
     state.setup_view.open_for(&workspace, fixes);
+    // The change is the proposal on screen; a refusal is on the result screen
+    // with its reason.
     state.setup_view.add_proposals(vec![proposal], Vec::new());
-    state.setup_view.go(crate::setup_view::Section::Plan);
-    state.setup_view.status = Some("added to the plan; y applies it, n drops it".into());
     true
 }
 
@@ -3793,8 +3796,8 @@ fn absorb_setup_answer(state: &mut crate::state::AppState) {
     set_footer_hint(
         state,
         format!(
-            "{count} change(s) suggested by the model are in /setup → Proposed changes. \
-             Nothing is applied until you press y on each."
+            "{count} change(s) suggested by the model are waiting: type /setup to answer \
+             them. Nothing is applied until every one has your y or n."
         ),
     );
 }
@@ -3812,13 +3815,23 @@ fn handle_setup_key(key: crossterm::event::KeyEvent, state: &mut crate::state::A
         interrupt(state);
         return true;
     }
-    if let Action::Prefill(text) = state.setup_view.handle_key(key) {
-        // Leave the view and let the user finish the sentence in the chat input.
-        state.chat_open = true;
-        state.focus = crate::state::Focus::Chat;
-        if state.chat_input_is_empty() {
-            state.chat_input.insert_str(&text);
+    match state.setup_view.handle_key(key) {
+        Action::Prefill(text) => {
+            // Leave the view and let the user finish the sentence in the chat
+            // input: they have chosen to stay.
+            state.setup_exit_on_close = false;
+            state.chat_open = true;
+            state.focus = crate::state::Focus::Chat;
+            if state.chat_input_is_empty() {
+                state.chat_input.insert_str(&text);
+            }
         }
+        Action::Close => {
+            if std::mem::take(&mut state.setup_exit_on_close) {
+                state.should_quit = true;
+            }
+        }
+        Action::None => {}
     }
     true
 }
@@ -8786,11 +8799,22 @@ mod tests {
         assert!(!f.state.setup_view.open);
     }
 
+    /// The title of the proposal on screen.
+    fn setup_card_title(state: &crate::state::AppState) -> String {
+        state
+            .setup_view
+            .card()
+            .expect("a proposal is on screen")
+            .title
+    }
+
     #[test]
-    fn each_proposed_change_is_applied_only_by_its_own_y() {
+    fn each_proposed_change_is_one_key_and_nothing_is_applied_before_the_last() {
+        use crate::setup_view::Mode;
         use crossterm::event::KeyCode;
         let (mut f, _g) = setup_fixture();
         super::dispatch_nav_command("/setup", &mut f.state);
+        assert_eq!(f.state.setup_view.mode(), Mode::Review);
         let titles: Vec<String> = f
             .state
             .setup_view
@@ -8804,60 +8828,70 @@ mod tests {
                 && titles.iter().any(|t| t.contains("scripts/check.sh")),
             "{titles:?}"
         );
-        assert_eq!(
-            f.state.setup_view.section(),
-            crate::setup_view::Section::Plan
-        );
 
-        // Opening, moving, and keys that are not `y` change nothing.
+        // Keys that are not an answer change nothing.
         for code in [
-            KeyCode::Down,
-            KeyCode::Up,
             KeyCode::Enter,
             KeyCode::Char(' '),
-            KeyCode::Char('n'),
+            KeyCode::Down,
+            KeyCode::Up,
         ] {
             setup_press(&mut f.state, code);
         }
-        // `n` dismissed the first item; nothing was applied.
         assert!(!gpu_on() && readers().is_empty());
-        assert_eq!(f.state.setup_view.plan().items.len(), titles.len() - 1);
+        assert_eq!(f.state.setup_view.mode(), Mode::Review);
 
-        // `y` applies the selected item and only it.
-        let selected = f.state.setup_view.plan().items[f.state.setup_view.selected()]
-            .proposal
-            .title
-            .clone();
-        setup_press(&mut f.state, KeyCode::Char('y'));
-        let applied = (gpu_on(), readers());
-        assert!(
-            (selected.contains("GPU") && applied == (true, vec![]))
-                || (selected.contains("scripts/check.sh")
-                    && applied == (false, vec!["scripts/check.sh".to_string()])),
-            "{selected}: {applied:?}"
-        );
+        // Yes to the GPU, no to the script; only the last answer applies.
+        let mut answered = 0;
+        while f.state.setup_view.mode() == Mode::Review {
+            assert!(!gpu_on(), "nothing is written before the last answer");
+            let key = if setup_card_title(&f.state).contains("GPU") {
+                'y'
+            } else {
+                'n'
+            };
+            setup_press(&mut f.state, KeyCode::Char(key));
+            answered += 1;
+        }
+        assert_eq!(answered, titles.len());
+        assert_eq!(f.state.setup_view.mode(), Mode::Done);
+        assert!(gpu_on() && readers().is_empty());
         assert!(
             f.state
                 .setup_view
-                .status
-                .as_deref()
-                .unwrap()
-                .starts_with("done:")
-        );
-        // It is gone from the plan, and a second `y` does not apply the other one.
-        assert!(
-            !f.state
-                .setup_view
-                .plan()
-                .items
+                .done_rows()
                 .iter()
-                .any(|v| v.proposal.title == selected),
-            "an applied item leaves the plan"
+                .any(|r| r.text.starts_with('✓')),
+            "the result screen lists what was applied"
         );
     }
 
     #[test]
+    fn closing_the_view_ends_ahma_setup_but_not_a_typed_setup() {
+        use crossterm::event::KeyCode;
+        let (mut f, _g) = setup_fixture();
+        // Typed inside a running TUI: Esc just closes the view.
+        super::dispatch_nav_command("/setup", &mut f.state);
+        setup_press(&mut f.state, KeyCode::Esc);
+        assert!(!f.state.should_quit);
+
+        // `ahma setup` opened it: leaving the view leaves the program.
+        super::dispatch_nav_command("/setup", &mut f.state);
+        f.state.setup_exit_on_close = true;
+        setup_press(&mut f.state, KeyCode::Esc);
+        assert!(f.state.should_quit);
+
+        // But `t` means "let me type": the user chose to stay.
+        f.state.should_quit = false;
+        super::dispatch_nav_command("/setup", &mut f.state);
+        f.state.setup_exit_on_close = true;
+        setup_press(&mut f.state, KeyCode::Char('t'));
+        assert!(!f.state.should_quit && !f.state.setup_exit_on_close);
+    }
+
+    #[test]
     fn a_high_risk_grant_needs_a_second_y_on_the_same_item() {
+        use crate::setup_view::Mode;
         use crossterm::event::KeyCode;
         let (mut f, _g) = setup_fixture();
         super::dispatch_nav_command("/setup", &mut f.state);
@@ -8875,17 +8909,18 @@ mod tests {
             source: ahma_mcp::setup_plan::Source::User,
         };
         f.state.setup_view.add_proposals(vec![p], Vec::new());
-        let idx = f
-            .state
-            .setup_view
-            .plan()
-            .items
-            .iter()
-            .position(|v| v.proposal.title == "Grant a folder")
-            .expect("in the plan");
-        for _ in 0..idx {
-            setup_press(&mut f.state, KeyCode::Down);
-        }
+        assert_eq!(
+            setup_card_title(&f.state),
+            "Grant a folder",
+            "it is on screen"
+        );
+        let grants = || {
+            ahma_common::config::AhmaSettings::load()
+                .sandbox
+                .persistent_scopes
+                .len()
+        };
+
         setup_press(&mut f.state, KeyCode::Char('y'));
         assert!(
             f.state
@@ -8895,50 +8930,40 @@ mod tests {
                 .unwrap()
                 .contains("press y again")
         );
-        assert!(
-            ahma_common::config::AhmaSettings::load()
-                .sandbox
-                .persistent_scopes
-                .is_empty(),
-            "the first y granted nothing"
-        );
+        assert_eq!(setup_card_title(&f.state), "Grant a folder", "still on it");
         // Moving off the item cancels the confirmation.
         setup_press(&mut f.state, KeyCode::Up);
         setup_press(&mut f.state, KeyCode::Down);
         setup_press(&mut f.state, KeyCode::Char('y'));
-        assert!(
-            ahma_common::config::AhmaSettings::load()
-                .sandbox
-                .persistent_scopes
-                .is_empty()
+        assert_eq!(
+            setup_card_title(&f.state),
+            "Grant a folder",
+            "a first y again"
         );
         setup_press(&mut f.state, KeyCode::Char('y'));
-        assert_eq!(
-            ahma_common::config::AhmaSettings::load()
-                .sandbox
-                .persistent_scopes
-                .len(),
-            1
-        );
+
+        // Answered, but nothing applies until the others are answered too.
+        assert_eq!(grants(), 0);
+        while f.state.setup_view.mode() == Mode::Review {
+            setup_press(&mut f.state, KeyCode::Char('n'));
+        }
+        assert_eq!(grants(), 1);
     }
 
     #[test]
-    fn a_setup_set_request_joins_the_plan_and_is_validated_like_any_other() {
+    fn a_setup_set_request_is_the_change_on_screen_and_is_validated_like_any_other() {
+        use crate::setup_view::Mode;
         use crossterm::event::KeyCode;
         let (mut f, _g) = setup_fixture();
         super::dispatch_nav_command("/setup set tools.timeout_secs 90", &mut f.state);
         assert!(f.state.setup_view.open);
-        let titles = |s: &crate::state::AppState| -> Vec<String> {
-            s.setup_view
-                .plan()
-                .items
-                .iter()
-                .map(|v| v.proposal.title.clone())
-                .collect()
-        };
-        assert!(titles(&f.state).contains(&"Set tools.timeout_secs to 90".to_string()));
+        assert_eq!(
+            setup_card_title(&f.state),
+            "Set tools.timeout_secs to 90",
+            "your own change is the one in front of you"
+        );
 
-        // A security key aimed at the repository file is listed as refused.
+        // A security key aimed at the repository file is refused, with the reason.
         super::dispatch_nav_command("/setup set --project sandbox.allow_gpu true", &mut f.state);
         let refused: Vec<String> = f
             .state
@@ -8954,18 +8979,31 @@ mod tests {
         );
         assert!(!gpu_on());
 
-        // Apply the timeout one.
-        let idx = titles(&f.state)
-            .iter()
-            .position(|t| t == "Set tools.timeout_secs to 90")
-            .unwrap();
-        for _ in 0..idx {
-            setup_press(&mut f.state, KeyCode::Down);
+        // Yes to the timeout, no to the rest.
+        while f.state.setup_view.mode() == Mode::Review {
+            let key = if setup_card_title(&f.state) == "Set tools.timeout_secs to 90" {
+                'y'
+            } else {
+                'n'
+            };
+            setup_press(&mut f.state, KeyCode::Char(key));
         }
-        setup_press(&mut f.state, KeyCode::Char('y'));
         assert_eq!(
             ahma_common::config::AhmaSettings::load().tools.timeout_secs,
             90
+        );
+        assert!(!gpu_on() && readers().is_empty());
+        // The refusal and its reason are on the result screen.
+        let shown: Vec<String> = f
+            .state
+            .setup_view
+            .done_rows()
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+        assert!(
+            shown.iter().any(|t| t.starts_with("not offered")),
+            "{shown:?}"
         );
 
         // A usage line, not a crash, for an incomplete request.
@@ -9080,6 +9118,8 @@ mod tests {
         use crossterm::event::KeyCode;
         let (mut f, _g) = setup_fixture();
         super::dispatch_nav_command("/setup", &mut f.state);
+        // The proposals come first; `d` is the way to the reference.
+        setup_press(&mut f.state, KeyCode::Char('d'));
         setup_press(&mut f.state, KeyCode::Char('2'));
         assert_eq!(
             f.state.setup_view.section(),

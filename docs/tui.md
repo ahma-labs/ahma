@@ -151,9 +151,11 @@ useful ones:
 
 ## Setup
 
-`/setup` shows what ahma is set to and what it allows for this folder, with a plan of proposed
-changes you confirm one at a time, and takes a request in your own words (`/setup allow the
-GPU`). `ahma setup` in a terminal opens straight onto it. See [setup.md](setup.md).
+`/setup` shows the changes ahma proposes for this folder one at a time, each with why it is
+proposed; `y` or `n` answers it and the next appears, and what you said yes to is applied after
+the last answer. Behind `d` it shows what ahma is set to and what it allows, and it takes a
+request in your own words (`/setup allow the GPU`). `ahma setup` in a terminal opens straight
+onto it and exits when you are done. See [setup.md](setup.md).
 
 ## Chatting
 
