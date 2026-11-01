@@ -95,9 +95,34 @@ pub fn gpu_denial_note(stderr: &str, stdout: &str) -> Option<String> {
          (SPEC R6.2.7), so GPU-accelerated work falls back to the CPU or fails with errors like \
          `failed to create command queue`, a failed Metal buffer allocation, or no Metal device. \
          This is a capability, not a path — no `sandbox_grant` can help. Nothing more for you to \
-         do here: tell the human that `[sandbox] allow_gpu = true` in ~/.ahma/settings.toml \
-         enables it (takes effect on the next command for terminal hooks, on the next server \
-         start for an MCP session), or continue on the CPU."
+         do here: tell the human that one command enables it, \
+         `ahma settings set sandbox.allow_gpu true` (it takes effect on the next command for \
+         terminal hooks, on the next server start for an MCP session), or continue on the CPU."
+            .to_string(),
+    )
+}
+
+/// The GPU note for a command that **succeeded**: its output shows Metal
+/// could not open the GPU, so GPU work most likely ran on the CPU or was
+/// skipped, and nothing else says so. Only this note goes on a successful run:
+/// test suites print "Operation not permitted" while passing, and calling them
+/// denied would be a false alarm. `None` when the GPU is already allowed (the
+/// sandbox is then not the cause) or the output shows no Metal failure.
+pub fn gpu_fallback_note(stderr: &str, stdout: &str) -> Option<String> {
+    if allow_gpu_enabled()
+        || !stderr
+            .lines()
+            .chain(stdout.lines())
+            .any(looks_like_gpu_denial)
+    {
+        return None;
+    }
+    Some(
+        "ahma: this command finished, but its output shows Metal could not open the GPU: the \
+         sandbox withholds it by default (SPEC R6.2.7). GPU work most likely ran on the CPU or \
+         was skipped. If it ran slower than expected or skipped GPU work, tell the human that \
+         one command enables it: `ahma settings set sandbox.allow_gpu true` (next command for \
+         terminal hooks; restart an MCP server)."
             .to_string(),
     )
 }
@@ -152,6 +177,43 @@ mod tests {
         assert!(
             allowed.contains("allow_gpu` is already on") && allowed.contains("quote"),
             "{allowed}"
+        );
+        set_allow_gpu(false);
+    }
+
+    /// The one owner command, at the moment of the block (field report,
+    /// neubit4: an agent could only say "edit settings.toml", and the human
+    /// ran the GPU suites by hand).
+    #[test]
+    fn a_gpu_failure_names_the_one_command_that_enables_it() {
+        set_allow_gpu(false);
+        let note =
+            gpu_denial_note("ggml_metal_init: error: failed to create command queue", "").unwrap();
+        assert!(
+            note.contains("ahma settings set sandbox.allow_gpu true"),
+            "{note}"
+        );
+        set_allow_gpu(false);
+    }
+
+    /// A run that exited 0 after falling back to the CPU is the silent case:
+    /// the only trace is the Metal line in its output.
+    #[test]
+    fn a_successful_run_that_fell_back_to_the_cpu_is_told_so() {
+        set_allow_gpu(false);
+        let note = gpu_fallback_note("ggml_metal_init: error: failed to create command queue", "")
+            .expect("a success with a Metal failure in its output");
+        assert!(note.contains("finished"), "{note}");
+        assert!(note.contains("CPU"), "{note}");
+        assert!(
+            note.contains("ahma settings set sandbox.allow_gpu true"),
+            "{note}"
+        );
+        assert!(gpu_fallback_note("all 12 tests passed", "").is_none());
+        set_allow_gpu(true);
+        assert!(
+            gpu_fallback_note("failed to create command queue", "").is_none(),
+            "with the GPU allowed the sandbox is not the cause"
         );
         set_allow_gpu(false);
     }

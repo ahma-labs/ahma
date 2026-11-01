@@ -104,7 +104,7 @@ pub use exec_config::{
     ExecConfigClass, HandoffAllowances, classify as classify_exec_config, deny_write_globs,
     resolve_git_dirs, set_handoff_allowances,
 };
-pub use gpu::{allow_gpu_enabled, gpu_denial_note, set_allow_gpu};
+pub use gpu::{allow_gpu_enabled, gpu_denial_note, gpu_fallback_note, set_allow_gpu};
 pub use grant_channel::{LoggingGrantNotifier, ScopeGrantNotifier};
 pub use host_detect::{HostSandbox, OUTER_SANDBOX_PID_ENV, detect_host_sandbox};
 #[cfg(target_os = "linux")]
