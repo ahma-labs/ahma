@@ -480,16 +480,18 @@ impl SettingsEditor {
     /// from disk, so a grant recorded while the panel was open is kept.
     pub fn save(&mut self) {
         let edited = self.settings.clone();
-        let saved = AhmaSettings::update(|on_disk| {
-            let persistent_scopes = std::mem::take(&mut on_disk.sandbox.persistent_scopes);
-            on_disk.tools = edited.tools.clone();
-            on_disk.sandbox = edited.sandbox.clone();
-            on_disk.sandbox.persistent_scopes = persistent_scopes;
-            on_disk.logging = edited.logging.clone();
-            on_disk.http = edited.http.clone();
-            on_disk.auth = edited.auth.clone();
-            on_disk.instance = edited.instance.clone();
-        });
+        // Audited (SPEC R-CFG10.5): each key the panel changed gets a record.
+        let saved =
+            AhmaSettings::update_audited("tui", &chrono::Local::now().to_rfc3339(), |on_disk| {
+                let persistent_scopes = std::mem::take(&mut on_disk.sandbox.persistent_scopes);
+                on_disk.tools = edited.tools.clone();
+                on_disk.sandbox = edited.sandbox.clone();
+                on_disk.sandbox.persistent_scopes = persistent_scopes;
+                on_disk.logging = edited.logging.clone();
+                on_disk.http = edited.http.clone();
+                on_disk.auth = edited.auth.clone();
+                on_disk.instance = edited.instance.clone();
+            });
         match saved {
             Ok(fresh) => {
                 self.settings = fresh;

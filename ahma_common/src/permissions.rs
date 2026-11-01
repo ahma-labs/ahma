@@ -78,6 +78,10 @@ pub enum GrantKind {
     /// A key the SSH key broker may sign with for one destination in one
     /// workspace (`[[sandbox.ssh_sign]]`, SPEC R-CRED.3).
     SshSign,
+    /// A change to an ordinary setting (`tools.timeout_secs`, `sandbox.allow_gpu`),
+    /// recorded in the audit log only. It grants nothing and is not a ledger
+    /// record, so it is never listed by `ahma permissions list` (SPEC R-CFG10.5).
+    Setting,
 }
 
 impl GrantKind {
@@ -91,11 +95,12 @@ impl GrantKind {
             GrantKind::LogTarget => "log-target",
             GrantKind::HookUnsandboxed => "hook-unsandboxed",
             GrantKind::SshSign => "ssh-sign",
+            GrantKind::Setting => "setting",
         }
     }
 
     /// Every kind, in the order `ahma permissions list` groups them.
-    pub const ALL: [GrantKind; 7] = [
+    pub const ALL: [GrantKind; 8] = [
         GrantKind::FsScope,
         GrantKind::SshSign,
         GrantKind::WebDomain,
@@ -103,6 +108,7 @@ impl GrantKind {
         GrantKind::Tool,
         GrantKind::LogTarget,
         GrantKind::HookUnsandboxed,
+        GrantKind::Setting,
     ];
 
     /// Whether grants of this kind are written to the settings file, and so can
@@ -117,7 +123,7 @@ impl GrantKind {
             | GrantKind::Tool
             | GrantKind::LogTarget
             | GrantKind::SshSign => true,
-            GrantKind::HookUnsandboxed => false,
+            GrantKind::HookUnsandboxed | GrantKind::Setting => false,
         }
     }
 
@@ -1350,6 +1356,49 @@ pub fn audit_entry(
     }
 }
 
+/// The audit entry for one setting changed (SPEC R-CFG10.5): `subject` is the
+/// dotted key, `access` reads `<file>: <before> -> <after>` with a secret key's
+/// values redacted and long values cut, and `surface` is who changed it (`cli`,
+/// `tui`, `setup`). An unset (back to the default) is a `Revoke`, any other
+/// change a `Grant`; the `setting` kind says which it really is.
+pub fn setting_audit_entry(
+    at: &str,
+    surface: &str,
+    file: &str,
+    key: &str,
+    before: &str,
+    after: &str,
+) -> AuditEntry {
+    fn shown(key: &str, value: &str) -> String {
+        const LIMIT: usize = 160;
+        let value = crate::settings_origin::shown_value(key, value);
+        if value.chars().count() > LIMIT {
+            let cut: String = value.chars().take(LIMIT).collect();
+            format!("{cut}…")
+        } else {
+            value.to_string()
+        }
+    }
+    let action = if after == "(unset)" {
+        AuditAction::Revoke
+    } else {
+        AuditAction::Grant
+    };
+    audit_entry(
+        at,
+        action,
+        GrantKind::Setting,
+        key,
+        Some(format!(
+            "{file}: {} -> {}",
+            shown(key, before),
+            shown(key, after)
+        )),
+        GrantTier::Always,
+        Some(surface.to_string()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,6 +1407,58 @@ mod tests {
 
     fn key(p: &str) -> PathBuf {
         PathBuf::from(p)
+    }
+
+    #[test]
+    fn a_setting_change_is_audited_redacted_and_never_listed_as_a_grant() {
+        let e = setting_audit_entry(
+            "2026-11-01T12:00:00+00:00",
+            "cli",
+            "project",
+            "tools.timeout_secs",
+            "1800",
+            "3600",
+        );
+        assert_eq!(e.kind, GrantKind::Setting);
+        assert_eq!(e.action, AuditAction::Grant);
+        assert_eq!(e.subject, "tools.timeout_secs");
+        assert_eq!(e.access.as_deref(), Some("project: 1800 -> 3600"));
+        assert_eq!(e.surface.as_deref(), Some("cli"));
+        assert_eq!(
+            serde_json::to_value(&e).unwrap()["kind"],
+            serde_json::json!("setting")
+        );
+
+        let unset = setting_audit_entry(
+            "t",
+            "tui",
+            "user",
+            "tools.context_length",
+            "8192",
+            "(unset)",
+        );
+        assert_eq!(unset.action, AuditAction::Revoke);
+
+        let secret = setting_audit_entry(
+            "t",
+            "cli",
+            "user",
+            "auth.require_token",
+            "\"hunter2\"",
+            "\"s3cret\"",
+        );
+        let line = serde_json::to_string(&secret).unwrap();
+        assert!(
+            !line.contains("hunter2") && !line.contains("s3cret"),
+            "{line}"
+        );
+
+        let long = "x".repeat(500);
+        let cut = setting_audit_entry("t", "cli", "user", "instance.label", "a", &long);
+        assert!(cut.access.unwrap().chars().count() < 200);
+
+        assert!(!GrantKind::Setting.is_persisted());
+        assert!(!GrantKind::persisted().any(|k| k == GrantKind::Setting));
     }
 
     #[test]

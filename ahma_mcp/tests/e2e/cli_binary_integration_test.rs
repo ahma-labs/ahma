@@ -105,6 +105,99 @@ mod ahma_mcp_tests {
         );
     }
 
+    /// `ahma settings set` respects the trust tiers, refuses grants it would not
+    /// check, and leaves an audit line for each change (SPEC R-CFG2.2, R-CFG10.5).
+    #[test]
+    fn test_ahma_settings_set_is_tiered_and_audited() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let home = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".ahma")).unwrap();
+        let bare = TempDir::new().unwrap();
+
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            test_command(&binary)
+                .env("AHMA_TEST_HOME", home.path())
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("Failed to execute ahma settings")
+        };
+        let err = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).to_string();
+
+        // A preference goes to the repository's file.
+        let ok = run(
+            repo.path(),
+            &[
+                "settings",
+                "set",
+                "--project",
+                "tools.source_readers",
+                "['scripts/t.sh']",
+            ],
+        );
+        assert!(ok.status.success(), "{}", err(&ok));
+        let project = std::fs::read_to_string(repo.path().join(".ahma/settings.toml")).unwrap();
+        assert!(
+            project.contains("source_readers = [\"scripts/t.sh\"]"),
+            "{project}"
+        );
+
+        // A security key is refused there, and the file is unchanged.
+        let refused = run(
+            repo.path(),
+            &["settings", "set", "--project", "sandbox.allow_gpu", "true"],
+        );
+        assert!(!refused.status.success());
+        assert!(
+            err(&refused).contains("security setting"),
+            "{}",
+            err(&refused)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".ahma/settings.toml")).unwrap(),
+            project
+        );
+
+        // A grant is not a setting: `settings set` points at the checked command.
+        let ledger = run(
+            repo.path(),
+            &["settings", "set", "network.allow", "[\"a.com\"]"],
+        );
+        assert!(!ledger.status.success());
+        assert!(
+            err(&ledger).contains("ahma network allow"),
+            "{}",
+            err(&ledger)
+        );
+
+        // No .ahma directory: --project says so instead of guessing a place.
+        let none = run(
+            bare.path(),
+            &["settings", "set", "--project", "tools.timeout_secs", "90"],
+        );
+        assert!(!none.status.success());
+        assert!(err(&none).contains("no .ahma directory"), "{}", err(&none));
+
+        // The user's own file takes the security key, and both changes are audited.
+        let mine = run(
+            repo.path(),
+            &["settings", "set", "sandbox.allow_gpu", "true"],
+        );
+        assert!(mine.status.success(), "{}", err(&mine));
+        let audit = std::fs::read_to_string(home.path().join(".ahma/permissions-audit.jsonl"))
+            .expect("the changes are audited");
+        assert_eq!(audit.lines().count(), 2, "{audit}");
+        assert!(
+            audit.contains("\"kind\":\"setting\"")
+                && audit.contains("\"subject\":\"tools.source_readers\"")
+                && audit.contains("project: ")
+                && audit.contains("\"subject\":\"sandbox.allow_gpu\"")
+                && audit.contains("user: false -> true"),
+            "{audit}"
+        );
+    }
+
     /// `ahma explain` gives a hooked agent the `ahma_help` text in command
     /// form, and what it says about temp is read from this home's settings
     /// (SPEC R-HELP.1, R-HELP.2).

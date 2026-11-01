@@ -1768,8 +1768,11 @@ pub enum SettingsCommand {
         /// The new value.
         value: String,
         /// Edit this file instead of `~/.ahma/settings.toml`.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "project")]
         path: Option<PathBuf>,
+        /// Edit this repository's `.ahma/settings.toml` (committed with the repo). Only preference-tier keys; a security-tier key is refused because the file could not set it.
+        #[arg(long)]
+        project: bool,
     },
     /// Explain one setting, e.g. `ahma settings explain sandbox.allow_gpu`: what it does, its default, who may set it (you, or a repository too), and the command that changes it. With no key, list every setting by table. Reads only; changes nothing.
     Explain {
@@ -1781,8 +1784,11 @@ pub enum SettingsCommand {
         /// `<table>.<key>`, as `ahma settings show` lists them.
         key: String,
         /// Edit this file instead of `~/.ahma/settings.toml`.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "project")]
         path: Option<PathBuf>,
+        /// Edit this repository's `.ahma/settings.toml` instead of `~/.ahma/settings.toml`.
+        #[arg(long)]
+        project: bool,
     },
 }
 
@@ -1811,6 +1817,10 @@ pub struct SettingsOriginCtx {
     /// provenance. Its rejection is reported at `warn` at startup instead
     /// (R-CFG2.2).
     pub project: Option<ProjectOrigin>,
+    /// Where this repository's `.ahma/settings.toml` is (or would be), for
+    /// `ahma settings set --project`. `None` when there is no `.ahma` directory
+    /// and no `--tools-dir`, or under `--no-settings`.
+    pub project_settings_file: Option<PathBuf>,
     /// What a server process logs about its settings at startup: one line per
     /// setting that differs from the compiled-in default (R-CFG5.2) and one per
     /// settings file others can write (R-CFG6.3). Computed by
@@ -1866,6 +1876,12 @@ pub struct ProjectOrigin {
 /// settings key it overrides.
 pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
     let project = project_origin(cli);
+    let project_settings_file = if cli.no_settings {
+        None
+    } else {
+        crate::shell::resolution::normalize_tools_dir(cli.tools_dir.clone())
+            .map(|dir| ahma_common::config::project_settings_path(&dir))
+    };
     let mut cli_overrides: Vec<(&'static str, String)> = Vec::new();
     collect_boolean_flag_overrides(cli, &mut cli_overrides);
     collect_option_overrides(cli, &mut cli_overrides);
@@ -1874,6 +1890,7 @@ pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
         settings_path: cli.settings_path.clone(),
         cli_overrides,
         project,
+        project_settings_file,
         startup_lines: Vec::new(),
     }
 }

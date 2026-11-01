@@ -225,8 +225,15 @@ pub(crate) fn run_settings_command(
     match args.command {
         SettingsCommand::Init { force, path } => run_settings_init(force, path),
         SettingsCommand::Show { origin } => run_settings_show(origin, origin_ctx),
-        SettingsCommand::Set { key, value, path } => run_settings_set(&key, Some(&value), path),
-        SettingsCommand::Unset { key, path } => run_settings_set(&key, None, path),
+        SettingsCommand::Set {
+            key,
+            value,
+            path,
+            project,
+        } => run_settings_set(&key, Some(&value), path, project, origin_ctx),
+        SettingsCommand::Unset { key, path, project } => {
+            run_settings_set(&key, None, path, project, origin_ctx)
+        }
         SettingsCommand::Explain { key } => {
             print!("{}", settings_explain_text(key.as_deref())?);
             Ok(())
@@ -280,11 +287,30 @@ fn settings_explain_text(key: Option<&str>) -> Result<String> {
 }
 
 /// `ahma settings set` / `unset` (SPEC R-CFG10).
-fn run_settings_set(key: &str, value: Option<&str>, path: Option<PathBuf>) -> Result<()> {
-    use ahma_common::config::{AhmaSettings, settings_path};
-    let target = path.or_else(settings_path).ok_or_else(|| {
-        anyhow::anyhow!("cannot find the home directory for ~/.ahma/settings.toml")
-    })?;
+///
+/// `--project` writes this repository's `.ahma/settings.toml`; a security-tier key
+/// is refused there (R-CFG2.2). Every change is recorded in the audit log
+/// (R-CFG10.5).
+fn run_settings_set(
+    key: &str,
+    value: Option<&str>,
+    path: Option<PathBuf>,
+    project: bool,
+    origin_ctx: &SettingsOriginCtx,
+) -> Result<()> {
+    use ahma_common::config::{AhmaSettings, SettingsFile, settings_path};
+    let target = if project {
+        origin_ctx.project_settings_file.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no .ahma directory here: run from the repository root (or create `.ahma/`), \
+                 or pass --tools-dir"
+            )
+        })?
+    } else {
+        path.or_else(settings_path).ok_or_else(|| {
+            anyhow::anyhow!("cannot find the home directory for ~/.ahma/settings.toml")
+        })?
+    };
     let edit = AhmaSettings::set_in_file(&target, key, value)?;
     if edit.before == edit.after {
         println!("{key} is already {} ({})", edit.after, target.display());
@@ -295,6 +321,14 @@ fn run_settings_set(key: &str, value: Option<&str>, path: Option<PathBuf>) -> Re
             edit.after,
             target.display()
         );
+        ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
+            &chrono::Local::now().to_rfc3339(),
+            "cli",
+            SettingsFile::for_path(&target).label(),
+            key,
+            &edit.before,
+            &edit.after,
+        ));
     }
     Ok(())
 }
@@ -1581,6 +1615,10 @@ fn revoke_permission(
         GrantKind::HookUnsandboxed => anyhow::bail!(
             "hook consent is session-scoped and never persisted; revoke it with \
                  `ahma hooks revoke`"
+        ),
+        GrantKind::Setting => anyhow::bail!(
+            "a setting change is an audit record, not a grant; undo one with \
+                 `ahma settings unset <table.key>` (or `ahma settings set` to the old value)"
         ),
     };
     let Some((description, apply)) = preview else {

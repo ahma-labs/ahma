@@ -2445,6 +2445,29 @@ impl AhmaSettings {
         Ok(settings)
     }
 
+    /// [`Self::update`], then one audit record per setting the change altered
+    /// (SPEC R-CFG10.5). `surface` names who changed it (`tui`, `setup`) and `at`
+    /// is the caller's RFC 3339 timestamp, as for every audit entry.
+    ///
+    /// Ledger keys are skipped: each has a dedicated writer that audits it with
+    /// the richer record (path, access, tier, risk), and a second line here
+    /// would only double it.
+    pub fn update_audited(surface: &str, at: &str, change: impl FnOnce(&mut Self)) -> Result<Self> {
+        let mut before = None;
+        let after = Self::update(|s| {
+            before = Some(s.clone());
+            change(s);
+        })?;
+        if let Some(before) = before {
+            for (key, was, now) in setting_changes(&before, &after) {
+                crate::permissions::append_audit(&crate::permissions::setting_audit_entry(
+                    at, surface, "user", &key, &was, &now,
+                ));
+            }
+        }
+        Ok(after)
+    }
+
     /// Save to an explicit path — useful for tests and alternate locations.
     ///
     /// The write is atomic: contents are written to a temporary sibling file
@@ -2556,24 +2579,57 @@ impl AhmaSettings {
         w.into_string()
     }
 
+    /// [`render_documented`](Self::render_documented) for a repository's
+    /// `.ahma/settings.toml`: its own header, and only the preference-tier
+    /// tables and keys, since a security-tier key written there is ignored and
+    /// reported (SPEC R-CFG2.2).
+    pub fn render_documented_project(&self) -> String {
+        let mut w = SettingsDoc::new();
+        w.project = true;
+        self.render_into(&mut w);
+        w.into_string()
+    }
+
     /// The body of [`render_documented`](Self::render_documented), writing into
     /// `w` so [`setting_docs`] can read the entries it recorded.
     fn render_into(&self, w: &mut SettingsDoc) {
         let d = Self::default();
 
-        w.line("# ~/.ahma/settings.toml — Ahma user settings");
-        w.line("#");
-        w.line("# Auto-maintained: ahma regenerates this file on startup to match the running");
-        w.line("# version. Every option is documented with its default; only values you have");
-        w.line("# changed from the default are written as active (uncommented) lines — defaults");
-        w.line("# stay commented out. Uncomment a line and edit it to override; your changes are");
-        w.line("# preserved across upgrades (hand-written comments are not).");
-        w.line("#");
-        w.line(
+        if w.project {
+            w.line("# .ahma/settings.toml — this repository's ahma settings");
+            w.line("#");
+            w.line("# Committed with the repository, and read by everyone who works on it. Only");
+            w.line(
+                "# preferences (timeouts, tool bundles, source_readers, logging) take effect from",
+            );
+            w.line("# here; a security-tier key is ignored and named at startup (SPEC R-CFG2.2).");
+            w.line(
+                "# Set those yourself: `ahma settings explain <key>`, then `ahma settings set`.",
+            );
+            w.line("#");
+            w.line(
+                "# Defaults stay commented out; only values changed from the default are active.",
+            );
+            w.blank();
+        } else {
+            w.line("# ~/.ahma/settings.toml — Ahma user settings");
+            w.line("#");
+            w.line("# Auto-maintained: ahma regenerates this file on startup to match the running");
+            w.line("# version. Every option is documented with its default; only values you have");
+            w.line(
+                "# changed from the default are written as active (uncommented) lines — defaults",
+            );
+            w.line(
+                "# stay commented out. Uncomment a line and edit it to override; your changes are",
+            );
+            w.line("# preserved across upgrades (hand-written comments are not).");
+            w.line("#");
+            w.line(
             "# Priority: CLI flags > this file > built-in defaults (AHMA_* env vars are ignored).",
         );
-        w.line("# `ahma settings show` prints effective values; `ahma settings init` resets this file.");
-        w.blank();
+            w.line("# `ahma settings show` prints effective values; `ahma settings init` resets this file.");
+            w.blank();
+        }
 
         // ── LM Studio ────────────────────────────────────────────────────────
         w.section("LM Studio (local OpenAI-compatible server)", "lmstudio");
@@ -3107,8 +3163,23 @@ impl AhmaSettings {
                  `tools.timeout_secs`. `ahma settings show` lists them."
             );
         };
-        if settings_tier(table, field).is_none() {
-            anyhow::bail!("unknown setting `{key}`. `ahma settings show` lists every setting.");
+        let Some(tier) = settings_tier(table, field) else {
+            anyhow::bail!("unknown setting `{key}`. `ahma settings explain` lists every setting.");
+        };
+        if let Some(command) = ledger_key_command(table, field) {
+            anyhow::bail!(
+                "`{key}` holds grants, so `settings set` does not write it: it would skip the \
+                 checks and the audit record the dedicated command makes. Use {command}."
+            );
+        }
+        let file = SettingsFile::for_path(path);
+        if file == SettingsFile::Project && tier == SettingsTier::Security {
+            anyhow::bail!(
+                "`{key}` is a security setting: a repository's {} cannot set it (it would be \
+                 ignored, and named at every startup). Set it for yourself with \
+                 `ahma settings set {key} <value>`; `ahma settings explain {key}` says why.",
+                path.display()
+            );
         }
         let current = Self::load_from_checked(path).map_err(|e| {
             anyhow::anyhow!("{}. Fix that line first; nothing was changed.", e.summary())
@@ -3151,7 +3222,11 @@ impl AhmaSettings {
             )
         })?;
 
-        atomic_write_toml(path, &updated.render_documented())?;
+        let text = match file {
+            SettingsFile::User => updated.render_documented(),
+            SettingsFile::Project => updated.render_documented_project(),
+        };
+        atomic_write_toml(path, &text)?;
         // The file on disk, not the struct in hand, is what the next ahma reads.
         let written = Self::load_from_checked(path)
             .map_err(|e| anyhow::anyhow!("the file written does not parse: {}", e.summary()))?;
@@ -3369,6 +3444,10 @@ struct SettingsDoc {
     out: String,
     /// The `[table]` the next [`setting`](Self::setting) belongs to.
     table: String,
+    /// Rendering a repository's `.ahma/settings.toml`: security-tier tables and
+    /// keys are left out entirely, because nothing there can set them (R-CFG2.2)
+    /// and listing them would suggest otherwise.
+    project: bool,
     /// Every setting emitted, in order: what `ahma settings explain` reads
     /// (SPEC R-CFG11), so the explanation can never differ from the comment
     /// written into the file.
@@ -3380,8 +3459,14 @@ impl SettingsDoc {
         Self {
             out: String::new(),
             table: String::new(),
+            project: false,
             entries: Vec::new(),
         }
+    }
+
+    /// Whether `key` in the current table is left out of a project file.
+    fn hidden(&self, key: &str) -> bool {
+        self.project && settings_tier(&self.table, key) != Some(SettingsTier::Preference)
     }
 
     fn line(&mut self, s: &str) {
@@ -3395,11 +3480,14 @@ impl SettingsDoc {
 
     /// Emit a section banner (`# ── Title ──…`) followed by its `[table]` header.
     fn section(&mut self, title: &str, table: &str) {
+        self.table = table.to_string();
+        if self.project && SECURITY_TABLES.contains(&table) {
+            return;
+        }
         let prefix = format!("# ── {title} ");
         let pad = 80usize.saturating_sub(prefix.chars().count());
         self.line(&format!("{prefix}{}", "─".repeat(pad)));
         self.line(&format!("[{table}]"));
-        self.table = table.to_string();
     }
 
     /// Emit one setting: a doc comment that always states the default, then the
@@ -3408,6 +3496,9 @@ impl SettingsDoc {
     /// both sides must come from the same formatter. A trailing blank line keeps
     /// adjacent settings visually separated.
     fn setting(&mut self, doc: &str, key: &str, value: String, default: String) {
+        if self.hidden(key) {
+            return;
+        }
         self.entries.push(SettingDoc {
             table: self.table.clone(),
             key: key.to_string(),
@@ -3509,20 +3600,111 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Every ordinary setting whose value differs between `before` and `after`, as
+/// `(table.key, before, after)` with TOML-rendered values and `(unset)` for an
+/// absent optional key. Ledger keys are left out (see
+/// [`AhmaSettings::update_audited`]).
+pub fn setting_changes(
+    before: &AhmaSettings,
+    after: &AhmaSettings,
+) -> Vec<(String, String, String)> {
+    let tables = |s: &AhmaSettings| -> toml::Table {
+        match toml::Value::try_from(s) {
+            Ok(toml::Value::Table(t)) => t,
+            _ => toml::Table::new(),
+        }
+    };
+    let (b, a) = (tables(before), tables(after));
+    let mut out = Vec::new();
+    for (table, now) in &a {
+        let (Some(now), Some(was)) = (now.as_table(), b.get(table).and_then(|t| t.as_table()))
+        else {
+            continue;
+        };
+        let keys: std::collections::BTreeSet<&String> = now.keys().chain(was.keys()).collect();
+        for key in keys {
+            if ledger_key_command(table, key).is_some() {
+                continue;
+            }
+            let render =
+                |t: &toml::Table| t.get(key).map_or("(unset)".to_string(), |v| v.to_string());
+            let (was, now) = (render(was), render(now));
+            if was != now {
+                out.push((format!("{table}.{key}"), was, now));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The command that manages a *ledger* key, or `None` for an ordinary setting.
+///
+/// A ledger key holds grants: a directory, a host, a tool approval. Each has a
+/// dedicated command that checks the value (the hard denylist, the host and
+/// domain patterns) and writes an audit record. `ahma settings set` does neither,
+/// so it refuses these keys and names the command instead (SPEC R-CFG11.3).
+pub fn ledger_key_command(table: &str, key: &str) -> Option<&'static str> {
+    Some(match (table, key) {
+        ("sandbox", "persistent_scopes") => {
+            "`ahma sandbox grant <path>` (and `ahma sandbox revoke`); it checks the path against the hard denylist"
+        }
+        ("sandbox", "ssh_sign")
+        | ("permissions", "tool_approvals")
+        | ("log_targets", "approvals") => {
+            "`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved"
+        }
+        ("network", "allow") => "`ahma network allow <host>` / `ahma network revoke <host>`",
+        ("web", "always_allow") => "`ahma web allow <domain>` / `ahma web revoke <domain>`",
+        ("web", "never_allow") => "`ahma web deny <domain>` / `ahma web revoke <domain>`",
+        _ => return None,
+    })
+}
+
 /// How a human changes `table.key` (SPEC R-CFG11): the dedicated command for a
 /// ledger key, which validates and audits, else `ahma settings set`.
 pub fn how_to_change(table: &str, key: &str) -> String {
-    match (table, key) {
-        ("sandbox", "persistent_scopes") => {
-            "`ahma sandbox grant <path>` (and `ahma sandbox revoke`); it checks the path against the hard denylist".into()
+    match ledger_key_command(table, key) {
+        Some(command) => command.to_string(),
+        None => format!(
+            "`ahma settings set {table}.{key} <value>` (`ahma settings unset {table}.{key}` restores the default)"
+        ),
+    }
+}
+
+/// Which settings file a write targets (SPEC R-CFG2.2, R-CFG10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsFile {
+    /// `~/.ahma/settings.toml`, or any file that is not a repository's.
+    User,
+    /// A repository's `<workspace>/.ahma/settings.toml`: committed and read by
+    /// everyone who clones it, so only preference-tier keys may be set there.
+    Project,
+}
+
+impl SettingsFile {
+    /// Classify `path`: a `settings.toml` inside a directory named `.ahma` that
+    /// is not the user's own file is a repository's.
+    pub fn for_path(path: &Path) -> Self {
+        let is_user = settings_path().is_some_and(|u| u == path);
+        let in_dot_ahma = path.file_name().is_some_and(|f| f == "settings.toml")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|d| d == ".ahma");
+        if in_dot_ahma && !is_user {
+            Self::Project
+        } else {
+            Self::User
         }
-        ("sandbox", "ssh_sign") | ("permissions", _) | ("log_targets", _) => {
-            "`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved".into()
+    }
+
+    /// `user` or `project`, for messages and the audit log.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
         }
-        ("network", "allow") => "`ahma network allow <host>` / `ahma network revoke <host>`".into(),
-        ("web", "always_allow") => "`ahma web allow <domain>` / `ahma web revoke <domain>`".into(),
-        ("web", "never_allow") => "`ahma web deny <domain>` / `ahma web revoke <domain>`".into(),
-        _ => format!("`ahma settings set {table}.{key} <value>` (`ahma settings unset {table}.{key}` restores the default)"),
     }
 }
 
@@ -4015,6 +4197,175 @@ mod tests {
                     surface: Some("mcp:logs_approve".into()),
                 }],
             },
+        }
+    }
+
+    /// A repository's `.ahma/settings.toml` inside a temp dir.
+    fn project_file(dir: &tempfile::TempDir) -> PathBuf {
+        let ahma = dir.path().join(".ahma");
+        std::fs::create_dir_all(&ahma).unwrap();
+        ahma.join("settings.toml")
+    }
+
+    #[test]
+    fn a_security_key_is_refused_in_a_project_file_and_nothing_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = project_file(&dir);
+        for key in [
+            "sandbox.allow_gpu",
+            "tools.long_running",
+            "http.unix_socket_path",
+        ] {
+            let err = AhmaSettings::set_in_file(&path, key, Some("true")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("security setting"), "{key}: {msg}");
+            assert!(
+                msg.contains(&format!("ahma settings set {key}")),
+                "{key}: {msg}"
+            );
+        }
+        assert!(!path.exists(), "a refused write creates no file");
+        // The same key is fine in the user's own file.
+        let user = dir.path().join("user-settings.toml");
+        AhmaSettings::set_in_file(&user, "sandbox.allow_gpu", Some("true")).unwrap();
+    }
+
+    #[test]
+    fn a_preference_is_written_to_a_project_file_in_its_own_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = project_file(&dir);
+        let edit =
+            AhmaSettings::set_in_file(&path, "tools.source_readers", Some("['scripts/t.sh']"))
+                .unwrap();
+        assert_eq!(edit.after, "[\"scripts/t.sh\"]");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("this repository's ahma settings"), "{text}");
+        assert!(!text.contains("Ahma user settings"), "{text}");
+        for table in [
+            "[sandbox]",
+            "[network]",
+            "[web]",
+            "[auth]",
+            "[permissions]",
+            "[log_targets]",
+        ] {
+            assert!(
+                !text.contains(table),
+                "a project file lists no {table}: {text}"
+            );
+        }
+        assert!(!text.contains("long_running"), "{text}");
+        // What was written is what the project loader honours, with nothing refused.
+        let load = load_project_settings(&path).unwrap();
+        assert!(
+            load.rejected_security.is_empty(),
+            "{:?}",
+            load.rejected_security
+        );
+        assert!(
+            load.rejected_unknown.is_empty(),
+            "{:?}",
+            load.rejected_unknown
+        );
+        assert_eq!(
+            load.accepted["tools"]["source_readers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // Unsetting returns it to the default.
+        AhmaSettings::set_in_file(&path, "tools.source_readers", None).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\nsource_readers = ")
+        );
+    }
+
+    #[test]
+    fn settings_set_refuses_every_ledger_key_and_names_its_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        for (key, command) in [
+            ("sandbox.persistent_scopes", "ahma sandbox grant"),
+            ("sandbox.ssh_sign", "ahma permissions"),
+            ("permissions.tool_approvals", "ahma permissions"),
+            ("log_targets.approvals", "ahma permissions"),
+            ("network.allow", "ahma network allow"),
+            ("web.always_allow", "ahma web allow"),
+            ("web.never_allow", "ahma web deny"),
+        ] {
+            let msg = AhmaSettings::set_in_file(&path, key, Some("[]"))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("holds grants"), "{key}: {msg}");
+            assert!(msg.contains(command), "{key}: {msg}");
+        }
+        assert!(!path.exists());
+        // Ordinary keys in the same tables are untouched by the rule.
+        for key in [
+            "web.default_policy",
+            "network.restrict",
+            "permissions.advisor",
+        ] {
+            let raw = if key == "web.default_policy" {
+                "deny"
+            } else {
+                "false"
+            };
+            AhmaSettings::set_in_file(&path, key, Some(raw))
+                .unwrap_or_else(|e| panic!("{key}: {e}"));
+        }
+    }
+
+    #[test]
+    fn setting_changes_reports_ordinary_keys_only() {
+        let before = AhmaSettings::default();
+        let mut after = before.clone();
+        after.tools.timeout_secs = 99;
+        after.sandbox.allow_gpu = true;
+        after.tools.context_length = Some(8192);
+        after.network.allow = vec!["example.com".into()];
+        after.sandbox.persistent_scopes = Vec::new();
+        let got = setting_changes(&before, &after);
+        let keys: Vec<&str> = got.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "sandbox.allow_gpu",
+                "tools.context_length",
+                "tools.timeout_secs"
+            ]
+        );
+        let ctx = got
+            .iter()
+            .find(|(k, _, _)| k == "tools.context_length")
+            .unwrap();
+        assert_eq!((ctx.1.as_str(), ctx.2.as_str()), ("(unset)", "8192"));
+        // And back again: the reverse change is reported as an unset.
+        let back = setting_changes(&after, &before);
+        let ctx = back
+            .iter()
+            .find(|(k, _, _)| k == "tools.context_length")
+            .unwrap();
+        assert_eq!(ctx.2, "(unset)");
+        assert!(setting_changes(&before, &before).is_empty());
+    }
+
+    #[test]
+    fn settings_file_is_told_apart_by_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            SettingsFile::for_path(&project_file(&dir)),
+            SettingsFile::Project
+        );
+        assert_eq!(
+            SettingsFile::for_path(&dir.path().join("settings.toml")),
+            SettingsFile::User
+        );
+        if let Some(user) = settings_path() {
+            assert_eq!(SettingsFile::for_path(&user), SettingsFile::User);
         }
     }
 
