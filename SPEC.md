@@ -457,6 +457,16 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   R2.7.7), never hidden. A lock directory that exists but cannot be read — inside ahma's
   own sandbox it is out of scope by design — **must** be reported as "cannot tell", with
   where to look instead, and never as "no workspace is held".
+- **R2.7.10**: **A command that waits for a person, or runs for hours, does not hold the
+  queue — when the human says so.** `[tools] long_running` (entries `{ command, timeout_secs? }`)
+  lists commands that run in the `service` lane, without the lease, with their own timeout in
+  place of the tool timeout (`timeout_seconds` on the call still wins). A line matches only
+  when it is exactly one plain command, starting with the entry as whole words: a list, pipe,
+  redirection or substitution never rides along without the lease. The key is Security tier
+  (R-CFG2.1): only the user's own `~/.ahma/settings.toml` may declare one, never a
+  repository's file, and no agent can, because a lease-free command runs beside every other
+  writer. Field case: a local review server that waits hours for the owner's answer was killed
+  at the 30-minute tool timeout while every later build queued behind it.
 
 ### R3: Performance
 

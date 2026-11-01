@@ -991,6 +991,27 @@ pub struct ToolSettings {
     /// Default: `[]`
     #[serde(default)]
     pub source_readers: Vec<String>,
+    /// Commands that run for hours or wait for a person (a local review
+    /// server, `make serve`) and so must not hold the workspace write queue
+    /// for their whole life (SPEC R2.7.10). A command line that is exactly one
+    /// such command, with nothing chained to it, runs without the lease, with
+    /// its own `timeout_secs` in place of `timeout_secs` above. Security tier:
+    /// only your own `~/.ahma/settings.toml` may declare one, never a
+    /// repository's file, because it runs beside every other writer.
+    /// Default: `[]`
+    #[serde(default)]
+    pub long_running: Vec<LongRunningCommand>,
+}
+
+/// One entry of `[tools] long_running` (SPEC R2.7.10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LongRunningCommand {
+    /// The command, matched as whole words at the start of the line.
+    pub command: String,
+    /// Kill it after this many seconds instead of the tool timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 impl Default for ToolSettings {
@@ -1014,6 +1035,7 @@ impl Default for ToolSettings {
             workspace_queue: true,
             edit_guard: true,
             source_readers: Vec::new(),
+            long_running: Vec::new(),
         }
     }
 }
@@ -2678,6 +2700,12 @@ impl AhmaSettings {
             toml_str_list(&self.tools.source_readers),
             toml_str_list(&d.tools.source_readers),
         );
+        w.setting(
+            "Commands that run for hours or wait for a person; they run without the write queue's lease (SPEC R2.7.10).",
+            "long_running",
+            toml_long_running(&self.tools.long_running),
+            toml_long_running(&d.tools.long_running),
+        );
 
         // ── Sandbox & filesystem security ────────────────────────────────────
         w.section("Sandbox & filesystem security", "sandbox");
@@ -3183,6 +3211,21 @@ fn toml_str_list(v: &[String]) -> String {
 /// Render a list of paths as an inline TOML array.
 fn toml_path_list(v: &[PathBuf]) -> String {
     let items: Vec<String> = v.iter().map(|p| toml_path(p)).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render `[tools] long_running` as an inline TOML array of inline tables.
+fn toml_long_running(v: &[LongRunningCommand]) -> String {
+    let items: Vec<String> = v
+        .iter()
+        .map(|e| match e.timeout_secs {
+            Some(t) => format!(
+                "{{ command = {}, timeout_secs = {t} }}",
+                toml_str(&e.command)
+            ),
+            None => format!("{{ command = {} }}", toml_str(&e.command)),
+        })
+        .collect();
     format!("[{}]", items.join(", "))
 }
 
@@ -3715,6 +3758,10 @@ mod tests {
                 workspace_queue: false,
                 edit_guard: false,
                 source_readers: vec!["scripts/heavy".into(), "make test".into()],
+                long_running: vec![LongRunningCommand {
+                    command: "scripts/audition ask".into(),
+                    timeout_secs: Some(14400),
+                }],
             },
             sandbox: SandboxSettings {
                 disable: true,
@@ -5223,6 +5270,10 @@ const SECURITY_KEYS: &[(&str, &str)] = &[
     // a project file pointing the bridge at another socket redirects every tool
     // call to a server it chose.
     ("http", "unix_socket_path"),
+    // R2.7.10: a declared long-running command runs without the workspace
+    // lease, beside every other writer; a cloned repository must not be able
+    // to declare its own.
+    ("tools", "long_running"),
 ];
 
 /// The tier of `table.key`, or `None` if the key is not known to this build.
@@ -5365,6 +5416,9 @@ mod tier_tests {
             ("auth", "require_token_path"),
             ("auth", "rate_limit_rps"),
             ("http", "unix_socket_path"),
+            // A cloned repository must not be able to run its own commands
+            // without the workspace lease (SPEC R2.7.10).
+            ("tools", "long_running"),
             ("permissions", "tool_approvals"),
             ("log_targets", "approvals"),
         ] {
@@ -5595,6 +5649,55 @@ pub fn merge_project_over_user(user: &AhmaSettings, project: &toml::Table) -> Ah
 mod project_settings_tests {
     use super::*;
     use std::io::Write;
+
+    /// SPEC R2.7.10: a long-running command runs without the workspace lease,
+    /// so only the user's own file may declare one; a cloned repository's file
+    /// is refused and named.
+    #[test]
+    fn a_project_file_cannot_declare_a_long_running_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_project(
+            dir.path(),
+            "[tools]\nlong_running = [{ command = \"cargo fmt\" }]\ntimeout_secs = 42\n",
+        );
+        let load = load_project_settings(&path).expect("parses");
+        assert!(
+            load.rejected_security
+                .iter()
+                .any(|k| k == "tools.long_running"),
+            "{:?}",
+            load.rejected_security
+        );
+    }
+
+    #[test]
+    fn long_running_commands_parse_render_and_round_trip() {
+        let s = AhmaSettings::parse(
+            "[tools]\nlong_running = [{ command = \"scripts/audition ask\", timeout_secs = 14400 }, { command = \"make serve\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.tools.long_running,
+            vec![
+                LongRunningCommand {
+                    command: "scripts/audition ask".into(),
+                    timeout_secs: Some(14400),
+                },
+                LongRunningCommand {
+                    command: "make serve".into(),
+                    timeout_secs: None,
+                },
+            ]
+        );
+        assert!(AhmaSettings::default().tools.long_running.is_empty());
+        let rendered = s.render_documented();
+        assert!(rendered.contains("long_running"), "{rendered}");
+        assert_eq!(AhmaSettings::parse(&rendered).unwrap(), s, "round trip");
+        assert!(
+            AhmaSettings::parse("[tools]\nlong_running = [{ cmd = \"x\" }]\n").is_err(),
+            "a misspelt field is refused, not ignored"
+        );
+    }
 
     fn write_project(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("settings.toml");

@@ -208,7 +208,8 @@ impl<'a> ServiceBuilder<'a> {
             .with_scope_grant_notifier(grant_notifier)
             .with_workspace_queue(
                 crate::adapter::workspace_queue::WorkspaceQueue::new(config.workspace_queue)
-                    .with_source_readers(config.source_readers.clone()),
+                    .with_source_readers(config.source_readers.clone())
+                    .with_long_running(config.long_running.clone()),
             ),
         );
         // Every command signs with SSH keys through a broker (SPEC R-CRED.1),

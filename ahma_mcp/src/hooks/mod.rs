@@ -1876,7 +1876,8 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     )?
     .with_workspace_queue(
         crate::adapter::workspace_queue::WorkspaceQueue::new(cfg.workspace_queue)
-            .with_source_readers(cfg.source_readers.clone()),
+            .with_source_readers(cfg.source_readers.clone())
+            .with_long_running(cfg.long_running.clone()),
     )
     // The harness shows this command's stderr to the model: a wait for
     // the workspace is explained there, not left as a silent hang.

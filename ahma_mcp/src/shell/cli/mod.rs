@@ -139,6 +139,9 @@ pub struct AppConfig {
     /// This project's own commands that only read sources (settings.toml
     /// `[tools].source_readers`, SPEC R2.7.8).
     pub source_readers: Vec<String>,
+    /// Commands declared to run without the workspace lease
+    /// (`[tools].long_running`, SPEC R2.7.10).
+    pub long_running: Vec<ahma_common::config::LongRunningCommand>,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
@@ -295,6 +298,7 @@ impl Default for AppConfig {
             workspace_queue: true,
             edit_guard: true,
             source_readers: Vec::new(),
+            long_running: Vec::new(),
 
             no_sandbox: false,
             restrict_network: false,
@@ -3489,6 +3493,7 @@ pub fn build_app_config_with_settings(
         workspace_queue: s.tools.workspace_queue,
         edit_guard: s.tools.edit_guard,
         source_readers: s.tools.source_readers.clone(),
+        long_running: s.tools.long_running.clone(),
 
         no_sandbox: sandbox.no_sandbox,
         restrict_network: cli.restrict_network || s.network.restrict,

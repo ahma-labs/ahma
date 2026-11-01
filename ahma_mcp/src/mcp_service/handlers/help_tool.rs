@@ -362,7 +362,9 @@ fn slow() -> String {
      interactive prompt) holds the workspace write queue while it waits, so every later build \
      queues behind it, and it is killed at the tool timeout. Make such a command print what the \
      person needs (a URL, a question) and exit, then ask them in your reply and start the next \
-     step when they answer.\n"
+     step when they answer. If it has to stay running, the human can declare it once in their \
+     own settings: ahma settings set tools.long_running \"[{command='<the command>', \
+     timeout_secs=14400}]\" — it then runs without holding the queue, with that timeout.\n"
         .to_string()
 }
 
