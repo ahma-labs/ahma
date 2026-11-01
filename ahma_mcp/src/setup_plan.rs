@@ -367,7 +367,7 @@ fn validate_grant(
             path.display()
         )));
     }
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let home = ahma_common::config::ahma_home_dir();
     let risk = match classify_grant_risk(
         &canonical,
@@ -386,7 +386,7 @@ fn validate_grant(
     let current = AhmaSettings::load_from_checked(&env.user_file)
         .map_err(|e| refuse(format!("{}: {}", env.user_file.display(), e.summary())))?;
     let access = if read_only { "read-only" } else { "read-write" };
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let workspace = canon(&env.workspace);
     let already = current.sandbox.persistent_scopes.iter().any(|s| {
         canon(&s.path) == canonical
@@ -630,8 +630,7 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
         Some(p) => p,
         None => std::env::current_dir().context("cannot read the current directory")?,
     };
-    let workspace = workspace
-        .canonicalize()
+    let workspace = dunce::canonicalize(&workspace)
         .with_context(|| format!("cannot read {}", workspace.display()))?;
     let env = Env::for_workspace(&workspace)
         .context("cannot find the home directory for ~/.ahma/settings.toml")?;

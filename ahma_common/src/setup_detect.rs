@@ -193,7 +193,7 @@ const DOD_HEADINGS: &[&str] = &[
 /// Project scripts named in a "definition of done" section of AGENTS.md or
 /// CLAUDE.md that exist inside the project and are not yet declared readers.
 fn detect_source_readers(workspace: &Path, settings: &AhmaSettings) -> Vec<Detected> {
-    let Ok(root) = workspace.canonicalize() else {
+    let Ok(root) = dunce::canonicalize(workspace) else {
         return Vec::new();
     };
     let mut seen = Vec::<String>::new();
@@ -280,7 +280,7 @@ fn script_of(command: &str, root: &Path) -> Option<String> {
     if !first.contains('/') || !plain || first.starts_with('/') || first.starts_with('-') {
         return None;
     }
-    let real = root.join(first).canonicalize().ok()?;
+    let real = dunce::canonicalize(root.join(first)).ok()?;
     (real.is_file() && real.starts_with(root)).then(|| first.to_string())
 }
 
