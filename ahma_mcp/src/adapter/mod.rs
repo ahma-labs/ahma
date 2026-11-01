@@ -403,6 +403,13 @@ impl Adapter {
         let lane = subcommand_config
             .and_then(|s| s.concurrency)
             .unwrap_or_else(|| match shell_command_line(args) {
+                // Declared by the human to run without the lease (SPEC R2.7.10).
+                Some(line)
+                    if lane::long_running_entry(line, self.workspace_queue.long_running())
+                        .is_some() =>
+                {
+                    Lane::Service
+                }
                 Some(line) => {
                     // A redirection writes the workspace when its file lies in
                     // this workspace or in another repository the session can
@@ -760,7 +767,8 @@ impl Adapter {
         let title = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
-        let timeout = self.sync_timeout(timeout_seconds);
+        let timeout =
+            self.sync_timeout(timeout_seconds.or_else(|| self.declared_timeout(args.as_ref())));
         let lease = match self
             .enqueue_exclusive(lane, &safe_wd, &op_id, &title)
             .map(|t| t.with_reason(queue_reason))
@@ -816,6 +824,14 @@ impl Adapter {
         )
         .await;
         run.result
+    }
+
+    /// The timeout `[tools] long_running` declares for this command line, if
+    /// it is one (SPEC R2.7.10); the caller's own `timeout_seconds` wins.
+    pub fn declared_timeout(&self, args: Option<&Map<String, serde_json::Value>>) -> Option<u64> {
+        shell_command_line(args)
+            .and_then(|line| lane::long_running_entry(line, self.workspace_queue.long_running()))
+            .and_then(|entry| entry.timeout_secs)
     }
 
     /// The synchronous path's timeout: the caller's, else the pool default.
@@ -1311,6 +1327,7 @@ impl Adapter {
         let op_id_clone = op_id.clone();
         let wd = safe_wd_str.clone();
 
+        let timeout = timeout.or_else(|| self.declared_timeout(args.as_ref()));
         let timeout_duration = timeout.map(Duration::from_secs);
 
         let mut operation = Operation::new_with_timeout(
@@ -3745,6 +3762,33 @@ mod tests {
         let notices = notices.lock();
         assert_eq!(notices.len(), 1, "one notice per wait: {notices:?}");
         assert!(notices[0].contains("op_holder"), "{notices:?}");
+    }
+
+    /// SPEC R2.7.10: a command the human declared long-running takes no
+    /// lease and gets its own timeout; anything chained to it is judged as
+    /// usual.
+    #[test]
+    fn a_declared_long_running_command_runs_without_the_lease() {
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let adapter = adapter.with_workspace_queue(
+            workspace_queue::WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")))
+                .with_long_running(vec![ahma_common::config::LongRunningCommand {
+                    command: "scripts/audition ask".into(),
+                    timeout_secs: Some(14400),
+                }]),
+        );
+        let ask = shell_args("scripts/audition ask --id 3");
+        assert_eq!(
+            adapter.resolve_lane(Some(&ask), None, td.path()),
+            workspace_queue::Lane::Service
+        );
+        assert_eq!(adapter.declared_timeout(Some(&ask)), Some(14400));
+        let chained = shell_args("scripts/audition ask && cargo fmt");
+        assert_eq!(
+            adapter.resolve_lane(Some(&chained), None, td.path()),
+            workspace_queue::Lane::Exclusive
+        );
+        assert_eq!(adapter.declared_timeout(Some(&chained)), None);
     }
 
     /// SPEC R2.7.3, R2.7.4: what a hooked command prints while it waits (the

@@ -117,6 +117,7 @@ Run `ahma settings init` to generate this file automatically.
 # workspace_queue = true   # writers run one at a time per workspace, in arrival order
 # edit_guard = true        # refuse ahma's own file edits while a writer runs
 # source_readers = []      # this project's own commands that only read sources
+# long_running   = []      # commands that wait for a person or run for hours; no write-queue lease
 # skip_probes  = false    # skip availability probes at startup
 # minimize_tokens     = false # `ahma tui` chat: ask the model for terse answers
 # small_model_harness = false # `ahma tui` chat: tighter result/conversation budgets
@@ -206,6 +207,7 @@ sessions, and a running one after it restarts (the agent's `restart` tool).
 | `workspace_queue` | `true` | Writers run one at a time per workspace, in arrival order (SPEC R2.7). Off restores unordered async — only sensible with `execution_mode = "sync"`. |
 | `edit_guard` | `true` | ahma's own `write_file`/`replace_in_file`/`multi_edit`/`apply_patch` refuse an edit while a command that may rewrite sources runs in that workspace (SPEC R2.7.8). Builds and tests never block an edit. |
 | `source_readers` | `[]` | This project's own commands that only read sources, matched as a prefix of the command line in whole words (`["scripts/heavy", "make test"]`). Edits proceed while one runs. |
+| `long_running` | `[]` | Commands that wait for a person or run for hours (`[{ command = "scripts/audition ask", timeout_secs = 14400 }]`). A line that is exactly one of them runs without the write-queue lease, with its own timeout. Security tier: your own settings file only, never a repository's (SPEC R2.7.10). |
 
 Details: SPEC R2.1, R2.4, R2.7.
 

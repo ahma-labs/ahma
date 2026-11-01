@@ -195,7 +195,12 @@ the session that started it. An agent sees the same report in the `status` tool,
   once that they are waiting (a hook writes it to stderr, which the client shows) and, if the
   workspace stays busy for the whole timeout, fail with `Not run: …` naming the holder.
 - **A long-running command in the exclusive lane holds the workspace** until it ends. Run
-  servers and log followers through `livelog` (or declare them `service`), or `cancel` the
+  log followers through `livelog`, declare an MTDF tool `"concurrency": "service"`, or, for a
+  shell command that waits for a person or runs for hours (a local review server,
+  `make serve`), declare it in your own `~/.ahma/settings.toml`:
+  `ahma settings set tools.long_running "[{command='scripts/audition ask', timeout_secs=14400}]"`.
+  It then runs without the lease and with that timeout, as long as the line is exactly that
+  one command. A repository's own settings file cannot declare one. Otherwise `cancel` the
   holder the queued result names.
 
 ## See also

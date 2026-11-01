@@ -703,6 +703,39 @@ pub fn classify_shell_command(command: &str) -> Lane {
     }
 }
 
+/// The `[tools] long_running` entry `command` is (SPEC R2.7.10): a line that is
+/// exactly one plain command — no list, pipe, redirection or substitution, so
+/// nothing can ride along without the lease — starting with the entry's
+/// command as whole words.
+pub fn long_running_entry<'a>(
+    command: &str,
+    entries: &'a [ahma_common::config::LongRunningCommand],
+) -> Option<&'a ahma_common::config::LongRunningCommand> {
+    if entries.is_empty() {
+        return None;
+    }
+    let (lifted, inner) = lift_substitutions(command)?;
+    if !inner.is_empty() {
+        return None;
+    }
+    let line = parse_line(&lifted)?;
+    let [seg] = line.segs.as_slice() else {
+        return None;
+    };
+    if !line.writes.is_empty() {
+        return None;
+    }
+    let joined = seg.join(" ");
+    entries.iter().find(|e| {
+        let want = e.command.trim();
+        !want.is_empty()
+            && (joined == want
+                || joined
+                    .strip_prefix(want)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+    })
+}
+
 /// Why a command line takes its turn in the workspace queue, in words an agent
 /// can act on (SPEC R2.7.4). Meant for a line already judged exclusive at
 /// `site`: it names the first thing that made it so, in the order the
@@ -2497,5 +2530,34 @@ mod queue_reason_tests {
     fn a_reader_queued_by_a_nested_sandbox_is_told_so() {
         let nested = why("git status --short", false);
         assert!(nested.contains("another sandbox"), "{nested}");
+    }
+
+    /// SPEC R2.7.10: a declared long-running command matches only as a whole
+    /// line of its own, never a line that chains something after it.
+    #[test]
+    fn a_long_running_entry_matches_only_its_own_single_command() {
+        use ahma_common::config::LongRunningCommand;
+        let entries = vec![LongRunningCommand {
+            command: "scripts/audition ask".into(),
+            timeout_secs: Some(14400),
+        }];
+        for cmd in ["scripts/audition ask", "scripts/audition ask --id 3"] {
+            assert_eq!(
+                long_running_entry(cmd, &entries).and_then(|e| e.timeout_secs),
+                Some(14400),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "scripts/audition askx",
+            "scripts/audition ask && cargo fmt",
+            "scripts/audition ask; sed -i s/a/b/ f",
+            "scripts/audition ask | tee log",
+            "scripts/audition ask > log",
+            "scripts/audition ask $(touch f)",
+            "cd x && scripts/audition ask",
+        ] {
+            assert!(long_running_entry(cmd, &entries).is_none(), "{cmd}");
+        }
     }
 }

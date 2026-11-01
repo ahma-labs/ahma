@@ -498,6 +498,9 @@ pub struct WorkspaceQueue {
     /// `[tools] source_readers`: commands a project declares read-only for
     /// its sources (SPEC R2.7.8).
     source_readers: Vec<String>,
+    /// `[tools] long_running` (SPEC R2.7.10): commands the human declared to
+    /// run without the lease.
+    long_running: Vec<ahma_common::config::LongRunningCommand>,
 }
 
 impl WorkspaceQueue {
@@ -507,6 +510,7 @@ impl WorkspaceQueue {
             enabled,
             lock_dir: default_lock_dir(),
             source_readers: Vec::new(),
+            long_running: Vec::new(),
         }
     }
 
@@ -517,6 +521,7 @@ impl WorkspaceQueue {
             enabled,
             lock_dir,
             source_readers: Vec::new(),
+            long_running: Vec::new(),
         }
     }
 
@@ -527,6 +532,21 @@ impl WorkspaceQueue {
     pub fn with_source_readers(mut self, readers: Vec<String>) -> Self {
         self.source_readers = readers;
         self
+    }
+
+    /// Install `[tools] long_running` (SPEC R2.7.10).
+    #[must_use]
+    pub fn with_long_running(
+        mut self,
+        commands: Vec<ahma_common::config::LongRunningCommand>,
+    ) -> Self {
+        self.long_running = commands;
+        self
+    }
+
+    /// The declared long-running commands.
+    pub fn long_running(&self) -> &[ahma_common::config::LongRunningCommand] {
+        &self.long_running
     }
 
     /// The declared source readers.
@@ -541,6 +561,7 @@ impl WorkspaceQueue {
             enabled: false,
             lock_dir: None,
             source_readers: Vec::new(),
+            long_running: Vec::new(),
         }
     }
 
