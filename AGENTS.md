@@ -645,9 +645,9 @@ To maintain fast CI runtimes and prevent unbounded cache bloat across GitHub Act
 
 ### Distributed Caching (sccache)
 - **sccache** is used across all macOS and Linux CI jobs (Windows CI is exempt and relies on plain Cargo target caching).
-- Uses the **GitHub Actions Backend** (`SCCACHE_GHA_ENABLED: "true"`) for atomic uploads of object files directly to the GHA cache API.
-- Each CI job **must** use unique `SCCACHE_GHA_CACHE_TO` keys (`sccache-{OS}-{ARCH}-{JOB}-day{DAY}`) to prevent concurrent write conflicts.
-- Each CI job **must** use `SCCACHE_GHA_CACHE_FROM` with comma-separated fallbacks. Debug-profile jobs (clippy, nextest, android, coverage) share cache; release-profile jobs must not include debug caches in `CACHE_FROM`.
+- Uses the **GitHub Actions backend**, switched on in exactly one place: the `.github/actions/sccache-ghac` composite action exports `SCCACHE_GHA_ENABLED=on`, and `SCCACHE_GHA_RW_MODE=READ_ONLY` for a caller that asks for `mode: read-only`. It also pins sccache's version, which namespaces the cached objects, so an upgrade is a deliberate cold start rather than a silent one.
+- Do not set `SCCACHE_GHA_VERSION` outside the experiment below: its mere presence turns ghac on by itself, a second, hidden switch.
+- `.github/actions/sccache-verify` runs after every job that uses the cache (`if: always()`) and is a **hard gate**, because every ghac failure is silent: it fails when the backend is not ghac, on read/general errors, when every write was lost, and when misses were recorded but nothing was stored (after waiting up to 30 s for in-flight writes).
 - **Temporary note**: CI currently builds `sccache` from an experimental fork (`paulirotta/sccache@gha-retry-layer`) to validate a retry layer for upstream [mozilla/sccache#2821](https://github.com/mozilla/sccache/issues/2821). Reverts to stable once upstream lands or by January 2027.
 
 ### Cargo Registry & Action Versioning
