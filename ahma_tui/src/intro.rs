@@ -49,7 +49,7 @@ pub const TOPICS: &[Topic] = &[
     },
     Topic {
         title: "Models",
-        summary: "/setup connects one, /model switches. Local models are private but slower.",
+        summary: "/connect sets one up, /model switches. Local models are private but slower.",
         detail: &[
             "Ollama, LM Studio and llama-server on this machine are found by themselves;",
             "cloud keys come from environment variables and are never stored. An editor's own",

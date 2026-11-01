@@ -268,7 +268,7 @@ tree. The view must be correct **at startup**, not only for events that happen a
   - **R24.12.1 — Help cannot drift from the keys.** The help overlay and footer **must** render
     from the one key table (`keymap::KEY_REFERENCE`) that tests check both ways: every
     documented key does something, and every bound key is documented.
-  - **R24.12.2 — Setup is checked, and keys are not handled.** `/setup` fetches the provider's
+  - **R24.12.2 — Setup is checked, and keys are not handled.** `/connect` (formerly `/setup`; `/setup llm` still reaches it) fetches the provider's
     model list before saving (the connection test) and offers only models the provider has. A
     cloud key is read from the environment and registered as a `${VAR}` reference; the TUI
     never asks for or stores the key. A URL-addressed provider carries its configured key to
@@ -282,7 +282,7 @@ tree. The view must be correct **at startup**, not only for events that happen a
     full on click (R24.8.4); `x3` is a message and `/x3` the command.
   - **R24.12.5 — Chat stays on a model that exists.** A client's own model (`mcp://`) exists
     only while that client is connected. When it goes, chat moves to the most recent model ahma
-    runs itself (`.ahma/session.toml` `recent`) — or to none, with a pointer to `/setup` — and
+    runs itself (`.ahma/session.toml` `recent`) — or to none, with a pointer to `/connect` — and
     says so; when the client returns and the user has not chosen another model meanwhile, chat
     moves back, also said. Local model servers are looked for again every 30 s while idle.
   - **R24.12.6 — Two levels of explanation.** `/intro` (alias `/getting-started`) shows ahma in
@@ -306,6 +306,7 @@ tree. The view must be correct **at startup**, not only for events that happen a
     that holds it, never run. The reading line names what is offered (`tools: core + git`); a
     cloud model is offered everything. `more_tools` exists only inside ahma's own agent loop —
     it is never listed to MCP clients.
+  - **R24.13 — `/setup` is the guided settings view** (root SPEC R-SETUP.4). It is a full-window overlay with four tabs (Install, Settings, Allow & deny, Proposed changes), opened by `/setup` or by `ahma setup` in a terminal. `y` applies the selected proposed change only and `n` dismisses it; there is no apply-all; a high-risk item needs a second `y`. `t` (or `/setup <words>`) hands the sentence to the chat model, which can only propose changes as data in an `ahma-proposal` block that is validated before it appears. `/connect` is the model wizard.
 
 ### R25: Tool-call session reuse (TUI chat)
 

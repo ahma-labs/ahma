@@ -604,7 +604,11 @@ pub struct SandboxScopeInfo {
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show keyboard reference"),
     ("/?", "show keyboard reference (alias)"),
-    ("/setup", "connect an LLM, step by step (alias /connect)"),
+    (
+        "/setup",
+        "see what is set and allowed, and say what to change [what you want]",
+    ),
+    ("/connect", "connect an LLM, step by step (also /setup llm)"),
     ("/provider", "select LLM provider"),
     ("/model", "select model for current provider"),
     ("/minimize on", "ask the model for concise replies"),
@@ -2112,6 +2116,11 @@ pub struct AppState {
 
     // ── Settings editor ──
     pub settings_editor: crate::settings_editor::SettingsEditor,
+    /// The `/setup` view (SPEC R-SETUP.4).
+    pub setup_view: crate::setup_view::SetupView,
+    /// A `/setup <words>` question is in flight: when the turn ends, the answer's
+    /// `ahma-proposal` block (if any) is read into the setup plan.
+    pub setup_asked: bool,
 
     // ── Liveness indicator ──
     /// Two-cell Braille "liveness" glyph shown in front of the streaming `ahma`
@@ -2800,6 +2809,8 @@ impl AppState {
             chat_rows_cache: std::cell::RefCell::new(ChatRowsCache::default()),
 
             settings_editor: crate::settings_editor::SettingsEditor::default(),
+            setup_view: crate::setup_view::SetupView::default(),
+            setup_asked: false,
 
             windows: vec![],
             next_window_id: 0,

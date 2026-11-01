@@ -95,7 +95,7 @@ simply runs for you at the end. Run it yourself after either command, and re-run
 to reconfigure:
 
 ```bash
-ahma setup          # interactive wizard (same prompts as the curl installer)
+ahma setup --cli    # interactive wizard (same prompts as the curl installer)
 ahma setup --auto   # non-interactive defaults
 ```
 
@@ -272,7 +272,7 @@ animation, and a task inside expands into its live output.
   sessions that have since closed.
 - **Approval gates** — tool approvals, sandbox grants, egress — are answered
   here.
-- **Chat is a toggle** (`i`), not the screen: `/setup` connects an LLM (checked
+- **Chat is a toggle** (`i`), not the screen: `/connect` connects an LLM (checked
   before it is saved), each window keeps its own conversation (`/resume`), and
   every window shows its model, context fill and token spend. Esc or Ctrl-C
   stops a running reply.
@@ -294,13 +294,16 @@ space is available and where, to look for the tool's own cache/temp option first
 to ask you for `ahma sandbox grant <dir>` only when nothing else works. See
 [docs/ahma-help.md](docs/ahma-help.md).
 
-### `ahma setup --plan` — set up in advance, one confirmed change at a time
+### `ahma setup` — see what is allowed, and say what you want
 
-Instead of finding out about the sandbox when a command is blocked, `ahma setup --plan`
-looks at the project and your settings and proposes what to turn on: the GPU for a local
-model, a project script that only reads sources, a toolchain profile that was switched
-off. Each item says why, what it allows and how to undo it, and nothing changes until you
-answer `y` for that item. See [docs/setup.md](docs/setup.md).
+Instead of finding out about the sandbox when a command is blocked, run `ahma setup`
+(or `/setup` in `ahma tui`). It shows your settings and the repository's, with where each
+value comes from; everything that is granted or switched on, and how to take it back; and
+a plan of proposed changes: the GPU for a local model, a project script that only reads
+sources, a toolchain profile that was switched off. Tell it what you want to allow or
+deny and the model you connected can propose changes. Every item says why, what it
+allows and how to undo it, and nothing changes until you answer `y` for that one item.
+`ahma setup --plan` prints the plan without the TUI. See [docs/setup.md](docs/setup.md).
 
 ### One hub per user
 

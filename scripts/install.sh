@@ -406,9 +406,17 @@ echo "Please ensure ${INSTALL_DIR} is in your PATH:"
 echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
 echo ""
 
-# Run the Rust-based setup wizard
+# Run the Rust-based setup wizard. In a terminal a bare `ahma setup` opens the guided
+# settings view; the installer wants the line-mode wizard that installs the
+# integrations, which `--cli` asks for (a release before that flag has no guided view,
+# so a bare `setup` is already the wizard there).
+SETUP_FLAGS=""
+if "$AHMA_BIN" setup --help 2>/dev/null | grep -q -- '--cli'; then
+    SETUP_FLAGS="--cli"
+fi
 if [ -e /dev/tty ] && [ -t 1 ]; then
-    "$AHMA_BIN" setup < /dev/tty
+    # shellcheck disable=SC2086
+    "$AHMA_BIN" setup $SETUP_FLAGS < /dev/tty
 else
     echo "Non-interactive shell detected. Running auto-setup..."
     "$AHMA_BIN" setup --auto

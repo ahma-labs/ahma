@@ -1661,6 +1661,18 @@ pub struct SetupArgs {
     /// With --plan: the folder to look at (default: the current directory).
     #[arg(long = "path", value_name = "DIR", requires = "plan")]
     pub path: Option<PathBuf>,
+
+    /// Use the line-mode wizard even in a terminal. Without any option, `ahma setup` in a terminal opens the guided view (the same as `/setup` in `ahma tui`): your settings and what is allowed, a plan of proposed changes you confirm one at a time, and a chat to say what you want to allow or deny.
+    #[arg(long = "cli")]
+    pub cli: bool,
+}
+
+impl SetupArgs {
+    /// Whether this invocation asks for nothing in particular, so the guided
+    /// view is what `ahma setup` should open (SPEC R-SETUP.4).
+    pub fn opens_guided_view(&self) -> bool {
+        !(self.auto || self.mcp || self.hooks || self.skills || self.tls || self.plan || self.cli)
+    }
 }
 
 /// Arguments for `ahma uninstall`.

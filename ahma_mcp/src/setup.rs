@@ -1308,7 +1308,28 @@ mod tests {
             plan: false,
             apply: false,
             path: None,
+            cli: false,
         }
+    }
+
+    #[test]
+    fn bare_setup_opens_the_guided_view_and_any_option_keeps_the_wizard() {
+        assert!(setup_args(false, false, false, false, false).opens_guided_view());
+        for args in [
+            setup_args(true, false, false, false, false),
+            setup_args(false, true, false, false, false),
+            setup_args(false, false, true, false, false),
+            setup_args(false, false, false, true, false),
+            setup_args(false, false, false, false, true),
+        ] {
+            assert!(!args.opens_guided_view(), "{args:?}");
+        }
+        let mut plan = setup_args(false, false, false, false, false);
+        plan.plan = true;
+        assert!(!plan.opens_guided_view());
+        let mut cli = setup_args(false, false, false, false, false);
+        cli.cli = true;
+        assert!(!cli.opens_guided_view(), "--cli is the line wizard");
     }
 
     // ─── mcp_shared_transport_url ─────────────────────────────────────────────

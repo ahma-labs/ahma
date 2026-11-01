@@ -435,4 +435,27 @@ mod skill_version_invariants {
             "skills/ahma/SKILL.md must document /ahma update"
         );
     }
+    /// A bare `ahma setup` in a terminal opens the guided settings view, so the
+    /// installers — which run it from a terminal to install the integrations — must
+    /// ask for the line-mode wizard with `--cli`, but only where the binary has the
+    /// flag (the installer may fetch an older release; SPEC R-SETUP.4).
+    #[test]
+    fn installers_ask_for_the_line_wizard_where_the_binary_supports_it() {
+        for script in ["scripts/install.sh", "scripts/install.ps1"] {
+            let text = std::fs::read_to_string(get_workspace_path(script))
+                .unwrap_or_else(|e| panic!("cannot read {script}: {e}"));
+            assert!(
+                text.contains("setup --help") && text.contains("--cli"),
+                "{script} must detect `--cli` before using it"
+            );
+            assert!(
+                !text.lines().any(|l| {
+                    let l = l.trim();
+                    (l.ends_with("setup < /dev/tty") || l == "& $mcpBin setup")
+                        && !l.starts_with('#')
+                }),
+                "{script} runs a bare `setup` in a terminal, which now opens the guided view"
+            );
+        }
+    }
 }

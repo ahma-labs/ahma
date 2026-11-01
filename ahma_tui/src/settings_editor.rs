@@ -796,7 +796,7 @@ impl SettingsEditor {
             row(
                 "agent.provider",
                 "Provider",
-                "Change with /provider or /setup",
+                "Change with /provider or /connect",
                 text(&a.provider),
             ),
             row("agent.model", "Model", "Change with /model", text(&a.model)),

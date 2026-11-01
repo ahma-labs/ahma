@@ -24,6 +24,7 @@ pub mod mcp_connections;
 pub mod mcp_source;
 pub mod session_config;
 pub mod settings_editor;
+pub mod setup_view;
 pub mod startup_notices;
 pub mod state;
 pub mod task_tree;
@@ -66,6 +67,8 @@ pub struct TokenPrefs {
 
 /// Run the TUI event loop, blocking until the user quits.
 ///
+/// * `initial_command` — a slash command to run once the first frame's setup is
+///   done (`ahma setup` passes `/setup`), as if the user had typed it.
 /// * `connect` — explicit `--connect` URL, or `None` to auto-probe local
 ///   transports (Unix socket first on Unix, then `http://localhost:3000`).
 pub async fn run_tui(
@@ -73,6 +76,7 @@ pub async fn run_tui(
     profile: Option<String>,
     path: Option<std::path::PathBuf>,
     token_prefs: TokenPrefs,
+    initial_command: Option<String>,
 ) -> Result<()> {
     // Pre-flight the directory this TUI will answer `roots/list` with, so a
     // typo or a `$HOME` launch is named here rather than surfacing later as a
@@ -107,5 +111,5 @@ pub async fn run_tui(
         }
     }
     let connection = connection::resolve_connection(connect).await?;
-    app::run(&connection, profile, path, token_prefs).await
+    app::run(&connection, profile, path, token_prefs, initial_command).await
 }
