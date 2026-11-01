@@ -538,6 +538,7 @@ impl WorkspaceQueue {
             holder_path: self.holder_path(key),
             holder,
             done: false,
+            reason: None,
         })
     }
 
@@ -715,6 +716,29 @@ pub struct Ticket {
     holder_path: Option<PathBuf>,
     holder: HolderInfo,
     done: bool,
+    /// Why this command waits its turn at all (SPEC R2.7.4), shown while it
+    /// waits. `None` where there is nothing to explain (an MTDF tool that
+    /// declared itself exclusive, a PTY or session command).
+    reason: Option<String>,
+}
+
+impl Ticket {
+    /// The command waiting on this ticket.
+    pub fn title(&self) -> &str {
+        &self.holder.title
+    }
+
+    /// Why it waits its turn, when that was worked out.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    /// Attach the reason this command waits its turn.
+    #[must_use]
+    pub fn with_reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
 }
 
 /// Progress callback while a ticket waits: called with who is ahead, at most

@@ -307,7 +307,13 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   operation is still waiting for its workspace, the result **must** say `NOT started —
   queued behind` the operation(s) ahead of it, named by id, command and age, that it will run
   automatically in order, and that it must not be sent again. A queued `sed -i` that reads
-  like an applied one is the failure this prevents.
+  like an applied one is the failure this prevents. The notice shown while it waits **must**
+  name the waiting command *first* and the holder after it, and say why the command waits
+  at all (the construct, program or redirection that made it exclusive, or that ahma runs
+  nested inside another sandbox so no read-only lane exists): harnesses merge the notice
+  into the command's own output and summarise from its first line, and a notice that opened
+  with the holder's command made that summary name the wrong command (field report,
+  2026-10-31).
 - **R2.7.4**: **Three lanes, and the read-only lane is the kernel's word, not ahma's.**
   - *Exclusive* (the default) takes the lease.
   - *Read-only* takes none and never waits. The command is spawned with a sandbox that
@@ -359,7 +365,8 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. A `$(…)` substitution is judged by the command it runs, so
     `echo "$(gh pr view 87)"` is a reader and `echo $(rm x)` is not. It treats a backtick
     substitution (inside double quotes too, where the shell still runs it; inside single
-    quotes a backtick is a character), a writing redirection into a workspace or to a target it cannot resolve
+    quotes a backtick is a character), a braced expansion other than a plain `${NAME}`, a
+    writing redirection into a workspace or to a target it cannot resolve
     without expansion (`$OUT`, a glob, `~`, a relative path after `cd`), grouping, an escape
     or an unknown program as exclusive. It is permissive only where the kernel lane makes a mistake harmless.
 - **R2.7.5**: **No result is lost to a forgotten `await`.** Each session remembers every
@@ -411,7 +418,11 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   - *Project readers.* A project may declare its own source-reading wrappers
     (`tools.source_readers`, a preference-tier list of command prefixes matched in whole
     words); a wrong entry costs a stale verdict the drift report names, never confinement.
-    A declared prefix is matched **per segment**, never against the whole line: it excuses
+    The wrappers `timeout`, `time`, `nice`, `caffeinate` and `env NAME=…`, parsed strictly
+    (an option they do not know leaves the line unknown; `nohup`, which writes `nohup.out`,
+    is never stripped), are judged by the command they run, in every lane and for the edit
+    guard; `env` with any other argument runs a program nothing here can see, so it is
+    unknown. A declared prefix is matched **per segment**, never against the whole line: it excuses
     its own command, not what is chained after it, so `scripts/heavy && sed -i … src/f.rs`
     is judged by the `sed`. A writing redirection keeps the line unknown unless every
     segment is a declared reader (a wrapper writing its own log).
