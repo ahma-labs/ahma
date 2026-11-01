@@ -821,7 +821,9 @@ mod tests {
     fn a_hard_denylist_path_is_refused_whoever_proposes_it() {
         let f = fixture();
         let home = ahma_common::config::ahma_home_dir().expect("a home directory");
-        for path in [home.join(".ssh"), home.clone(), PathBuf::from("/")] {
+        // The real filesystem root of this platform (`/` or `C:\`), not a literal.
+        let root = home.ancestors().last().expect("a root").to_path_buf();
+        for path in [home.join(".ssh"), home.clone(), root] {
             let mut p = proposal(Change::GrantPath {
                 path: path.clone(),
                 read_only: true,
