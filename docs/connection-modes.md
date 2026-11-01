@@ -231,7 +231,7 @@ In HTTP mode, each MCP session gets its own sandbox scope derived from the `root
 
 Cursor runs all `stdio` MCP servers in a **shared process** context when the IDE window has no workspace folder open (e.g. after a fresh install or when opening a single file rather than a folder). In this case, Cursor's MCP client responds to `roots/list` with an empty array `{"roots":[]}`.
 
-Ahma treats an empty `roots/list` response as "client has no workspace roots yet" and keeps the sandbox in a deferred state. Any `tools/call` request before a real workspace root is provided returns HTTP 409 / JSON-RPC error `-32001` ("Sandbox initializing...") instead of silently scoping every command to an empty or wrong directory.
+Ahma treats an empty `roots/list` response as "client has no workspace roots yet" and keeps the sandbox in a deferred state. Any `tools/call` request before a real workspace root is provided returns HTTP 409 / JSON-RPC error `-32001` ("Sandbox initializing...") instead of silently scoping every command to an empty or wrong directory. The built-ins that change nothing (`status`, `ahma_help`, `await`, …) still answer, so `ahma_help topic=roots` can explain the wait.
 
 **Resolutions (pick one):**
 

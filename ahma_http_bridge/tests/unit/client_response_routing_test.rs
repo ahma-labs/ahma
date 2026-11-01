@@ -363,3 +363,58 @@ async fn test_response_routing_locks_sandbox_with_real_id() {
         );
     }
 }
+
+/// SPEC R-HELP.1, RB.1.1: before the sandbox is Active the bridge still
+/// refuses every tool that acts on the workspace (409 / -32001), but lets
+/// through the built-ins that change nothing and exist for exactly this
+/// moment (`status`, `ahma_help`, …), so an agent stuck in roots negotiation
+/// can see why. The fake peer never configures the sandbox and answers any
+/// tool call it is sent, so a success here means the bridge forwarded it.
+async fn run_sandbox_exempt_tools_answer_before_the_lock(mode: TransportMode) {
+    let factory = Arc::new(FakePeerFactory {
+        behavior: PeerBehavior::SendFakePing,
+    });
+    let server = spawn_in_process_server(factory)
+        .await
+        .expect("Failed to spawn in-process server");
+    let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(mode);
+    mcp.initialize_only("exempt-gate-client")
+        .await
+        .expect("initialize_only failed");
+    let _sse = mcp
+        .open_handshake_sse(mcp.session_id().unwrap())
+        .await
+        .expect("open_handshake_sse failed");
+    mcp.send_initialized()
+        .await
+        .expect("send_initialized failed");
+
+    for tool in ["ahma_help", "status"] {
+        let res = mcp.call_tool(tool, json!({})).await;
+        assert!(
+            res.success,
+            "{tool} must answer before the sandbox lock ({mode:?}): {:?}",
+            res.error
+        );
+    }
+    let blocked = mcp
+        .call_tool("run_terminal_command", json!({ "command": "pwd" }))
+        .await;
+    assert!(!blocked.success, "a workspace tool stays gated ({mode:?})");
+    let err = blocked.error.unwrap_or_default();
+    assert!(err.contains("-32001"), "{err}");
+    assert!(
+        err.contains("ahma_help topic=roots"),
+        "the refusal points at help: {err}"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_exempt_tools_answer_before_the_lock_json() {
+    run_sandbox_exempt_tools_answer_before_the_lock(TransportMode::Json).await;
+}
+
+#[tokio::test]
+async fn sandbox_exempt_tools_answer_before_the_lock_sse() {
+    run_sandbox_exempt_tools_answer_before_the_lock(TransportMode::Sse).await;
+}

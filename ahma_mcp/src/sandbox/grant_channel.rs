@@ -146,7 +146,9 @@ pub fn runtime_denial_remediation_cli(path: &Path, access: ScopeAccess) -> Strin
          next command; nothing to restart. The grant is checked against ahma's denylist and \
          audited. Writing outside the workspace (a global binary under ~/.cargo, a cache under \
          ~/Library) is denied by default; the narrowest directory that fixes the denial is the \
-         one to grant, read-only unless a write was refused.",
+         one to grant, read-only unless a write was refused. Before asking: `ahma explain \
+         blocked` lists what an agent can try first (the tool's own cache or temp option, the \
+         temp directory).",
         verb = verb,
         denied = path.display(),
         target = target.display(),
@@ -556,7 +558,8 @@ pub fn hook_denial_text(
          (pick a tier), then re-run the command:\n  ahma sandbox \
          grant {target}{ro_flag} --session   # this terminal session only, at most 12h\n  ahma \
          sandbox grant {target}{ro_flag}             # until revoked, bound to this workspace\n\n\
-         Either applies on your next command; nothing to restart.",
+         Either applies on your next command; nothing to restart. Before asking: `ahma explain \
+         blocked` lists what an agent can try first.",
         if access.is_write() { "write" } else { "read" },
         path.display(),
         body.to_message(),
@@ -1383,6 +1386,15 @@ mod context_tests {
         }
     }
 
+    /// SPEC R-HELP.4: a hooked agent has no `ahma_help` tool, so its refusal
+    /// names the command that gives the same guidance, and never the tool.
+    #[test]
+    fn the_cli_remediation_points_at_ahma_explain() {
+        let text = runtime_denial_remediation_cli(Path::new("/opt/cache/x"), ScopeAccess::Rw);
+        assert!(text.contains("ahma explain blocked"), "{text}");
+        assert!(!text.contains("ahma_help"), "{text}");
+    }
+
     #[test]
     fn hook_denial_text_leads_with_blocked_and_has_every_section() {
         let ws = tempfile::tempdir().unwrap();
@@ -1449,7 +1461,7 @@ mod context_tests {
   ahma sandbox grant /opt/cache --session   # this terminal session only, at most 12h
   ahma sandbox grant /opt/cache             # until revoked, bound to this workspace
 
-Either applies on your next command; nothing to restart."#;
+Either applies on your next command; nothing to restart. Before asking: `ahma explain blocked` lists what an agent can try first."#;
 
     #[test]
     fn golden_hook_denial_frame() {

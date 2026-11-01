@@ -2329,6 +2329,15 @@ pub(crate) fn run_queue_command() -> Result<()> {
     }
 }
 
+/// `ahma explain`: the `ahma_help` text for an agent that reaches ahma only
+/// through a hooked shell (SPEC R-HELP.1). Reads and prints; writes nothing.
+pub(crate) fn run_explain_command(topic: Option<&str>) -> Result<()> {
+    use crate::mcp_service::handlers::help_tool::{HelpFacts, render_for_cli};
+    let cwd = std::env::current_dir().unwrap_or_default();
+    print!("{}", render_for_cli(topic, &HelpFacts::for_cli(&cwd)));
+    Ok(())
+}
+
 /// `ahma ps`: the process list a sandboxed agent cannot get from `/bin/ps`,
 /// which is setuid and therefore unexecutable under any sandbox (SPEC R6.2.8).
 /// Marks processes that are themselves sandboxed, which is how a confined

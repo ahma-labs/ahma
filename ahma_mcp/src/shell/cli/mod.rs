@@ -1106,6 +1106,7 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Doctor(args) => commands::run_doctor_command(args),
         Subcommands::Queue => commands::run_queue_command(),
         Subcommands::Ps { filter } => commands::run_ps_command(filter.as_deref()),
+        Subcommands::Explain { topic } => commands::run_explain_command(topic.as_deref()),
     }
 }
 
@@ -1537,6 +1538,12 @@ pub enum Subcommands {
         /// Only processes whose command line contains this text.
         #[arg(value_name = "FILTER")]
         filter: Option<String>,
+    },
+    /// Explain how to get work done inside ahma's sandbox, for an AI agent that reaches ahma only through a terminal hook (an MCP client calls the `ahma_help` tool for the same text). Topics: start, temp (is temp space available and where, and how it helps your tools), blocked (what to try when a command fails with "Operation not permitted": the tool's own cache or temp option first, a human grant last), slow, readonly and roots. Read-only and never queued, so it answers while a build holds the workspace.
+    Explain {
+        /// The topic; omit it for the list of topics.
+        #[arg(value_name = "TOPIC")]
+        topic: Option<String>,
     },
 }
 

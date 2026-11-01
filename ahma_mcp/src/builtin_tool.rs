@@ -313,6 +313,21 @@ impl BuiltinTool {
 mod tests {
     use super::*;
 
+    /// The bridge gates on a list it can see without depending on this crate
+    /// (SPEC R-HELP.1); this is what keeps it equal to the source of truth.
+    #[test]
+    fn the_bridges_exempt_list_is_exactly_the_sandbox_exempt_built_ins() {
+        let mut here: Vec<&str> = BuiltinTool::ALL
+            .iter()
+            .filter(|t| t.is_sandbox_exempt())
+            .map(|t| t.name())
+            .collect();
+        let mut there = ahma_common::mcp_methods::SCOPE_EXEMPT_TOOLS.to_vec();
+        here.sort_unstable();
+        there.sort_unstable();
+        assert_eq!(here, there);
+    }
+
     /// The core set is small, and everything outside it is reachable.
     #[test]
     fn small_models_start_with_a_small_core() {
