@@ -174,25 +174,39 @@ async fn run() -> Result<()> {
     match subcommand {
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
-            // Resolve explicit on/off token-preference flags; None = fall back
-            // to settings.toml and the deprecated env vars.
-            let flag_pair = |on: bool, off: bool| -> Option<bool> {
-                match (on, off) {
-                    (true, _) => Some(true),
-                    (_, true) => Some(false),
-                    _ => None,
-                }
-            };
-            let token_prefs = ahma_tui::TokenPrefs {
-                minimize_tokens: flag_pair(cli.minimize_tokens, cli.no_minimize_tokens),
-                small_model_harness: flag_pair(cli.small_model_harness, cli.no_small_model_harness),
-                context_length: cli.context_length,
-            };
             ahma_tui::run_tui(
                 tui_args.connect.as_deref(),
                 tui_args.profile.clone(),
                 tui_args.path.clone(),
-                token_prefs,
+                tui_token_prefs(
+                    cli.minimize_tokens,
+                    cli.no_minimize_tokens,
+                    cli.small_model_harness,
+                    cli.no_small_model_harness,
+                    cli.context_length,
+                ),
+                None,
+            )
+            .await
+        }
+        // `ahma setup` in a terminal, with no item flag: the guided view
+        // (SPEC R-SETUP.4). `--cli`, `--auto`, an item flag, `--plan`, or a
+        // pipe (the install scripts' `< /dev/tty` is a terminal; CI is not)
+        // keeps the line-mode wizard.
+        Subcommands::Setup(setup_args) if setup_args.opens_guided_view() && stdio_is_terminal() => {
+            tracing::info!("Starting the guided setup view");
+            ahma_tui::run_tui(
+                None,
+                None,
+                None,
+                tui_token_prefs(
+                    cli.minimize_tokens,
+                    cli.no_minimize_tokens,
+                    cli.small_model_harness,
+                    cli.no_small_model_harness,
+                    cli.context_length,
+                ),
+                Some("/setup".to_string()),
             )
             .await
         }
@@ -495,6 +509,37 @@ fn check_powershell_available() {
             std::process::exit(1);
         }
     }
+}
+
+/// Token and context preferences from the global flags, for the TUI.
+///
+/// Each pair of on/off flags resolves to `Some(true)`, `Some(false)` or `None`
+/// (fall back to settings.toml and the deprecated env vars).
+fn tui_token_prefs(
+    minimize: bool,
+    no_minimize: bool,
+    small_harness: bool,
+    no_small_harness: bool,
+    context_length: Option<u32>,
+) -> ahma_tui::TokenPrefs {
+    let flag_pair = |on: bool, off: bool| -> Option<bool> {
+        match (on, off) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    };
+    ahma_tui::TokenPrefs {
+        minimize_tokens: flag_pair(minimize, no_minimize),
+        small_model_harness: flag_pair(small_harness, no_small_harness),
+        context_length,
+    }
+}
+
+/// Whether both stdin and stdout are a terminal: the guided view needs both.
+fn stdio_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 #[cfg(test)]

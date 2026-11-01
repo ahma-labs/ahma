@@ -56,7 +56,7 @@ first-time install: [docs/installation.md](https://github.com/ahma-labs/ahma/blo
 | VS Code sandbox integration | add `"sandboxEnabled": true` + `"sandbox": {...}` to the server entry — auto-approves tool calls |
 | Multi-IDE install script | `curl -fsSL https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh \| bash` |
 | Dev containers | run the install script from `postCreateCommand`, combine with a committed `.vscode/mcp.json` |
-| One-step setup (all of the above) | `ahma setup` (interactive) or `ahma setup -y` (non-interactive) |
+| One-step setup (all of the above) | `ahma setup --cli` (interactive) or `ahma setup -y` (non-interactive); bare `ahma setup` is the guided settings view |
 
 **Helping a user set up Ahma:** check for `.vscode/mcp.json`, offer to create it, ask which
 bundles they need, then tell them to reload the window.

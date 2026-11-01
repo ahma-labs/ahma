@@ -149,9 +149,15 @@ useful ones:
 | `↑`/`↓` (chat input) | Earlier / later message, from the first / last line |
 | Click a tool call in chat | Open its full arguments and result |
 
+## Setup
+
+`/setup` shows what ahma is set to and what it allows for this folder, with a plan of proposed
+changes you confirm one at a time, and takes a request in your own words (`/setup allow the
+GPU`). `ahma setup` in a terminal opens straight onto it. See [setup.md](setup.md).
+
 ## Chatting
 
-- **Connect an LLM with `/setup`** (also offered when you first chat with a
+- **Connect an LLM with `/connect`** (also offered when you first chat with a
   window). It checks the provider before saving anything: the model list is
   fetched from the provider — that is the connection test — and the models you
   pick from are the ones it actually has. Cloud providers read their key from

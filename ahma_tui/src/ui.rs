@@ -65,6 +65,9 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.settings_editor.open {
         draw_settings_panel(frame, state, theme, full);
     }
+    if state.setup_view.open {
+        draw_setup_view(frame, state, theme, full);
+    }
     // Grant questions are security decisions, drawn over every other overlay.
     // With both open, the one on top must be the one the keys answer: the
     // scope question takes keys first (`handle_scope_grant_key` runs before
@@ -82,6 +85,138 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.doctor_confirm.is_some() {
         draw_doctor_confirm(frame, state, theme, full);
     }
+}
+
+/// The `/setup` view (SPEC R-SETUP.4): tabs, the rows of the current section,
+/// the explanation of the selected row, and the keys.
+fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    use crate::setup_view::{Section, Tone};
+
+    let view = &state.setup_view;
+    let popup_w = area.width.saturating_sub(4).max(60).min(area.width);
+    let popup_h = area.height.saturating_sub(2).max(16).min(area.height);
+    let popup = centered_rect(popup_w, popup_h, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            " Setup · what ahma is set to and what it allows ",
+            theme.title().bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::vertical([
+        Constraint::Length(3), // header
+        Constraint::Length(1), // tabs
+        Constraint::Min(4),    // list
+        Constraint::Length(7), // detail
+        Constraint::Length(1), // footer
+    ])
+    .split(inner);
+
+    // Header: where things are, and whether a model can be talked to.
+    let model = if state.llm_selection.is_some() {
+        format!(
+            "talk with {} — press t, or type /setup <what you want>",
+            state.llm_label()
+        )
+    } else {
+        "no model connected: /connect sets one up; this view works without one".to_string()
+    };
+    let header = vec![
+        Line::from(Span::styled(
+            format!("folder   {}", state.workspace),
+            theme.normal(),
+        )),
+        Line::from(Span::styled(
+            "files    ~/.ahma/settings.toml (yours)  ·  <folder>/.ahma/settings.toml (this repository)",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(format!("model    {model}"), theme.dim())),
+    ];
+    frame.render_widget(Paragraph::new(header), rows[0]);
+
+    // Tabs.
+    let mut tabs = Vec::new();
+    for (i, section) in Section::ALL.iter().enumerate() {
+        let count = match section {
+            Section::Plan => format!(" ({})", view.plan().items.len()),
+            _ => String::new(),
+        };
+        let label = format!(" {} {}{} ", i + 1, section.label(), count);
+        tabs.push(Span::styled(
+            label,
+            if *section == view.section() {
+                theme.selected_item()
+            } else {
+                theme.dim()
+            },
+        ));
+        tabs.push(Span::raw(" "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(tabs)), rows[1]);
+
+    // List, scrolled to keep the selection on screen.
+    let list = view.rows();
+    let visible = rows[2].height as usize;
+    let selected = view.selected();
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    let tone = |t: Tone| match t {
+        Tone::Normal => theme.normal(),
+        Tone::Dim => theme.dim(),
+        Tone::Ok => theme.success(),
+        Tone::Warn => theme.pending(),
+        Tone::Bad => theme.failed(),
+    };
+    let mut lines: Vec<Line> = list
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(i, row)| {
+            let marker = if i == selected { "▶ " } else { "  " };
+            let style = if i == selected {
+                theme.selected_item()
+            } else {
+                tone(row.tone)
+            };
+            Line::from(Span::styled(format!("{marker}{}", row.text), style))
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            match view.section() {
+                Section::Settings => "  Everything is at its default. [a] shows every setting.",
+                Section::Allow => "  Nothing has been granted or switched on.",
+                Section::Plan => "  No changes proposed.",
+                Section::Install => "  Nothing to show.",
+            },
+            theme.dim(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), rows[2]);
+
+    // Detail of the selected row.
+    let detail: Vec<Line> = view
+        .detail_lines()
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, theme.normal())))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(detail).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(theme.dim()),
+        ),
+        rows[3],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(view.footer(), theme.dim()))),
+        rows[4],
+    );
 }
 
 /// "Apply this fix?" for `/doctor fix <n>`: the exact change, then `y`.
@@ -1573,9 +1708,9 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
 fn chat_history_hint(state: &AppState) -> &'static str {
     if state.llm_selection.is_none() {
         if state.unicode {
-            "  No LLM configured — /setup connects one"
+            "  No LLM configured — /connect connects one"
         } else {
-            "  No LLM configured - /setup connects one"
+            "  No LLM configured - /connect connects one"
         }
     } else {
         "  Type a message and press Enter to start chatting"
@@ -4543,7 +4678,11 @@ fn help_left_rows() -> Vec<HelpRow> {
         ("# <goal>", "Decompose a goal into steps with the LLM"),
         ("/sync", "Tool calls wait for results (default, saved)"),
         ("/async", "Tool calls return ids to await (saved)"),
-        ("/setup", "Connect an LLM (guided)"),
+        (
+            "/setup",
+            "Settings and what is allowed, with a plan you confirm (also: ahma setup)",
+        ),
+        ("/connect", "Connect an LLM (guided)"),
         ("/resume", "Bring back this window's saved conversation"),
         ("Click a tool call", "Open its arguments and result in full"),
         ("", ""),
@@ -5367,6 +5506,70 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Paint the `/setup` view into a test terminal and read the screen back.
+    fn render_setup_view(state: &AppState, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_setup_view(frame, state, &theme, Rect::new(0, 0, width, height));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The setup view paints every tab at a normal size, shows the proposal and
+    /// its explanation, and survives a terminal far too small for it.
+    #[test]
+    fn the_setup_view_paints_every_tab_and_survives_a_tiny_terminal() {
+        use crate::setup_view::Section;
+        let _guard = crate::HOME_SEAM_GUARD.lock();
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: held under HOME_SEAM_GUARD, and nextest gives each test a process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".ahma")).unwrap();
+        std::fs::write(ws.path().join("m.gguf"), "x").unwrap();
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = ws.path().to_string_lossy().into_owned();
+        state.setup_view.open_for(ws.path(), Vec::new());
+
+        let plan = render_setup_view(&state, 110, 34);
+        assert!(plan.contains("Setup"), "{plan}");
+        assert!(plan.contains("Proposed changes"), "{plan}");
+        assert!(
+            plan.contains("Let sandboxed commands use the GPU"),
+            "{plan}"
+        );
+        assert!(plan.contains("allows:") && plan.contains("undo:"), "{plan}");
+        assert!(plan.contains("[y] apply this one"), "{plan}");
+
+        for (section, expect) in [
+            (Section::Install, "MCP server entries"),
+            (Section::Settings, "Everything is at its default"),
+            (Section::Allow, "[profile"),
+        ] {
+            state.setup_view.go(section);
+            let screen = render_setup_view(&state, 110, 34);
+            assert!(screen.contains(expect), "{section:?}: {screen}");
+        }
+
+        // Far smaller than the layout wants: no panic, whatever is clipped.
+        for (w, h) in [(60, 16), (20, 5), (1, 1), (200, 3)] {
+            let _ = render_setup_view(&state, w, h);
+        }
     }
 
     /// End-to-end for the `!pwd` report: the command's actual output must be on

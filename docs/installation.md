@@ -128,9 +128,13 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 Run the setup wizard to configure everything below in one step:
 
 ```bash
-ahma setup          # interactive: asks which editors/features to configure
+ahma setup --cli    # interactive: asks which editors/features to configure
 ahma setup -y       # non-interactive: auto-detect and configure with defaults
+ahma setup          # in a terminal: the guided view of your settings and what is allowed
 ```
+
+A bare `ahma setup` in a terminal opens the guided view ([docs/setup.md](setup.md)); the
+installers and anything that wants the question-by-question wizard use `--cli`.
 
 `ahma setup` writes MCP server entries and agent skills for the editors it detects (Cursor, VS
 Code, Claude Code, Codex, …). [Terminal hooks](#terminal-hooks) are opt-in and excluded from the

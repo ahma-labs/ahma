@@ -16,6 +16,7 @@ pub async fn run(
     profile_override: Option<String>,
     workspace_path: Option<std::path::PathBuf>,
     token_prefs: crate::TokenPrefs,
+    initial_command: Option<String>,
 ) -> Result<()> {
     use std::io;
     use std::time::Duration;
@@ -110,6 +111,11 @@ pub async fn run(
     load_granted_scopes(&mut state);
     offer_folder_trust(&mut state);
     maybe_show_intro_on_first_run(&mut state);
+    // `ahma setup` opens straight onto /setup. After the trust question and the
+    // intro so neither is skipped; the command is the one the user could type.
+    if let Some(command) = initial_command {
+        dispatch_nav_command(&command, &mut state);
+    }
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
     state.mcp_source_tx = Some(spawn_mcp_source(
@@ -916,7 +922,7 @@ fn begin_cloud_setup(
             format!(
                 "{name} needs an API key in the environment: set `{var}` (e.g. \
                  `export {var}=…` in your shell profile), restart `ahma tui` from that \
-                 shell, and run /setup again. The key is never typed here or stored — \
+                 shell, and run /connect again. The key is never typed here or stored — \
                  ahma reads it from `${var}` when it calls {name}.",
                 var = cloud.key_env
             ),
@@ -966,14 +972,14 @@ fn handle_setup_models(models: Vec<String>, state: &mut crate::state::AppState) 
         let advice = match (&pending.cloud, pending.provider_name.as_str()) {
             (Some(cloud), name) => format!(
                 "{name} did not return a model list. Check that `${}` holds a valid key, \
-                 then /setup.",
+                 then /connect.",
                 cloud.key_env
             ),
             (None, "Ollama") => "No models from Ollama. Is it running (`ollama serve`) with a \
-                 model pulled (e.g. `ollama pull qwen2.5-coder`)? Then /setup."
+                 model pulled (e.g. `ollama pull qwen2.5-coder`)? Then /connect."
                 .to_string(),
             (None, name) => format!(
-                "No models from {name} at {}. Start its server with a model loaded, then /setup.",
+                "No models from {name} at {}. Start its server with a model loaded, then /connect.",
                 pending.base_url
             ),
         };
@@ -1487,7 +1493,7 @@ fn maybe_decompose_goal(
         if base_url.is_empty() {
             push_assistant_message(
                 state,
-                "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+                "No LLM configured. /connect connects one step by step (or /provider picks a known one).",
             );
             return true;
         }
@@ -1618,7 +1624,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     if base_url.is_empty() {
         push_assistant_message(
             state,
-            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+            "No LLM configured. /connect connects one step by step (or /provider picks a known one).",
         );
         return;
     }
@@ -1713,6 +1719,7 @@ fn end_turn(state: &mut crate::state::AppState) {
     state.reset_liveness();
     state.chat.finish_stream();
     state.chat.finish_user_timing();
+    absorb_setup_answer(state);
 }
 
 /// End the running turn with `error`, a message that already leads with a
@@ -1726,9 +1733,12 @@ fn end_turn_with_error(state: &mut crate::state::AppState, error: &str, transien
     let retry = transient
         && state.turn_retries == 0
         && state.turn.as_ref().is_some_and(|t| t.streamed_chars == 0);
+    let setup_asked = state.setup_asked;
     end_turn(state);
     state.chat_scroll = 0;
     if retry {
+        // The retried turn is still the answer to the same `/setup` question.
+        state.setup_asked = setup_asked;
         let (base_url, model) = parse_llm_selection(state);
         if !base_url.is_empty() {
             state.turn_retries += 1;
@@ -2440,6 +2450,7 @@ fn handle_overlay_key(key: crossterm::event::KeyEvent, state: &mut crate::state:
         || handle_scope_grant_key(key, state)
         || handle_web_approval_key(key, state)
         || handle_settings_key(key, state)
+        || handle_setup_key(key, state)
         || handle_help_key(key, state)
         || handle_picker_key(key, state)
         || handle_intro_key(key, state)
@@ -3250,6 +3261,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_export_nav_command(cmd, state)
         || handle_settings_nav_command(cmd, state)
         || handle_doctor_nav_command(cmd, state)
+        || handle_setup_nav_command(cmd, state)
         || handle_tools_nav_command(cmd, state)
         || handle_approval_nav_command(cmd, state)
         || handle_provider_admin_command(cmd, state)
@@ -3414,7 +3426,7 @@ fn invoke_skill(
     if base_url.is_empty() {
         push_assistant_message(
             state,
-            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+            "No LLM configured. /connect connects one step by step (or /provider picks a known one).",
         );
         return;
     }
@@ -3588,7 +3600,9 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
         "/intro" | "/getting-started" => open_intro(state),
         // The guided setup was reachable only by selecting a window with no
         // LLM configured — i.e. never, once anything was picked.
-        "/setup" | "/connect" => start_llm_setup_wizard(state),
+        // The LLM wizard. `/setup` is the guided settings view now
+        // (`handle_setup_nav_command`); `/setup llm` still reaches this.
+        "/connect" => start_llm_setup_wizard(state),
         "/resume" => {
             if let Some(home) = ahma_common::config::ahma_home_dir() {
                 resume_transcript(state, &home);
@@ -3632,6 +3646,180 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
         _ => return false,
     }
 
+    true
+}
+
+/// `/setup` (SPEC R-SETUP.4): the guided view of what ahma is set to and what
+/// it allows, with a plan of proposed changes you confirm one at a time.
+///
+/// - `/setup` opens the view;
+/// - `/setup set [--project] <key> <value>` and `/setup unset [--project] <key>`
+///   add your own change to the plan (it is validated like any other and applied
+///   only on your `y`);
+/// - `/setup llm` is the "connect a model" wizard (`/connect`);
+/// - anything else is a question or a request ("I want to allow the GPU", "deny
+///   network except crates.io") for the chat model, briefed with the settings and
+///   the plan. The model can only answer and propose; it never applies anything.
+fn handle_setup_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    let rest = match cmd.strip_prefix("/setup") {
+        Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest.trim(),
+        _ => return false,
+    };
+    // Picked from the menu: the entry's own placeholder.
+    if rest.is_empty() || rest.starts_with('[') || rest.starts_with('<') {
+        open_setup_view(state);
+        return true;
+    }
+    if rest == "llm" {
+        start_llm_setup_wizard(state);
+        return true;
+    }
+    let (unset, args) = if let Some(a) = rest.strip_prefix("unset ") {
+        (true, a.trim())
+    } else if let Some(a) = rest.strip_prefix("set ") {
+        (false, a.trim())
+    } else {
+        ask_setup(state, rest, cmd);
+        return true;
+    };
+    let (project, args) = match args.strip_prefix("--project") {
+        Some(a) => (true, a.trim_start()),
+        None => (false, args),
+    };
+    let (key, value) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    let (key, value) = (key.trim(), value.trim());
+    if key.is_empty() || (!unset && value.is_empty()) {
+        push_assistant_message(
+            state,
+            "Usage: `/setup set [--project] <table.key> <value>` or `/setup unset [--project] \
+             <table.key>`. `ahma settings explain <table.key>` says what a key does.",
+        );
+        return true;
+    }
+    let proposal = ahma_mcp::setup_plan::user_proposal(
+        unset,
+        crate::setup_view::file_for_flag(project),
+        key,
+        value,
+    );
+    let fixes = setup_doctor_fixes(state);
+    let workspace = std::path::PathBuf::from(&state.workspace);
+    state.setup_view.open_for(&workspace, fixes);
+    state.setup_view.add_proposals(vec![proposal], Vec::new());
+    state.setup_view.go(crate::setup_view::Section::Plan);
+    state.setup_view.status = Some("added to the plan; y applies it, n drops it".into());
+    true
+}
+
+/// The doctor's fixes for the setup plan, which lists them beside the detectors'.
+fn setup_doctor_fixes(state: &crate::state::AppState) -> Vec<ahma_common::doctor::Fix> {
+    ahma_common::doctor::fixes(&doctor_findings(state))
+}
+
+fn open_setup_view(state: &mut crate::state::AppState) {
+    let fixes = setup_doctor_fixes(state);
+    let workspace = std::path::PathBuf::from(&state.workspace);
+    state.setup_view.open_for(&workspace, fixes);
+}
+
+/// `/setup <words>`: a chat turn whose payload carries the settings, what is
+/// granted and the plan, and the closed grammar the model may propose in. The
+/// transcript shows only what was typed.
+fn ask_setup(state: &mut crate::state::AppState, question: &str, typed: &str) {
+    let (base_url, model) = parse_llm_selection(state);
+    if base_url.is_empty() {
+        open_setup_view(state);
+        push_assistant_message(
+            state,
+            "No model is set up to talk with yet — /connect sets one up. The view needs no model: \
+             `/setup set <key> <value>` adds a change of your own to the plan.",
+        );
+        return;
+    }
+    let fixes = setup_doctor_fixes(state);
+    let workspace = std::path::PathBuf::from(&state.workspace);
+    state.setup_view.prepare(&workspace, fixes);
+    let payload = ahma_mcp::setup_plan::briefing(
+        state.setup_view.snapshot(),
+        state.setup_view.plan(),
+        &workspace,
+        question,
+    );
+    state.setup_asked = true;
+    state.turn_retries = 0;
+    state.chat.push(crate::state::ChatEntry::User {
+        text: typed.to_string(),
+        payload: Some(payload),
+        started_at: Some(std::time::Instant::now()),
+        duration_ms: None,
+    });
+    state.chat.push(crate::state::ChatEntry::Assistant {
+        content: String::new(),
+        streaming: true,
+    });
+    state.chat_open = true;
+    state.chat_scroll = 0;
+    send_chat_turn(state, base_url, model);
+}
+
+/// The turn that answered a `/setup` question has ended: read the answer's
+/// `ahma-proposal` block into the plan. Only that block is read, every change in
+/// it is validated like any other, and nothing is applied.
+fn absorb_setup_answer(state: &mut crate::state::AppState) {
+    if !std::mem::take(&mut state.setup_asked) {
+        return;
+    }
+    // The reply to *this* question: after the latest user message, never an
+    // older answer left in the transcript when this turn failed.
+    let mut answer = String::new();
+    for entry in state.chat.entries().iter().rev() {
+        match entry {
+            crate::state::ChatEntry::User { .. } => break,
+            crate::state::ChatEntry::Assistant { content, .. } if !content.is_empty() => {
+                answer = content.clone();
+                break;
+            }
+            _ => {}
+        }
+    }
+    let parsed = ahma_mcp::setup_plan::parse_model_proposals(&answer, &state.llm_label());
+    if parsed.proposals.is_empty() && parsed.dropped.is_empty() {
+        return;
+    }
+    let count = parsed.proposals.len();
+    state
+        .setup_view
+        .add_proposals(parsed.proposals, parsed.dropped);
+    set_footer_hint(
+        state,
+        format!(
+            "{count} change(s) suggested by the model are in /setup → Proposed changes. \
+             Nothing is applied until you press y on each."
+        ),
+    );
+}
+
+/// Keys of the `/setup` view.
+fn handle_setup_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
+    use crate::setup_view::Action;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if !state.setup_view.open {
+        return false;
+    }
+    // Ctrl-C quits from everywhere, as in the settings panel.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        interrupt(state);
+        return true;
+    }
+    if let Action::Prefill(text) = state.setup_view.handle_key(key) {
+        // Leave the view and let the user finish the sentence in the chat input.
+        state.chat_open = true;
+        state.focus = crate::state::Focus::Chat;
+        if state.chat_input_is_empty() {
+            state.chat_input.insert_str(&text);
+        }
+    }
     true
 }
 
@@ -3708,7 +3896,7 @@ fn ask_doctor(state: &mut crate::state::AppState, question: &str, typed: &str) {
         run_doctor_report(state);
         push_assistant_message(
             state,
-            "No model is set up to answer questions yet — /setup connects one. The report above \
+            "No model is set up to answer questions yet — /connect connects one. The report above \
              needs no model.",
         );
         return;
@@ -4943,7 +5131,7 @@ fn follow_client_model_availability(state: &mut crate::state::AppState) {
             state.llm_selection = None;
             state.current_provider_url = None;
             format!(
-                "{} disconnected and no other model is set up — /setup connects one",
+                "{} disconnected and no other model is set up — /connect connects one",
                 crate::ui::shorten_llm_label(&gone)
             )
         }
@@ -6491,7 +6679,7 @@ fn analyze_operation(state: &mut crate::state::AppState, key: &crate::state::OpK
     if base_url.is_empty() {
         push_assistant_message(
             state,
-            "No LLM configured. /setup connects one step by step (or /provider picks a known one).",
+            "No LLM configured. /connect connects one step by step (or /provider picks a known one).",
         );
         return;
     }
@@ -8512,6 +8700,399 @@ mod tests {
             state.chat_input_is_empty(),
             "y must not land in the input box"
         );
+    }
+
+    // ── /setup (SPEC R-SETUP.4) ─────────────────────────────────────────────
+
+    /// A temp home and a project folder with a local model file and a
+    /// definition-of-done script, and a state pointing at it.
+    struct SetupFixture {
+        _home: tempfile::TempDir,
+        ws: tempfile::TempDir,
+        state: crate::state::AppState,
+    }
+
+    fn setup_fixture() -> (SetupFixture, parking_lot::MutexGuard<'static, ()>) {
+        let guard = crate::HOME_SEAM_GUARD.lock();
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs this test in its own process; set before any read.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".ahma")).unwrap();
+        std::fs::create_dir_all(ws.path().join("scripts")).unwrap();
+        std::fs::write(ws.path().join("scripts/check.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(ws.path().join("local.gguf"), "x").unwrap();
+        std::fs::write(
+            ws.path().join("AGENTS.md"),
+            "## Definition of Done\n\nRun `scripts/check.sh`.\n",
+        )
+        .unwrap();
+        let mut state = crate::state::AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = dunce::canonicalize(ws.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        (
+            SetupFixture {
+                _home: home,
+                ws,
+                state,
+            },
+            guard,
+        )
+    }
+
+    fn setup_press(state: &mut crate::state::AppState, code: crossterm::event::KeyCode) {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        assert!(super::handle_setup_key(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            state
+        ));
+    }
+
+    fn gpu_on() -> bool {
+        ahma_common::config::AhmaSettings::load().sandbox.allow_gpu
+    }
+
+    fn readers() -> Vec<String> {
+        ahma_common::config::AhmaSettings::load()
+            .tools
+            .source_readers
+    }
+
+    #[test]
+    fn setup_opens_the_view_and_connect_is_the_model_wizard() {
+        let (mut f, _g) = setup_fixture();
+        super::dispatch_nav_command("/setup", &mut f.state);
+        assert!(f.state.setup_view.open);
+        assert!(
+            !matches!(f.state.modal, crate::state::ModalState::LlmSetupProvider(_)),
+            "/setup is no longer the model wizard"
+        );
+        setup_press(&mut f.state, crossterm::event::KeyCode::Esc);
+        assert!(!f.state.setup_view.open);
+
+        super::dispatch_nav_command("/connect", &mut f.state);
+        assert!(matches!(
+            f.state.modal,
+            crate::state::ModalState::LlmSetupProvider(_)
+        ));
+        f.state.close_modal();
+        super::dispatch_nav_command("/setup llm", &mut f.state);
+        assert!(matches!(
+            f.state.modal,
+            crate::state::ModalState::LlmSetupProvider(_)
+        ));
+        assert!(!f.state.setup_view.open);
+    }
+
+    #[test]
+    fn each_proposed_change_is_applied_only_by_its_own_y() {
+        use crossterm::event::KeyCode;
+        let (mut f, _g) = setup_fixture();
+        super::dispatch_nav_command("/setup", &mut f.state);
+        let titles: Vec<String> = f
+            .state
+            .setup_view
+            .plan()
+            .items
+            .iter()
+            .map(|v| v.proposal.title.clone())
+            .collect();
+        assert!(
+            titles.iter().any(|t| t.contains("GPU"))
+                && titles.iter().any(|t| t.contains("scripts/check.sh")),
+            "{titles:?}"
+        );
+        assert_eq!(
+            f.state.setup_view.section(),
+            crate::setup_view::Section::Plan
+        );
+
+        // Opening, moving, and keys that are not `y` change nothing.
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Char('n'),
+        ] {
+            setup_press(&mut f.state, code);
+        }
+        // `n` dismissed the first item; nothing was applied.
+        assert!(!gpu_on() && readers().is_empty());
+        assert_eq!(f.state.setup_view.plan().items.len(), titles.len() - 1);
+
+        // `y` applies the selected item and only it.
+        let selected = f.state.setup_view.plan().items[f.state.setup_view.selected()]
+            .proposal
+            .title
+            .clone();
+        setup_press(&mut f.state, KeyCode::Char('y'));
+        let applied = (gpu_on(), readers());
+        assert!(
+            (selected.contains("GPU") && applied == (true, vec![]))
+                || (selected.contains("scripts/check.sh")
+                    && applied == (false, vec!["scripts/check.sh".to_string()])),
+            "{selected}: {applied:?}"
+        );
+        assert!(
+            f.state
+                .setup_view
+                .status
+                .as_deref()
+                .unwrap()
+                .starts_with("done:")
+        );
+        // It is gone from the plan, and a second `y` does not apply the other one.
+        assert!(
+            !f.state
+                .setup_view
+                .plan()
+                .items
+                .iter()
+                .any(|v| v.proposal.title == selected),
+            "an applied item leaves the plan"
+        );
+    }
+
+    #[test]
+    fn a_high_risk_grant_needs_a_second_y_on_the_same_item() {
+        use crossterm::event::KeyCode;
+        let (mut f, _g) = setup_fixture();
+        super::dispatch_nav_command("/setup", &mut f.state);
+        // A folder that does not exist yet is a high-risk grant (a warning the
+        // human must read), not a refusal.
+        let missing = f.ws.path().join("not-yet-there");
+        let p = ahma_mcp::setup_plan::Proposal {
+            title: "Grant a folder".into(),
+            why: "w".into(),
+            allows: "a".into(),
+            change: ahma_mcp::setup_plan::Change::GrantPath {
+                path: missing.clone(),
+                read_only: true,
+            },
+            source: ahma_mcp::setup_plan::Source::User,
+        };
+        f.state.setup_view.add_proposals(vec![p], Vec::new());
+        let idx = f
+            .state
+            .setup_view
+            .plan()
+            .items
+            .iter()
+            .position(|v| v.proposal.title == "Grant a folder")
+            .expect("in the plan");
+        for _ in 0..idx {
+            setup_press(&mut f.state, KeyCode::Down);
+        }
+        setup_press(&mut f.state, KeyCode::Char('y'));
+        assert!(
+            f.state
+                .setup_view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("press y again")
+        );
+        assert!(
+            ahma_common::config::AhmaSettings::load()
+                .sandbox
+                .persistent_scopes
+                .is_empty(),
+            "the first y granted nothing"
+        );
+        // Moving off the item cancels the confirmation.
+        setup_press(&mut f.state, KeyCode::Up);
+        setup_press(&mut f.state, KeyCode::Down);
+        setup_press(&mut f.state, KeyCode::Char('y'));
+        assert!(
+            ahma_common::config::AhmaSettings::load()
+                .sandbox
+                .persistent_scopes
+                .is_empty()
+        );
+        setup_press(&mut f.state, KeyCode::Char('y'));
+        assert_eq!(
+            ahma_common::config::AhmaSettings::load()
+                .sandbox
+                .persistent_scopes
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_setup_set_request_joins_the_plan_and_is_validated_like_any_other() {
+        use crossterm::event::KeyCode;
+        let (mut f, _g) = setup_fixture();
+        super::dispatch_nav_command("/setup set tools.timeout_secs 90", &mut f.state);
+        assert!(f.state.setup_view.open);
+        let titles = |s: &crate::state::AppState| -> Vec<String> {
+            s.setup_view
+                .plan()
+                .items
+                .iter()
+                .map(|v| v.proposal.title.clone())
+                .collect()
+        };
+        assert!(titles(&f.state).contains(&"Set tools.timeout_secs to 90".to_string()));
+
+        // A security key aimed at the repository file is listed as refused.
+        super::dispatch_nav_command("/setup set --project sandbox.allow_gpu true", &mut f.state);
+        let refused: Vec<String> = f
+            .state
+            .setup_view
+            .plan()
+            .refused
+            .iter()
+            .map(|(p, r)| format!("{}: {r}", p.title))
+            .collect();
+        assert!(
+            refused.iter().any(|r| r.contains("security setting")),
+            "{refused:?}"
+        );
+        assert!(!gpu_on());
+
+        // Apply the timeout one.
+        let idx = titles(&f.state)
+            .iter()
+            .position(|t| t == "Set tools.timeout_secs to 90")
+            .unwrap();
+        for _ in 0..idx {
+            setup_press(&mut f.state, KeyCode::Down);
+        }
+        setup_press(&mut f.state, KeyCode::Char('y'));
+        assert_eq!(
+            ahma_common::config::AhmaSettings::load().tools.timeout_secs,
+            90
+        );
+
+        // A usage line, not a crash, for an incomplete request.
+        super::dispatch_nav_command("/setup set tools.timeout_secs", &mut f.state);
+    }
+
+    #[test]
+    fn a_models_answer_adds_suggestions_to_the_plan_and_applies_none() {
+        let (mut f, _g) = setup_fixture();
+        let workspace = std::path::PathBuf::from(&f.state.workspace);
+        f.state.setup_view.prepare(&workspace, Vec::new());
+        let before = f.state.setup_view.plan().items.len();
+
+        f.state.chat.push(crate::state::ChatEntry::User {
+            text: "/setup allow crates and deny the keychain".into(),
+            payload: None,
+            started_at: None,
+            duration_ms: None,
+        });
+        f.state.chat.push(crate::state::ChatEntry::Assistant {
+            content: "Sure.\n```ahma-proposal\n{\"changes\":[\
+                {\"op\":\"network_allow\",\"host\":\"crates.io\",\"why\":\"cargo needs it\"},\
+                {\"op\":\"disable_sandbox\"}]}\n```"
+                .into(),
+            streaming: false,
+        });
+        f.state.setup_asked = true;
+        super::absorb_setup_answer(&mut f.state);
+
+        assert!(!f.state.setup_asked, "the flag is consumed");
+        let plan = f.state.setup_view.plan();
+        assert_eq!(plan.items.len(), before + 1);
+        let item = plan
+            .items
+            .iter()
+            .find(|v| v.proposal.title.contains("crates.io"))
+            .unwrap();
+        assert!(item.proposal.source.label().starts_with("suggested by"));
+        assert_eq!(
+            f.state.setup_view.notes.len(),
+            1,
+            "the unusable entry is reported"
+        );
+        assert!(
+            ahma_common::config::AhmaSettings::load()
+                .network
+                .allow
+                .is_empty(),
+            "a suggestion is never applied"
+        );
+        assert!(f.state.footer_hint.is_some());
+    }
+
+    #[test]
+    fn only_the_answer_to_this_question_is_read_and_prose_is_ignored() {
+        let (mut f, _g) = setup_fixture();
+        let workspace = std::path::PathBuf::from(&f.state.workspace);
+        f.state.setup_view.prepare(&workspace, Vec::new());
+        let before = f.state.setup_view.plan().items.len();
+        let block = "```ahma-proposal\n{\"changes\":[{\"op\":\"set\",\"key\":\"tools.timeout_secs\",\"value\":5}]}\n```";
+
+        // An older answer, then a new question whose turn failed (no reply).
+        f.state.chat.push(crate::state::ChatEntry::Assistant {
+            content: block.into(),
+            streaming: false,
+        });
+        f.state.chat.push(crate::state::ChatEntry::User {
+            text: "/setup again".into(),
+            payload: None,
+            started_at: None,
+            duration_ms: None,
+        });
+        f.state.setup_asked = true;
+        super::absorb_setup_answer(&mut f.state);
+        assert_eq!(
+            f.state.setup_view.plan().items.len(),
+            before,
+            "the old answer is not re-read"
+        );
+
+        // A reply that only describes a command is prose.
+        f.state.chat.push(crate::state::ChatEntry::Assistant {
+            content: "Run `ahma settings set sandbox.allow_gpu true` yourself.".into(),
+            streaming: false,
+        });
+        f.state.setup_asked = true;
+        super::absorb_setup_answer(&mut f.state);
+        assert_eq!(f.state.setup_view.plan().items.len(), before);
+        assert!(!gpu_on());
+
+        // And with the flag off, a block is ignored.
+        f.state.chat.push(crate::state::ChatEntry::Assistant {
+            content: block.into(),
+            streaming: false,
+        });
+        super::absorb_setup_answer(&mut f.state);
+        assert_eq!(f.state.setup_view.plan().items.len(), before);
+    }
+
+    #[test]
+    fn asking_without_a_model_opens_the_view_and_says_how_to_connect_one() {
+        let (mut f, _g) = setup_fixture();
+        super::dispatch_nav_command("/setup deny cargo publish", &mut f.state);
+        assert!(f.state.setup_view.open);
+        assert!(!f.state.setup_asked, "no turn was started");
+        let said = format!("{:?}", f.state.chat.entries());
+        assert!(said.contains("/connect"), "{said}");
+    }
+
+    #[test]
+    fn tell_ahma_finishes_the_sentence_in_the_chat_input() {
+        use crossterm::event::KeyCode;
+        let (mut f, _g) = setup_fixture();
+        super::dispatch_nav_command("/setup", &mut f.state);
+        setup_press(&mut f.state, KeyCode::Char('2'));
+        assert_eq!(
+            f.state.setup_view.section(),
+            crate::setup_view::Section::Settings
+        );
+        // Everything is at its default, so no row yet; `a` shows them all.
+        setup_press(&mut f.state, KeyCode::Char('e'));
+        assert!(f.state.setup_view.open, "no row to change yet");
+        setup_press(&mut f.state, KeyCode::Char('a'));
+        setup_press(&mut f.state, KeyCode::Char('e'));
+        assert!(!f.state.setup_view.open, "the view steps aside");
+        let typed: String = f.state.chat_input.lines().join("\n");
+        assert!(typed.starts_with("/setup set "), "{typed:?}");
     }
 
     /// `/doctor` reports; `/doctor fix 1` shows the exact change; only `y`

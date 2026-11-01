@@ -266,9 +266,16 @@ Write-Host ""
 Write-Host "PowerShell (built into Windows 10/11) is used at runtime. No additional installation needed."
 Write-Host ""
 
-# Run the Rust-based setup wizard
+# Run the Rust-based setup wizard. In a terminal a bare `ahma setup` opens the guided
+# settings view; the installer wants the line-mode wizard that installs the
+# integrations, which `--cli` asks for (a release before that flag has no guided view,
+# so a bare `setup` is already the wizard there).
+$setupFlags = @()
+if ((& $mcpBin setup --help 2>$null | Out-String) -match '--cli') {
+    $setupFlags = @('--cli')
+}
 if ([Environment]::UserInteractive) {
-    & $mcpBin setup
+    & $mcpBin setup @setupFlags
 } else {
     Write-Host "Non-interactive shell detected. Running auto-setup..."
     & $mcpBin setup --auto
