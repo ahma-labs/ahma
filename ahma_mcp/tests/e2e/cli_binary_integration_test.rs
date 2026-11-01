@@ -105,6 +105,76 @@ mod ahma_mcp_tests {
         );
     }
 
+    /// `ahma setup --plan` proposes what the project suggests, changes nothing,
+    /// and says "no changes" once the proposal is in effect (SPEC R-SETUP.3).
+    #[test]
+    fn test_ahma_setup_plan_proposes_and_settles() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let home = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("scripts")).unwrap();
+        std::fs::write(repo.path().join("scripts/check.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(repo.path().join("local.gguf"), "x").unwrap();
+        std::fs::write(
+            repo.path().join("AGENTS.md"),
+            "## Definition of Done\n\nRun `scripts/check.sh` before you stop.\n",
+        )
+        .unwrap();
+
+        let run = |args: &[&str]| {
+            let o = test_command(&binary)
+                .env("AHMA_TEST_HOME", home.path())
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .expect("Failed to execute ahma setup");
+            assert!(
+                o.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let settings = home.path().join(".ahma/settings.toml");
+        // Startup seeds a documented settings file, so "unchanged" means no
+        // active line, not no file.
+        let active = |needle: &str| {
+            std::fs::read_to_string(&settings)
+                .unwrap_or_default()
+                .lines()
+                .any(|l| l.trim_start().starts_with(needle))
+        };
+
+        let plan = run(&["setup", "--plan"]);
+        assert!(plan.contains("2 change(s) proposed"), "{plan}");
+        assert!(plan.contains("sandbox.allow_gpu: false -> true"), "{plan}");
+        assert!(plan.contains("local.gguf"), "{plan}");
+        assert!(plan.contains("tools.source_readers"), "{plan}");
+        assert!(plan.contains("scripts/check.sh"), "{plan}");
+        assert!(plan.contains("undo:    ahma settings unset"), "{plan}");
+        assert!(plan.contains("Nothing was changed"), "{plan}");
+        assert!(!active("allow_gpu"), "planning changes no setting");
+        assert!(!active("source_readers"), "planning changes no setting");
+
+        // Without a terminal, --apply asks nobody and changes nothing.
+        let apply = run(&["setup", "--plan", "--apply"]);
+        assert!(apply.contains("needs a terminal"), "{apply}");
+        assert!(!active("allow_gpu") && !active("source_readers"));
+
+        // Apply by hand what the plan said, then the plan settles.
+        run(&["settings", "set", "sandbox.allow_gpu", "true"]);
+        run(&[
+            "settings",
+            "set",
+            "tools.source_readers",
+            "['scripts/check.sh']",
+        ]);
+        assert!(active("allow_gpu = true") && active("source_readers"));
+        let again = run(&["setup", "--plan"]);
+        assert!(again.starts_with("No changes proposed"), "{again}");
+    }
+
     /// `ahma settings set` respects the trust tiers, refuses grants it would not
     /// check, and leaves an audit line for each change (SPEC R-CFG2.2, R-CFG10.5).
     #[test]

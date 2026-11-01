@@ -77,4 +77,5 @@ saying what that would let tools do.
 - [docs/tui.md](tui.md) — `/intro`, `/settings`, and the rest of the TUI
 - [docs/permissions.md](permissions.md) — the permission ledger and audit log
 - [docs/settings.md](settings.md) — every setting
+- [docs/setup.md](setup.md) — `ahma setup --plan` proposes your doctor's fixes together with project-specific settings
 - SPEC: R-DOCTOR, R-PERM, R5.4.8
