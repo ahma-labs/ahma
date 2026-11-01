@@ -87,34 +87,228 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     }
 }
 
-/// The `/setup` view (SPEC R-SETUP.4): tabs, the rows of the current section,
-/// the explanation of the selected row, and the keys.
+/// `text` broken into lines of at most `width` characters, at spaces; a word
+/// longer than the line (a path) is cut rather than lost off the edge. The
+/// indentation the text starts with is kept on every line.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let indent = text.chars().take_while(|c| *c == ' ').count();
+    let width = width.saturating_sub(indent).max(8);
+    let pad = " ".repeat(indent);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        while word.len() > width {
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            out.push(word.drain(..width).collect());
+        }
+        let word: String = word.into_iter().collect();
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out.into_iter().map(|l| format!("{pad}{l}")).collect()
+}
+
+fn setup_tone_style(theme: &Theme, tone: crate::setup_view::Tone) -> Style {
+    use crate::setup_view::Tone;
+    match tone {
+        Tone::Normal => theme.normal(),
+        Tone::Dim => theme.dim(),
+        Tone::Ok => theme.success(),
+        Tone::Warn => theme.pending(),
+        Tone::Bad => theme.failed(),
+    }
+}
+
+/// The `/setup` view (SPEC R-SETUP.4): the proposed change on screen with its
+/// reason, the result screen, or the reference sections behind `d`.
 fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    use crate::setup_view::{Section, Tone};
+    use crate::setup_view::Mode;
 
     let view = &state.setup_view;
     let popup_w = area.width.saturating_sub(4).max(60).min(area.width);
     let popup_h = area.height.saturating_sub(2).max(16).min(area.height);
     let popup = centered_rect(popup_w, popup_h, area);
     frame.render_widget(Clear, popup);
+    let title = match view.mode() {
+        Mode::Review => match view.card() {
+            Some(card) => format!(
+                " Setup · proposed change {} of {} ",
+                card.position, card.total
+            ),
+            None => " Setup ".to_string(),
+        },
+        Mode::Done => " Setup · result ".to_string(),
+        Mode::Browse => " Setup · what ahma is set to and what it allows ".to_string(),
+    };
     let block = Block::default()
-        .title(Span::styled(
-            " Setup · what ahma is set to and what it allows ",
-            theme.title().bold(),
-        ))
+        .title(Span::styled(title, theme.title().bold()))
         .borders(Borders::ALL)
         .border_style(theme.border_focused());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
+    match view.mode() {
+        Mode::Review => draw_setup_review(frame, state, theme, inner),
+        Mode::Done => draw_setup_done(frame, state, theme, inner),
+        Mode::Browse => draw_setup_browse(frame, state, theme, inner),
+    }
+}
 
+/// The footer line(s), wrapped so a narrow terminal still shows every key.
+fn draw_setup_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(state.setup_view.footer(), theme.dim()))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+/// One proposed change: what, why, what it allows, the exact change, its undo.
+fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    use crate::setup_view::{Answer, Tone};
+
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let width = rows[0].width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("folder  {}", state.workspace),
+            theme.dim(),
+        )),
+        Line::from(""),
+    ];
+    let Some(card) = state.setup_view.card() else {
+        lines.push(Line::from(Span::styled("Nothing to answer.", theme.dim())));
+        frame.render_widget(Paragraph::new(lines), rows[0]);
+        draw_setup_footer(frame, state, theme, rows[1]);
+        return;
+    };
+
+    // Progress: one mark per proposal, the one on screen highlighted.
+    let mut marks = Vec::new();
+    for (i, answer) in card.progress.iter().enumerate() {
+        let (glyph, style) = match answer {
+            Some(Answer::Yes) => (" ● ", theme.success()),
+            Some(Answer::No) => (" ● ", theme.dim()),
+            None => (" ○ ", theme.normal()),
+        };
+        marks.push(Span::styled(
+            glyph,
+            if i + 1 == card.position {
+                theme.selected_item()
+            } else {
+                style
+            },
+        ));
+    }
+    lines.push(Line::from(marks));
+    lines.push(Line::from(""));
+
+    let title_style = setup_tone_style(theme, card.tone).bold();
+    for (i, part) in wrap_words(&card.title, width).into_iter().enumerate() {
+        let mut spans = vec![Span::styled(part, title_style)];
+        if i == 0
+            && let Some(badge) = &card.badge
+        {
+            spans.push(Span::styled(format!("  {badge}"), title_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(card.source.clone(), theme.dim())));
+    lines.push(Line::from(""));
+
+    const LABEL: usize = 9;
+    let body = width.saturating_sub(LABEL);
+    for (label, text) in &card.fields {
+        for (i, part) in wrap_words(text, body).into_iter().enumerate() {
+            let head = if i == 0 {
+                format!("{label:<LABEL$}")
+            } else {
+                " ".repeat(LABEL)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(head, theme.dim().bold()),
+                Span::styled(part, theme.normal()),
+            ]));
+        }
+    }
+    for warning in &card.warnings {
+        for (i, part) in wrap_words(warning, body).into_iter().enumerate() {
+            let head = if i == 0 {
+                format!("{:<LABEL$}", "WARNING")
+            } else {
+                " ".repeat(LABEL)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{head}{part}"),
+                setup_tone_style(theme, Tone::Bad).bold(),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(card.prompt.clone(), theme.normal().bold()),
+        Span::raw("   "),
+        Span::styled("[y] yes", theme.success().bold()),
+        Span::raw("   "),
+        Span::styled("[n] no", theme.failed().bold()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        match card.answer {
+            Some(Answer::Yes) => "Your answer: yes. Press n to change it.",
+            Some(Answer::No) => "Your answer: no. Press y to change it.",
+            None => "Nothing is written until every change has your y or n.",
+        },
+        theme.dim(),
+    )));
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+    draw_setup_footer(frame, state, theme, rows[1]);
+}
+
+/// What the answers did, or "nothing to change".
+fn draw_setup_done(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let width = rows[0].width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("folder  {}", state.workspace),
+            theme.dim(),
+        )),
+        Line::from(""),
+    ];
+    for row in state.setup_view.done_rows() {
+        let style = setup_tone_style(theme, row.tone);
+        for part in wrap_words(&row.text, width) {
+            lines.push(Line::from(Span::styled(part, style)));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+    draw_setup_footer(frame, state, theme, rows[1]);
+}
+
+/// The reference: tabs, the rows of the current section, the explanation of the
+/// selected row, and the keys.
+fn draw_setup_browse(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    use crate::setup_view::Section;
+
+    let view = &state.setup_view;
     let rows = Layout::vertical([
         Constraint::Length(3), // header
         Constraint::Length(1), // tabs
         Constraint::Min(4),    // list
         Constraint::Length(7), // detail
-        Constraint::Length(1), // footer
+        Constraint::Length(2), // footer
     ])
-    .split(inner);
+    .split(area);
 
     // Header: where things are, and whether a model can be talked to.
     let model = if state.llm_selection.is_some() {
@@ -138,14 +332,10 @@ fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
     ];
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    // Tabs.
+    // Tabs, then the way back to the proposals.
     let mut tabs = Vec::new();
     for (i, section) in Section::ALL.iter().enumerate() {
-        let count = match section {
-            Section::Plan => format!(" ({})", view.plan().items.len()),
-            _ => String::new(),
-        };
-        let label = format!(" {} {}{} ", i + 1, section.label(), count);
+        let label = format!(" {} {} ", i + 1, section.label());
         tabs.push(Span::styled(
             label,
             if *section == view.section() {
@@ -156,6 +346,13 @@ fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
         ));
         tabs.push(Span::raw(" "));
     }
+    let pending = view.plan().items.len();
+    if pending > 0 {
+        tabs.push(Span::styled(
+            format!(" p  {pending} proposed change(s) waiting "),
+            theme.pending(),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(tabs)), rows[1]);
 
     // List, scrolled to keep the selection on screen.
@@ -163,13 +360,6 @@ fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
     let visible = rows[2].height as usize;
     let selected = view.selected();
     let offset = selected.saturating_sub(visible.saturating_sub(1));
-    let tone = |t: Tone| match t {
-        Tone::Normal => theme.normal(),
-        Tone::Dim => theme.dim(),
-        Tone::Ok => theme.success(),
-        Tone::Warn => theme.pending(),
-        Tone::Bad => theme.failed(),
-    };
     let mut lines: Vec<Line> = list
         .iter()
         .enumerate()
@@ -180,7 +370,7 @@ fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
             let style = if i == selected {
                 theme.selected_item()
             } else {
-                tone(row.tone)
+                setup_tone_style(theme, row.tone)
             };
             Line::from(Span::styled(format!("{marker}{}", row.text), style))
         })
@@ -190,7 +380,6 @@ fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
             match view.section() {
                 Section::Settings => "  Everything is at its default. [a] shows every setting.",
                 Section::Allow => "  Nothing has been granted or switched on.",
-                Section::Plan => "  No changes proposed.",
                 Section::Install => "  Nothing to show.",
             },
             theme.dim(),
@@ -213,10 +402,7 @@ fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
         rows[3],
     );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(view.footer(), theme.dim()))),
-        rows[4],
-    );
+    draw_setup_footer(frame, state, theme, rows[4]);
 }
 
 /// "Apply this fix?" for `/doctor fix <n>`: the exact change, then `y`.
@@ -5530,11 +5716,12 @@ mod tests {
             .join("\n")
     }
 
-    /// The setup view paints every tab at a normal size, shows the proposal and
-    /// its explanation, and survives a terminal far too small for it.
+    /// The setup view paints the proposal with its reasons, then the result,
+    /// then every reference tab, and survives a terminal far too small for any.
     #[test]
-    fn the_setup_view_paints_every_tab_and_survives_a_tiny_terminal() {
+    fn the_setup_view_paints_every_screen_and_survives_a_tiny_terminal() {
         use crate::setup_view::Section;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let _guard = crate::HOME_SEAM_GUARD.lock();
         let home = tempfile::tempdir().unwrap();
         // SAFETY: held under HOME_SEAM_GUARD, and nextest gives each test a process.
@@ -5545,17 +5732,51 @@ mod tests {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         state.workspace = ws.path().to_string_lossy().into_owned();
         state.setup_view.open_for(ws.path(), Vec::new());
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
 
-        let plan = render_setup_view(&state, 110, 34);
-        assert!(plan.contains("Setup"), "{plan}");
-        assert!(plan.contains("Proposed changes"), "{plan}");
+        // The first thing seen is the change, with every reason, and the keys.
+        let card = render_setup_view(&state, 110, 34);
+        assert!(card.contains("proposed change 1 of 1"), "{card}");
         assert!(
-            plan.contains("Let sandboxed commands use the GPU"),
-            "{plan}"
+            card.contains("Let sandboxed commands use the GPU"),
+            "{card}"
         );
-        assert!(plan.contains("allows:") && plan.contains("undo:"), "{plan}");
-        assert!(plan.contains("[y] apply this one"), "{plan}");
+        for label in ["Why", "Allows", "Change", "Undo"] {
+            assert!(card.contains(label), "{label}: {card}");
+        }
+        assert!(
+            card.contains("[y] yes") && card.contains("[n] no"),
+            "{card}"
+        );
+        for (w, h) in [(60, 16), (20, 5), (1, 1), (200, 3)] {
+            let _ = render_setup_view(&state, w, h);
+        }
 
+        // A narrow terminal wraps the reasons rather than losing them.
+        let narrow = render_setup_view(&state, 64, 30);
+        assert!(
+            narrow.contains("Why") && narrow.contains("Undo"),
+            "{narrow}"
+        );
+
+        // `n` was the only change: the result screen says what happened.
+        state.setup_view.handle_key(key('n'));
+        let done = render_setup_view(&state, 110, 34);
+        assert!(done.contains("result"), "{done}");
+        assert!(done.contains("declined"), "{done}");
+        assert!(done.contains("[Enter] done"), "{done}");
+        for (w, h) in [(60, 16), (20, 5), (1, 1), (200, 3)] {
+            let _ = render_setup_view(&state, w, h);
+        }
+
+        // `r` asks about it again: a proposal is waiting while we look around.
+        state.setup_view.handle_key(key('r'));
+        assert!(
+            render_setup_view(&state, 110, 34).contains("proposed change 1 of 1"),
+            "asked again"
+        );
+
+        // Behind `d`: every reference section.
         for (section, expect) in [
             (Section::Install, "MCP server entries"),
             (Section::Settings, "Everything is at its default"),
@@ -5564,12 +5785,15 @@ mod tests {
             state.setup_view.go(section);
             let screen = render_setup_view(&state, 110, 34);
             assert!(screen.contains(expect), "{section:?}: {screen}");
+            for (w, h) in [(60, 16), (20, 5), (1, 1), (200, 3)] {
+                let _ = render_setup_view(&state, w, h);
+            }
         }
 
-        // Far smaller than the layout wants: no panic, whatever is clipped.
-        for (w, h) in [(60, 16), (20, 5), (1, 1), (200, 3)] {
-            let _ = render_setup_view(&state, w, h);
-        }
+        // The way back is announced while something is waiting.
+        state.setup_view.go(Section::Install);
+        let browse = render_setup_view(&state, 110, 34);
+        assert!(browse.contains("proposed change(s) waiting"), "{browse}");
     }
 
     /// End-to-end for the `!pwd` report: the command's actual output must be on

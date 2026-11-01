@@ -95,6 +95,36 @@ pub enum Change {
     DoctorFix(Fix),
 }
 
+impl Change {
+    /// A stable name for what this change does, independent of the words a
+    /// proposal wraps around it, so a "no" is remembered even after a detector
+    /// rewords its title. Two proposals with one identity are the same change.
+    pub fn identity(&self) -> String {
+        let file = |f: &SettingsFile| match f {
+            SettingsFile::User => "user",
+            SettingsFile::Project => "project",
+        };
+        match self {
+            Self::Set {
+                file: f,
+                key,
+                value,
+            } => format!("set|{}|{key}|{value}", file(f)),
+            Self::Unset { file: f, key } => format!("unset|{}|{key}", file(f)),
+            Self::AddToList { file: f, key, item } => format!("add|{}|{key}|{item}", file(f)),
+            Self::RemoveFromList { file: f, key, item } => {
+                format!("remove|{}|{key}|{item}", file(f))
+            }
+            Self::GrantPath { path, read_only } => {
+                format!("grant|{}|{read_only}", path.display())
+            }
+            Self::NetworkAllow { host } => format!("network|{host}"),
+            Self::Install(InstallItem::McpConfig) => "install|mcp".into(),
+            Self::DoctorFix(fix) => format!("doctor|{}", fix.describe()),
+        }
+    }
+}
+
 /// One proposed change and the words that explain it.
 #[derive(Debug, Clone)]
 pub struct Proposal {
@@ -526,6 +556,9 @@ pub struct Plan {
     pub refused: Vec<(Proposal, Refusal)>,
     /// How many proposals were already in effect (and so are not listed).
     pub settled: usize,
+    /// How many proposals you declined earlier in this folder and so are not
+    /// listed (SPEC R-SETUP.4.8).
+    pub declined: usize,
 }
 
 impl Plan {
@@ -551,7 +584,117 @@ pub fn plan_from(env: &Env, proposals: Vec<Proposal>) -> Plan {
 /// Every deterministic proposal for `env.workspace`: the detectors, then
 /// `installs` if asked for, then a proposal per doctor fix in `fixes`.
 pub fn build_plan(env: &Env, fixes: Vec<Fix>, installs: bool) -> Plan {
-    plan_from(env, detected_proposals(env, fixes, installs))
+    let (shown, hidden) = split_declined(env, detected_proposals(env, fixes, installs));
+    let mut plan = plan_from(env, shown);
+    plan.declined = pending_count(env, hidden);
+    plan
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What you declined, remembered per folder (SPEC R-SETUP.4.8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The file beside `settings.toml` that remembers declines, as
+/// `{ "<folder>": ["<change identity>", …] }`.
+const DECLINED_FILE: &str = "setup-declined.json";
+
+fn declined_path(env: &Env) -> PathBuf {
+    env.user_file.with_file_name(DECLINED_FILE)
+}
+
+/// The folder as the store names it: canonical, so `.` and the full path agree.
+fn folder_key(env: &Env) -> String {
+    dunce::canonicalize(&env.workspace)
+        .unwrap_or_else(|_| env.workspace.clone())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether a "no" to this proposal is worth remembering. Only what ahma itself
+/// raises can come back on its own; something you or a model asked for once is
+/// not re-raised, so there is nothing to suppress.
+pub fn declines_are_remembered(source: &Source) -> bool {
+    matches!(
+        source,
+        Source::Detector(_) | Source::Doctor | Source::Install
+    )
+}
+
+fn read_declined(env: &Env) -> std::collections::BTreeMap<String, Vec<String>> {
+    // A missing or damaged file is "nothing declined": asking again is the safe
+    // failure, and the next `record_declined` rewrites it.
+    std::fs::read_to_string(declined_path(env))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_declined(
+    env: &Env,
+    store: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    let path = declined_path(env);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    // Write beside it and rename, so a reader never sees half a file.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(store)?)
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))?;
+    Ok(())
+}
+
+/// Remember that you said no to these, in this folder. Anything that is not
+/// ahma's own proposal is ignored.
+pub fn record_declined(env: &Env, proposals: &[&Proposal]) -> Result<()> {
+    let new: Vec<String> = proposals
+        .iter()
+        .filter(|p| declines_are_remembered(&p.source))
+        .map(|p| p.change.identity())
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let mut store = read_declined(env);
+    let entry = store.entry(folder_key(env)).or_default();
+    for id in new {
+        if !entry.contains(&id) {
+            entry.push(id);
+        }
+    }
+    write_declined(env, &store)
+}
+
+/// Ask about everything in this folder again.
+pub fn forget_declined(env: &Env) -> Result<()> {
+    let mut store = read_declined(env);
+    if store.remove(&folder_key(env)).is_some() {
+        write_declined(env, &store)?;
+    }
+    Ok(())
+}
+
+/// `proposals` split into those to show and those you declined earlier here.
+pub fn split_declined(env: &Env, proposals: Vec<Proposal>) -> (Vec<Proposal>, Vec<Proposal>) {
+    let declined = read_declined(env)
+        .remove(&folder_key(env))
+        .unwrap_or_default();
+    proposals.into_iter().partition(|p| {
+        !(declines_are_remembered(&p.source) && declined.contains(&p.change.identity()))
+    })
+}
+
+/// What [`split_declined`] shows, and how many it left out.
+pub fn without_declined(env: &Env, proposals: Vec<Proposal>) -> (Vec<Proposal>, usize) {
+    let (shown, hidden) = split_declined(env, proposals);
+    (shown, hidden.len())
+}
+
+/// How many of `hidden` would be offered if asked about again: a declined item
+/// you have since done by hand is not worth mentioning.
+pub fn pending_count(env: &Env, hidden: Vec<Proposal>) -> usize {
+    plan_from(env, hidden).items.len()
 }
 
 /// The proposals [`build_plan`] validates, before validation, so a caller can
@@ -591,6 +734,7 @@ pub fn render_plan(plan: &Plan) -> String {
             "No changes proposed ({} already in effect).",
             plan.settled
         );
+        declined_note(&mut out, plan);
         return out;
     }
     let _ = writeln!(out, "{} change(s) proposed:", plan.items.len());
@@ -623,7 +767,20 @@ pub fn render_plan(plan: &Plan) -> String {
     if plan.settled > 0 {
         let _ = writeln!(out, "\n({} more already in effect.)", plan.settled);
     }
+    declined_note(&mut out, plan);
     out
+}
+
+/// Say what was left out because you declined it, so a quiet plan is not a
+/// mystery and the way back is known.
+fn declined_note(out: &mut String, plan: &Plan) {
+    if plan.declined > 0 {
+        let _ = writeln!(
+            out,
+            "{} declined earlier, not shown. Run `ahma setup` and press r to be asked again.",
+            plan.declined
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1310,7 +1467,11 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
             Risk::Security => " This changes what the sandbox permits.",
             Risk::Normal => "",
         };
-        print!("\n{}. {}{extra}\nApply? [y/N] ", i + 1, item.proposal.title);
+        print!(
+            "\n{}. {}{extra}\nApply? [y = yes, n = no and don't ask again here, Enter = skip] ",
+            i + 1,
+            item.proposal.title
+        );
         std::io::stdout().flush()?;
         let mut answer = String::new();
         stdin.lock().read_line(&mut answer)?;
@@ -1319,6 +1480,11 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
             match apply(&env, &item.proposal, "cli", &now) {
                 Ok(done) => println!("Done: {done}"),
                 Err(e) => println!("Could not apply: {e:#}"),
+            }
+        } else if answer.trim().eq_ignore_ascii_case("n") {
+            match record_declined(&env, &[&item.proposal]) {
+                Ok(()) => println!("Declined; not asked again in this folder."),
+                Err(e) => println!("Skipped (could not remember the answer: {e:#})."),
             }
         } else {
             println!("Skipped.");
@@ -1466,6 +1632,121 @@ mod tests {
         assert!(plan.is_empty());
         assert_eq!(plan.settled, 2);
         assert!(render_plan(&plan).starts_with("No changes proposed (2 already in effect)"));
+    }
+
+    fn detected(item: &str) -> Proposal {
+        Proposal {
+            title: format!("Let edits continue while `{item}` runs"),
+            why: "w".into(),
+            allows: "a".into(),
+            change: Change::AddToList {
+                file: SettingsFile::User,
+                key: "tools.source_readers".into(),
+                item: item.into(),
+            },
+            source: Source::Detector("source-readers"),
+        }
+    }
+
+    #[test]
+    fn a_change_has_a_stable_identity_that_ignores_the_words_around_it() {
+        let a = detected("scripts/a.sh");
+        let mut reworded = detected("scripts/a.sh");
+        reworded.title = "something else entirely".into();
+        reworded.why = "another reason".into();
+        assert_eq!(a.change.identity(), reworded.change.identity());
+        assert_ne!(
+            a.change.identity(),
+            detected("scripts/b.sh").change.identity()
+        );
+        let in_repo = Change::AddToList {
+            file: SettingsFile::Project,
+            key: "tools.source_readers".into(),
+            item: "scripts/a.sh".into(),
+        };
+        assert_ne!(
+            a.change.identity(),
+            in_repo.identity(),
+            "which file matters"
+        );
+        assert_ne!(
+            Change::NetworkAllow {
+                host: "a.io".into()
+            }
+            .identity(),
+            Change::NetworkAllow {
+                host: "b.io".into()
+            }
+            .identity()
+        );
+    }
+
+    #[test]
+    fn a_declined_proposal_is_not_offered_again_in_that_folder_only() {
+        let f = fixture();
+        let a = detected("scripts/a.sh");
+        let b = detected("scripts/b.sh");
+        record_declined(&f.env, &[&a]).unwrap();
+
+        let (shown, hidden) = without_declined(&f.env, vec![a.clone(), b.clone()]);
+        assert_eq!(hidden, 1);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].change.identity(), b.change.identity());
+
+        // It is remembered on disk, not in this process: a second Env reads it.
+        let again = Env { ..f.env.clone() };
+        assert_eq!(without_declined(&again, vec![a.clone()]).1, 1);
+
+        // Another folder is still asked.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = Env {
+            workspace: elsewhere.path().to_path_buf(),
+            ..f.env.clone()
+        };
+        assert_eq!(without_declined(&other, vec![a.clone()]).1, 0);
+
+        // Changing your mind brings it back.
+        forget_declined(&f.env).unwrap();
+        assert_eq!(without_declined(&f.env, vec![a, b]).1, 0);
+    }
+
+    #[test]
+    fn only_what_ahma_itself_proposes_is_remembered_as_declined() {
+        let f = fixture();
+        let mut yours = detected("scripts/a.sh");
+        yours.source = Source::User;
+        let mut model = detected("scripts/b.sh");
+        model.source = Source::Model("any".into());
+        record_declined(&f.env, &[&yours, &model]).unwrap();
+        assert_eq!(without_declined(&f.env, vec![yours, model]).1, 0);
+        assert!(
+            !f.env
+                .user_file
+                .with_file_name("setup-declined.json")
+                .exists(),
+            "nothing to remember, nothing written"
+        );
+    }
+
+    #[test]
+    fn the_plan_says_how_many_it_left_out() {
+        let f = fixture();
+        std::fs::create_dir_all(f.ws.path().join("scripts")).unwrap();
+        std::fs::write(f.ws.path().join("scripts/check.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            f.ws.path().join("AGENTS.md"),
+            "## Definition of Done\n\nRun `scripts/check.sh`.\n",
+        )
+        .unwrap();
+        let before = build_plan(&f.env, Vec::new(), false);
+        assert_eq!(before.items.len(), 1, "{:?}", before.items);
+        record_declined(&f.env, &[&before.items[0].proposal]).unwrap();
+
+        let after = build_plan(&f.env, Vec::new(), false);
+        assert!(after.items.is_empty());
+        assert_eq!(after.declined, 1);
+        let text = render_plan(&after);
+        assert!(text.contains("1 declined earlier"), "{text}");
     }
 
     #[test]

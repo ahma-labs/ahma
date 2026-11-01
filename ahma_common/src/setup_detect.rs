@@ -281,7 +281,28 @@ fn script_of(command: &str, root: &Path) -> Option<String> {
         return None;
     }
     let real = dunce::canonicalize(root.join(first)).ok()?;
-    (real.is_file() && real.starts_with(root)).then(|| first.to_string())
+    (real.is_file() && real.starts_with(root) && is_script(&real)).then(|| first.to_string())
+}
+
+/// Extensions of files meant to be run by an interpreter.
+const SCRIPT_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "ps1", "cmd", "bat", "py", "rb", "pl",
+];
+
+/// Whether `path` is something a shell runs: it starts with `#!`, or carries a
+/// script extension. The same test on every platform, since a Windows checkout
+/// has no execute bit to ask. A manifest or a document that a definition of done
+/// merely mentions is neither, and is not a "script that only reads sources".
+fn is_script(path: &Path) -> bool {
+    use std::io::Read;
+    if has_extension(path, SCRIPT_EXTENSIONS) {
+        return true;
+    }
+    let mut head = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && head == *b"#!"
 }
 
 /// A toolchain the project uses whose profile is switched off.
@@ -462,6 +483,51 @@ mod tests {
             "## Definition of Done\n\n`scripts/check.sh`\n",
         );
         assert!(detect(dir.path(), &AhmaSettings::default()).is_empty());
+    }
+
+    fn readers(dir: &Path) -> Vec<String> {
+        detect(dir, &AhmaSettings::default())
+            .into_iter()
+            .filter(|d| d.detector == "source-readers")
+            .map(|d| match d.edit {
+                Edit::AddToList { item, .. } => item,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// Field case: AGENTS.md names `ahma_http_bridge/Cargo.toml` in prose inside
+    /// its definition of done, and setup offered it as a script that "only reads
+    /// sources". A manifest is a file the build reads, not a command that runs.
+    #[test]
+    fn a_data_file_named_in_the_definition_of_done_is_not_a_script() {
+        let dir = project();
+        write(dir.path(), "crate/Cargo.toml", "[package]\n");
+        write(dir.path(), "docs/NOTES.md", "# notes\n");
+        write(dir.path(), "scripts/check.sh", "#!/bin/sh\n");
+        write(
+            dir.path(),
+            "AGENTS.md",
+            "## Definition of Done\n\nIf you touched `crate/Cargo.toml` or `docs/NOTES.md`, \
+             run `scripts/check.sh`.\n",
+        );
+        assert_eq!(readers(dir.path()), ["scripts/check.sh"]);
+    }
+
+    #[test]
+    fn a_script_is_a_shebang_file_or_one_with_a_script_extension() {
+        let dir = project();
+        write(dir.path(), "scripts/check", "#!/usr/bin/env bash\necho\n");
+        write(dir.path(), "scripts/lint.SH", "echo\n");
+        write(dir.path(), "scripts/plain", "just words\n");
+        write(dir.path(), "scripts/empty", "");
+        write(
+            dir.path(),
+            "AGENTS.md",
+            "## Definition of Done\n\n```\nscripts/check\nscripts/lint.SH\nscripts/plain\n\
+             scripts/empty\n```\n",
+        );
+        assert_eq!(readers(dir.path()), ["scripts/check", "scripts/lint.SH"]);
     }
 
     #[test]

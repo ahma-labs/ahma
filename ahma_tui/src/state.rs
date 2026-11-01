@@ -2173,6 +2173,9 @@ pub struct AppState {
     /// A `/setup <words>` question is in flight: when the turn ends, the answer's
     /// `ahma-proposal` block (if any) is read into the setup plan.
     pub setup_asked: bool,
+    /// `ahma setup` opened the view: closing it ends the program, because the
+    /// view was the whole task (SPEC R-SETUP.4.7).
+    pub setup_exit_on_close: bool,
 
     // ── Liveness indicator ──
     /// Two-cell Braille "liveness" glyph shown in front of the streaming `ahma`
@@ -2863,6 +2866,7 @@ impl AppState {
             settings_editor: crate::settings_editor::SettingsEditor::default(),
             setup_view: crate::setup_view::SetupView::default(),
             setup_asked: false,
+            setup_exit_on_close: false,
 
             windows: vec![],
             next_window_id: 0,
