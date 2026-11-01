@@ -426,6 +426,14 @@ one function — the CLI, the TUI modal and an elicitation answer all share it �
 function applies the denylist above and writes the audit record, so no surface can skip
 either.
 
+The same log also records a change to an ordinary setting (`ahma settings set`, the TUI
+settings panel) as `kind: setting`, so a security-tier switch such as `sandbox.allow_gpu`
+leaves a trace of who turned it on and how. It records and grants nothing, and
+`ahma permissions list` does not show it. A grant itself is not a setting:
+`ahma settings set` refuses `sandbox.persistent_scopes`, `network.allow` and the
+other ledger keys, because the commands above check them and it would not
+([settings.md](settings.md), SPEC R-CFG10.5-7).
+
 ## See also
 
 - [`docs/security-sandbox.md`](security-sandbox.md) — how the sandbox itself works

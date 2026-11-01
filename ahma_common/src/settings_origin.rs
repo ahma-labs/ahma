@@ -227,7 +227,7 @@ fn dotted_tier(dotted: &str) -> Option<SettingsTier> {
     settings_tier(table, key)
 }
 
-fn shown_value<'a>(key: &str, value: &'a str) -> &'a str {
+pub(crate) fn shown_value<'a>(key: &str, value: &'a str) -> &'a str {
     if SECRET_KEYS.contains(&key) {
         "<redacted>"
     } else {

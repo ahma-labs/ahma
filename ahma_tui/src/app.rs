@@ -3523,7 +3523,11 @@ fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
     state.minimize_tokens = desired;
     state.token_prefs.minimize_tokens = Some(desired);
 
-    let saved = ahma_common::config::AhmaSettings::update(|s| s.tools.minimize_tokens = desired);
+    let saved = ahma_common::config::AhmaSettings::update_audited(
+        "tui",
+        &chrono::Local::now().to_rfc3339(),
+        |s| s.tools.minimize_tokens = desired,
+    );
     let status = if desired { "on" } else { "off" };
     match saved {
         Ok(_) => push_assistant_message(
@@ -3549,7 +3553,11 @@ fn set_execution_mode(
     state: &mut crate::state::AppState,
     mode: ahma_common::config::ExecutionPolicy,
 ) {
-    match ahma_common::config::AhmaSettings::update(|s| s.tools.execution_mode = mode) {
+    match ahma_common::config::AhmaSettings::update_audited(
+        "tui",
+        &chrono::Local::now().to_rfc3339(),
+        |s| s.tools.execution_mode = mode,
+    ) {
         Ok(_) => {
             state.settings_editor.note_execution_mode(mode);
             let what = match mode {

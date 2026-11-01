@@ -12,6 +12,7 @@ ahma settings show        # print effective configuration (with source annotatio
 ahma settings show --origin  # print exact per-key provenance (cli / user / default + file path)
 ahma settings set tools.timeout_secs 3600   # change one key, in its own table, checked
 ahma settings unset tools.timeout_secs      # back to the compiled-in default
+ahma settings set --project tools.timeout_secs 3600   # this repository's .ahma/settings.toml
 ahma settings explain sandbox.allow_gpu     # what a key does, its default, who may set it
 ahma settings explain                       # list every key by table
 ahma --no-settings serve stdio  # ignore settings file for one invocation
@@ -36,6 +37,27 @@ set`, because those check the path or host and write an audit record. With no
 key it lists every setting, marking the ones a repository may also set. It reads
 only text built into ahma, so an agent can run it inside the sandbox
 (SPEC R-CFG11).
+
+### What `settings set` will and will not write
+
+- **`--project`** edits this repository's `.ahma/settings.toml`. Only preferences
+  go there; a security-tier key (anything in `[sandbox]`, `[network]`, `[web]`,
+  `[auth]`, `[permissions]`, plus `tools.long_running`) is refused with the command
+  that sets it for you, because the file could not set it and ahma would only
+  name it as ignored at every startup. The file gets its own header and does not
+  list the security tables. With no `.ahma` directory it refuses; run it from
+  the repository root.
+- **Grants are not settings.** `sandbox.persistent_scopes`, `network.allow`,
+  `web.always_allow` / `never_allow`, `permissions.tool_approvals`,
+  `sandbox.ssh_sign` and `log_targets.approvals` are refused by `settings set`
+  and name their own command (`ahma sandbox grant`, `ahma network allow`,
+  `ahma web allow|deny`, `ahma permissions revoke`). Those check a path against
+  the hard denylist, or a host against the host patterns, and write the audit
+  record; `settings set` does neither.
+- **Every change is recorded.** `settings set|unset` and the TUI settings panel
+  append one line per key to `~/.ahma/permissions-audit.jsonl` (`kind: setting`,
+  the key, `user: false -> true`, and `cli` or `tui`). A secret's values are
+  redacted. (SPEC R-CFG10.5-7.)
 
 ### What a server logs about its settings at startup
 
