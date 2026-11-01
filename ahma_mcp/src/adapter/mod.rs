@@ -2207,6 +2207,14 @@ fn explain_ungrantable_failure(
                 .or_else(|| sandbox::launch_services_denial_note(stderr, stdout)),
         )
         .collect();
+    if let Ok(output) = result {
+        // A success carries only the GPU note (SPEC R6.2.7): the silent CPU
+        // fallback is the one case where a run that "worked" was held back.
+        return Ok(match sandbox::gpu_fallback_note(stderr, stdout) {
+            Some(note) => format!("{output}\n\n{note}"),
+            None => output,
+        });
+    }
     if notes.is_empty() {
         return result;
     }
@@ -3104,6 +3112,9 @@ async fn finalize_streaming_operation(
             Some(working_dir),
         )
         .await;
+    } else if let Some(note) = sandbox::gpu_fallback_note(&stderr_str, &stdout_str) {
+        // The async twin of the success note in `explain_ungrantable_failure`.
+        op_monitor.append_alert(op_id, note).await;
     }
 
     let changed_during_run = match drift {
@@ -3262,6 +3273,34 @@ async fn process_streaming_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R6.2.7: a command that succeeded but quietly ran on the CPU still
+    /// gets the GPU note, and only that note — a test suite that prints
+    /// "Operation not permitted" while passing must not be told it was denied.
+    #[test]
+    fn a_successful_command_keeps_its_output_and_gains_only_the_gpu_note() {
+        sandbox::set_allow_gpu(false);
+        let out = explain_ungrantable_failure(
+            Ok("12 cells ran".to_string()),
+            "ggml_metal_init: error: failed to create command queue",
+            "",
+            &|h| h.remediation.clone(),
+        )
+        .unwrap();
+        assert!(out.starts_with("12 cells ran"), "{out}");
+        assert!(
+            out.contains("ahma settings set sandbox.allow_gpu true"),
+            "{out}"
+        );
+        let quiet = explain_ungrantable_failure(
+            Ok("ok".to_string()),
+            "test denies_write ... Operation not permitted (expected)",
+            "",
+            &|h| h.remediation.clone(),
+        )
+        .unwrap();
+        assert_eq!(quiet, "ok");
+    }
 
     #[test]
     fn a_nested_sandbox_refusal_is_unfixable_and_keeps_the_original_error() {

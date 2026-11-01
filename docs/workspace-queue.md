@@ -74,7 +74,9 @@ status()                                     → ── Finished since your last
   wrapper (`timeout 600 cargo nextest run`) is still a test run. A project declares its own
   source-reading scripts in `tools.source_readers`; an entry excuses its own command, not
   what is chained after it. The first refusal for a
-  command gives the reason; later ones are one line. ahma's own file tools and the edit
+  command gives the reason; later ones are one line. When the holder is the project's own
+  script, the refusal ends with the line a human runs to declare it a source reader, for
+  example `ahma settings set tools.source_readers "['scripts/coach-reference.sh']"`. ahma's own file tools and the edit
   guard for Claude Code, Codex, Copilot CLI, Cursor, Antigravity and VS Code decide the
   same way.
 

@@ -303,7 +303,17 @@ pub fn child_lease_env(key: &Path) -> String {
 /// Why an edit to `path` is refused while `holder` runs in `workspace` (SPEC
 /// R2.7.8). One wording for ahma's own file tools and the harness edit hook, so
 /// a model learns one rule.
-pub fn edit_refusal(path: &Path, workspace: &Path, holder: Option<&HolderInfo>) -> String {
+///
+/// `declared` is the current `[tools] source_readers`: when the holder is a
+/// project's own program (its first word is a path), the refusal ends with the
+/// exact line a human runs so it stops blocking edits, merged with what is
+/// already declared.
+pub fn edit_refusal(
+    path: &Path,
+    workspace: &Path,
+    holder: Option<&HolderInfo>,
+    declared: &[String],
+) -> String {
     let who = holder
         .map(HolderInfo::describe)
         .unwrap_or_else(|| "a command in another ahma session".to_string());
@@ -316,10 +326,45 @@ pub fn edit_refusal(path: &Path, workspace: &Path, holder: Option<&HolderInfo>) 
          files. An edit now could be overwritten, or change what that command sees partway \
          through.{usually} `await` it (or `cancel` it), then make the edit. Builds and tests do \
          not block edits; if this command only reads sources (a test or build wrapper), a human \
-         can declare it in `[tools] source_readers` and edits will proceed while it runs.",
+         can declare it in `[tools] source_readers` and edits will proceed while it runs.{fix}",
         path.display(),
-        workspace.display()
+        workspace.display(),
+        fix = holder
+            .and_then(|h| source_reader_suggestion(&h.title, declared))
+            .unwrap_or_default(),
     )
+}
+
+/// ` The one line: …` for a holder whose program is the project's own (a
+/// path such as `scripts/coach-reference.sh`), or `None`. Never for a generic
+/// program (`python3`, `bash`, `make`): declaring one of those would excuse
+/// every command that starts with it, and a human asked to approve it would.
+fn source_reader_suggestion(title: &str, declared: &[String]) -> Option<String> {
+    let program = title.split_whitespace().next()?;
+    if !program.contains('/') || declared.iter().any(|d| d.trim() == program) {
+        return None;
+    }
+    let value = source_readers_value(declared, program)?;
+    Some(format!(
+        " If `{program}` only reads sources, the line a human runs is: \
+         ahma settings set tools.source_readers \"{value}\""
+    ))
+}
+
+/// `declared` plus `program` as a TOML array of literal strings, the value
+/// `ahma settings set` takes (it replaces the whole list). Literal strings
+/// survive every shell's quoting; `None` when an entry contains a `'`, which a
+/// literal string cannot hold.
+pub(crate) fn source_readers_value(declared: &[String], program: &str) -> Option<String> {
+    let mut entries: Vec<&str> = declared.iter().map(|d| d.trim()).collect();
+    if !entries.contains(&program) {
+        entries.push(program);
+    }
+    if entries.iter().any(|e| e.contains('\'')) {
+        return None;
+    }
+    let quoted: Vec<String> = entries.iter().map(|e| format!("'{e}'")).collect();
+    Some(format!("[{}]", quoted.join(", ")))
 }
 
 /// The one-line form of [`edit_refusal`], for every refusal after the first
@@ -624,7 +669,7 @@ impl WorkspaceQueue {
                 .unwrap_or_else(|_| path.to_path_buf())
         };
         let Some(holder) = holder else {
-            return Some(edit_refusal(path, &workspace, None));
+            return Some(edit_refusal(path, &workspace, None, self.source_readers()));
         };
         if !holder.blocks_edit_of(&canonical) {
             return None;
@@ -632,7 +677,12 @@ impl WorkspaceQueue {
         if self.already_refused(&workspace, &holder.op_id) {
             Some(edit_refusal_again(path, &holder))
         } else {
-            Some(edit_refusal(path, &workspace, Some(&holder)))
+            Some(edit_refusal(
+                path,
+                &workspace,
+                Some(&holder),
+                self.source_readers(),
+            ))
         }
     }
 
@@ -900,6 +950,52 @@ impl Drop for Lease {
 
 #[cfg(test)]
 mod tests {
+    /// SPEC R2.7.8: a refusal names the one line a human runs so the
+    /// project's own reader stops blocking edits, merged with what is already
+    /// declared because `settings set` replaces the whole list, and only for a
+    /// path-like program a human can recognise as the project's own.
+    #[test]
+    fn an_edit_refusal_names_the_merged_source_readers_line() {
+        let holder = HolderInfo::new("op_7", "scripts/coach-reference.sh --all > log 2>&1");
+        let text = edit_refusal(
+            Path::new("/ws/docs/a.md"),
+            Path::new("/ws"),
+            Some(&holder),
+            &["make check".to_string()],
+        );
+        let line = "ahma settings set tools.source_readers \"['make check', 'scripts/coach-reference.sh']\"";
+        assert!(text.contains(line), "{text}");
+
+        for title in ["python3 x.py", "cargo nextest run", "bash -c 'make'"] {
+            let holder = HolderInfo::new("op_8", title);
+            let text = edit_refusal(Path::new("/ws/a.md"), Path::new("/ws"), Some(&holder), &[]);
+            assert!(
+                !text.contains("ahma settings set"),
+                "never suggests a generic program: {title}: {text}"
+            );
+        }
+    }
+
+    /// The suggested value is what `ahma settings set` actually accepts.
+    #[test]
+    fn the_suggested_source_readers_value_parses() {
+        let value =
+            source_readers_value(&["make check".to_string()], "scripts/x.sh").expect("a value");
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("settings.toml");
+        ahma_common::config::AhmaSettings::set_in_file(&file, "tools.source_readers", Some(&value))
+            .unwrap();
+        let settings = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(
+            settings.tools.source_readers,
+            vec!["make check".to_string(), "scripts/x.sh".to_string()]
+        );
+        assert!(
+            source_readers_value(&["it's".to_string()], "scripts/x.sh").is_none(),
+            "an entry a literal string cannot hold gets no suggestion"
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
