@@ -1649,6 +1649,18 @@ pub struct SetupArgs {
     /// Only initialize TLS certificate.
     #[arg(long = "tls")]
     pub tls: bool,
+
+    /// Show the plan of settings this folder suggests, and what each would allow, why, and how to undo it. Changes nothing. Detectors look at the project (a local model file, scripts named in AGENTS.md, toolchains) and at `ahma doctor`; running it again after applying shows no changes.
+    #[arg(long = "plan")]
+    pub plan: bool,
+
+    /// With --plan: offer each proposed change in turn and apply it only when you answer y. Needs a terminal; nothing is applied without one.
+    #[arg(long = "apply", requires = "plan")]
+    pub apply: bool,
+
+    /// With --plan: the folder to look at (default: the current directory).
+    #[arg(long = "path", value_name = "DIR", requires = "plan")]
+    pub path: Option<PathBuf>,
 }
 
 /// Arguments for `ahma uninstall`.

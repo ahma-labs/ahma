@@ -168,6 +168,9 @@ async fn execute_actions(
 /// global. When MCP is selected, the connection transport is requested as a
 /// follow-up detail of that action.
 pub async fn run(args: SetupArgs) -> Result<()> {
+    if args.plan {
+        return crate::setup_plan::run_plan_command(args.path, args.apply);
+    }
     let interactive = is_interactive_session(&args);
 
     if interactive {
@@ -1302,6 +1305,9 @@ mod tests {
             hooks,
             skills,
             tls,
+            plan: false,
+            apply: false,
+            path: None,
         }
     }
 

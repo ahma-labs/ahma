@@ -294,6 +294,14 @@ space is available and where, to look for the tool's own cache/temp option first
 to ask you for `ahma sandbox grant <dir>` only when nothing else works. See
 [docs/ahma-help.md](docs/ahma-help.md).
 
+### `ahma setup --plan` — set up in advance, one confirmed change at a time
+
+Instead of finding out about the sandbox when a command is blocked, `ahma setup --plan`
+looks at the project and your settings and proposes what to turn on: the GPU for a local
+model, a project script that only reads sources, a toolchain profile that was switched
+off. Each item says why, what it allows and how to undo it, and nothing changes until you
+answer `y` for that item. See [docs/setup.md](docs/setup.md).
+
 ### One hub per user
 
 Whatever starts ahma — an editor, `ahma tui`, or a shell hook — there is one

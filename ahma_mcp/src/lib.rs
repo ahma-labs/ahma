@@ -172,6 +172,7 @@ pub mod service_builder;
 pub mod session_events;
 /// Setup wizard for MCP, hooks, TLS, and skills.
 pub mod setup;
+pub mod setup_plan;
 /// CLI shell entry points.
 pub mod shell;
 /// Platform shell selection and the default command timeout.

@@ -3675,7 +3675,11 @@ fn handle_doctor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
 
 fn doctor_findings(state: &crate::state::AppState) -> Vec<ahma_common::doctor::Finding> {
     let workspace = std::path::PathBuf::from(&state.workspace);
-    ahma_common::doctor::run(&ahma_common::doctor::DoctorInput::for_workspace(&workspace))
+    let mut input = ahma_common::doctor::DoctorInput::for_workspace(&workspace);
+    // SPEC R-DOCTOR.7, as `ahma doctor` does: build daemons left running inside
+    // a sandbox. Without this the TUI report silently skipped the check.
+    input.confined_daemons = ahma_mcp::sandbox::confinement::confined_daemons();
+    ahma_common::doctor::run(&input)
 }
 
 fn run_doctor_report(state: &mut crate::state::AppState) {

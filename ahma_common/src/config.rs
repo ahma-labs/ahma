@@ -2168,6 +2168,20 @@ impl std::fmt::Display for SettingsFileError {
 
 impl std::error::Error for SettingsFileError {}
 
+/// What [`AhmaSettings::preview_set`] found: the change, and the file text a
+/// write would produce.
+#[derive(Debug, Clone)]
+pub struct SettingsPreview {
+    /// The value before and after, as `set_in_file` would report it.
+    pub edit: SettingsEdit,
+    /// The complete file a write would leave.
+    pub text: String,
+    /// Which kind of settings file this is.
+    pub file: SettingsFile,
+    table: String,
+    field: String,
+}
+
 /// One setting changed by [`AhmaSettings::set_in_file`]: its value before and
 /// after, as TOML (`"(unset)"` for an optional key with no value).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3154,6 +3168,52 @@ impl AhmaSettings {
     /// written: an unknown key, a value that does not fit, a file that does not
     /// parse (its line is named — fix that first).
     pub fn set_in_file(path: &Path, key: &str, raw: Option<&str>) -> Result<SettingsEdit> {
+        Self::set_in_file_as(SettingsFile::for_path(path), path, key, raw)
+    }
+
+    /// [`set_in_file`](Self::set_in_file) with the kind of file stated rather
+    /// than guessed from the path. A caller that already knows which file it is
+    /// writing (the setup plan) must say so: the guess is only for a `--path`.
+    pub fn set_in_file_as(
+        file: SettingsFile,
+        path: &Path,
+        key: &str,
+        raw: Option<&str>,
+    ) -> Result<SettingsEdit> {
+        let preview = Self::preview_set_as(file, path, key, raw)?;
+        atomic_write_toml(path, &preview.text)?;
+        // The file on disk, not the struct in hand, is what the next ahma reads.
+        let written = Self::load_from_checked(path)
+            .map_err(|e| anyhow::anyhow!("the file written does not parse: {}", e.summary()))?;
+        Ok(SettingsEdit {
+            before: preview.edit.before,
+            after: Self::value_text(&written, &preview.table, &preview.field),
+        })
+    }
+
+    /// The TOML text of `table.field` in `settings`, or `(unset)`.
+    fn value_text(settings: &Self, table: &str, field: &str) -> String {
+        toml::Value::try_from(settings)
+            .ok()
+            .and_then(|v| v.get(table)?.get(field).cloned())
+            .map_or_else(|| "(unset)".to_string(), |v| v.to_string())
+    }
+
+    /// Every check [`set_in_file`](Self::set_in_file) makes, and the file it
+    /// would write, without writing anything — so a plan can show "before ->
+    /// after" for a proposed change and refuse a bad one with the same words the
+    /// command would (SPEC R-CFG10).
+    pub fn preview_set(path: &Path, key: &str, raw: Option<&str>) -> Result<SettingsPreview> {
+        Self::preview_set_as(SettingsFile::for_path(path), path, key, raw)
+    }
+
+    /// [`preview_set`](Self::preview_set) for a stated kind of file.
+    pub fn preview_set_as(
+        file: SettingsFile,
+        path: &Path,
+        key: &str,
+        raw: Option<&str>,
+    ) -> Result<SettingsPreview> {
         let Some((table, field)) = key
             .split_once('.')
             .filter(|(t, k)| !t.is_empty() && !k.is_empty() && !k.contains('.'))
@@ -3172,7 +3232,6 @@ impl AhmaSettings {
                  checks and the audit record the dedicated command makes. Use {command}."
             );
         }
-        let file = SettingsFile::for_path(path);
         if file == SettingsFile::Project && tier == SettingsTier::Security {
             anyhow::bail!(
                 "`{key}` is a security setting: a repository's {} cannot set it (it would be \
@@ -3185,12 +3244,6 @@ impl AhmaSettings {
             anyhow::anyhow!("{}. Fix that line first; nothing was changed.", e.summary())
         })?;
 
-        let value_of = |settings: &Self| -> String {
-            toml::Value::try_from(settings)
-                .ok()
-                .and_then(|v| v.get(table)?.get(field).cloned())
-                .map_or_else(|| "(unset)".to_string(), |v| v.to_string())
-        };
         let mut doc = toml::Value::try_from(&current)
             .with_context(|| format!("could not represent the settings in {}", path.display()))?;
         let tables = doc
@@ -3226,13 +3279,15 @@ impl AhmaSettings {
             SettingsFile::User => updated.render_documented(),
             SettingsFile::Project => updated.render_documented_project(),
         };
-        atomic_write_toml(path, &text)?;
-        // The file on disk, not the struct in hand, is what the next ahma reads.
-        let written = Self::load_from_checked(path)
-            .map_err(|e| anyhow::anyhow!("the file written does not parse: {}", e.summary()))?;
-        Ok(SettingsEdit {
-            before: value_of(&current),
-            after: value_of(&written),
+        Ok(SettingsPreview {
+            edit: SettingsEdit {
+                before: Self::value_text(&current, table, field),
+                after: Self::value_text(&updated, table, field),
+            },
+            text,
+            file,
+            table: table.to_string(),
+            field: field.to_string(),
         })
     }
 

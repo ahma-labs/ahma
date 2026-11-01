@@ -69,6 +69,7 @@ pub mod scope_grant;
 pub mod session_event;
 pub mod session_grants;
 pub mod settings_origin;
+pub mod setup_detect;
 /// clap arguments for `ahma simplify`, shared by the CLI parser (`ahma_mcp`) and
 /// the analysis engine (`ahma_simplify`) so neither depends on the other.
 pub mod simplify_args;
