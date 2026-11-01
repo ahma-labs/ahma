@@ -59,6 +59,52 @@ mod ahma_mcp_tests {
         );
     }
 
+    /// `ahma settings explain` says what a key is, who may set it and the one
+    /// command that changes it, and offers the near names for a typo
+    /// (SPEC R-CFG11).
+    #[test]
+    fn test_ahma_settings_explain_describes_a_key() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let home = TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            test_command(&binary)
+                .env("AHMA_TEST_HOME", home.path())
+                .args(args)
+                .output()
+                .expect("Failed to execute ahma settings explain")
+        };
+
+        let one = run(&["settings", "explain", "sandbox.allow_gpu"]);
+        let text = String::from_utf8_lossy(&one.stdout).to_string();
+        assert!(one.status.success(), "{text}");
+        assert!(text.contains("Metal"), "{text}");
+        assert!(text.contains("only you"), "{text}");
+        assert!(
+            text.contains("ahma settings set sandbox.allow_gpu"),
+            "{text}"
+        );
+
+        let all = run(&["settings", "explain"]);
+        let list = String::from_utf8_lossy(&all.stdout).to_string();
+        assert!(all.status.success(), "{list}");
+        assert!(
+            list.contains("[tools]") && list.contains("source_readers"),
+            "{list}"
+        );
+
+        let typo = run(&["settings", "explain", "sandbox.allow_gpus"]);
+        assert!(!typo.status.success());
+        let err = String::from_utf8_lossy(&typo.stderr).to_string();
+        assert!(
+            err.contains("sandbox.allow_gpu"),
+            "offers the real name: {err}"
+        );
+        assert!(
+            !home.path().join(".ahma").join("settings.toml").exists(),
+            "explain writes nothing"
+        );
+    }
+
     /// `ahma explain` gives a hooked agent the `ahma_help` text in command
     /// form, and what it says about temp is read from this home's settings
     /// (SPEC R-HELP.1, R-HELP.2).

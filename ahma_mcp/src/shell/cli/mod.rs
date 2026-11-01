@@ -1771,6 +1771,11 @@ pub enum SettingsCommand {
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
     },
+    /// Explain one setting, e.g. `ahma settings explain sandbox.allow_gpu`: what it does, its default, who may set it (you, or a repository too), and the command that changes it. With no key, list every setting by table. Reads only; changes nothing.
+    Explain {
+        /// `<table>.<key>`; omit to list them all.
+        key: Option<String>,
+    },
     /// Return one setting to its compiled-in default, e.g. `ahma settings unset tools.timeout_secs`.
     Unset {
         /// `<table>.<key>`, as `ahma settings show` lists them.

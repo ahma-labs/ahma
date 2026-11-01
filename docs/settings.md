@@ -12,6 +12,8 @@ ahma settings show        # print effective configuration (with source annotatio
 ahma settings show --origin  # print exact per-key provenance (cli / user / default + file path)
 ahma settings set tools.timeout_secs 3600   # change one key, in its own table, checked
 ahma settings unset tools.timeout_secs      # back to the compiled-in default
+ahma settings explain sandbox.allow_gpu     # what a key does, its default, who may set it
+ahma settings explain                       # list every key by table
 ahma --no-settings serve stdio  # ignore settings file for one invocation
 ```
 
@@ -20,6 +22,20 @@ the same invocation overrides the key (e.g. `ahma --timeout 30 settings show --o
 `user (<path>)` when the settings file explicitly sets the key — even if it sets it
 to the default value — and `default` otherwise. Both `--settings-path` and
 `--no-settings` are honored.
+
+### Asking what a setting means
+
+`ahma settings explain <table>.<key>` prints the key's description (the same
+words as the comment above it in the settings file), its default, who may set
+it, and the command that changes it. "Who may set it" is the trust tier
+(SPEC R-CFG2): a *preference* may also come from a repository's
+`.ahma/settings.toml`; a *security* key only from your own file or a flag. A
+key that is a grant (a directory, a host, a tool approval) points at its own
+command (`ahma sandbox grant`, `ahma network allow`, …) rather than `settings
+set`, because those check the path or host and write an audit record. With no
+key it lists every setting, marking the ones a repository may also set. It reads
+only text built into ahma, so an agent can run it inside the sandbox
+(SPEC R-CFG11).
 
 ### What a server logs about its settings at startup
 
