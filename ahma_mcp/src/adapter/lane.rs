@@ -180,15 +180,6 @@ fn redirection(word: &str) -> Option<Redirection> {
     (!rest.contains(['<', '>'])).then(|| Redirection::Write(file(rest)))
 }
 
-/// Split a command line into pipeline/list segments of words, honouring plain
-/// single and double quotes. `None` for anything with a shell operator this
-/// module does not model, an unbalanced quote, a writing redirection, or a
-/// substitution — the caller treats that as "cannot tell", i.e. exclusive.
-fn segments(command: &str) -> Option<Vec<Segment>> {
-    let line = parse_line(command)?;
-    line.writes.is_empty().then_some(line.segs)
-}
-
 /// A tokenized word and whether any `<` or `>` inside it was quoted.
 type TokenWord = (String, bool);
 
@@ -294,6 +285,9 @@ fn tokenize_line(command: &str) -> Option<Vec<Vec<TokenWord>>> {
                 tok.quote = None;
                 i += 1;
             }
+            // Inside double quotes a backtick is still a command
+            // substitution; inside single quotes it is a character.
+            Some('"') if c == '`' => return None,
             Some(_) => {
                 tok.quoted_angle |= c == '<' || c == '>';
                 tok.cur.push(c);
@@ -354,9 +348,12 @@ fn extract_segment_redirections(seg: Vec<TokenWord>, writes: &mut Vec<String>) -
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// [`segments`], with writing redirections parsed out into [`Line::writes`]
-/// instead of refused. Input redirections other than `< /dev/null` are still
-/// refused: they are reads, but not ones this module models.
+/// Split a command line into pipeline/list segments of words, honouring plain
+/// single and double quotes, with writing redirections parsed out into
+/// [`Line::writes`]. `None` for anything with a shell operator this module does
+/// not model, an unbalanced quote or a substitution, which the caller treats as
+/// "cannot tell", i.e. exclusive. Input redirections other than `< /dev/null`
+/// are refused too: they are reads, but not ones this module models.
 fn parse_line(command: &str) -> Option<Line> {
     let raw_segs = tokenize_line(command)?;
     let mut writes = Vec::new();
@@ -881,22 +878,38 @@ fn lift_substitutions(command: &str) -> Option<(String, Vec<String>)> {
 /// before. `declared` are a project's own wrappers (`[tools] source_readers`):
 /// a command line starting with one, as whole words, reads sources.
 pub fn classify_source_effect(command: &str, declared: &[String]) -> SourceEffect {
-    let trimmed = command.trim();
-    if declared.iter().map(|d| d.trim()).any(|d| {
-        !d.is_empty()
-            && (trimmed == d
-                || trimmed
-                    .strip_prefix(d)
-                    .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
-    }) {
-        return SourceEffect::ReadsSources;
-    }
-    let Some(segs) = segments(trimmed) else {
+    let Some(line) = parse_line(command.trim()) else {
         return SourceEffect::Unknown;
     };
-    segs.iter()
+    // A writing redirection makes the line unknown, except where every
+    // segment is a declared reader: a project's own test wrapper writing its
+    // log (`scripts/heavy > target/heavy.log`).
+    if !line.writes.is_empty()
+        && !line
+            .segs
+            .iter()
+            .all(|seg| is_declared_reader(seg, declared))
+    {
+        return SourceEffect::Unknown;
+    }
+    line.segs
+        .iter()
         .map(|seg| segment_effect(seg, declared))
         .fold(SourceEffect::ReadsSources, worse)
+}
+
+/// Whether `seg` starts with a declared reader, as whole words. Per segment,
+/// never per line: a declared prefix excuses its own command, not what is
+/// chained after it (`scripts/heavy && sed -i … src/f.rs`, SPEC R2.7.8).
+fn is_declared_reader(seg: &[String], declared: &[String]) -> bool {
+    let joined = seg.join(" ");
+    declared.iter().map(|d| d.trim()).any(|d| {
+        !d.is_empty()
+            && (joined == d
+                || joined
+                    .strip_prefix(d)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+    })
 }
 
 /// The more conservative of two effects: a rewrite anywhere in a pipeline or
@@ -1049,6 +1062,9 @@ fn program_source_effect(program: &str, args: &[String]) -> SourceEffect {
 
 fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
     use SourceEffect::*;
+    if is_declared_reader(seg, declared) {
+        return ReadsSources;
+    }
     // `VAR=value cmd`: the assignment only sets the command's environment.
     let words: Vec<String> = seg
         .iter()
@@ -2071,5 +2087,87 @@ mod writes_inside_tests {
             writes_inside(&out.join("dangling"), &ws, &[]),
             "writing a dangling symlink creates its target"
         );
+    }
+}
+
+/// Two ways a line used to be read as something it is not (found in review,
+/// 2026-10-31). Neither escapes the kernel sandbox — the read-only lane still
+/// cannot write — but both broke what the queue and the edit guard promise:
+/// a quoted backtick ran a hidden writer, and a declared reader's prefix
+/// excused everything chained after it (SPEC R2.7.4, R2.7.8).
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    const WS: &str = "/ws";
+
+    fn at(cmd: &str, read_only_enforced: bool) -> Lane {
+        let inside = |p: &Path| p.starts_with(WS);
+        classify_shell_command_at(
+            cmd,
+            &RunSite {
+                cwd: Path::new(WS),
+                read_only_enforced,
+                writes_workspace: &inside,
+            },
+        )
+    }
+
+    /// Inside double quotes a backtick is still a command substitution.
+    #[test]
+    fn a_backtick_inside_double_quotes_is_a_hidden_command() {
+        for cmd in [
+            "echo \"`touch f`\"",
+            "grep -n \"`sed -i s/a/b/ src/lib.rs`\" f",
+            "cat \"x `rm -rf y` z\"",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
+        }
+        assert_eq!(
+            classify_source_effect("cargo test \"`sed -i s/a/b/ src/lib.rs`\"", &[]),
+            SourceEffect::Unknown,
+            "a test run hiding a rewrite does not read sources only"
+        );
+        assert_eq!(
+            at("gh pr checks 1 --watch \"`touch f`\"", false),
+            Lane::Exclusive,
+            "a watcher hiding a writer takes no lease-free lane"
+        );
+    }
+
+    /// Inside single quotes a backtick is a literal character.
+    #[test]
+    fn a_backtick_inside_single_quotes_is_just_a_character() {
+        assert_eq!(classify_shell_command("grep -n '`' f"), Lane::ReadOnly);
+    }
+
+    /// A declared reader's prefix covers its own segment, not the line.
+    #[test]
+    fn a_declared_reader_excuses_only_its_own_segment() {
+        let declared = vec!["scripts/heavy".to_string()];
+        for cmd in [
+            "scripts/heavy && sed -i s/a/b/ src/f.rs",
+            "scripts/heavy; cargo fmt",
+            "scripts/heavy | tee src/out.rs; git checkout src",
+        ] {
+            assert_ne!(
+                classify_source_effect(cmd, &declared),
+                SourceEffect::ReadsSources,
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "scripts/heavy",
+            "scripts/heavy --all",
+            "scripts/heavy > target/heavy.log 2>&1",
+            "cd rust && scripts/heavy",
+            "scripts/heavy && git status",
+        ] {
+            assert_eq!(
+                classify_source_effect(cmd, &declared),
+                SourceEffect::ReadsSources,
+                "{cmd}"
+            );
+        }
     }
 }

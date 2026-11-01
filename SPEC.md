@@ -358,7 +358,8 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     see why a job is slow (`uptime`, `sysctl` without `-w` or `name=value`, `vm_stat`,
     `iostat`, `top`, `lsof`, `pgrep`). Those must never queue behind the job they inspect. A `$(…)` substitution is judged by the command it runs, so
     `echo "$(gh pr view 87)"` is a reader and `echo $(rm x)` is not. It treats a backtick
-    substitution, a writing redirection into a workspace or to a target it cannot resolve
+    substitution (inside double quotes too, where the shell still runs it; inside single
+    quotes a backtick is a character), a writing redirection into a workspace or to a target it cannot resolve
     without expansion (`$OUT`, a glob, `~`, a relative path after `cd`), grouping, an escape
     or an unknown program as exclusive. It is permissive only where the kernel lane makes a mistake harmless.
 - **R2.7.5**: **No result is lost to a forgotten `await`.** Each session remembers every
@@ -410,6 +411,10 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   - *Project readers.* A project may declare its own source-reading wrappers
     (`tools.source_readers`, a preference-tier list of command prefixes matched in whole
     words); a wrong entry costs a stale verdict the drift report names, never confinement.
+    A declared prefix is matched **per segment**, never against the whole line: it excuses
+    its own command, not what is chained after it, so `scripts/heavy && sed -i … src/f.rs`
+    is judged by the `sed`. A writing redirection keeps the line unknown unless every
+    segment is a declared reader (a wrapper writing its own log).
   - *Pre-edit hooks.* `ahma hooks install` **must** install the same check as a pre-edit
     hook in every supported client that has one — Claude Code, Codex (`apply_patch`, paths
     read from the patch), Copilot CLI, Cursor and Antigravity; VS Code's agents run those
