@@ -2551,8 +2551,15 @@ impl AhmaSettings {
     /// startup sync and the TUI/CLI save paths go through it, so the file stays
     /// documented and minimal no matter who writes it.
     pub fn render_documented(&self) -> String {
-        let d = Self::default();
         let mut w = SettingsDoc::new();
+        self.render_into(&mut w);
+        w.into_string()
+    }
+
+    /// The body of [`render_documented`](Self::render_documented), writing into
+    /// `w` so [`setting_docs`] can read the entries it recorded.
+    fn render_into(&self, w: &mut SettingsDoc) {
+        let d = Self::default();
 
         w.line("# ~/.ahma/settings.toml — Ahma user settings");
         w.line("#");
@@ -3051,6 +3058,18 @@ impl AhmaSettings {
             toml_tool_approvals(&self.permissions.tool_approvals),
             toml_tool_approvals(&d.permissions.tool_approvals),
         );
+        w.setting(
+            "Let the permission advisor (a model you chose) add a labelled recommendation to a grant prompt. It only advises: the default stays deny and nothing is granted by it (SPEC R-PERM.8).",
+            "advisor",
+            self.permissions.advisor.to_string(),
+            d.permissions.advisor.to_string(),
+        );
+        w.setting(
+            "Seconds a grant prompt waits for the advisor before showing without it.",
+            "advisor_timeout_secs",
+            self.permissions.advisor_timeout_secs.to_string(),
+            d.permissions.advisor_timeout_secs.to_string(),
+        );
 
         // ── Approved log targets ─────────────────────────────────────────────
         w.section(
@@ -3063,8 +3082,6 @@ impl AhmaSettings {
             toml_log_target_approvals(&self.log_targets.approvals),
             toml_log_target_approvals(&d.log_targets.approvals),
         );
-
-        w.into_string()
     }
 
     /// [`Self::ensure_current`] against the standard `~/.ahma/settings.toml`.
@@ -3350,11 +3367,21 @@ fn toml_log_target_approvals(v: &[crate::permissions::LogTargetApproval]) -> Str
 /// [`AhmaSettings::render_documented`].
 struct SettingsDoc {
     out: String,
+    /// The `[table]` the next [`setting`](Self::setting) belongs to.
+    table: String,
+    /// Every setting emitted, in order: what `ahma settings explain` reads
+    /// (SPEC R-CFG11), so the explanation can never differ from the comment
+    /// written into the file.
+    entries: Vec<SettingDoc>,
 }
 
 impl SettingsDoc {
     fn new() -> Self {
-        Self { out: String::new() }
+        Self {
+            out: String::new(),
+            table: String::new(),
+            entries: Vec::new(),
+        }
     }
 
     fn line(&mut self, s: &str) {
@@ -3372,6 +3399,7 @@ impl SettingsDoc {
         let pad = 80usize.saturating_sub(prefix.chars().count());
         self.line(&format!("{prefix}{}", "─".repeat(pad)));
         self.line(&format!("[{table}]"));
+        self.table = table.to_string();
     }
 
     /// Emit one setting: a doc comment that always states the default, then the
@@ -3380,6 +3408,12 @@ impl SettingsDoc {
     /// both sides must come from the same formatter. A trailing blank line keeps
     /// adjacent settings visually separated.
     fn setting(&mut self, doc: &str, key: &str, value: String, default: String) {
+        self.entries.push(SettingDoc {
+            table: self.table.clone(),
+            key: key.to_string(),
+            doc: doc.to_string(),
+            default: default.clone(),
+        });
         self.line(&format!("# {doc} (default: {default})"));
         if value == default {
             self.line(&format!("# {key} = {default}"));
@@ -3392,6 +3426,124 @@ impl SettingsDoc {
     fn into_string(self) -> String {
         self.out
     }
+}
+
+/// What one setting is, as the documented settings file states it: the same
+/// words that sit above the key in `~/.ahma/settings.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingDoc {
+    /// The `[table]` the key lives in.
+    pub table: String,
+    /// The key.
+    pub key: String,
+    /// The one-paragraph description from the settings file.
+    pub doc: String,
+    /// The compiled-in default, as TOML text.
+    pub default: String,
+}
+
+impl SettingDoc {
+    /// `table.key`, the name `ahma settings set` takes.
+    pub fn dotted(&self) -> String {
+        format!("{}.{}", self.table, self.key)
+    }
+
+    /// Who may set this key (SPEC R-CFG2).
+    pub fn tier(&self) -> SettingsTier {
+        settings_tier(&self.table, &self.key).unwrap_or(SettingsTier::Security)
+    }
+}
+
+/// Every setting with its description, in file order. Derived from
+/// [`AhmaSettings::render_documented`], the one place the words are written.
+pub fn setting_docs() -> &'static [SettingDoc] {
+    static DOCS: std::sync::OnceLock<Vec<SettingDoc>> = std::sync::OnceLock::new();
+    DOCS.get_or_init(|| {
+        let mut w = SettingsDoc::new();
+        AhmaSettings::default().render_into(&mut w);
+        w.entries
+    })
+}
+
+/// The names in [`setting_docs`] closest to `wanted`, for "did you mean".
+/// A name that contains `wanted` (or the reverse) ranks first, then a shared
+/// key part, then edit distance; at most `limit` are returned.
+pub fn similar_setting_names(wanted: &str, limit: usize) -> Vec<String> {
+    let wanted = wanted.to_ascii_lowercase();
+    let last = wanted.rsplit('.').next().unwrap_or(&wanted).to_string();
+    let mut scored: Vec<(usize, String)> = setting_docs()
+        .iter()
+        .map(|d| {
+            let name = d.dotted();
+            let score = if name.contains(&wanted) || wanted.contains(&name) {
+                0
+            } else if d.key == last || d.key.contains(&last) {
+                1
+            } else {
+                2 + edit_distance(&name, &wanted)
+            };
+            (score, name)
+        })
+        .collect();
+    scored.sort();
+    scored
+        .into_iter()
+        .filter(|(score, _)| *score < 12)
+        .take(limit)
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// Plain Levenshtein distance; names are short, so the quadratic table is fine.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// How a human changes `table.key` (SPEC R-CFG11): the dedicated command for a
+/// ledger key, which validates and audits, else `ahma settings set`.
+pub fn how_to_change(table: &str, key: &str) -> String {
+    match (table, key) {
+        ("sandbox", "persistent_scopes") => {
+            "`ahma sandbox grant <path>` (and `ahma sandbox revoke`); it checks the path against the hard denylist".into()
+        }
+        ("sandbox", "ssh_sign") | ("permissions", _) | ("log_targets", _) => {
+            "`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved".into()
+        }
+        ("network", "allow") => "`ahma network allow <host>` / `ahma network revoke <host>`".into(),
+        ("web", "always_allow") => "`ahma web allow <domain>` / `ahma web revoke <domain>`".into(),
+        ("web", "never_allow") => "`ahma web deny <domain>` / `ahma web revoke <domain>`".into(),
+        _ => format!("`ahma settings set {table}.{key} <value>` (`ahma settings unset {table}.{key}` restores the default)"),
+    }
+}
+
+/// Render the `ahma settings explain` text for one key (SPEC R-CFG11).
+pub fn explain_setting(doc: &SettingDoc) -> String {
+    let who = match doc.tier() {
+        SettingsTier::Preference => {
+            "you, in ~/.ahma/settings.toml, or a repository in its .ahma/settings.toml (a preference)"
+        }
+        SettingsTier::Security => {
+            "only you, in ~/.ahma/settings.toml or with a flag; a repository's .ahma/settings.toml cannot set it (it shapes the security boundary)"
+        }
+    };
+    format!(
+        "{}\n\n{}\n\n  default:     {}\n  set by:      {}\n  change with: {}\n",
+        doc.dotted(),
+        doc.doc,
+        doc.default,
+        who,
+        how_to_change(&doc.table, &doc.key),
+    )
 }
 
 /// Atomic TOML write (temp sibling → rename), with a pid-scoped temp name so two
@@ -3864,6 +4016,105 @@ mod tests {
                 }],
             },
         }
+    }
+
+    #[test]
+    fn every_known_setting_has_a_description() {
+        // The docs are recorded while the file is rendered, so a key with no
+        // description would be a key the settings file does not mention at all.
+        let documented: std::collections::HashSet<(String, String)> = setting_docs()
+            .iter()
+            .map(|d| (d.table.clone(), d.key.clone()))
+            .collect();
+        for (table, key) in known_settings_keys().iter().cloned().chain(
+            OPTIONAL_PREFERENCE_KEYS
+                .iter()
+                .map(|(t, k)| (t.to_string(), k.to_string())),
+        ) {
+            assert!(
+                documented.contains(&(table.clone(), key.clone())),
+                "{table}.{key} is a setting but render_documented never describes it"
+            );
+        }
+        for d in setting_docs() {
+            assert!(
+                !d.doc.trim().is_empty(),
+                "{} has an empty description",
+                d.dotted()
+            );
+        }
+        // Collected, not asserted one at a time: a key whose default is `None`
+        // is absent from the derived key set, so it needs a hand entry in
+        // OPTIONAL_PREFERENCE_KEYS (or a Security rule), or a repository file's
+        // copy of it is reported "unrecognised". Name them all at once.
+        let untiered: Vec<String> = setting_docs()
+            .iter()
+            .filter(|d| settings_tier(&d.table, &d.key).is_none())
+            .map(SettingDoc::dotted)
+            .collect();
+        assert!(
+            untiered.is_empty(),
+            "documented but classified as unknown (add to OPTIONAL_PREFERENCE_KEYS): {untiered:?}"
+        );
+    }
+
+    #[test]
+    fn explain_names_the_default_the_tier_and_the_command() {
+        let gpu = setting_docs()
+            .iter()
+            .find(|d| d.dotted() == "sandbox.allow_gpu")
+            .expect("allow_gpu is documented");
+        let text = explain_setting(gpu);
+        assert!(text.contains("sandbox.allow_gpu"), "{text}");
+        assert!(
+            text.contains("Metal"),
+            "carries the file's own words: {text}"
+        );
+        assert!(text.contains("default:     false"), "{text}");
+        assert!(
+            text.contains("only you"),
+            "a Security key is user-only: {text}"
+        );
+        assert!(
+            text.contains("ahma settings set sandbox.allow_gpu"),
+            "{text}"
+        );
+
+        let timeout = setting_docs()
+            .iter()
+            .find(|d| d.dotted() == "tools.timeout_secs")
+            .expect("timeout_secs is documented");
+        assert!(
+            explain_setting(timeout).contains("a repository in its .ahma/settings.toml"),
+            "a Preference key says a repository may set it"
+        );
+    }
+
+    #[test]
+    fn ledger_keys_point_at_their_own_command_not_settings_set() {
+        for (table, key, command) in [
+            ("sandbox", "persistent_scopes", "ahma sandbox grant"),
+            ("network", "allow", "ahma network allow"),
+            ("web", "always_allow", "ahma web allow"),
+            ("web", "never_allow", "ahma web deny"),
+            ("permissions", "tool_approvals", "ahma permissions"),
+        ] {
+            let how = how_to_change(table, key);
+            assert!(how.contains(command), "{table}.{key}: {how}");
+            assert!(!how.contains("settings set"), "{table}.{key}: {how}");
+        }
+    }
+
+    #[test]
+    fn a_misspelt_name_finds_the_real_one() {
+        let near = similar_setting_names("sandbox.allow_gpus", 3);
+        assert_eq!(near.first().map(String::as_str), Some("sandbox.allow_gpu"));
+        let by_key = similar_setting_names("source_reader", 3);
+        assert!(
+            by_key.contains(&"tools.source_readers".to_string()),
+            "{by_key:?}"
+        );
+        assert!(similar_setting_names("zzzzzzzzzzzzzzzzzzzzzzzz", 3).is_empty());
     }
 
     #[test]
@@ -5311,6 +5562,10 @@ pub fn settings_tier(table: &str, key: &str) -> Option<SettingsTier> {
 /// they are named in [`SECURITY_KEYS`].
 const OPTIONAL_PREFERENCE_KEYS: &[(&str, &str)] = &[
     ("tools", "request_budget_override_secs"),
+    // A context-window budget for the chat agent; `None` until set, so the
+    // derived set cannot see it. Missing here, a repository's own copy of it
+    // was refused as "unrecognised" (found by the settings-description test).
+    ("tools", "context_length"),
     ("tools", "tools_dir"),
     ("agent", "provider"),
     ("agent", "model"),

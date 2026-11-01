@@ -442,6 +442,7 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
                 | (Some("--version"), _) => true,
                 (Some("sandbox" | "permissions" | "network"), Some("list")) => true,
                 (Some("hooks"), Some("status")) => true,
+                (Some("settings"), Some("explain")) => true,
                 (Some("doctor"), _) => !has("--fix"),
                 _ => false,
             }
@@ -2522,6 +2523,26 @@ mod queue_reason_tests {
             Lane::ReadOnly
         );
         assert_eq!(classify_shell_command("ahma explain"), Lane::ReadOnly);
+    }
+
+    /// `ahma settings explain` reads only compiled-in text. `show` stays out:
+    /// inside the read-only sandbox `~/.ahma` is unreadable, so it would print
+    /// defaults and look like the real settings.
+    #[test]
+    fn settings_explain_never_queues_but_settings_set_does() {
+        assert_eq!(
+            classify_shell_command("ahma settings explain sandbox.allow_gpu"),
+            Lane::ReadOnly
+        );
+        assert_eq!(
+            classify_shell_command("ahma settings explain"),
+            Lane::ReadOnly
+        );
+        assert_ne!(
+            classify_shell_command("ahma settings set sandbox.allow_gpu true"),
+            Lane::ReadOnly
+        );
+        assert_ne!(classify_shell_command("ahma settings show"), Lane::ReadOnly);
     }
 
     /// The cause no single command can fix: ahma nested inside another

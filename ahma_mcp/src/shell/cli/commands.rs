@@ -227,6 +227,55 @@ pub(crate) fn run_settings_command(
         SettingsCommand::Show { origin } => run_settings_show(origin, origin_ctx),
         SettingsCommand::Set { key, value, path } => run_settings_set(&key, Some(&value), path),
         SettingsCommand::Unset { key, path } => run_settings_set(&key, None, path),
+        SettingsCommand::Explain { key } => {
+            print!("{}", settings_explain_text(key.as_deref())?);
+            Ok(())
+        }
+    }
+}
+
+/// The text of `ahma settings explain [key]` (SPEC R-CFG11): one key in full, or
+/// every key grouped by table. An unknown name is an error that offers the
+/// nearest real ones.
+fn settings_explain_text(key: Option<&str>) -> Result<String> {
+    use ahma_common::config::{SettingsTier, explain_setting, setting_docs, similar_setting_names};
+    use std::fmt::Write as _;
+
+    let Some(key) = key else {
+        let mut out = String::from(
+            "Every setting, by table. `ahma settings explain <table.key>` says what one does.\n\
+             (repo) = a repository's .ahma/settings.toml may also set it; the rest are yours alone.\n",
+        );
+        let mut table = "";
+        for d in setting_docs() {
+            if d.table != table {
+                let _ = write!(out, "\n[{}]\n", d.table);
+                table = &d.table;
+            }
+            let mark = if d.tier() == SettingsTier::Preference {
+                " (repo)"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "  {}{mark}", d.key);
+        }
+        return Ok(out);
+    };
+    match setting_docs().iter().find(|d| d.dotted() == key) {
+        Some(doc) => Ok(explain_setting(doc)),
+        None => {
+            let near = similar_setting_names(key, 3);
+            if near.is_empty() {
+                anyhow::bail!("unknown setting `{key}`. `ahma settings explain` lists them all.")
+            }
+            anyhow::bail!(
+                "unknown setting `{key}`. Did you mean {}? (`ahma settings explain` lists them all.)",
+                near.iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
     }
 }
 

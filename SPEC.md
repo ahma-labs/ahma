@@ -554,6 +554,12 @@ Server configuration (everything except MTDF tool definitions) **must** be deter
 - **R-CFG10.3**: Every remediation ahma prints for a setting **should** be that one command, and any command ahma suggests a human paste **must** be a single line without a trailing comment, valid as written in bash, zsh, fish and PowerShell where the command itself is.
 - **R-CFG10.4**: The compiled-in defaults **must** equal what an empty file — and a file with every table present but empty — parses to. A struct whose derived `Default` disagreed with its serde field defaults made "no settings file" quietly differ from "an empty one" (the TUI's permission advisor was off without a file, on with one).
 
+### R-CFG11: Every Setting Explains Itself
+
+- **R-CFG11.1**: `ahma settings explain <table>.<key>` **must** print what the setting does, its compiled-in default, who may set it (you alone, or a repository's `.ahma/settings.toml` too — the R-CFG2 tier), and the command that changes it. With no key it lists every setting by table. An unknown name is refused and the nearest real names are offered. It reads only compiled-in text, so it works from inside the sandbox and is on the read-only lane (R2.7.4).
+- **R-CFG11.2**: The description **must** be the comment `render_documented` writes above the key, not a second copy: the settings file and `explain` are one text, so they cannot disagree, and a key `render_documented` does not describe is not a setting. A test fails for any known key without a description.
+- **R-CFG11.3**: A ledger key (`sandbox.persistent_scopes`, `network.allow`, `web.*`, `permissions.*`, `log_targets.*`) **must** be explained with its dedicated command (`ahma sandbox grant`, `ahma network allow`, …), never `ahma settings set`: those commands validate against the hard denylist and audit, and a raw settings edit does neither.
+
 ### R-CFG9: Test-Only Configuration
 
 Production and test code must be separated so that test harness machinery can never alter production security decisions.
