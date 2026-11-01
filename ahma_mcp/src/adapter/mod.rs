@@ -386,7 +386,20 @@ impl Adapter {
         subcommand_config: Option<&crate::config::SubcommandConfig>,
         working_dir: &std::path::Path,
     ) -> workspace_queue::Lane {
+        self.resolve_lane_with_reason(args, subcommand_config, working_dir)
+            .0
+    }
+
+    /// [`Self::resolve_lane`], with the reason an exclusive shell line takes
+    /// its turn (SPEC R2.7.4), for the notice it shows while it waits.
+    pub fn resolve_lane_with_reason(
+        &self,
+        args: Option<&Map<String, serde_json::Value>>,
+        subcommand_config: Option<&crate::config::SubcommandConfig>,
+        working_dir: &std::path::Path,
+    ) -> (workspace_queue::Lane, Option<String>) {
         use workspace_queue::Lane;
+        let mut reason = None;
         let lane = subcommand_config
             .and_then(|s| s.concurrency)
             .unwrap_or_else(|| match shell_command_line(args) {
@@ -406,21 +419,25 @@ impl Adapter {
                         .collect();
                     let writes_workspace =
                         |path: &std::path::Path| lane::writes_inside(path, &workspace, &scopes);
-                    lane::classify_shell_command_at(
-                        line,
-                        &lane::RunSite {
-                            cwd: working_dir,
-                            read_only_enforced: self.sandbox.can_enforce_read_only(),
-                            writes_workspace: &writes_workspace,
-                        },
-                    )
+                    let site = lane::RunSite {
+                        cwd: working_dir,
+                        read_only_enforced: self.sandbox.can_enforce_read_only(),
+                        writes_workspace: &writes_workspace,
+                    };
+                    let lane = lane::classify_shell_command_at(line, &site);
+                    if lane == Lane::Exclusive {
+                        reason = Some(lane::why_exclusive(line, &site));
+                    }
+                    lane
                 }
                 None => Lane::Exclusive,
             });
         if lane == Lane::ReadOnly && !self.sandbox.can_enforce_read_only() {
-            Lane::Exclusive
+            let nested = "ahma runs inside another sandbox here, so read-only commands cannot \
+                          be held to the read-only lane and every command takes its turn";
+            (Lane::Exclusive, Some(nested.to_string()))
         } else {
-            lane
+            (lane, reason)
         }
     }
 
@@ -737,13 +754,17 @@ impl Adapter {
         // hooks, CLI one-shots, `synchronous: true` tools — queues exactly like
         // an async operation, so a hooked `sed -i` never lands in the middle of
         // an MCP `cargo nextest run`.
-        let lane = self.resolve_lane(args.as_ref(), subcommand_config, &safe_wd);
+        let (lane, queue_reason) =
+            self.resolve_lane_with_reason(args.as_ref(), subcommand_config, &safe_wd);
         self.command_starts(lane);
         let title = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
         let timeout = self.sync_timeout(timeout_seconds);
-        let lease = match self.enqueue_exclusive(lane, &safe_wd, &op_id, &title) {
+        let lease = match self
+            .enqueue_exclusive(lane, &safe_wd, &op_id, &title)
+            .map(|t| t.with_reason(queue_reason))
+        {
             Some(ticket) => Some(self.acquire_for_sync(ticket, timeout).await?),
             None => None,
         };
@@ -816,10 +837,15 @@ impl Adapter {
     ) -> Result<workspace_queue::Lease, anyhow::Error> {
         let last_ahead = parking_lot::Mutex::new(Vec::new());
         let announced = std::sync::atomic::AtomicBool::new(false);
+        let waiting = ticket.title().to_string();
+        let reason = ticket.reason().map(str::to_string);
         let observe = |ahead: &[workspace_queue::HolderInfo]| {
             *last_ahead.lock() = ahead.to_vec();
             if !announced.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let line = format!("ahma: {}", queued_message(ahead));
+                let line = format!(
+                    "ahma: {}",
+                    queued_message(Some(&waiting), reason.as_deref(), ahead)
+                );
                 match &self.queue_wait_notice {
                     Some(notice) => (notice.0)(&line),
                     None => tracing::info!("{line}"),
@@ -836,7 +862,7 @@ impl Adapter {
                     "Not run: the workspace stayed busy for its whole {}s timeout. {}. \
                      Retry once that finishes, or cancel it.",
                     timeout.as_secs(),
-                    queued_message(&ahead)
+                    queued_message(Some(&waiting), reason.as_deref(), &ahead)
                 ))
             }
         }
@@ -1315,7 +1341,8 @@ impl Adapter {
 
         // Workspace write queue (SPEC R2.7): the place in line is taken here,
         // synchronously, before anything is spawned.
-        let lane = self.resolve_lane(args.as_ref(), subcommand_config, &safe_wd);
+        let (lane, queue_reason) =
+            self.resolve_lane_with_reason(args.as_ref(), subcommand_config, &safe_wd);
         self.command_starts(lane);
         let workspace = self.workspace_key_for(&safe_wd);
         let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
@@ -1324,7 +1351,9 @@ impl Adapter {
             .clone()
             .or_else(|| operation.title.clone())
             .unwrap_or_else(|| command.to_string());
-        let ticket = self.enqueue_exclusive(lane, &safe_wd, &op_id, &holder_title);
+        let ticket = self
+            .enqueue_exclusive(lane, &safe_wd, &op_id, &holder_title)
+            .map(|t| t.with_reason(queue_reason));
         let display_command = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| command.to_string());
@@ -1991,18 +2020,40 @@ fn shell_command_line(args: Option<&Map<String, serde_json::Value>>) -> Option<&
 }
 
 /// What ahma says while an operation waits for its workspace (SPEC R2.7.3).
-pub(crate) fn queued_message(ahead: &[workspace_queue::HolderInfo]) -> String {
-    match ahead {
-        [] => "Queued: waiting for the workspace, held by another ahma process".to_string(),
-        [only] => format!(
-            "Queued: waiting for the workspace behind {}",
-            only.describe()
+///
+/// The waiting command comes first: harnesses merge this line into the
+/// command's own output and summarise from its first line, and a notice that
+/// opened with the *holder's* command made that summary name the wrong one
+/// (field report, 2026-10-31).
+pub(crate) fn queued_message(
+    waiting: Option<&str>,
+    reason: Option<&str>,
+    ahead: &[workspace_queue::HolderInfo],
+) -> String {
+    let who = match waiting {
+        Some(cmd) => format!(
+            "NOT started — `{}` is waiting for the workspace",
+            short_command(cmd)
         ),
-        [first, rest @ ..] => format!(
-            "Queued: waiting for the workspace behind {} and {} more",
-            first.describe(),
-            rest.len()
-        ),
+        None => "NOT started — waiting for the workspace".to_string(),
+    };
+    let holders = match ahead {
+        [] => "another ahma process holds it".to_string(),
+        [only] => format!("{} holds it", only.describe()),
+        [first, rest @ ..] => format!("{} and {} more hold it", first.describe(), rest.len()),
+    };
+    match reason {
+        Some(why) => format!("{who}; {holders}. Queued because {why}."),
+        None => format!("{who}; {holders}."),
+    }
+}
+
+/// A command line short enough to name in one notice line.
+fn short_command(cmd: &str) -> String {
+    let cmd = cmd.trim();
+    match cmd.char_indices().nth(80) {
+        Some((at, _)) => format!("{}…", &cmd[..at]),
+        None => cmd.to_string(),
     }
 }
 
@@ -2019,9 +2070,14 @@ async fn wait_for_lease(
         return Ok(None);
     };
     let started = Instant::now();
+    let waiting = ticket.title().to_string();
+    let reason = ticket.reason().map(str::to_string);
     let observe = |ahead: &[workspace_queue::HolderInfo]| {
         monitor.try_note_liveness(op_id);
-        monitor.note_progress(op_id, queued_message(ahead));
+        monitor.note_progress(
+            op_id,
+            queued_message(Some(&waiting), reason.as_deref(), ahead),
+        );
     };
     let lease = ticket.acquire(cancel, &observe).await.map_err(|_| ())?;
     let waited = started.elapsed();
@@ -3652,6 +3708,60 @@ mod tests {
         assert!(notices[0].contains("op_holder"), "{notices:?}");
     }
 
+    /// SPEC R2.7.3, R2.7.4: what a hooked command prints while it waits (the
+    /// line a harness merges into its output) opens with that command, names
+    /// the holder after it, and says why the command waits at all.
+    #[tokio::test]
+    async fn a_waiting_shell_line_names_itself_first_and_says_why() {
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let notices = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let sink = notices.clone();
+        let adapter = adapter
+            .with_workspace_queue(workspace_queue::WorkspaceQueue::with_lock_dir(
+                true,
+                Some(td.path().join("locks")),
+            ))
+            .with_queue_wait_notice(Arc::new(move |line: &str| {
+                sink.lock().push(line.to_string())
+            }));
+        let key = adapter.workspace_key_for(td.path());
+        let _held = adapter
+            .workspace_queue()
+            .enqueue(
+                &key,
+                workspace_queue::HolderInfo::new("op_holder", "cargo nextest run"),
+            )
+            .unwrap()
+            .acquire(&tokio_util::sync::CancellationToken::new(), &|_| {})
+            .await
+            .unwrap();
+
+        let line = "python3 -c pass";
+        let _ = adapter
+            .execute_sync_in_dir(
+                crate::shell_pool::platform_shell_program(),
+                Some(shell_args(line)),
+                &td.path().to_string_lossy(),
+                Some(1),
+                None,
+            )
+            .await
+            .expect_err("the workspace never frees up");
+        let notices = notices.lock();
+        let notice = notices.first().expect("one notice");
+        assert!(
+            notice.starts_with("ahma: NOT started — `"),
+            "opens with its own command: {notice}"
+        );
+        let own = notice.find("python3").expect("names itself");
+        let holder = notice.find("op_holder").expect("names the holder");
+        assert!(own < holder, "{notice}");
+        assert!(
+            notice.contains("Queued because `python3 -c` may write"),
+            "{notice}"
+        );
+    }
+
     /// SPEC R2.7.2, R2.7.4: a redirection into a scope that is not a workspace
     /// — the harness's own scratch directory, a cache or temp directory the
     /// session may write — does not make a reader a workspace writer. A
@@ -3819,10 +3929,41 @@ mod tests {
     fn the_queued_message_names_who_is_ahead() {
         let one = workspace_queue::HolderInfo::new("op_1", "cargo nextest run");
         let two = workspace_queue::HolderInfo::new("op_2", "cargo build");
-        assert!(queued_message(&[]).contains("another ahma process"));
-        assert!(queued_message(std::slice::from_ref(&one)).contains("op_1"));
-        let both = queued_message(&[one, two]);
+        assert!(queued_message(None, None, &[]).contains("another ahma process"));
+        assert!(queued_message(None, None, std::slice::from_ref(&one)).contains("op_1"));
+        let both = queued_message(None, None, &[one, two]);
         assert!(both.contains("op_1") && both.contains("1 more"), "{both}");
+    }
+
+    /// The waiting command comes first, so a log that merges this line into a
+    /// command's output (a harness's background file, its summary) names the
+    /// command it belongs to, not the holder (field report, 2026-10-31).
+    #[test]
+    fn the_queued_message_names_the_waiting_command_first_and_why() {
+        let holder = workspace_queue::HolderInfo::new("op_9", "cargo nextest run");
+        let text = queued_message(
+            Some("git status"),
+            Some("ahma runs inside another sandbox here"),
+            std::slice::from_ref(&holder),
+        );
+        assert!(
+            text.starts_with("NOT started — `git status` is waiting for the workspace"),
+            "{text}"
+        );
+        let own = text.find("git status").unwrap();
+        let other = text.find("cargo nextest run").unwrap();
+        assert!(own < other, "{text}");
+        assert!(text.contains("op `op_9`"), "{text}");
+        assert!(
+            text.contains("Queued because ahma runs inside another sandbox here"),
+            "{text}"
+        );
+        let anonymous = queued_message(None, None, std::slice::from_ref(&holder));
+        assert!(
+            anonymous.starts_with("NOT started — waiting for the workspace"),
+            "{anonymous}"
+        );
+        assert!(!anonymous.contains("Queued because"), "{anonymous}");
     }
 
     #[test]

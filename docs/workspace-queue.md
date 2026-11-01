@@ -33,7 +33,16 @@ status()                                     → ── Finished since your last
   `NOT started — queued behind …` and names who it waits for; it runs by itself.
 - **Readers never wait.** `git status/diff/log/show/ls-remote`, the listing forms of `git branch/tag/remote/config/stash/worktree` (also after `git -C <dir>`), `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl`, `sleep`, the diagnostics you run to see why a job is slow (`uptime`, `sysctl -n`, `vm_stat`, `top -l 1`, `lsof`) and similar — and **pipelines, lists and loops of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`, `FOO=1 gh pr checks 87`, `S=/path; grep … $S`, `for f in a b; do grep -c x $f; done`, `until gh pr checks 87; do sleep 60; done`) —
   plain reads skip the queue — under a sandbox that grants the workspace **no write access**,
-  so a misclassified command fails instead of writing.
+  so a misclassified command fails instead of writing. A braced variable (`sed -n ${n}p`)
+  and the wrappers `timeout`, `time`, `nice`, `caffeinate` and `env NAME=…` are judged by
+  the command they run.
+- **What still makes a line wait.** A heredoc (`<<`), a backtick (inside double quotes too),
+  grouping (`( … )`, `{ … }`), an escape, a line break, or a program ahma does not know
+  only reads (a project script, `python3`). And on a Mac where ahma itself runs inside
+  another sandbox (macOS refuses to nest Seatbelt profiles), there is no read-only lane at
+  all, so every command takes its turn. A waiting command says which:
+  `NOT started — `git status` is waiting for the workspace; op `op_12` (`cargo nextest run`,
+  41s) holds it. Queued because …`.
 - **Watching CI never holds the workspace.** `gh run watch`, `gh pr checks --watch` and
   `tail -f` read until their subject ends, which can be most of an hour. They take no lease:
   read-only where the kernel enforces that lane, `service` where it does not.
@@ -61,7 +70,10 @@ status()                                     → ── Finished since your last
   A formatter, codemod, checkout or package manager (`cargo fmt`, `git checkout`,
   `prettier --write`, `npm install`) rewrites them, so an edit is refused until it finishes,
   naming it and how long it usually takes. An unrecognised command (a project script) is
-  treated as a rewriter, but only inside the subtree it runs in. The first refusal for a
+  treated as a rewriter, but only inside the subtree it runs in. A test run behind a known
+  wrapper (`timeout 600 cargo nextest run`) is still a test run. A project declares its own
+  source-reading scripts in `tools.source_readers`; an entry excuses its own command, not
+  what is chained after it. The first refusal for a
   command gives the reason; later ones are one line. ahma's own file tools and the edit
   guard for Claude Code, Codex, Copilot CLI, Cursor, Antigravity and VS Code decide the
   same way.

@@ -239,6 +239,16 @@ impl LineTokenizer {
             '!' if !self.in_word && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {
                 self.push_char('!');
             }
+            // `${NAME}` is the same plain variable as `$NAME`. Anything else
+            // between the braces (`${a:-b}`, `${#a}`) is an expansion this
+            // module does not model.
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                let len = braced_name_len(&chars[i..])?;
+                for &ch in &chars[i..i + len] {
+                    self.push_char(ch);
+                }
+                return Some(len);
+            }
             // An operator this module does not model, outside quotes only:
             // a `}` inside a sed script is just a character.
             c if SHELL_OPERATORS.contains(&c) => return None,
@@ -442,6 +452,81 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
 /// exactly when every command in it is.
 const LIST_KEYWORDS: &[&str] = &["until", "while", "if", "elif", "then", "else", "do", "!"];
 
+/// The length of a `${NAME}` at the start of `chars` (`$`, `{`, a name of
+/// letters, digits and `_`, `}`), or `None` when the braces hold anything else.
+fn braced_name_len(chars: &[char]) -> Option<usize> {
+    let close = chars.iter().skip(2).position(|&c| c == '}')? + 2;
+    let name = &chars[2..close];
+    (!name.is_empty() && name.iter().all(|c| c.is_ascii_alphanumeric() || *c == '_'))
+        .then_some(close + 1)
+}
+
+/// How many leading words are wrappers that only change how the command after
+/// them runs: `timeout`, `time`, `nice`, `caffeinate` and `env NAME=value…`.
+/// Parsed strictly, so a wrapper option this module does not know leaves the
+/// wrapper in place (and the line as unknown as it was). Never `nohup`: it
+/// writes `nohup.out` into the working directory.
+fn wrapper_len<S: AsRef<str>>(words: &[S]) -> usize {
+    let mut at = 0;
+    while let Some(n) = one_wrapper_len(&words[at..]) {
+        at += n;
+    }
+    // A wrapper with nothing after it runs nothing this module can judge.
+    if at >= words.len() { 0 } else { at }
+}
+
+fn one_wrapper_len<S: AsRef<str>>(words: &[S]) -> Option<usize> {
+    let word = |i: usize| words.get(i).map(AsRef::as_ref);
+    let is_duration = |w: &str| {
+        let digits = w.trim_end_matches(['s', 'm', 'h', 'd']);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+    };
+    match word(0)? {
+        "time" => Some(if word(1) == Some("-p") { 2 } else { 1 }),
+        "nice" => match word(1) {
+            Some("-n") if word(2).is_some_and(|n| n.parse::<i32>().is_ok()) => Some(3),
+            Some(w) if w.starts_with('-') => w[1..].parse::<i32>().ok().map(|_| 2),
+            _ => Some(1),
+        },
+        "caffeinate" => {
+            let flags = words[1..]
+                .iter()
+                .take_while(|w| {
+                    let w = w.as_ref();
+                    w.len() > 1 && w.starts_with('-') && w[1..].chars().all(|c| "dimsu".contains(c))
+                })
+                .count();
+            match word(1 + flags) {
+                Some(w) if w.starts_with('-') => None,
+                _ => Some(1 + flags),
+            }
+        }
+        "env" => {
+            let names = words[1..]
+                .iter()
+                .take_while(|w| is_assignment(w.as_ref()))
+                .count();
+            match word(1 + names) {
+                Some(w) if w.starts_with('-') => None,
+                _ => Some(1 + names),
+            }
+        }
+        "timeout" => {
+            let mut i = 1;
+            loop {
+                match word(i)? {
+                    "-k" | "-s" | "--kill-after" | "--signal" => i += 2,
+                    "--foreground" | "--preserve-status" => i += 1,
+                    w if w.starts_with("--kill-after=") || w.starts_with("--signal=") => i += 1,
+                    w if is_duration(w) => return Some(i + 1),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Whether `word` is a `NAME=value` environment assignment.
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
@@ -615,6 +700,100 @@ pub fn classify_shell_command(command: &str) -> Lane {
     }
 }
 
+/// Why a command line takes its turn in the workspace queue, in words an agent
+/// can act on (SPEC R2.7.4). Meant for a line already judged exclusive at
+/// `site`: it names the first thing that made it so, in the order the
+/// classifier meets them.
+pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
+    const UNREADABLE: &str = "ahma cannot read it as a plain command line";
+    if command.contains("<<") {
+        return "it has a heredoc (`<<`), which ahma cannot read".to_string();
+    }
+    let Some((lifted, inner)) = lift_substitutions(command) else {
+        return UNREADABLE.to_string();
+    };
+    if let Some(c) = inner.iter().find(|c| read_line(c).is_none()) {
+        return why_exclusive(c, site);
+    }
+    match unparsed_construct(&lifted) {
+        Some('\n' | '\r') => {
+            return "it spans several lines, which ahma does not parse".to_string();
+        }
+        Some(c) => return format!("it uses `{c}`, a shell construct ahma does not parse"),
+        None => {}
+    }
+    let Some(line) = parse_line(&lifted) else {
+        return UNREADABLE.to_string();
+    };
+    let mut reading = Reading::default();
+    for seg in &line.segs {
+        if read_one_segment(seg, &mut reading).is_none() {
+            return format!(
+                "`{}` may write (it is not a command ahma knows only reads)",
+                segment_head(seg)
+            );
+        }
+    }
+    if let Some(target) = line.writes.first().or(reading.tee_files.first()) {
+        return format!("it writes `{target}`");
+    }
+    if !site.read_only_enforced {
+        return "ahma runs inside another sandbox here, so read-only commands cannot be held \
+                to the read-only lane and every command takes its turn"
+            .to_string();
+    }
+    "it may write the workspace".to_string()
+}
+
+/// The first character of a construct the tokenizer refuses, outside a
+/// `$(…)` already lifted out: an operator it does not model, a braced
+/// expansion other than `${NAME}`, or a backtick inside double quotes.
+fn unparsed_construct(command: &str) -> Option<char> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '`' => return Some('`'),
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '$' if chars.get(i + 1) == Some(&'{') => match braced_name_len(&chars[i..]) {
+                    Some(len) => {
+                        i += len;
+                        continue;
+                    }
+                    None => return Some('{'),
+                },
+                '!' if (i == 0 || chars[i - 1].is_whitespace())
+                    && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {}
+                c if SHELL_OPERATORS.contains(&c) => return Some(c),
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A segment's command, as an agent would name it: its program and first
+/// argument, after keywords, assignments and wrappers.
+fn segment_head(seg: &Segment) -> String {
+    let words: Vec<&String> = seg
+        .iter()
+        .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+        .collect();
+    let words = &words[wrapper_len(&words)..];
+    let head: Vec<&str> = words.iter().take(2).map(|w| w.as_str()).collect();
+    let head = head.join(" ");
+    match head.char_indices().nth(40) {
+        Some((at, _)) => format!("{}…", &head[..at]),
+        None => head,
+    }
+}
+
 /// Where a command line runs, for [`classify_shell_command_at`].
 pub struct RunSite<'a> {
     /// The directory the line starts in; a relative redirection target is
@@ -782,6 +961,7 @@ fn read_one_segment(seg: &Segment, reading: &mut Reading) -> Option<()> {
     if is_framing_only_segment(seg, &words) {
         return Some(());
     }
+    let words = &words[wrapper_len(&words)..];
     let (program, args) = words.split_first()?;
     let program = program.as_str();
     let args: Vec<String> = args.iter().map(|a| (*a).clone()).collect();
@@ -1071,6 +1251,7 @@ fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
         .skip_while(|w| w.contains('=') && !w.starts_with('-'))
         .cloned()
         .collect();
+    let words = &words[wrapper_len(&words)..];
     let Some((program, args)) = words.split_first() else {
         return Unknown;
     };
@@ -1088,6 +1269,12 @@ fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
         _ if program.contains('/') => return Unknown,
         _ => program.as_str(),
     };
+    // `env` with arguments runs another program; when the wrapper parse above
+    // could not see which (`env -i …`), nothing here knows what it does to
+    // sources. Bare `env` prints the environment and stays a reader.
+    if program == "env" && !args.is_empty() {
+        return Unknown;
+    }
     if program_is_read_only(program, args) {
         return ReadsSources;
     }
@@ -2169,5 +2356,132 @@ mod integrity_tests {
                 "{cmd}"
             );
         }
+    }
+}
+
+/// Readers that queued for no reason the agent could see, from a field report
+/// (neubit4, 2026-10-31), and the reason every exclusive verdict now carries
+/// (SPEC R2.7.4).
+#[cfg(test)]
+mod queue_reason_tests {
+    use super::*;
+
+    const WS: &str = "/ws";
+
+    fn why(cmd: &str, read_only_enforced: bool) -> String {
+        let inside = |p: &Path| p.starts_with(WS);
+        why_exclusive(
+            cmd,
+            &RunSite {
+                cwd: Path::new(WS),
+                read_only_enforced,
+                writes_workspace: &inside,
+            },
+        )
+    }
+
+    /// `${n}` is the same plain variable as `$n`; only a bare name counts.
+    #[test]
+    fn a_braced_plain_variable_is_a_plain_variable() {
+        for cmd in [
+            "sed -n ${n}p doc.md",
+            "for n in 985 991 994; do sed -n ${n}p doc.md; done",
+            "cd /ws && git diff doc.md | head -20; sed -n 36,50p doc.md; for n in 985 991 994; do sed -n ${n}p doc.md; done",
+            "echo ${HOME} ${1}",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::ReadOnly, "{cmd}");
+        }
+        for cmd in [
+            "echo ${a:-$(rm x)}",
+            "echo ${#a}",
+            "echo ${a",
+            "echo ${}",
+            "echo ${a/b/c}",
+        ] {
+            assert_eq!(classify_shell_command(cmd), Lane::Exclusive, "{cmd}");
+        }
+    }
+
+    /// `timeout`, `time`, `nice`, `caffeinate` and `env NAME=…` only change how
+    /// a command runs, so the command decides. Parsed strictly: an option
+    /// these do not know leaves the line as unknown as before.
+    #[test]
+    fn known_wrappers_are_judged_by_the_command_they_run() {
+        for cmd in [
+            "timeout 600 cargo nextest run",
+            "timeout -k 10 -s TERM 30m cargo test",
+            "time cargo test",
+            "nice -n 5 cargo test",
+            "caffeinate -i cargo nextest run --run-ignored all",
+            "env RUST_LOG=debug cargo test",
+            "timeout 600 nice cargo test",
+        ] {
+            assert_eq!(
+                classify_source_effect(cmd, &[]),
+                SourceEffect::ReadsSources,
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            classify_shell_command("timeout 5 git status"),
+            Lane::ReadOnly
+        );
+        for cmd in [
+            "nohup cargo test",
+            "timeout --weird 5 cargo test",
+            "env -i cargo test",
+            "timeout 5",
+            "caffeinate -t 5 cargo test",
+        ] {
+            assert_eq!(
+                classify_source_effect(cmd, &[]),
+                SourceEffect::Unknown,
+                "{cmd} is not stripped"
+            );
+        }
+        assert_eq!(
+            classify_shell_command("timeout 5 sed -i s/a/b/ f"),
+            Lane::Exclusive
+        );
+        assert_ne!(
+            classify_source_effect("timeout 5 cargo fmt", &[]),
+            SourceEffect::ReadsSources
+        );
+        // Was a reader before: `env` is on the read-only list for printing
+        // the environment, so `env -i cargo fmt` relaxed the edit guard.
+        assert_ne!(
+            classify_source_effect("env -i cargo fmt", &[]),
+            SourceEffect::ReadsSources
+        );
+        assert_eq!(
+            classify_source_effect("env", &[]),
+            SourceEffect::ReadsSources
+        );
+    }
+
+    #[test]
+    fn every_exclusive_verdict_says_why() {
+        assert!(why("python3 - <<'PY'", true).contains("heredoc"));
+        let py = why("python3 read.py", true);
+        assert!(py.contains("`python3") && py.contains("may write"), "{py}");
+        let sed = why("sed -i s/a/b/ f", true);
+        assert!(
+            sed.contains("`sed -i") && sed.contains("may write"),
+            "{sed}"
+        );
+        let sub = why("echo $(touch f)", true);
+        assert!(sub.contains("`touch f"), "{sub}");
+        let group = why("(cd a && ls)", true);
+        assert!(group.contains("`(`"), "{group}");
+        let out = why("git status > /ws/out.txt", true);
+        assert!(out.contains("writes `/ws/out.txt`"), "{out}");
+    }
+
+    /// The cause no single command can fix: ahma nested inside another
+    /// sandbox has no read-only lane, so even `git status` takes its turn.
+    #[test]
+    fn a_reader_queued_by_a_nested_sandbox_is_told_so() {
+        let nested = why("git status --short", false);
+        assert!(nested.contains("another sandbox"), "{nested}");
     }
 }

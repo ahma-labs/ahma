@@ -320,10 +320,15 @@ fn readonly() -> String {
      result says 'NOT started — queued behind' another operation; it will run on its own.\n\
      \n\
      Commands ahma recognises as read-only (`git status`/`diff`/`log`, `rg`, `grep`, `ls`, \
-     `cat`) skip the queue and answer at once, even during a build. ahma classifies by the \
-     command, so a script or interpreter run (python3 script.py, awk) is treated as a possible \
-     writer and waits its turn even if it only reads. When you only need to look, prefer the \
-     recognised read-only commands.\n"
+     `cat`, `sed -n`), and pipelines, lists and loops of them, skip the queue and answer at \
+     once, even during a build. `${n}` and the wrappers timeout, time, nice, caffeinate and \
+     `env NAME=value` are fine.\n\
+     \n\
+     A line waits its turn when it has a heredoc (<<), a backtick, grouping ( ) or { }, an \
+     escape, a line break, or a program ahma does not know only reads (a script, python3), \
+     even if it only reads. And where ahma itself runs inside another sandbox there is no \
+     read-only lane, so every command waits its turn. A waiting command's notice says which \
+     reason applied. When you only need to look, split the line into plain reads.\n"
         .to_string()
 }
 
