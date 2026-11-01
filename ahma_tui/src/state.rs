@@ -654,8 +654,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/export markdown", "export chat transcript to markdown"),
     ("/intro", "ahma in one screen — Enter on a line for more"),
     (
-        "/doctor [question]",
-        "check ahma's health; ask it anything about ahma; fixes only with your OK",
+        "/doctor",
+        "check ahma's health, or ask it anything about ahma; fixes only with your OK",
     ),
     (
         "/doctor fix <n>",
@@ -698,6 +698,22 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         .collect()
 }
 
+/// `text` without its `[optional]` and `<required>` placeholders and the spaces
+/// they leave behind: `/doctor fix <n>` is named `/doctor fix`.
+fn strip_placeholders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '[' | '<' => depth += 1,
+            ']' | '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Advance `selected` by one step through a list of length `len`, wrapping
 /// around at either end. Returns `selected` unchanged when `len == 0` (empty
 /// list has no valid index to move to).
@@ -724,6 +740,10 @@ pub struct CommandNavigator {
     /// `/name` entries for discovered Agent Skills (SPEC R-SK8), captured when
     /// the navigator opens so keystroke filtering does not re-scan the disk.
     pub skill_commands: Vec<NavCommand>,
+    /// The query the current `completions` were ranked for, so a changed query
+    /// puts the highlight back on the best match while a refresh for the same
+    /// query (new tools arriving) leaves it where the user moved it.
+    ranked_for: String,
 }
 
 impl CommandNavigator {
@@ -739,17 +759,42 @@ impl CommandNavigator {
         nav
     }
 
-    /// Does `cmd` match the palette query? `query` must already be lowercased.
-    /// Matching is a substring test over both the command and its description,
-    /// plus one alias: `/quit` also answers to a prefix of "exit".
-    fn command_matches(cmd: &NavCommand, query: &str) -> bool {
-        let query_no_slash = query.trim_start_matches('/');
-        let is_exit_alias = cmd.command == "/quit"
-            && !query_no_slash.is_empty()
-            && "exit".starts_with(query_no_slash);
-        cmd.command.to_lowercase().contains(query)
-            || cmd.description.to_lowercase().contains(query)
-            || is_exit_alias
+    /// How well `cmd` matches the palette query, `None` for no match; lower is
+    /// better. `query` must already be lowercased.
+    ///
+    /// Placeholders (`[question]`, `<url>`) are instructions to the reader, not
+    /// part of the name, so they are never matched: `/q` once highlighted
+    /// `/doctor [question]` above `/quit`.
+    ///
+    /// 0. `/quit`, when the query is a prefix of `quit` or `exit` (`/q`, `/e`);
+    /// 1. the name starts with the query;
+    /// 2. a word of the name starts with it;
+    /// 3. the name contains it;
+    /// 4. the description contains it.
+    fn match_rank(cmd: &NavCommand, query: &str) -> Option<u8> {
+        let q = query.trim_start_matches('/');
+        if q.is_empty() {
+            return Some(4);
+        }
+        if cmd.command == "/quit" && ("quit".starts_with(q) || "exit".starts_with(q)) {
+            return Some(0);
+        }
+        let name = strip_placeholders(&cmd.command.to_lowercase());
+        let name = name.trim_start_matches('/');
+        if name.starts_with(q) {
+            Some(1)
+        } else if name
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word.starts_with(q))
+        {
+            Some(2)
+        } else if name.contains(q) {
+            Some(3)
+        } else if cmd.description.to_lowercase().contains(q) {
+            Some(4)
+        } else {
+            None
+        }
     }
 
     /// Rebuild completions from builtins + dynamic `/run <tool>` and skill
@@ -765,14 +810,21 @@ impl CommandNavigator {
             });
         }
 
-        if self.input.is_empty() {
+        let query = self.input.to_lowercase();
+        if query.is_empty() {
             self.completions = cmds;
         } else {
-            let query = self.input.to_lowercase();
-            self.completions = cmds
+            let mut ranked: Vec<(u8, NavCommand)> = cmds
                 .into_iter()
-                .filter(|c| Self::command_matches(c, &query))
+                .filter_map(|c| Self::match_rank(&c, &query).map(|r| (r, c)))
                 .collect();
+            // Stable: within a rank the table's own order is kept.
+            ranked.sort_by_key(|(rank, _)| *rank);
+            self.completions = ranked.into_iter().map(|(_, c)| c).collect();
+        }
+        if self.ranked_for != query {
+            self.selected = 0;
+            self.ranked_for = query;
         }
         self.selected = self.selected.min(self.completions.len().saturating_sub(1));
     }
@@ -4912,6 +4964,54 @@ mod tests {
         nav.refresh_completions(&tools);
         assert!(!nav.completions.iter().any(|c| c.command == "/q"));
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
+    }
+
+    fn palette(input: &str) -> Vec<String> {
+        let mut nav = CommandNavigator::opened(&[], vec![]);
+        nav.input = input.to_string();
+        nav.refresh_completions(&[]);
+        nav.completions.into_iter().map(|c| c.command).collect()
+    }
+
+    #[test]
+    fn q_and_e_put_quit_first_not_doctor() {
+        for q in ["q", "/q", "qu", "e", "/e", "ex", "exi"] {
+            assert_eq!(palette(q).first().map(String::as_str), Some("/quit"), "{q}");
+        }
+    }
+
+    #[test]
+    fn a_longer_e_word_does_not_hijack_the_quit_alias() {
+        assert_eq!(
+            palette("exp").first().map(String::as_str),
+            Some("/export markdown")
+        );
+    }
+
+    #[test]
+    fn doctor_has_no_placeholder_and_is_found_by_name() {
+        assert_eq!(palette("doc").first().map(String::as_str), Some("/doctor"));
+        assert!(!palette("").iter().any(|c| c.contains("[question]")));
+    }
+
+    #[test]
+    fn placeholders_are_not_matched() {
+        assert!(
+            !palette("url")
+                .iter()
+                .any(|c| c.starts_with("/mcp add http"))
+        );
+        assert!(!palette("question").iter().any(|c| c == "/doctor"));
+    }
+
+    #[test]
+    fn the_top_match_is_highlighted_when_the_query_changes() {
+        let mut nav = CommandNavigator::opened(&[], vec![]);
+        nav.selected = 5;
+        nav.input = "q".to_string();
+        nav.refresh_completions(&[]);
+        assert_eq!(nav.selected, 0);
+        assert_eq!(nav.selected_command(), "/quit");
     }
 
     /// SPEC R-SK8: discovered Agent Skills appear in the `/` navigator and
