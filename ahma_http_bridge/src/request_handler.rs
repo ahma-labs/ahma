@@ -843,9 +843,9 @@ fn build_handshake_timeout_response(
 
 fn get_conflict_message(requires_client_roots: bool) -> &'static str {
     if requires_client_roots {
-        "Sandbox initializing from client roots. This server requires roots/list from client; configure --sandbox-scope for clients without roots support."
+        "Sandbox initializing from client roots. This server requires roots/list from client; configure --sandbox-scope for clients without roots support. (`ahma_help topic=roots` explains this; it answers now.)"
     } else {
-        "Sandbox initializing from client roots or explicit fallback scope - retry tools/call after handshake completes"
+        "Sandbox initializing from client roots or explicit fallback scope - retry tools/call after handshake completes. (`ahma_help topic=roots` explains this; it answers now.)"
     }
 }
 
@@ -856,10 +856,18 @@ fn get_conflict_message(requires_client_roots: bool) -> &'static str {
 /// gate's observable contract (409 + JSON-RPC -32001) is a SPEC hard invariant
 /// (RB.1.1), and it opens only on the subprocess's authoritative
 /// `notifications/sandbox/configured` (RB.2).
+///
+/// `exempt` is a call to one of the built-ins that change nothing
+/// ([`ahma_common::mcp_methods::SCOPE_EXEMPT_TOOLS`]): while the sandbox is still
+/// awaiting roots or configuring — including after the handshake timed out —
+/// it goes through, so `status` and `ahma_help` can explain the wait they are
+/// stuck in (SPEC R-HELP.1). The subprocess applies its own gate to every
+/// other tool. A failed or terminated session refuses everything.
 fn check_sandbox_lock(
     session_manager: &SessionManager,
     session_id: &str,
     request_id: Value,
+    exempt: bool,
 ) -> Option<Response> {
     let session = session_manager.get_session(session_id)?;
 
@@ -888,7 +896,11 @@ fn check_sandbox_lock(
             ));
         }
         ahma_common::sandbox_state::SandboxState::AwaitingRoots
-        | ahma_common::sandbox_state::SandboxState::Configuring { .. } => {}
+        | ahma_common::sandbox_state::SandboxState::Configuring { .. } => {
+            if exempt {
+                return None;
+            }
+        }
     }
 
     let (sse_connected, mcp_initialized) =
@@ -1739,8 +1751,14 @@ async fn gate_session_request(
     }
 
     // Sandbox gating for tools/call
+    let exempt = payload
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(ahma_common::mcp_methods::is_scope_exempt_tool);
     if method == Some(TOOLS_CALL_METHOD)
-        && let Some(response) = check_sandbox_lock(session_manager, session_id, request_id.clone())
+        && let Some(response) =
+            check_sandbox_lock(session_manager, session_id, request_id.clone(), exempt)
     {
         return Some(response);
     }
@@ -2306,14 +2324,14 @@ mod tests {
     #[test]
     fn check_sandbox_lock_none_for_unknown_session() {
         let mgr = keepalive_manager();
-        assert!(check_sandbox_lock(&mgr, "missing", json!(1)).is_none());
+        assert!(check_sandbox_lock(&mgr, "missing", json!(1), false).is_none());
     }
 
     #[tokio::test]
     async fn check_sandbox_lock_conflict_while_awaiting_roots() {
         let mgr = manager_with(None, 10, 3600, Arc::new(KeepAlivePeerFactory));
         let id = mgr.create_session().await.expect("create session");
-        let resp = check_sandbox_lock(&mgr, &id, json!("call-77")).expect("should be Some");
+        let resp = check_sandbox_lock(&mgr, &id, json!("call-77"), false).expect("should be Some");
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
         let body = body_json(resp).await;
@@ -2330,7 +2348,7 @@ mod tests {
         // handshake_timeout_secs = 0 → immediately timed out.
         let mgr = manager_with(None, 10, 0, Arc::new(KeepAlivePeerFactory));
         let id = mgr.create_session().await.expect("create session");
-        let resp = check_sandbox_lock(&mgr, &id, json!(88)).expect("should be Some");
+        let resp = check_sandbox_lock(&mgr, &id, json!(88), false).expect("should be Some");
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32002);
@@ -2344,7 +2362,13 @@ mod tests {
         let mgr = keepalive_manager();
         let failed = mgr.create_session().await.expect("create session");
         mgr.fail_sandbox(&failed, "scope unresolvable");
-        let resp = check_sandbox_lock(&mgr, &failed, json!("f-1")).expect("should be Some");
+        let resp = check_sandbox_lock(&mgr, &failed, json!("f-1"), false).expect("should be Some");
+        // A failed session refuses even the built-ins that change nothing:
+        // the exemption covers only the wait before the sandbox is Active.
+        assert!(
+            check_sandbox_lock(&mgr, &failed, json!("f-2"), true).is_some(),
+            "a failed sandbox refuses an exempt tool too"
+        );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32000);

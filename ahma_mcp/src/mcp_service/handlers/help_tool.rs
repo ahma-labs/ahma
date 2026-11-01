@@ -51,6 +51,11 @@ pub enum TempAccess {
     /// ahma is not enforcing a filesystem boundary here (`--no-sandbox`, or a
     /// platform without one), so temp is writable and nothing is confining it.
     NotEnforced,
+    /// The kernel lets commands write these directories unless the session
+    /// runs with `--no-temp-files`, and that setting cannot be read from here
+    /// (`ahma explain` inside a hooked command, where `~/.ahma` is out of
+    /// reach by design, SPEC R5.4.8).
+    Unconfirmed(Vec<PathBuf>),
 }
 
 /// What the help text says about this session. Gathered once from the live
@@ -68,20 +73,10 @@ pub struct HelpFacts {
 
 impl HelpFacts {
     /// The directories the kernel sandbox lets a command write for temp files,
-    /// on this platform. Mirrors the rules in `sandbox/landlock.rs`
-    /// (`add_landlock_temp_rules`) and `sandbox/seatbelt.rs`
-    /// (`get_macos_temp_rules`); keep them in step.
+    /// on this platform: the same list the Seatbelt and Landlock rules are
+    /// built from ([`crate::sandbox::temp_write_roots`]).
     pub fn kernel_temp_roots() -> Vec<PathBuf> {
-        if cfg!(target_os = "macos") {
-            vec![
-                PathBuf::from("/private/tmp"),
-                PathBuf::from("/private/var/folders"),
-            ]
-        } else if cfg!(target_os = "linux") {
-            vec![PathBuf::from("/tmp")]
-        } else {
-            Vec::new()
-        }
+        crate::sandbox::temp_write_roots()
     }
 
     /// Read the facts from the live sandbox and environment.
@@ -105,10 +100,46 @@ impl HelpFacts {
         }
     }
 
+    /// The facts as the `ahma explain` command can know them, from `cwd`:
+    /// whether temp is turned off comes from the settings file when it can be
+    /// read, and is reported as unconfirmed when it cannot.
+    pub fn for_cli(cwd: &Path) -> Self {
+        let canon = |p: PathBuf| dunce::canonicalize(&p).unwrap_or(p);
+        let roots = Self::kernel_temp_roots();
+        let disabled = ahma_common::config::settings_path()
+            .map(|p| match std::fs::read_to_string(&p) {
+                Ok(text) => ahma_common::config::AhmaSettings::parse(&text)
+                    .ok()
+                    .map(|s| s.sandbox.disable_temp),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+                Err(_) => None,
+            })
+            .unwrap_or(None);
+        let temp = match disabled {
+            Some(true) => TempAccess::Refused,
+            _ if roots.is_empty() => TempAccess::NotEnforced,
+            Some(false) => TempAccess::Open(roots),
+            None => TempAccess::Unconfirmed(roots),
+        };
+        Self {
+            temp,
+            temp_dir: canon(std::env::temp_dir()),
+            tmpdir_env: std::env::var_os("TMPDIR")
+                .filter(|v| !v.is_empty())
+                .map(|v| canon(PathBuf::from(v))),
+            workspace: cwd
+                .ancestors()
+                .find(|d| d.join(".git").exists())
+                .map(Path::to_path_buf),
+        }
+    }
+
     /// Whether `path` is inside a directory the kernel lets commands write for temp.
     fn temp_writable(&self, path: &Path) -> bool {
         match &self.temp {
-            TempAccess::Open(roots) => roots.iter().any(|r| path.starts_with(r)),
+            TempAccess::Open(roots) | TempAccess::Unconfirmed(roots) => {
+                roots.iter().any(|r| path.starts_with(r))
+            }
             TempAccess::NotEnforced => true,
             TempAccess::Refused => false,
         }
@@ -132,6 +163,22 @@ pub fn render(topic: Option<&str>, facts: &HelpFacts) -> String {
     }
 }
 
+/// [`render`] in the words of the `ahma explain` command, for an agent that
+/// reaches ahma only through a hooked shell and has no `ahma_help` tool.
+pub fn render_for_cli(topic: Option<&str>, facts: &HelpFacts) -> String {
+    render(topic, facts)
+        .replace(
+            "ahma_help topics (call ahma_help with topic=<name>):",
+            "ahma explain topics (run `ahma explain <topic>`):",
+        )
+        .replace(
+            "Start with topic=blocked",
+            "Start with `ahma explain blocked`",
+        )
+        .replace("? topic=temp.", "? `ahma explain temp`.")
+        .replace("ahma_help topic=", "ahma explain ")
+}
+
 fn index() -> String {
     let width = TOPICS.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
     let mut out = String::from("ahma_help topics (call ahma_help with topic=<name>):\n");
@@ -153,6 +200,11 @@ fn temp_headline(facts: &HelpFacts) -> String {
         TempAccess::Refused => {
             "Temp space: NOT AVAILABLE (this session was started with --no-temp-files)".to_string()
         }
+        TempAccess::Unconfirmed(_) => format!(
+            "Temp space: probably AVAILABLE at {} (unless ahma runs with --no-temp-files, \
+             which cannot be checked from here)",
+            facts.temp_dir.display()
+        ),
     }
 }
 
@@ -196,14 +248,16 @@ fn temp(facts: &HelpFacts) -> String {
              Caches the sandbox blocks can still be redirected: see ahma_help topic=blocked.\n",
             headline = temp_headline(facts),
         ),
-        TempAccess::Open(_) | TempAccess::NotEnforced => temp_open(facts),
+        TempAccess::Open(_) | TempAccess::NotEnforced | TempAccess::Unconfirmed(_) => {
+            temp_open(facts)
+        }
     }
 }
 
 fn temp_open(facts: &HelpFacts) -> String {
     let mut out = format!("{}\n\n", temp_headline(facts));
     match &facts.temp {
-        TempAccess::Open(roots) => {
+        TempAccess::Open(roots) | TempAccess::Unconfirmed(roots) => {
             let list: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
             out.push_str(&format!(
                 "Commands you run can write under: {}.\n",
@@ -415,7 +469,12 @@ mod tests {
 
     #[test]
     fn every_topic_says_something_in_every_state() {
-        for facts in [open_facts(), refused_facts(), unenforced_facts()] {
+        for facts in [
+            open_facts(),
+            refused_facts(),
+            unenforced_facts(),
+            unconfirmed_facts(),
+        ] {
             for (name, _) in TOPICS {
                 let text = render(Some(name), &facts);
                 assert!(
@@ -555,6 +614,46 @@ mod tests {
         let text = render(Some("blocked"), &refused_facts());
         assert!(!text.contains("mktemp -d"), "{text}");
         assert!(text.contains("--no-temp-files"), "{text}");
+    }
+
+    fn unconfirmed_facts() -> HelpFacts {
+        HelpFacts {
+            temp: TempAccess::Unconfirmed(vec![PathBuf::from("/private/tmp")]),
+            ..open_facts()
+        }
+    }
+
+    /// Run from a hooked shell, the help is a command, not a tool: no topic
+    /// may tell the agent to call a tool it does not have (SPEC R-HELP.1).
+    #[test]
+    fn the_cli_wording_never_names_the_mcp_tool() {
+        for facts in [open_facts(), refused_facts(), unconfirmed_facts()] {
+            for topic in std::iter::once(None).chain(TOPICS.iter().map(|(n, _)| Some(*n))) {
+                let text = render_for_cli(topic, &facts);
+                assert!(!text.contains("ahma_help"), "{topic:?}: {text}");
+            }
+        }
+        let index = render_for_cli(None, &open_facts());
+        assert!(index.contains("ahma explain blocked"), "{index}");
+        assert!(
+            render_for_cli(Some("blocked"), &open_facts()).contains("ahma explain temp"),
+            "points at the CLI topic"
+        );
+    }
+
+    /// Inside a hooked command ahma cannot read its own settings, so it does
+    /// not know whether `--no-temp-files` is on: it says so instead of guessing.
+    #[test]
+    fn temp_that_cannot_be_confirmed_says_so_and_names_the_one_switch() {
+        let text = render(Some("temp"), &unconfirmed_facts());
+        assert!(text.contains("probably AVAILABLE"), "{text}");
+        assert!(text.contains("--no-temp-files"), "{text}");
+        assert!(
+            text.contains("mktemp -d"),
+            "the recipes still apply: {text}"
+        );
+        let start = render(Some("start"), &unconfirmed_facts());
+        assert!(start.contains("Temp space: probably AVAILABLE"), "{start}");
     }
 
     #[test]

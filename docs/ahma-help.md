@@ -26,8 +26,21 @@ ahma_help(topic="blocked")   # a command failed with 'Operation not permitted'
 ```
 
 It works before the sandbox scope has settled, because that is when an agent most
-needs it. Through the HTTP bridge, the bridge may hold every call until the
-sandbox is active.
+needs it, through the HTTP bridge and hub as well as a direct connection. The
+server instructions every MCP client gives its model name it.
+
+An agent that reaches ahma only through a terminal hook (Claude Code's or
+Cursor's own shell) has no MCP tool. It runs the same text as a command:
+
+```
+ahma explain              # the index
+ahma explain blocked      # what to try when a command fails with 'Operation not permitted'
+ahma explain temp
+```
+
+`ahma explain` never waits behind a build and writes nothing. Inside a hooked
+command it cannot read `~/.ahma`, so it reports temp as "probably available"
+and names the one switch (`--no-temp-files`) that would turn it off.
 
 ## Topics
 

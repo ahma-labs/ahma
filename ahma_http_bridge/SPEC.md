@@ -80,7 +80,11 @@ honest gating.
   only permitted difference between the transports; gate order and error/timeout semantics are
   identical by construction, never duplicated per transport.
   - **RB.1.1 — Observable sandbox gate**: `tools/call` before the sandbox lock returns
-    HTTP 409 with JSON-RPC error `-32001`, on both transports.
+    HTTP 409 with JSON-RPC error `-32001`, on both transports. The one exception is a
+    scope-exempt built-in (`ahma_common::mcp_methods::SCOPE_EXEMPT_TOOLS`: `status`,
+    `ahma_help`, …), which changes nothing and is forwarded while the sandbox is awaiting
+    roots or configuring, so an agent can see why it waits (SPEC R-HELP.1). A failed or
+    terminated session refuses those too.
   - **RB.1.2 — Recoverable wait-window timeout**: when the bridge's wait window elapses before
     the subprocess answers a forwarded request, both transports return **HTTP 200** carrying a
     JSON-RPC `-32002` error with the original request id, and the session survives. A non-2xx

@@ -116,7 +116,7 @@ unanswered — treat that the same as a timeout and `await` again. `cancel(id="o
 ahma_help(topic="blocked")   # also: start, temp, slow, readonly, roots; no topic = index
 ```
 
-Guidance generated for this session; read it before asking the human for anything. It says whether temp space is available and where (commands can usually write the system temp dir), to find the tool's own cache/temp/output option first (`<tool> --help`; `--cache-dir`, `CARGO_TARGET_DIR`, `XDG_CACHE_HOME`) and point it at temp or a gitignored workspace folder, never to copy caches into the workspace, and only then to ask for `ahma sandbox grant <dir>`. Works before the scope settles.
+Guidance generated for this session; read it before asking the human for anything. It says whether temp space is available and where (commands can usually write the system temp dir), to find the tool's own cache/temp/output option first (`<tool> --help`; `--cache-dir`, `CARGO_TARGET_DIR`, `XDG_CACHE_HOME`) and point it at temp or a gitignored workspace folder, never to copy caches into the workspace, and only then to ask for `ahma sandbox grant <dir>`. Works before the scope settles. Reaching ahma only through a terminal hook (no MCP tool)? Run `ahma explain blocked` for the same text.
 
 ### `sandbox_grant` — Request persistent filesystem scope
 

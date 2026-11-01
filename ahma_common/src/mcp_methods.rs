@@ -52,7 +52,10 @@ macro_rules! instructions_head {
         "\
 Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
 kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
-Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
+Job Objects on Windows). When a command is blocked (\"Operation not permitted\", a denied \
+write) or the sandbox is not ready yet, call `ahma_help` (topic=blocked, or topic=roots) \
+before asking the user: it says what to try first and answers even before the scope settles. \
+Prefer `run_terminal_command` over the native terminal when: \
 (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; "
     };
 }
@@ -123,6 +126,29 @@ pub fn server_instructions(policy: crate::config::ExecutionPolicy) -> &'static s
         crate::config::ExecutionPolicy::Sync => SERVER_INSTRUCTIONS_SYNC,
         crate::config::ExecutionPolicy::Async => SERVER_INSTRUCTIONS,
     }
+}
+
+/// The built-in tools that may answer before the sandbox scope has settled
+/// (SPEC R5.1.2, R-HELP.1): they change nothing in the workspace, and an agent
+/// needs them most while roots are still being negotiated.
+///
+/// Spelled out here, not derived, because the HTTP bridge must gate on it and
+/// cannot depend on `ahma_mcp`. `ahma_mcp`'s `BuiltinTool::is_sandbox_exempt`
+/// remains the source of truth; a test there fails if the two ever differ.
+pub const SCOPE_EXEMPT_TOOLS: &[&str] = &[
+    "status",
+    "await",
+    "cancel",
+    "sandbox_grant",
+    "network_grant",
+    "restart",
+    "todo_write",
+    "ahma_help",
+];
+
+/// Whether `name` is one of [`SCOPE_EXEMPT_TOOLS`].
+pub fn is_scope_exempt_tool(name: &str) -> bool {
+    SCOPE_EXEMPT_TOOLS.contains(&name)
 }
 
 /// Client → server request invoking a tool.
@@ -500,6 +526,16 @@ mod tests {
             let legacy = json!({ "connected": connected });
             let typed = PushChannelChangedParams { connected };
             assert_eq!(wire(&typed), wire(&legacy));
+        }
+    }
+
+    /// SPEC R-HELP.1: the instructions every MCP client puts in front of its
+    /// model are how an agent learns `ahma_help` exists; both variants say so.
+    #[test]
+    fn both_instruction_variants_name_ahma_help() {
+        for text in [SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_SYNC] {
+            assert!(text.contains("call `ahma_help`"), "{text}");
+            assert!(text.contains("topic=blocked"), "{text}");
         }
     }
 

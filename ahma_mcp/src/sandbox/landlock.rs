@@ -407,11 +407,12 @@ fn add_landlock_temp_rules(
     access_all: landlock::BitFlags<landlock::AccessFs>,
 ) -> Result<()> {
     use landlock::{PathBeneath, PathFd, RulesetCreatedAttr};
-    let tmp_path = std::path::Path::new("/tmp");
-    if tmp_path.exists()
-        && let Ok(fd) = PathFd::new(tmp_path)
-    {
-        let _ = ruleset.add_rule(PathBeneath::new(fd, access_all));
+    for root in super::temp_write_roots() {
+        if root.exists()
+            && let Ok(fd) = PathFd::new(&root)
+        {
+            let _ = ruleset.add_rule(PathBeneath::new(fd, access_all));
+        }
     }
     Ok(())
 }

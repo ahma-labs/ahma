@@ -130,6 +130,23 @@ pub use ssh_agent::{
     SshAgentMode, set_ssh_agent_mode, set_upstream_agent, ssh_agent_mode, upstream_agent,
 };
 pub use types::{SandboxMode, ScopesGuard};
+
+/// The directories the kernel sandbox lets every command write for temp
+/// files, unless `--no-temp-files`: `/tmp` under Landlock, `/private/tmp` and
+/// `/private/var/folders` under Seatbelt; none where there is no boundary. The
+/// one list the Seatbelt and Landlock rules and `ahma_help` all read, so what
+/// the help says about temp cannot drift from what the kernel allows
+/// (SPEC R-HELP.2).
+pub fn temp_write_roots() -> Vec<std::path::PathBuf> {
+    let roots: &[&str] = if cfg!(target_os = "macos") {
+        &["/private/tmp", "/private/var/folders"]
+    } else if cfg!(target_os = "linux") {
+        &["/tmp"]
+    } else {
+        &[]
+    };
+    roots.iter().map(std::path::PathBuf::from).collect()
+}
 /// Re-entry hook for the Windows AppContainer launcher. Exported unconditionally
 /// (a no-op off Windows) so `main` can call it without a `cfg` of its own; it
 /// **must** run before CLI parsing. See `sandbox::windows` for why a launcher

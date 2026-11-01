@@ -436,7 +436,10 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
         "ahma" => {
             let mut it = args.iter().map(String::as_str);
             match (it.next(), it.next()) {
-                (Some("queue"), None) | (Some("ps"), _) | (Some("--version"), _) => true,
+                (Some("queue"), None)
+                | (Some("ps"), _)
+                | (Some("explain"), _)
+                | (Some("--version"), _) => true,
                 (Some("sandbox" | "permissions" | "network"), Some("list")) => true,
                 (Some("hooks"), Some("status")) => true,
                 (Some("doctor"), _) => !has("--fix"),
@@ -2475,6 +2478,17 @@ mod queue_reason_tests {
         assert!(group.contains("`(`"), "{group}");
         let out = why("git status > /ws/out.txt", true);
         assert!(out.contains("writes `/ws/out.txt`"), "{out}");
+    }
+
+    /// `ahma explain` is how a hooked agent asks what to do while a build
+    /// holds the workspace; it must not wait behind that build.
+    #[test]
+    fn ahma_explain_never_queues() {
+        assert_eq!(
+            classify_shell_command("ahma explain blocked"),
+            Lane::ReadOnly
+        );
+        assert_eq!(classify_shell_command("ahma explain"), Lane::ReadOnly);
     }
 
     /// The cause no single command can fix: ahma nested inside another

@@ -59,6 +59,45 @@ mod ahma_mcp_tests {
         );
     }
 
+    /// `ahma explain` gives a hooked agent the `ahma_help` text in command
+    /// form, and what it says about temp is read from this home's settings
+    /// (SPEC R-HELP.1, R-HELP.2).
+    #[test]
+    fn test_ahma_explain_prints_the_help_in_command_form() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+
+        let run = |args: &[&str]| {
+            let output = test_command(&binary)
+                .env("AHMA_TEST_HOME", home.path())
+                .current_dir(ws.path())
+                .args(args)
+                .output()
+                .expect("Failed to execute ahma explain");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                output.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!stdout.contains("ahma_help"), "command form only: {stdout}");
+            stdout
+        };
+
+        let index = run(&["explain"]);
+        assert!(index.contains("ahma explain blocked"), "{index}");
+        let blocked = run(&["explain", "blocked"]);
+        assert!(blocked.contains("ahma sandbox grant"), "{blocked}");
+        assert!(blocked.contains("--help"), "{blocked}");
+
+        let settings = home.path().join(".ahma").join("settings.toml");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "[sandbox]\ndisable_temp = true\n").unwrap();
+        let temp = run(&["explain", "temp"]);
+        assert!(temp.contains("NOT AVAILABLE"), "{temp}");
+    }
+
     /// `ahma doctor` reports on a chosen home and folder, changes nothing
     /// without --fix, and says what fixing would do (SPEC R-DOCTOR).
     #[test]

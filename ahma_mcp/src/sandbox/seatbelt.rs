@@ -481,11 +481,13 @@ impl Sandbox {
         if self.no_temp_files {
             String::new()
         } else {
-            let mut rules = "(allow file-read* (subpath \"/private/tmp\"))\n\
-             (allow file-write* (subpath \"/private/tmp\"))\n\
-             (allow file-read* (subpath \"/private/var/folders\"))\n\
-             (allow file-write* (subpath \"/private/var/folders\"))\n"
-                .to_string();
+            let mut rules = String::new();
+            for root in super::temp_write_roots() {
+                rules.push_str(&format!(
+                    "(allow file-read* (subpath \"{0}\"))\n(allow file-write* (subpath \"{0}\"))\n",
+                    root.display()
+                ));
+            }
             rules.push_str(&volume_temporary_items_rules(writable_roots));
             rules
         }
