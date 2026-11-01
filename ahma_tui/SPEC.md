@@ -47,6 +47,12 @@ Criteria specified in §3 or in the root SPEC are cited by id, not restated.
   turn, a tool call or a replayed event — and every use is disclosed twice: a warning log line
   naming the command, and an `UNSANDBOXED` label on its output window. Disclosure, not
   prohibition, is what R7 requires of an escape hatch.
+- **The command navigator ranks its matches.** What is highlighted is what Enter runs, so the
+  best match must be first: `/q` and `/e` (any prefix of `quit` or `exit`) put `/quit` first,
+  then a name prefix, a word prefix, a substring of the name, and last the description. The
+  placeholders in a command's label (`[question]`, `<url>`) are never matched: they describe
+  arguments, and `/q` once highlighted `/doctor [question]` above `/quit`. The highlight
+  returns to the top whenever the query changes.
 - **Approval gates (root R-WEB.6, R-WEB.6.3, R-PERM.7.1, R-PERM.3.8, R-PERM.10(e))**: the TUI
   renders and resolves chat tool approval (`y`/`n`), sandbox scope grants and web egress; all
   three deny on Enter/Esc. A denied operation is selectable and `a` re-raises its grant
