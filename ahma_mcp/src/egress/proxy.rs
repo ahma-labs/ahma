@@ -403,6 +403,25 @@ async fn resolve_egress_approval(
     }
 }
 
+/// A refusal the tool's user can act on (SPEC R-WEB.16.2): the status line,
+/// then a plain-text body saying what was blocked and, for a host that is only
+/// missing from the allow list, the one command that allows it. Tools that
+/// show a proxy's error body (and `curl -v`) then say more than a bare status.
+fn refusal(status: &str, host: &str, why: Option<&str>) -> Vec<u8> {
+    let body = match why {
+        None => format!(
+            "ahma blocked network access to {host}: it is not on the egress allow list \
+             (--restrict-network). A human can allow it with `ahma network allow {host}`.\n"
+        ),
+        Some(reason) => format!("ahma blocked network access to {host}: {reason}.\n"),
+    };
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 /// Handle HTTP CONNECT (used by HTTPS tunnels).
 async fn handle_connect(
     mut client: TcpStream,
@@ -427,7 +446,7 @@ async fn handle_connect(
     if !resolve_egress_approval(host, target, &allowlist, &net_approval).await {
         warn!("Egress proxy blocked CONNECT to {host}");
         client
-            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+            .write_all(&refusal("407 Proxy Authentication Required", host, None))
             .await?;
         return Ok(());
     }
@@ -440,9 +459,11 @@ async fn handle_connect(
         Err(reason) => {
             warn!("Egress proxy blocked CONNECT to {host}: {reason}");
             client
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
-                )
+                .write_all(&refusal(
+                    "407 Proxy Authentication Required",
+                    host,
+                    Some(&reason.to_string()),
+                ))
                 .await?;
             return Ok(());
         }
@@ -500,7 +521,7 @@ async fn handle_plain_http(
     if !resolve_egress_approval(&host, &target, &allowlist, &net_approval).await {
         warn!("Egress proxy blocked HTTP {first_line} (host={host})");
         client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .write_all(&refusal("403 Forbidden", &host, None))
             .await?;
         return Ok(());
     }
@@ -512,7 +533,7 @@ async fn handle_plain_http(
         Err(reason) => {
             warn!("Egress proxy blocked HTTP {first_line} (host={host}): {reason}");
             client
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .write_all(&refusal("403 Forbidden", &host, Some(&reason.to_string())))
                 .await?;
             return Ok(());
         }
@@ -772,6 +793,36 @@ mod tests {
             resp_str.contains("400 Bad Request"),
             "missing Host header must yield 400, got: {resp_str:?}"
         );
+    }
+
+    /// SPEC R-WEB.16.2 (owner decision, 2026-11-01): the refusal says what
+    /// was blocked and the one command that allows it, on both paths, so a
+    /// blocked agent can tell the human instead of guessing at a network fault.
+    #[tokio::test]
+    async fn a_blocked_host_is_told_the_command_that_allows_it() {
+        let proxy = start_proxy(EgressAllowlist::deny_all()).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = String::from_utf8_lossy(&read_chunk(&mut client).await).to_string();
+        assert!(resp.contains("403 Forbidden"), "{resp}");
+        assert!(resp.contains("ahma network allow example.com"), "{resp}");
+        let (head, body) = resp.split_once("\r\n\r\n").expect("a head and a body");
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "the length covers the body exactly: {resp:?}"
+        );
+
+        let mut tunnel = TcpStream::connect(proxy.local_addr).await.unwrap();
+        tunnel
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = String::from_utf8_lossy(&read_chunk(&mut tunnel).await).to_string();
+        assert!(resp.contains("407"), "{resp}");
+        assert!(resp.contains("ahma network allow example.com"), "{resp}");
     }
 
     #[tokio::test]

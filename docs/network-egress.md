@@ -13,7 +13,10 @@ grant model.
 subprocess through a guarded local proxy and forwards only hostnames on an
 allowlist. It is genuinely kernel-enforced — Seatbelt denies outbound IP except
 the proxy on macOS, Landlock restricts outbound TCP to the proxy port on Linux
-6.7+ — and it denies everything by default.
+6.7+ — and it denies everything by default. A blocked request gets a `403`
+(plain HTTP) or `407` (HTTPS) whose body names the host and the command that
+allows it, `ahma network allow <host>`, so a tool that prints the proxy's answer,
+or `curl -v`, says why it failed.
 
 Almost nobody turned it on, because with an empty `[network] allow` the first
 command failed:
