@@ -51,8 +51,28 @@ runs:
         # steps (and the release jobs) expect to be clean.
         stats="${RUNNER_TEMP:-.}/sccache-stats.json"
 
+        # sccache uploads an object AFTER the compile that missed returns, so stats read the
+        # moment the last test finishes can show misses whose writes are still in flight: run
+        # 41196061599 reported "3 Rust misses but wrote 0 objects" on a run that compiled almost
+        # nothing. Wait (bounded) until every miss has been accounted for as a write or a write
+        # error, then judge. A backend that really stores nothing still fails below, only up to
+        # SETTLE_SECS later; nothing is masked.
+        settle_secs=30
+        waited=0
+        while :; do
+          sccache --show-stats --stats-format=json > "$stats"
+          accounted=$(jq -r '.stats.cache_writes + .stats.cache_write_errors' "$stats")
+          attempted=$(jq -r '[.stats.cache_misses.counts[]] | add // 0' "$stats")
+          if [ "$accounted" -ge "$attempted" ] || [ "$waited" -ge "$settle_secs" ]; then
+            break
+          fi
+          sleep 1
+          waited=$((waited + 1))
+        done
+        if [ "$waited" -gt 0 ]; then
+          echo "Waited ${waited}s for in-flight cache writes ($accounted of $attempted accounted for)."
+        fi
         sccache --show-stats
-        sccache --show-stats --stats-format=json > "$stats"
 
         # Asserted on the JSON form, not the text: `--show-stats` output has no stable grammar,
         # and #561 is the standing reminder that a plausible-looking config that never took
