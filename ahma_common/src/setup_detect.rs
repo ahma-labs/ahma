@@ -260,6 +260,40 @@ fn body_rewrites(path: &Path, rewrites_sources: &dyn Fn(&str) -> bool) -> bool {
         .any(rewrites_sources)
 }
 
+/// The most lines of a script shown to a model as evidence.
+pub const MAX_EVIDENCE_LINES: usize = 200;
+
+/// The lines of `script`, a path inside `workspace`, numbered so a reader can
+/// cite them, bounded to [`MAX_EVIDENCE_LINES`] lines and 64 KiB.
+/// `None` for a path that leaves the project (through `..` or a symlink) or
+/// that is not a readable file. Reads only.
+pub fn script_evidence(workspace: &Path, script: &str) -> Option<String> {
+    use std::io::Read;
+    let root = dunce::canonicalize(workspace).ok()?;
+    let real = dunce::canonicalize(root.join(script)).ok()?;
+    if !real.starts_with(&root) || !real.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(&real)
+        .and_then(|f| f.take(MAX_SCRIPT_BYTES).read_to_string(&mut text))
+        .ok()?;
+    let total = text.lines().count();
+    let mut out: String = text
+        .lines()
+        .take(MAX_EVIDENCE_LINES)
+        .enumerate()
+        .map(|(i, line)| format!("{:>4}| {line}\n", i + 1))
+        .collect();
+    if total > MAX_EVIDENCE_LINES {
+        out.push_str(&format!(
+            "({} more lines not shown)\n",
+            total - MAX_EVIDENCE_LINES
+        ));
+    }
+    Some(out)
+}
+
 /// Project scripts named in a "definition of done" section of AGENTS.md or
 /// CLAUDE.md that exist inside the project, are not yet declared readers, and
 /// show no sign of writing: neither their name nor any of their lines.
@@ -692,6 +726,29 @@ mod tests {
         assert!(user.why.contains("CLAUDE.md"), "{}", user.why);
         std::fs::create_dir_all(dir.path().join(".ahma")).unwrap();
         assert_eq!(found(dir.path()).file, SettingsFile::Project);
+    }
+
+    /// What a model may read to advise on a reader: the script's own lines,
+    /// numbered so it can cite them, bounded, and only from inside the project.
+    #[test]
+    fn a_scripts_evidence_is_its_numbered_lines_from_inside_the_project_only() {
+        let dir = project();
+        let body: String = (1..=300).map(|i| format!("echo line {i}\n")).collect();
+        write(
+            dir.path(),
+            "scripts/check.sh",
+            &format!("#!/bin/sh\n{body}"),
+        );
+        let text = script_evidence(dir.path(), "scripts/check.sh").expect("read");
+        assert!(text.contains("   2| echo line 1"), "{text}");
+        assert!(
+            text.lines().count() <= MAX_EVIDENCE_LINES + 1,
+            "bounded: {} lines",
+            text.lines().count()
+        );
+        assert!(text.contains("more lines not shown"), "{text}");
+        assert!(script_evidence(dir.path(), "../outside.sh").is_none());
+        assert!(script_evidence(dir.path(), "scripts/missing.sh").is_none());
     }
 
     #[test]

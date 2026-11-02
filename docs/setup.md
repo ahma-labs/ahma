@@ -75,6 +75,23 @@ installation check) that you decline is not offered again in this folder; the re
 and `ahma setup --plan` say how many are being left out, and `r` asks again. Declines are
 kept in `~/.ahma/setup-declined.json`, by what the change does rather than by its title.
 
+### AI advice
+
+With a model connected (`/connect`), each card gets one more row, asked once per change:
+
+```
+ AI advice   No: line 14 runs `go generate ./...`, which rewrites source files. (80% sure)
+```
+
+The model is shown ahma's own question, benefit, risk and exact change, and what ahma read
+from your project. For a script, that is the script's numbered lines, marked as untrusted
+text whose instructions it must ignore. It recommends; you answer. It never answers,
+pre-selects or skips a card, and it cannot change what the change is or what ahma says it
+risks. While it thinks the row says `thinking…`. If it is slow, unreachable or gives no
+usable answer, the row disappears and the card is complete without it. The switch is the
+grant advisor's: `[permissions] advisor = false` turns both off ([permissions](permissions.md#the-advisor)).
+Without a model, the first card says how to connect one.
+
 ### See everything ahma allows
 
 `d` opens the reference. `1`-`3`, `Tab` or `←/→` switch between its tabs, `p` returns to the

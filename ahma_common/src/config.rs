@@ -3129,7 +3129,7 @@ impl AhmaSettings {
             toml_tool_approvals(&d.permissions.tool_approvals),
         );
         w.setting(
-            "Let the permission advisor (a model you chose) add a labelled recommendation to a grant prompt. It only advises: the default stays deny and nothing is granted by it (SPEC R-PERM.8).",
+            "Let the advisor (a model you chose) add a labelled recommendation to a grant prompt and to each change `ahma setup` proposes. It only advises: the default stays deny and nothing is granted or answered by it (SPEC R-PERM.8, R-SETUP.4.9).",
             "advisor",
             self.permissions.advisor.to_string(),
             d.permissions.advisor.to_string(),

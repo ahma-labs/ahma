@@ -80,6 +80,12 @@ pub enum BridgeEvent {
         decision_id: String,
         advice: Option<ahma_core::advisor::GrantAdvice>,
     },
+    /// The setup advisor answered (or gave up) about one proposed change
+    /// (SPEC R-SETUP.4.9).
+    SetupAdvice {
+        identity: String,
+        advice: Option<ahma_mcp::setup_advice::SetupAdvice>,
+    },
 }
 
 pub type McpChatConfig = ahma_core::agent::McpChatConfig;

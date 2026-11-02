@@ -384,12 +384,14 @@ pub struct PermissionSettings {
     /// Default: empty list
     pub tool_approvals: Vec<ToolApproval>,
     /// Show a model's one-line recommendation beside a grant prompt in the TUI
-    /// (SPEC R-PERM.8). The model sees the evidence, never the agent's own
-    /// words; it recommends and never answers. Default: `true`
+    /// (SPEC R-PERM.8), and on each change `ahma setup` proposes (R-SETUP.4.9).
+    /// The model sees the evidence, never the asking party's own words; it
+    /// recommends and never answers. Default: `true`
     #[serde(default = "default_true")]
     pub advisor: bool,
     /// How long the TUI waits for the advisor before showing the prompt
-    /// without it. Default: `6`
+    /// without it (setup, whose cards do not wait, allows five times this).
+    /// Default: `6`
     #[serde(default = "default_advisor_timeout_secs")]
     pub advisor_timeout_secs: u64,
 }
