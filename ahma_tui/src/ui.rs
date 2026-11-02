@@ -259,6 +259,11 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
             setup_tone_style(theme, Tone::Bad).bold(),
         );
     }
+    if let Some(advice) = &card.advice {
+        // Labelled as the AI's, apart from ahma's own words (SPEC R-SETUP.4.9).
+        lines.push(Line::from(""));
+        labelled(&mut lines, "AI advice", advice, theme.title());
+    }
     if !card.details.is_empty() {
         lines.push(Line::from(""));
         for (label, text) in &card.details {

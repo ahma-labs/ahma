@@ -168,7 +168,7 @@ Run `ahma settings init` to generate this file automatically.
 #                         # connect to your own agent), "passthrough" (your SSH_AUTH_SOCK, no
 #                         # broker), "off" (none). See ssh-agent-broker.md (R-CRED.11)
 # [permissions]
-# advisor              = true   # TUI: the selected model recommends an answer beside a grant prompt (R-PERM.8)
+# advisor              = true   # TUI: the selected model recommends an answer beside a grant prompt and each setup change (R-PERM.8, R-SETUP.4.9)
 # advisor_timeout_secs = 6      # how long to wait for it before showing the prompt without it
 # disable_temp = false    # block all access to system temp dir (overrides tmp_access)
 # defer        = false    # defer sandbox lock until client provides roots/list

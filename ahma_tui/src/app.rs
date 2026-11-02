@@ -3722,7 +3722,54 @@ fn setup_doctor_fixes(state: &crate::state::AppState) -> Vec<ahma_common::doctor
 fn open_setup_view(state: &mut crate::state::AppState) {
     let fixes = setup_doctor_fixes(state);
     let workspace = std::path::PathBuf::from(&state.workspace);
+    state.setup_view.advisor_available = setup_advisor_model(state).is_some();
     state.setup_view.open_for(&workspace, fixes);
+    ask_setup_advisor(state);
+}
+
+/// The model the setup advisor would ask, `(base_url, model, budget)`, or
+/// `None` when advice is switched off (`permissions.advisor`, the same switch as
+/// the grant advisor), no model is selected, or the model is an MCP agent.
+fn setup_advisor_model(
+    state: &crate::state::AppState,
+) -> Option<(String, String, std::time::Duration)> {
+    let settings = ahma_common::config::AhmaSettings::load();
+    if !settings.permissions.advisor {
+        return None;
+    }
+    let (base_url, model) = parse_llm_selection(state);
+    if base_url.is_empty() || model.is_empty() || base_url.starts_with("mcp://") {
+        return None;
+    }
+    // A card is complete without advice and shows `thinking…` meanwhile, so it
+    // can wait longer than a grant prompt, which holds a command back.
+    let budget =
+        std::time::Duration::from_secs(settings.permissions.advisor_timeout_secs.max(1) * 5);
+    Some((base_url, model, budget))
+}
+
+/// Ask the advisor about the change on screen, once per change (SPEC
+/// R-SETUP.4.9). Its answer arrives as `BridgeEvent::SetupAdvice`.
+fn ask_setup_advisor(state: &mut crate::state::AppState) {
+    if !state.setup_view.open {
+        return;
+    }
+    let Some((base_url, model, budget)) = setup_advisor_model(state) else {
+        return;
+    };
+    let Some(tx) = state.bridge_tx.clone() else {
+        return;
+    };
+    let Some((identity, messages)) = state.setup_view.advice_request() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let client = crate::llm_bridge::build_configured_client(base_url, model);
+        let advice = ahma_mcp::setup_advice::advise(&client, &messages, budget).await;
+        let _ = tx
+            .send(crate::llm_bridge::BridgeEvent::SetupAdvice { identity, advice })
+            .await;
+    });
 }
 
 /// `/setup <words>`: a chat turn whose payload carries the settings, what is
@@ -3833,6 +3880,7 @@ fn handle_setup_key(key: crossterm::event::KeyEvent, state: &mut crate::state::A
         }
         Action::None => {}
     }
+    ask_setup_advisor(state);
     true
 }
 
@@ -5507,6 +5555,9 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             {
                 gate.advice = advice;
             }
+        }
+        BridgeEvent::SetupAdvice { identity, advice } => {
+            state.setup_view.set_advice(&identity, advice);
         }
         BridgeEvent::Decomposed { steps } => {
             handle_decomposed_event(steps, state);
@@ -9110,6 +9161,58 @@ mod tests {
         assert!(!f.state.setup_asked, "no turn was started");
         let said = format!("{:?}", f.state.chat.entries());
         assert!(said.contains("/connect"), "{said}");
+    }
+
+    /// Without a model there is no advisor: no row on the card, and the intro
+    /// says how to get one (SPEC R-SETUP.4.9).
+    #[test]
+    fn no_setup_advisor_without_a_model() {
+        let (mut f, _g) = setup_fixture();
+        super::dispatch_nav_command("/setup", &mut f.state);
+        let card = f.state.setup_view.card().expect("a card");
+        assert!(card.advice.is_none());
+        assert!(card.intro.unwrap().contains("/connect"));
+    }
+
+    /// With a model, the change on screen is asked about once; the answer (here:
+    /// none, the model is unreachable) reaches the card and answers nothing.
+    #[test]
+    fn the_setup_advisor_asks_once_and_its_answer_never_answers_the_card() {
+        use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+        // A runtime of its own, so the home-seam guard is held by a plain
+        // function rather than across an `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut f, _g) = setup_fixture();
+        let _enter = rt.enter();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        f.state.bridge_tx = Some(tx);
+        f.state.llm_selection = Some(crate::state::LlmSelection::named("local", "m"));
+        f.state.current_provider_url = Some("http://127.0.0.1:9".into());
+        super::dispatch_nav_command("/setup", &mut f.state);
+        let card = f.state.setup_view.card().expect("a card");
+        assert_eq!(card.advice.as_deref(), Some("thinking…"));
+        assert!(!card.intro.unwrap().contains("/connect"));
+        // A key that does not move asks nothing more.
+        setup_press(&mut f.state, crossterm::event::KeyCode::Char(' '));
+        let event = rt
+            .block_on(tokio::time::timeout(
+                TestTimeouts::get(TimeoutCategory::HttpRequest),
+                rx.recv(),
+            ))
+            .expect("the advisor gives up in time")
+            .expect("an event");
+        let crate::llm_bridge::BridgeEvent::SetupAdvice { advice, .. } = &event else {
+            panic!("expected the setup advisor's answer");
+        };
+        assert!(advice.is_none(), "an unreachable model gives no advice");
+        assert!(rx.try_recv().is_err(), "asked once");
+        super::handle_bridge_event(event, &mut f.state);
+        let card = f.state.setup_view.card().unwrap();
+        assert!(card.advice.is_none(), "no answer, no row");
+        assert_eq!(card.answer, None);
     }
 
     #[test]

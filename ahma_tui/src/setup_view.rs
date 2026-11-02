@@ -136,6 +136,9 @@ pub struct Card {
     pub details: Vec<(&'static str, String)>,
     /// What setup is and how to answer, until the first answer is given.
     pub intro: Option<String>,
+    /// The advisor's recommendation (`thinking…` while it is asked), never an
+    /// answer (SPEC R-SETUP.4.9).
+    pub advice: Option<String>,
     /// Warnings to read before a high-risk `y`.
     pub warnings: Vec<String>,
     /// The question the `y` and `n` answer, worded for how much care it needs.
@@ -209,6 +212,21 @@ pub struct SetupView {
     pub notes: Vec<String>,
     /// Space: show the exact change, its undo and who found it.
     details: bool,
+    /// A model is connected, so each change can be advised on.
+    pub advisor_available: bool,
+    /// What the advisor said, by the identity of the change it was asked about.
+    advice: Vec<(String, Advice)>,
+}
+
+/// The advisor's state for one change.
+#[derive(Debug, Clone)]
+enum Advice {
+    /// Asked; no answer yet.
+    Asking,
+    /// Its recommendation.
+    Ready(ahma_mcp::setup_advice::SetupAdvice),
+    /// No answer in time, or none that could be read: no row.
+    None,
 }
 
 impl SetupView {
@@ -412,7 +430,12 @@ impl SetupView {
             } else {
                 Vec::new()
             },
-            intro: unanswered.then(|| intro(total)),
+            intro: unanswered.then(|| intro(total, self.advisor_available)),
+            advice: match self.advice_of(&v.proposal.change.identity()) {
+                Some(Advice::Asking) => Some("thinking…".into()),
+                Some(Advice::Ready(a)) => Some(a.line()),
+                Some(Advice::None) | None => None,
+            },
             warnings: match &v.risk {
                 Risk::High(reasons) => reasons.clone(),
                 _ => Vec::new(),
@@ -429,6 +452,40 @@ impl SetupView {
                 .map(|i| self.answer_at(i))
                 .collect(),
         })
+    }
+
+    fn advice_of(&self, id: &str) -> Option<&Advice> {
+        self.advice.iter().find(|(i, _)| i == id).map(|(_, a)| a)
+    }
+
+    /// The question for the advisor about the change on screen, if it has not
+    /// been asked yet: its identity and the messages. Marks it as being asked,
+    /// so each change is asked about once (SPEC R-SETUP.4.9).
+    pub fn advice_request(&mut self) -> Option<(String, Vec<serde_json::Value>)> {
+        if self.mode != Mode::Review {
+            return None;
+        }
+        let v = self.plan.items.get(self.at)?;
+        let id = v.proposal.change.identity();
+        if self.advice_of(&id).is_some() {
+            return None;
+        }
+        let evidence = self
+            .env
+            .as_ref()
+            .and_then(|env| ahma_mcp::setup_advice::evidence(env, v));
+        let messages = ahma_mcp::setup_advice::build_messages(v, evidence.as_deref());
+        self.advice.push((id.clone(), Advice::Asking));
+        Some((id, messages))
+    }
+
+    /// The advisor's answer about the change `id`, or `None` when it gave up.
+    pub fn set_advice(&mut self, id: &str, advice: Option<ahma_mcp::setup_advice::SetupAdvice>) {
+        let value = advice.map_or(Advice::None, Advice::Ready);
+        match self.advice.iter_mut().find(|(i, _)| i == id) {
+            Some((_, slot)) => *slot = value,
+            None => self.advice.push((id.to_string(), value)),
+        }
     }
 
     fn move_to(&mut self, index: usize) {
@@ -914,7 +971,7 @@ impl SetupView {
 }
 
 /// What setup is and how to answer, for someone who has never seen it.
-fn intro(total: usize) -> String {
+fn intro(total: usize, advisor: bool) -> String {
     let found = if total == 1 {
         "one thing".to_string()
     } else {
@@ -923,7 +980,13 @@ fn intro(total: usize) -> String {
     format!(
         "ahma keeps the commands your AI agents run inside this folder. It checked this \
          project and found {found} that may get in their way. Answer each with y or n; \
-         nothing changes until you have answered all of them."
+         nothing changes until you have answered all of them.{}",
+        if advisor {
+            ""
+        } else {
+            " Connect an AI model with /connect and it will read the evidence for each one \
+             and advise you."
+        }
     )
 }
 
@@ -1080,6 +1143,53 @@ mod tests {
         assert!(!v.card().unwrap().details.is_empty());
         press(&mut v, ' ');
         assert!(v.card().unwrap().details.is_empty());
+    }
+
+    /// SPEC R-SETUP.4.9: one question per change, advice shown as advice,
+    /// and never an answer.
+    #[test]
+    fn advice_is_asked_once_per_change_and_never_answers_it() {
+        use ahma_mcp::setup_advice::{SetupAdvice, Verdict};
+        let (mut v, f) = view();
+        f.two_proposals(&mut v);
+        assert!(v.card().unwrap().advice.is_none(), "nothing asked yet");
+        let (id, messages) = v.advice_request().expect("the card on screen");
+        assert!(!messages.is_empty());
+        assert_eq!(v.card().unwrap().advice.as_deref(), Some("thinking…"));
+        assert!(v.advice_request().is_none(), "asked once");
+
+        v.set_advice(
+            &id,
+            Some(SetupAdvice {
+                recommendation: Verdict::Yes,
+                confidence: 0.9,
+                reasons: vec!["a model file is in the project".into()],
+            }),
+        );
+        let card = v.card().unwrap();
+        assert_eq!(
+            card.advice.as_deref(),
+            Some("Yes: a model file is in the project. (90% sure)")
+        );
+        assert_eq!(card.answer, None, "advice never answers");
+
+        // The next card is asked about on its own; coming back does not re-ask.
+        press(&mut v, 'n');
+        let (next, _) = v.advice_request().expect("the next card");
+        assert_ne!(next, id);
+        v.set_advice(&next, None);
+        assert!(v.card().unwrap().advice.is_none(), "gave up: no row");
+        press(&mut v, 'h');
+        assert!(v.advice_request().is_none());
+    }
+
+    #[test]
+    fn without_a_model_the_intro_says_how_to_get_advice() {
+        let (mut v, f) = view();
+        f.two_proposals(&mut v);
+        assert!(v.card().unwrap().intro.unwrap().contains("/connect"));
+        v.advisor_available = true;
+        assert!(!v.card().unwrap().intro.unwrap().contains("/connect"));
     }
 
     #[test]

@@ -246,8 +246,9 @@ judge shown the actor's summary approves most of what it is shown. Every answer 
 the advice and whether you followed it in the audit log, and `ahma doctor` reports how
 long you take to answer prompts; a median under three seconds is a warning, because a
 prompt answered faster than it can be read is theater. `[permissions] advisor = false`
-turns the advisor off; `advisor_timeout_secs` (default 6) bounds the wait. (SPEC
-R-PERM.8, R-DOCTOR.8.)
+turns the advisor off; `advisor_timeout_secs` (default 6) bounds the wait. The same
+switch covers the advice on each change `ahma setup` proposes ([setup](setup.md#ai-advice)).
+(SPEC R-PERM.8, R-DOCTOR.8.)
 
 ## What ahma will never grant
 
