@@ -122,14 +122,20 @@ pub struct Card {
     pub total: usize,
     /// What is proposed, in one line.
     pub title: String,
-    /// Who proposed it (`detected: gpu`, `suggested by …`).
+    /// Who proposed it, in words (`found in this project`, `suggested by …`).
     pub source: String,
-    /// `[sandbox boundary]` or `[HIGH RISK]`, when it needs care.
+    /// `[security]` or `[HIGH RISK]`, when it needs care.
     pub badge: Option<String>,
     /// How the badge and title are coloured.
     pub tone: Tone,
-    /// Labelled text: why, what it allows, the exact change, its undo.
+    /// Labelled text a newcomer reads: why it is asked, what is gained, what
+    /// is risked.
     pub fields: Vec<(&'static str, String)>,
+    /// The exact change, its undo and who found it: shown after Space, empty
+    /// otherwise.
+    pub details: Vec<(&'static str, String)>,
+    /// What setup is and how to answer, until the first answer is given.
+    pub intro: Option<String>,
     /// Warnings to read before a high-risk `y`.
     pub warnings: Vec<String>,
     /// The question the `y` and `n` answer, worded for how much care it needs.
@@ -201,6 +207,8 @@ pub struct SetupView {
     pub status: Option<String>,
     /// Things a model said that ahma could not use.
     pub notes: Vec<String>,
+    /// Space: show the exact change, its undo and who found it.
+    details: bool,
 }
 
 impl SetupView {
@@ -374,30 +382,47 @@ impl SetupView {
         let v = self.plan.items.get(self.at)?;
         let (badge, tone) = match &v.risk {
             Risk::Normal => (None, Tone::Normal),
-            Risk::Security => (Some("[sandbox boundary]".to_string()), Tone::Warn),
+            Risk::Security => (Some("[security]".to_string()), Tone::Warn),
             Risk::High(_) => (Some("[HIGH RISK]".to_string()), Tone::Bad),
         };
+        let total = self.plan.items.len();
+        let unanswered = (0..total).all(|i| self.answer_at(i).is_none());
         Some(Card {
             position: self.at + 1,
-            total: self.plan.items.len(),
-            title: v.proposal.title.clone(),
+            total,
+            title: if v.proposal.optional {
+                format!("{} (optional)", v.proposal.title)
+            } else {
+                v.proposal.title.clone()
+            },
             source: v.proposal.source.label(),
             badge,
             tone,
             fields: vec![
-                ("Why", v.proposal.why.clone()),
-                ("Allows", v.proposal.allows.clone()),
-                ("Change", v.preview.clone()),
-                ("Undo", v.undo.clone()),
+                ("Why we ask", v.proposal.why.clone()),
+                ("Benefit", v.proposal.benefit.clone()),
+                ("Risk", v.proposal.risk.clone()),
             ],
+            details: if self.details {
+                vec![
+                    ("Change", v.preview.clone()),
+                    ("Undo", v.undo.clone()),
+                    ("Found by", v.proposal.source.label()),
+                ]
+            } else {
+                Vec::new()
+            },
+            intro: unanswered.then(|| intro(total)),
             warnings: match &v.risk {
                 Risk::High(reasons) => reasons.clone(),
                 _ => Vec::new(),
             },
             prompt: match &v.risk {
-                Risk::Normal => "Apply this change?".into(),
-                Risk::Security => "This changes what the sandbox permits. Apply it?".into(),
-                Risk::High(_) => "HIGH RISK — read the warning. Apply it? (y, then y again)".into(),
+                Risk::Normal => "Make this change?".into(),
+                Risk::Security => "This changes what the sandbox allows. Make this change?".into(),
+                Risk::High(_) => {
+                    "HIGH RISK — read the warning. Make this change? (y, then y again)".into()
+                }
             },
             answer: self.answer_at(self.at),
             progress: (0..self.plan.items.len())
@@ -713,19 +738,29 @@ impl SetupView {
         };
         let pending = self.plan.items.len();
         let keys = match self.mode {
-            Mode::Review => "[←/→] previous/next  [d] look around  [t] tell ahma  \
-                 [Esc] leave, nothing changes"
-                .to_string(),
-            Mode::Done => format!("[Enter] done  [d] look around  [t] tell ahma{more}"),
+            Mode::Review => {
+                let details = if self.details {
+                    "[Space] hide details"
+                } else {
+                    "[Space] details"
+                };
+                format!(
+                    "[y] yes  [n] no  [←/→] back/next  {details}  [d] see everything ahma \
+                     allows  [t] ask a question  [Esc] leave, nothing changes"
+                )
+            }
+            Mode::Done => {
+                format!("[Enter] done  [d] see everything ahma allows  [t] ask a question{more}")
+            }
             Mode::Browse => match self.section() {
                 Section::Install => format!(
-                    "[Tab] section  [↑/↓] row  [p] proposed changes ({pending})  [t] tell ahma  [Esc] close"
+                    "[Tab] section  [↑/↓] row  [p] proposed changes ({pending})  [t] ask a question  [Esc] close"
                 ),
                 Section::Settings => format!(
-                    "[↑/↓] row  [e] change  [a] show all  [p] proposed ({pending})  [t] tell ahma  [Tab] section  [Esc] close"
+                    "[↑/↓] row  [e] change  [a] show all  [p] proposed ({pending})  [t] ask a question  [Tab] section  [Esc] close"
                 ),
                 Section::Allow => format!(
-                    "[↑/↓] row  [u] take back  [p] proposed ({pending})  [t] tell ahma  [Tab] section  [Esc] close"
+                    "[↑/↓] row  [u] take back  [p] proposed ({pending})  [t] ask a question  [Tab] section  [Esc] close"
                 ),
             },
         };
@@ -777,6 +812,7 @@ impl SetupView {
             KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
                 self.move_to(self.at + 1)
             }
+            KeyCode::Char(' ') => self.details = !self.details,
             KeyCode::Char('d') | KeyCode::Tab => self.go(Section::Install),
             _ => {}
         }
@@ -861,13 +897,11 @@ impl SetupView {
         };
         match row.undo {
             Undo::Proposal(change) => {
-                let p = Proposal {
-                    title: format!("Take back: {}", row.subject),
-                    why: format!("You chose to take back {} ({}).", row.subject, row.detail),
-                    allows: "Narrows what tools may do; nothing is widened.".into(),
+                let p = Proposal::new(
                     change,
-                    source: ahma_mcp::setup_plan::Source::User,
-                };
+                    format!("You chose to take back {} ({}).", row.subject, row.detail),
+                    ahma_mcp::setup_plan::Source::User,
+                );
                 self.add_proposals(vec![p], Vec::new());
             }
             Undo::Command(command) => {
@@ -877,6 +911,20 @@ impl SetupView {
             }
         }
     }
+}
+
+/// What setup is and how to answer, for someone who has never seen it.
+fn intro(total: usize) -> String {
+    let found = if total == 1 {
+        "one thing".to_string()
+    } else {
+        format!("{total} things")
+    };
+    format!(
+        "ahma keeps the commands your AI agents run inside this folder. It checked this \
+         project and found {found} that may get in their way. Answer each with y or n; \
+         nothing changes until you have answered all of them."
+    )
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -983,15 +1031,67 @@ mod tests {
         assert_eq!(v.mode(), Mode::Review);
         let card = v.card().unwrap();
         assert_eq!((card.position, card.total), (1, 2));
+        // A question, why it is asked, what is gained and what is risked; the
+        // exact change is one key away (SPEC R-SETUP.4.7).
+        assert!(card.title.ends_with('?'), "{}", card.title);
         let labels: Vec<_> = card.fields.iter().map(|(l, _)| *l).collect();
-        assert_eq!(labels, ["Why", "Allows", "Change", "Undo"]);
+        assert_eq!(labels, ["Why we ask", "Benefit", "Risk"]);
         assert!(card.fields.iter().all(|(_, text)| !text.is_empty()));
-        assert!(card.source.starts_with("detected:"), "{}", card.source);
+        assert!(card.details.is_empty(), "details wait for Space");
+        // What would fail (the GPU) is asked before the optional reader.
+        assert!(card.title.contains("GPU"), "{}", card.title);
         assert_eq!(
             card.prompt,
-            "This changes what the sandbox permits. Apply it?"
+            "This changes what the sandbox allows. Make this change?"
         );
-        assert!(v.footer().contains("[Esc] leave, nothing changes"));
+        let footer = v.footer();
+        for key in [
+            "[y] yes",
+            "[n] no",
+            "[Space] details",
+            "[Esc] leave, nothing changes",
+        ] {
+            assert!(footer.contains(key), "{key} missing from {footer}");
+        }
+        assert!(!footer.contains("look around"), "{footer}");
+    }
+
+    #[test]
+    fn space_shows_the_exact_change_its_undo_and_who_found_it() {
+        let (mut v, f) = view();
+        f.two_proposals(&mut v);
+        press(&mut v, ' ');
+        let card = v.card().unwrap();
+        let labels: Vec<_> = card.details.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, ["Change", "Undo", "Found by"]);
+        assert!(
+            card.details[0].1.contains("sandbox.allow_gpu"),
+            "{:?}",
+            card.details
+        );
+        assert!(
+            card.details[1].1.starts_with("ahma settings"),
+            "{:?}",
+            card.details
+        );
+        assert_eq!(card.details[2].1, "found in this project");
+        // It stays open on the next card, and Space hides it again.
+        press(&mut v, 'y');
+        assert!(!v.card().unwrap().details.is_empty());
+        press(&mut v, ' ');
+        assert!(v.card().unwrap().details.is_empty());
+    }
+
+    #[test]
+    fn the_first_card_says_what_setup_is_until_the_first_answer() {
+        let (mut v, f) = view();
+        f.two_proposals(&mut v);
+        let intro = v.card().unwrap().intro.expect("an intro before any answer");
+        for needle in ["2 things", "y or n", "nothing changes"] {
+            assert!(intro.contains(needle), "{needle} missing from {intro}");
+        }
+        press(&mut v, 'n');
+        assert!(v.card().unwrap().intro.is_none(), "it has done its job");
     }
 
     #[test]
@@ -1090,16 +1190,15 @@ mod tests {
     fn a_high_risk_grant_needs_a_second_y_and_moving_cancels_the_first() {
         let (mut v, f) = view();
         // A folder that does not exist yet is a high-risk grant, not a refusal.
-        let p = Proposal {
-            title: "Grant a folder".into(),
-            why: "w".into(),
-            allows: "a".into(),
-            change: ahma_mcp::setup_plan::Change::GrantPath {
+        let mut p = Proposal::new(
+            ahma_mcp::setup_plan::Change::GrantPath {
                 path: f.ws.path().join("not-yet-there"),
                 read_only: true,
             },
-            source: ahma_mcp::setup_plan::Source::User,
-        };
+            "w",
+            ahma_mcp::setup_plan::Source::User,
+        );
+        p.title = "Grant a folder".into();
         v.add_proposals(vec![p], Vec::new());
         assert_eq!(title(&v), "Grant a folder");
         assert!(!v.card().unwrap().warnings.is_empty());
@@ -1189,7 +1288,8 @@ mod tests {
         assert!(v.rows()[0].text.contains("[profile"));
         press(&mut v, 'u');
         assert_eq!(v.mode(), Mode::Review, "the proposal is on screen");
-        assert!(title(&v).starts_with("Take back:"));
+        // Worded as what it does, like any other change.
+        assert!(title(&v).starts_with("Stop "), "{}", title(&v));
         // Nothing was written by proposing it.
         assert!(
             ahma_common::config::AhmaSettings::load()

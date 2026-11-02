@@ -136,16 +136,14 @@ fn draw_setup_view(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
     use crate::setup_view::Mode;
 
     let view = &state.setup_view;
-    let popup_w = area.width.saturating_sub(4).max(60).min(area.width);
-    let popup_h = area.height.saturating_sub(2).max(16).min(area.height);
-    let popup = centered_rect(popup_w, popup_h, area);
+    // The whole screen: setup has its own keys, and the panels, header and key
+    // bar underneath would show keys that do something else here, and bleed
+    // through at the edges (SPEC R24.13).
+    let popup = area;
     frame.render_widget(Clear, popup);
     let title = match view.mode() {
         Mode::Review => match view.card() {
-            Some(card) => format!(
-                " Setup · proposed change {} of {} ",
-                card.position, card.total
-            ),
+            Some(card) => format!(" Setup · question {} of {} ", card.position, card.total),
             None => " Setup ".to_string(),
         },
         Mode::Done => " Setup · result ".to_string(),
@@ -193,8 +191,18 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
         return;
     };
 
-    // Progress: one mark per proposal, the one on screen highlighted.
-    let mut marks = Vec::new();
+    if let Some(intro) = &card.intro {
+        for part in wrap_words(intro, width) {
+            lines.push(Line::from(Span::styled(part, theme.normal())));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Progress: which question this is, and one mark per question answered.
+    let mut marks = vec![Span::styled(
+        format!("Question {} of {}  ", card.position, card.total),
+        theme.dim(),
+    )];
     for (i, answer) in card.progress.iter().enumerate() {
         let (glyph, style) = match answer {
             Some(Answer::Yes) => (" ● ", theme.success()),
@@ -223,12 +231,11 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
         }
         lines.push(Line::from(spans));
     }
-    lines.push(Line::from(Span::styled(card.source.clone(), theme.dim())));
     lines.push(Line::from(""));
 
-    const LABEL: usize = 9;
+    const LABEL: usize = 12;
     let body = width.saturating_sub(LABEL);
-    for (label, text) in &card.fields {
+    let labelled = |lines: &mut Vec<Line>, label: &str, text: &str, style: Style| {
         for (i, part) in wrap_words(text, body).into_iter().enumerate() {
             let head = if i == 0 {
                 format!("{label:<LABEL$}")
@@ -237,21 +244,25 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
             };
             lines.push(Line::from(vec![
                 Span::styled(head, theme.dim().bold()),
-                Span::styled(part, theme.normal()),
+                Span::styled(part, style),
             ]));
         }
+    };
+    for (label, text) in &card.fields {
+        labelled(&mut lines, label, text, theme.normal());
     }
     for warning in &card.warnings {
-        for (i, part) in wrap_words(warning, body).into_iter().enumerate() {
-            let head = if i == 0 {
-                format!("{:<LABEL$}", "WARNING")
-            } else {
-                " ".repeat(LABEL)
-            };
-            lines.push(Line::from(Span::styled(
-                format!("{head}{part}"),
-                setup_tone_style(theme, Tone::Bad).bold(),
-            )));
+        labelled(
+            &mut lines,
+            "WARNING",
+            warning,
+            setup_tone_style(theme, Tone::Bad).bold(),
+        );
+    }
+    if !card.details.is_empty() {
+        lines.push(Line::from(""));
+        for (label, text) in &card.details {
+            labelled(&mut lines, label, text, theme.dim());
         }
     }
     lines.push(Line::from(""));
@@ -266,7 +277,7 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
         match card.answer {
             Some(Answer::Yes) => "Your answer: yes. Press n to change it.",
             Some(Answer::No) => "Your answer: no. Press y to change it.",
-            None => "Nothing is written until every change has your y or n.",
+            None => "Nothing is written until every question has your y or n.",
         },
         theme.dim(),
     )));
@@ -5736,13 +5747,20 @@ mod tests {
 
         // The first thing seen is the change, with every reason, and the keys.
         let card = render_setup_view(&state, 110, 34);
-        assert!(card.contains("proposed change 1 of 1"), "{card}");
-        assert!(
-            card.contains("Let sandboxed commands use the GPU"),
-            "{card}"
-        );
-        for label in ["Why", "Allows", "Change", "Undo"] {
+        assert!(card.contains("question 1 of 1"), "{card}");
+        assert!(card.contains("use the GPU (graphics chip)?"), "{card}");
+        assert!(card.contains("found one thing"), "the intro: {card}");
+        for label in ["Why we ask", "Benefit", "Risk"] {
             assert!(card.contains(label), "{label}: {card}");
+        }
+        assert!(
+            !card.contains("sandbox.allow_gpu"),
+            "the key waits for Space: {card}"
+        );
+        state.setup_view.handle_key(key(' '));
+        let details = render_setup_view(&state, 110, 34);
+        for label in ["Change", "Undo", "sandbox.allow_gpu"] {
+            assert!(details.contains(label), "{label}: {details}");
         }
         assert!(
             card.contains("[y] yes") && card.contains("[n] no"),
@@ -5755,7 +5773,7 @@ mod tests {
         // A narrow terminal wraps the reasons rather than losing them.
         let narrow = render_setup_view(&state, 64, 30);
         assert!(
-            narrow.contains("Why") && narrow.contains("Undo"),
+            narrow.contains("Why we ask") && narrow.contains("Undo"),
             "{narrow}"
         );
 
@@ -5772,7 +5790,7 @@ mod tests {
         // `r` asks about it again: a proposal is waiting while we look around.
         state.setup_view.handle_key(key('r'));
         assert!(
-            render_setup_view(&state, 110, 34).contains("proposed change 1 of 1"),
+            render_setup_view(&state, 110, 34).contains("question 1 of 1"),
             "asked again"
         );
 
@@ -5794,6 +5812,45 @@ mod tests {
         state.setup_view.go(Section::Install);
         let browse = render_setup_view(&state, 110, 34);
         assert!(browse.contains("proposed change(s) waiting"), "{browse}");
+    }
+
+    /// The setup view owns the whole screen: the key bar underneath lists keys
+    /// that do something else here (`Tab panels`), so none of it may show.
+    #[test]
+    fn the_setup_view_hides_the_tui_key_bar_and_panels() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let _guard = crate::HOME_SEAM_GUARD.lock();
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: held under HOME_SEAM_GUARD, and nextest gives each test a process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("m.gguf"), "x").unwrap();
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = ws.path().to_string_lossy().into_owned();
+        let screen = |state: &AppState| {
+            let theme = Theme::new(true);
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, state, &theme)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..40)
+                .map(|y| {
+                    (0..120)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let before = screen(&state);
+        assert!(
+            before.contains("panels"),
+            "the bar is there to hide: {before}"
+        );
+        state.setup_view.open_for(ws.path(), Vec::new());
+        let after = screen(&state);
+        assert!(after.contains("question 1 of 1"), "{after}");
+        assert!(!after.contains("panels"), "{after}");
     }
 
     /// End-to-end for the `!pwd` report: the command's actual output must be on
