@@ -41,14 +41,17 @@ pub enum Source {
 }
 
 impl Source {
-    /// A short label for the plan.
+    /// Who found it, in plain words: no detector ids.
     pub fn label(&self) -> String {
         match self {
-            Self::Detector(name) => format!("detected: {name}"),
-            Self::Doctor => "ahma doctor".into(),
+            Self::Detector("source-readers") => {
+                "found in this project's instructions for AI agents".into()
+            }
+            Self::Detector(_) => "found in this project".into(),
+            Self::Doctor => "found by ahma doctor".into(),
             Self::User => "you asked".into(),
             Self::Model(name) => format!("suggested by {name}"),
-            Self::Install => "installation".into(),
+            Self::Install => "found in your AI apps' settings".into(),
         }
     }
 }
@@ -125,19 +128,240 @@ impl Change {
     }
 }
 
-/// One proposed change and the words that explain it.
+/// One proposed change and the words that explain it. The question, benefit
+/// and risk are ahma's, written from the change by [`explain`]; only `why`
+/// comes from whoever proposed it (SPEC R-SETUP.3, R-SETUP.4.4).
 #[derive(Debug, Clone)]
 pub struct Proposal {
-    /// What is proposed, in one line.
+    /// The question the human answers, e.g. "Let programs your AI agent runs
+    /// use the GPU (graphics chip)?".
     pub title: String,
     /// Why — what in this project or this machine suggested it.
     pub why: String,
-    /// What it allows, in plain words.
-    pub allows: String,
+    /// What the human gains by saying yes.
+    pub benefit: String,
+    /// What saying yes risks, and what it does not open.
+    pub risk: String,
+    /// A convenience, not a fix: asked after the things that would fail.
+    pub optional: bool,
     /// The change itself.
     pub change: Change,
     /// Who proposed it.
     pub source: Source,
+}
+
+impl Proposal {
+    /// A proposal of `change`, worded by [`explain`], for the reason `why`.
+    pub fn new(change: Change, why: impl Into<String>, source: Source) -> Self {
+        let Plain {
+            question,
+            benefit,
+            risk,
+            optional,
+        } = explain(&change);
+        Self {
+            title: question,
+            why: why.into(),
+            benefit,
+            risk,
+            optional,
+            change,
+            source,
+        }
+    }
+}
+
+/// The words a person reads before answering: a question, what they gain and
+/// what they risk. They name no setting key; the exact change is one key away
+/// (SPEC R-SETUP.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plain {
+    /// Ends with a question mark.
+    pub question: String,
+    /// What saying yes gains.
+    pub benefit: String,
+    /// What saying yes risks, and what it does not open.
+    pub risk: String,
+    /// A convenience rather than a fix.
+    pub optional: bool,
+}
+
+fn plain(question: String, benefit: &str, risk: String, optional: bool) -> Plain {
+    Plain {
+        question,
+        benefit: benefit.to_string(),
+        risk,
+        optional,
+    }
+}
+
+/// A toolchain profile's name as a person knows it.
+fn toolchain_name(profile: &str) -> String {
+    match profile {
+        "rust" => "Rust (cargo)".into(),
+        "node" => "Node.js (npm)".into(),
+        "go" => "Go".into(),
+        "android" => "Android (Gradle)".into(),
+        "apple" => "Xcode and Swift".into(),
+        "python" => "Python".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Where a setting saved in `file` applies.
+fn applies_where(file: SettingsFile) -> &'static str {
+    match file {
+        SettingsFile::Project => {
+            "Saved in this project's .ahma/settings.toml, so it applies to only this project \
+             (and to anyone who uses this repository)."
+        }
+        SettingsFile::User => {
+            "Saved in your own ahma settings, so it applies to every project with a script at \
+             this path."
+        }
+    }
+}
+
+/// Write the question, benefit and risk for `change`. The one place these words
+/// live, so a detector, a model, a typed request and a take-back are worded
+/// alike, and a model can never caption a change it proposes.
+pub fn explain(change: &Change) -> Plain {
+    match change {
+        Change::AddToList { file, key, item } if key == "tools.source_readers" => plain(
+            format!("Let your AI agent keep editing files while `{item}` runs?"),
+            "Your agent keeps working instead of waiting for the script to finish.",
+            format!(
+                "If the script also changes source files, its changes and your agent's can \
+                 overwrite each other. It gives no new access to files or the network. {}",
+                applies_where(*file)
+            ),
+            true,
+        ),
+        Change::RemoveFromList { item, key, .. } if key == "tools.source_readers" => plain(
+            format!("Make your AI agent wait again while `{item}` runs?"),
+            "Nothing the script changes can collide with your agent's edits.",
+            "Your agent pauses its edits whenever the script runs.".into(),
+            true,
+        ),
+        Change::Set { key, value, .. } if key == "sandbox.allow_gpu" && value == "true" => plain(
+            "Let programs your AI agent runs use the GPU (graphics chip)?".into(),
+            "Local AI models run at full speed instead of failing or falling back to the much \
+             slower CPU.",
+            "Sandboxed programs can talk to the graphics driver. No extra files, folders or \
+             network access are opened."
+                .into(),
+            false,
+        ),
+        Change::Set { key, .. } | Change::Unset { key, .. } if key == "sandbox.allow_gpu" => plain(
+            "Stop programs your AI agent runs from using the GPU (graphics chip)?".into(),
+            "Sandboxed programs can no longer reach the graphics driver.",
+            "Local AI models will fail to start or run slowly on the CPU.".into(),
+            false,
+        ),
+        Change::AddToList { key, item, .. } if key == "sandbox.profiles" => {
+            let name = toolchain_name(item);
+            plain(
+                format!("Let {name} builds use their shared tools and download caches?"),
+                "Builds and tests stop failing with \"Operation not permitted\".",
+                format!(
+                    "Programs your agent runs can read and change {name}'s caches and tool \
+                     folders, which every project on this computer shares. `ahma permissions \
+                     list` shows the exact folders."
+                ),
+                false,
+            )
+        }
+        Change::RemoveFromList { key, item, .. } if key == "sandbox.profiles" => {
+            let name = toolchain_name(item);
+            plain(
+                format!("Stop {name} builds from using their shared tools and caches?"),
+                "Programs your agent runs can no longer read or change those shared folders.",
+                format!(
+                    "{name} builds run by your agent will fail with \"Operation not permitted\"."
+                ),
+                false,
+            )
+        }
+        Change::GrantPath { path, read_only } => plain(
+            format!(
+                "Let your AI agent's commands {} files in {}?",
+                if *read_only {
+                    "read"
+                } else {
+                    "read and change"
+                },
+                path.display()
+            ),
+            "Commands that need that folder stop failing with \"Operation not permitted\".",
+            if *read_only {
+                "Anything your agent runs in this project can read everything in that folder."
+                    .into()
+            } else {
+                "Anything your agent runs in this project can read, change or delete files in \
+                 that folder."
+                    .into()
+            },
+            false,
+        ),
+        Change::NetworkAllow { host } => plain(
+            format!("Let programs your AI agent runs connect to {host}?"),
+            "Downloads and requests to that site work while network access is restricted.",
+            "Programs your agent runs could send data from this project to that site.".into(),
+            false,
+        ),
+        Change::Install(InstallItem::McpConfig) => plain(
+            "Update how your AI apps start ahma?".into(),
+            "Your AI apps start this version of ahma the way it expects.",
+            "Only ahma's own entry in each app's settings is rewritten; nothing else there \
+             changes."
+                .into(),
+            false,
+        ),
+        Change::DoctorFix(fix) => plain(
+            format!("{}?", fix.describe().trim_end_matches('.')),
+            "Fixes a problem ahma's own health check found.",
+            "Only what the question says is done, and it is recorded in ahma's audit log.".into(),
+            false,
+        ),
+        // A setting the user or a model named by its key: the key is what they
+        // asked about, so it is the clearest name for it.
+        Change::Set { key, value, .. } => plain(
+            format!("Change the setting `{key}` to {value}?"),
+            &setting_summary(key),
+            setting_risk_words(key),
+            false,
+        ),
+        Change::Unset { key, .. } => plain(
+            format!("Put the setting `{key}` back to its default?"),
+            &setting_summary(key),
+            setting_risk_words(key),
+            false,
+        ),
+        Change::AddToList { key, item, .. } => plain(
+            format!("Add `{item}` to the setting `{key}`?"),
+            &setting_summary(key),
+            setting_risk_words(key),
+            false,
+        ),
+        Change::RemoveFromList { key, item, .. } => plain(
+            format!("Remove `{item}` from the setting `{key}`?"),
+            &setting_summary(key),
+            setting_risk_words(key),
+            false,
+        ),
+    }
+}
+
+/// What changing an arbitrary setting risks, by its tier.
+fn setting_risk_words(key: &str) -> String {
+    match setting_risk(key) {
+        Risk::Normal => {
+            "It changes how ahma behaves, not what the sandbox lets programs reach.".into()
+        }
+        _ => "This setting controls what the sandbox allows, so it can widen what programs \
+              your agent runs may reach."
+            .into(),
+    }
 }
 
 /// How much care a proposal needs.
@@ -537,13 +761,7 @@ pub fn from_detected(d: Detected) -> Proposal {
             item,
         },
     };
-    Proposal {
-        title: d.title,
-        why: d.why,
-        allows: d.allows,
-        change,
-        source: Source::Detector(d.detector),
-    }
+    Proposal::new(change, d.why, Source::Detector(d.detector))
 }
 
 /// The plan: what is proposed and still to do, what was refused, and how much
@@ -569,8 +787,10 @@ impl Plan {
 }
 
 /// Validate `proposals` into a plan. Reads only.
-pub fn plan_from(env: &Env, proposals: Vec<Proposal>) -> Plan {
+pub fn plan_from(env: &Env, mut proposals: Vec<Proposal>) -> Plan {
     let mut plan = Plan::default();
+    // What would fail is asked before a convenience; otherwise found order.
+    proposals.sort_by_key(|p| p.optional);
     for proposal in proposals {
         match validate(env, &proposal) {
             Ok(v) if v.already => plan.settled += 1,
@@ -701,26 +921,31 @@ pub fn pending_count(env: &Env, hidden: Vec<Proposal>) -> usize {
 /// add its own (the user's, a model's) and validate them all together.
 pub fn detected_proposals(env: &Env, fixes: Vec<Fix>, installs: bool) -> Vec<Proposal> {
     let settings = AhmaSettings::load_from_checked(&env.user_file).unwrap_or_default();
-    let mut proposals: Vec<Proposal> = ahma_common::setup_detect::detect(&env.workspace, &settings)
-        .into_iter()
-        .map(from_detected)
-        .collect();
+    // A script is offered as a reader only if no line of it is a command the
+    // edit guard itself would hold edits back for (SPEC R-SETUP.3.4).
+    let rewrites = |line: &str| {
+        crate::adapter::lane::classify_source_effect(line, &[])
+            == crate::adapter::workspace_queue::SourceEffect::RewritesSources
+    };
+    let mut proposals: Vec<Proposal> =
+        ahma_common::setup_detect::detect_with(&env.workspace, &settings, &rewrites)
+            .into_iter()
+            .map(from_detected)
+            .collect();
     if installs {
-        proposals.push(Proposal {
-            title: "Bring installed clients' MCP entries up to date".into(),
-            why: "An installed client's ahma entry differs from the one this version recommends."
-                .into(),
-            allows: "Rewrites only ahma's own entry in that client's MCP config.".into(),
-            change: Change::Install(InstallItem::McpConfig),
-            source: Source::Install,
-        });
+        proposals.push(Proposal::new(
+            Change::Install(InstallItem::McpConfig),
+            "An AI app on this computer starts ahma with settings that differ from the ones \
+             this version of ahma expects.",
+            Source::Install,
+        ));
     }
-    proposals.extend(fixes.into_iter().map(|fix| Proposal {
-        title: fix.describe(),
-        why: "Found by `ahma doctor`.".into(),
-        allows: "Only what the sentence above says.".into(),
-        change: Change::DoctorFix(fix),
-        source: Source::Doctor,
+    proposals.extend(fixes.into_iter().map(|fix| {
+        Proposal::new(
+            Change::DoctorFix(fix),
+            "`ahma doctor` checks ahma's own setup and found this.",
+            Source::Doctor,
+        )
     }));
     proposals
 }
@@ -741,13 +966,19 @@ pub fn render_plan(plan: &Plan) -> String {
     for (i, v) in plan.items.iter().enumerate() {
         let marker = match &v.risk {
             Risk::Normal => "",
-            Risk::Security => "  [changes the sandbox boundary]",
+            Risk::Security => "  [security]",
             Risk::High(_) => "  [HIGH RISK]",
         };
-        let _ = writeln!(out, "\n{}. {}{marker}", i + 1, v.proposal.title);
-        let _ = writeln!(out, "   source:  {}", v.proposal.source.label());
+        let optional = if v.proposal.optional {
+            "  (optional)"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "\n{}. {}{optional}{marker}", i + 1, v.proposal.title);
         let _ = writeln!(out, "   why:     {}", v.proposal.why);
-        let _ = writeln!(out, "   allows:  {}", v.proposal.allows);
+        let _ = writeln!(out, "   benefit: {}", v.proposal.benefit);
+        let _ = writeln!(out, "   risk:    {}", v.proposal.risk);
+        let _ = writeln!(out, "   source:  {}", v.proposal.source.label());
         let _ = writeln!(out, "   change:  {}", v.preview);
         if let Risk::High(reasons) = &v.risk {
             for r in reasons {
@@ -1179,10 +1410,10 @@ fn setting_summary(key: &str) -> String {
 
 /// Read the model's proposals from `answer`: the last fenced `ahma-proposal`
 /// block, as JSON `{"changes": [{"op": "set", ...}]}`. Anything else in the
-/// answer is prose and is never read. The **title and the "allows" text are
-/// written here from the change itself**, so a model cannot caption a harmless
-/// looking line over a wide change; only its own reason is carried, cleaned and
-/// cut, and labelled as the model's.
+/// answer is prose and is never read. The **question, benefit and risk are
+/// written by [`explain`] from the change itself**, so a model cannot caption a
+/// harmless looking line over a wide change; only its own reason is carried,
+/// cleaned and cut, and labelled as the model's.
 pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
     let mut out = ModelProposals::default();
     let Some(start) = answer.rfind("```ahma-proposal") else {
@@ -1212,17 +1443,13 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
         }
         let text = |field: &str| c.get(field).and_then(|v| v.as_str()).map(str::to_string);
         let reason = text("why").map(|w| clean_reason(&w)).unwrap_or_default();
-        let (title, summary, change) = match c.get("op").and_then(|o| o.as_str()) {
+        let change = match c.get("op").and_then(|o| o.as_str()) {
             Some("set") => match (text("key"), c.get("value").and_then(json_to_toml_text)) {
-                (Some(key), Some(value)) => (
-                    format!("Set {key} to {value}"),
-                    setting_summary(&key),
-                    Change::Set {
-                        file: file_of(c),
-                        key,
-                        value,
-                    },
-                ),
+                (Some(key), Some(value)) => Change::Set {
+                    file: file_of(c),
+                    key,
+                    value,
+                },
                 _ => {
                     out.dropped
                         .push(format!("change {}: `set` needs a key and a value", i + 1));
@@ -1230,14 +1457,10 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
                 }
             },
             Some("unset") => match text("key") {
-                Some(key) => (
-                    format!("Return {key} to its default"),
-                    setting_summary(&key),
-                    Change::Unset {
-                        file: file_of(c),
-                        key,
-                    },
-                ),
+                Some(key) => Change::Unset {
+                    file: file_of(c),
+                    key,
+                },
                 None => {
                     out.dropped
                         .push(format!("change {}: `unset` needs a key", i + 1));
@@ -1245,30 +1468,16 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
                 }
             },
             Some(op @ ("add" | "remove")) => match (text("key"), text("item")) {
-                (Some(key), Some(item)) => {
-                    let adding = op == "add";
-                    (
-                        format!(
-                            "{} {item} {} {key}",
-                            if adding { "Add" } else { "Remove" },
-                            if adding { "to" } else { "from" }
-                        ),
-                        setting_summary(&key),
-                        if adding {
-                            Change::AddToList {
-                                file: file_of(c),
-                                key,
-                                item,
-                            }
-                        } else {
-                            Change::RemoveFromList {
-                                file: file_of(c),
-                                key,
-                                item,
-                            }
-                        },
-                    )
-                }
+                (Some(key), Some(item)) if op == "add" => Change::AddToList {
+                    file: file_of(c),
+                    key,
+                    item,
+                },
+                (Some(key), Some(item)) => Change::RemoveFromList {
+                    file: file_of(c),
+                    key,
+                    item,
+                },
                 _ => {
                     out.dropped
                         .push(format!("change {}: `{op}` needs a key and an item", i + 1));
@@ -1276,20 +1485,10 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
                 }
             },
             Some("grant") => match text("path") {
-                Some(path) => {
-                    let read_only = c.get("read_only").and_then(|r| r.as_bool()).unwrap_or(true);
-                    (
-                        format!(
-                            "Grant {path} ({}) to this workspace",
-                            if read_only { "read-only" } else { "read-write" }
-                        ),
-                        "Lets sandboxed commands in this workspace reach that folder.".into(),
-                        Change::GrantPath {
-                            path: PathBuf::from(path),
-                            read_only,
-                        },
-                    )
-                }
+                Some(path) => Change::GrantPath {
+                    path: PathBuf::from(path),
+                    read_only: c.get("read_only").and_then(|r| r.as_bool()).unwrap_or(true),
+                },
                 None => {
                     out.dropped
                         .push(format!("change {}: `grant` needs a path", i + 1));
@@ -1297,11 +1496,7 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
                 }
             },
             Some("network_allow") => match text("host") {
-                Some(host) => (
-                    format!("Allow subprocess network access to {host}"),
-                    "Lets sandboxed commands reach that host when egress is restricted.".into(),
-                    Change::NetworkAllow { host },
-                ),
+                Some(host) => Change::NetworkAllow { host },
                 None => {
                     out.dropped
                         .push(format!("change {}: `network_allow` needs a host", i + 1));
@@ -1317,17 +1512,15 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
                 continue;
             }
         };
-        out.proposals.push(Proposal {
-            title,
-            why: if reason.is_empty() {
-                "(the model gave no reason)".into()
+        out.proposals.push(Proposal::new(
+            change,
+            if reason.is_empty() {
+                "(the model gave no reason)".to_string()
             } else {
                 format!("The model's reason: {reason}")
             },
-            allows: summary,
-            change,
-            source: Source::Model(model.to_string()),
-        });
+            Source::Model(model.to_string()),
+        ));
     }
     out
 }
@@ -1335,31 +1528,19 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
 /// A user request typed as `/setup set <key> <value>` or `/setup unset <key>`,
 /// as a proposal from the user.
 pub fn user_proposal(unset: bool, file: SettingsFile, key: &str, value: &str) -> Proposal {
-    let (title, change) = if unset {
-        (
-            format!("Return {key} to its default"),
-            Change::Unset {
-                file,
-                key: key.to_string(),
-            },
-        )
+    let change = if unset {
+        Change::Unset {
+            file,
+            key: key.to_string(),
+        }
     } else {
-        (
-            format!("Set {key} to {value}"),
-            Change::Set {
-                file,
-                key: key.to_string(),
-                value: value.to_string(),
-            },
-        )
+        Change::Set {
+            file,
+            key: key.to_string(),
+            value: value.to_string(),
+        }
     };
-    Proposal {
-        title,
-        why: "You asked for it.".into(),
-        allows: setting_summary(key),
-        change,
-        source: Source::User,
-    }
+    Proposal::new(change, "You asked for it.", Source::User)
 }
 
 /// What the model is told when the user asks something in `/setup`: the rules,
@@ -1528,13 +1709,7 @@ mod tests {
     }
 
     fn proposal(change: Change) -> Proposal {
-        Proposal {
-            title: "t".into(),
-            why: "w".into(),
-            allows: "a".into(),
-            change,
-            source: Source::User,
-        }
+        Proposal::new(change, "w", Source::User)
     }
 
     fn set(file: SettingsFile, key: &str, value: &str) -> Proposal {
@@ -1635,17 +1810,15 @@ mod tests {
     }
 
     fn detected(item: &str) -> Proposal {
-        Proposal {
-            title: format!("Let edits continue while `{item}` runs"),
-            why: "w".into(),
-            allows: "a".into(),
-            change: Change::AddToList {
+        Proposal::new(
+            Change::AddToList {
                 file: SettingsFile::User,
                 key: "tools.source_readers".into(),
                 item: item.into(),
             },
-            source: Source::Detector("source-readers"),
-        }
+            "w",
+            Source::Detector("source-readers"),
+        )
     }
 
     #[test]
@@ -1831,10 +2004,10 @@ mod tests {
         let text = render_plan(&plan);
         assert!(text.contains("1 change(s) proposed"), "{text}");
         assert!(
-            text.contains("detected: gpu") && text.contains("tiny.gguf"),
+            text.contains("found in this project") && text.contains("tiny.gguf"),
             "{text}"
         );
-        assert!(text.contains("[changes the sandbox boundary]"), "{text}");
+        assert!(text.contains("[security]"), "{text}");
         assert!(text.contains("undo:"), "{text}");
 
         let item = plan.items[0].proposal.clone();
@@ -1884,12 +2057,12 @@ mod tests {
         assert_eq!(
             titles,
             [
-                "Set sandbox.allow_gpu to true",
-                "Add scripts/check.sh to tools.source_readers",
-                "Grant /tmp/data (read-only) to this workspace",
-                "Allow subprocess network access to crates.io",
-                "Return tools.timeout_secs to its default",
-                "Remove android from sandbox.profiles",
+                "Let programs your AI agent runs use the GPU (graphics chip)?",
+                "Let your AI agent keep editing files while `scripts/check.sh` runs?",
+                "Let your AI agent's commands read files in /tmp/data?",
+                "Let programs your AI agent runs connect to crates.io?",
+                "Put the setting `tools.timeout_secs` back to its default?",
+                "Stop Android (Gradle) builds from using their shared tools and caches?",
             ]
         );
         assert!(
@@ -1905,11 +2078,11 @@ mod tests {
         );
         // The model's own `title` field is never read.
         assert!(!got.proposals[1].title.contains("Harmless"));
-        // `allows` is ahma's own words about the setting, not the model's.
+        // The risk is ahma's own words about the change, not the model's.
         assert!(
-            got.proposals[0].allows.contains("Metal"),
+            got.proposals[0].risk.contains("graphics driver"),
             "{}",
-            got.proposals[0].allows
+            got.proposals[0].risk
         );
     }
 
@@ -2120,6 +2293,181 @@ mod tests {
             "Settings that differ from the defaults",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+    }
+
+    // ── the words a person reads (SPEC R-SETUP.3) ───────────────────────────
+
+    /// Every change ahma itself raises, and the take-backs the view offers.
+    fn every_curated_change() -> Vec<Change> {
+        let list = |key: &str, item: &str, add: bool| {
+            if add {
+                Change::AddToList {
+                    file: SettingsFile::User,
+                    key: key.into(),
+                    item: item.into(),
+                }
+            } else {
+                Change::RemoveFromList {
+                    file: SettingsFile::User,
+                    key: key.into(),
+                    item: item.into(),
+                }
+            }
+        };
+        vec![
+            Change::Set {
+                file: SettingsFile::User,
+                key: "sandbox.allow_gpu".into(),
+                value: "true".into(),
+            },
+            Change::Unset {
+                file: SettingsFile::User,
+                key: "sandbox.allow_gpu".into(),
+            },
+            list("tools.source_readers", "scripts/check.sh", true),
+            list("tools.source_readers", "scripts/check.sh", false),
+            Change::AddToList {
+                file: SettingsFile::Project,
+                key: "tools.source_readers".into(),
+                item: "scripts/check.sh".into(),
+            },
+            list("sandbox.profiles", "rust", true),
+            list("sandbox.profiles", "android", false),
+            Change::GrantPath {
+                path: PathBuf::from("/data/models"),
+                read_only: true,
+            },
+            Change::GrantPath {
+                path: PathBuf::from("/data/models"),
+                read_only: false,
+            },
+            Change::NetworkAllow {
+                host: "crates.io".into(),
+            },
+            Change::Install(InstallItem::McpConfig),
+            Change::DoctorFix(Fix::RemoveMissingScopes(vec![PathBuf::from("/gone")])),
+        ]
+    }
+
+    /// The question a newcomer answers names no setting key and no detector:
+    /// those are one key away, behind "details". It ends in a question mark,
+    /// and says what is gained and what is risked.
+    #[test]
+    fn every_change_ahma_raises_is_a_plain_question_with_a_benefit_and_a_risk() {
+        for change in every_curated_change() {
+            let p = explain(&change);
+            let all = format!("{} {} {}", p.question, p.benefit, p.risk);
+            assert!(p.question.ends_with('?'), "{change:?}: {}", p.question);
+            assert!(!p.benefit.trim().is_empty(), "{change:?}");
+            assert!(!p.risk.trim().is_empty(), "{change:?}");
+            for jargon in [
+                "tools.",
+                "sandbox.",
+                "source_readers",
+                "source-readers",
+                "allow_gpu",
+                "profiles",
+                "[network]",
+                "MCP",
+            ] {
+                assert!(!all.contains(jargon), "{change:?} says {jargon:?}: {all}");
+            }
+        }
+    }
+
+    /// Where a reader is saved decides where it applies, so the risk says so.
+    #[test]
+    fn a_readers_risk_says_which_projects_it_applies_to() {
+        let reader = |file| Change::AddToList {
+            file,
+            key: "tools.source_readers".into(),
+            item: "scripts/check.sh".into(),
+        };
+        assert!(
+            explain(&reader(SettingsFile::Project))
+                .risk
+                .contains("only this project"),
+            "{:?}",
+            explain(&reader(SettingsFile::Project))
+        );
+        assert!(
+            explain(&reader(SettingsFile::User))
+                .risk
+                .contains("every project"),
+            "{:?}",
+            explain(&reader(SettingsFile::User))
+        );
+    }
+
+    /// A model names a change; ahma writes the question, the benefit and the
+    /// risk. Only the model's reason is carried, and it is labelled as its own.
+    #[test]
+    fn a_models_proposal_carries_ahmas_words_not_the_models() {
+        let got = parse_model_proposals(
+            &block(
+                r#"{"changes":[{"op":"set","key":"sandbox.allow_gpu","value":true,
+                "why":"faster","benefit":"totally safe","risk":"none at all"}]}"#,
+            ),
+            "m",
+        );
+        let p = &got.proposals[0];
+        let ours = explain(&p.change);
+        assert_eq!(p.title, ours.question);
+        assert_eq!(p.benefit, ours.benefit);
+        assert_eq!(p.risk, ours.risk);
+        assert!(!format!("{} {}", p.benefit, p.risk).contains("totally safe"));
+        assert!(p.why.contains("faster"), "{}", p.why);
+    }
+
+    /// Something that stops a build from working is asked before an optional
+    /// convenience, whatever order the detectors found them in.
+    #[test]
+    fn fixes_are_asked_before_optional_items() {
+        let f = fixture();
+        let reader = Proposal::new(
+            Change::AddToList {
+                file: SettingsFile::User,
+                key: "tools.source_readers".into(),
+                item: "scripts/check.sh".into(),
+            },
+            "w",
+            Source::Detector("source-readers"),
+        );
+        let gpu = Proposal::new(
+            Change::Set {
+                file: SettingsFile::User,
+                key: "sandbox.allow_gpu".into(),
+                value: "true".into(),
+            },
+            "w",
+            Source::Detector("gpu"),
+        );
+        assert!(reader.optional && !gpu.optional);
+        let plan = plan_from(&f.env, vec![reader, gpu]);
+        let keys: Vec<String> = plan
+            .items
+            .iter()
+            .map(|v| v.proposal.change.identity())
+            .collect();
+        assert!(keys[0].contains("allow_gpu"), "{keys:?}");
+        assert!(render_plan(&plan).contains("(optional)"));
+    }
+
+    /// Who found it, in words: no detector ids.
+    #[test]
+    fn the_source_is_said_in_plain_words() {
+        for (source, want) in [
+            (Source::Detector("gpu"), "found in this project"),
+            (
+                Source::Detector("source-readers"),
+                "found in this project's instructions for AI agents",
+            ),
+            (Source::Doctor, "found by ahma doctor"),
+            (Source::User, "you asked"),
+            (Source::Model("m".into()), "suggested by m"),
+        ] {
+            assert_eq!(source.label(), want);
         }
     }
 }

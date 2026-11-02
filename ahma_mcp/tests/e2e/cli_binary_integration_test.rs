@@ -148,6 +148,16 @@ mod ahma_mcp_tests {
 
         let plan = run(&["setup", "--plan"]);
         assert!(plan.contains("2 change(s) proposed"), "{plan}");
+        // Each item is a question with what it gains and what it risks.
+        assert!(plan.contains("use the GPU (graphics chip)?"), "{plan}");
+        assert!(
+            plan.contains("benefit:") && plan.contains("risk:"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("(optional)"),
+            "the reader is a convenience: {plan}"
+        );
         assert!(plan.contains("sandbox.allow_gpu: false -> true"), "{plan}");
         assert!(plan.contains("local.gguf"), "{plan}");
         assert!(plan.contains("tools.source_readers"), "{plan}");

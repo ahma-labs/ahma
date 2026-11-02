@@ -23,7 +23,10 @@ pub enum Edit {
     AddToList { key: &'static str, item: String },
 }
 
-/// A detector's finding.
+/// A detector's finding: the edit, and the evidence in this project that
+/// suggests it. The question a person is asked, and what they gain and risk,
+/// are written from the edit itself in one place (`ahma_mcp::setup_plan::explain`),
+/// so a detector, a model and a typed request are worded alike (SPEC R-SETUP.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detected {
     /// Which detector (`gpu`, `source-readers`, `profile`).
@@ -32,12 +35,9 @@ pub struct Detected {
     pub file: SettingsFile,
     /// The edit.
     pub edit: Edit,
-    /// One line: what is proposed.
-    pub title: String,
-    /// Why this project suggests it.
+    /// Why this project suggests it: what was found, and what goes wrong
+    /// without the edit, in plain words.
     pub why: String,
-    /// What it allows, in plain words.
-    pub allows: String,
 }
 
 /// Directories never searched: dependency and build output, and VCS internals.
@@ -61,12 +61,26 @@ const SKIP_DIRS: &[&str] = &[
 const MAX_DEPTH: usize = 3;
 const MAX_ENTRIES: usize = 20_000;
 
-/// Run every detector on `workspace` against the current `settings`.
+/// Run every detector on `workspace` against the current `settings`, judging a
+/// script's lines by its name and nothing else. Prefer [`detect_with`] and the
+/// edit guard's own classifier.
 pub fn detect(workspace: &Path, settings: &AhmaSettings) -> Vec<Detected> {
+    detect_with(workspace, settings, &|_| false)
+}
+
+/// Run every detector. `rewrites_sources` says whether one command line
+/// rewrites source files; it is the edit guard's classifier, passed in because
+/// it lives above this crate, so a script setup offers as a reader is judged by
+/// the same rule that holds edits back while it runs (SPEC R-SETUP.3.4).
+pub fn detect_with(
+    workspace: &Path,
+    settings: &AhmaSettings,
+    rewrites_sources: &dyn Fn(&str) -> bool,
+) -> Vec<Detected> {
     let files = project_files(workspace);
     let mut out = Vec::new();
     out.extend(detect_gpu(workspace, &files, settings));
-    out.extend(detect_source_readers(workspace, settings));
+    out.extend(detect_source_readers(workspace, settings, rewrites_sources));
     out.extend(detect_profiles(&files, settings));
     out
 }
@@ -164,14 +178,10 @@ fn detect_gpu(workspace: &Path, files: &[PathBuf], settings: &AhmaSettings) -> O
             key: "sandbox.allow_gpu",
             value: "true".into(),
         },
-        title: "Let sandboxed commands use the GPU (Metal)".into(),
         why: format!(
-            "This project has {reason}. Without the GPU, a local model fails with \
-             `failed to create command queue` or silently runs on the CPU."
+            "This project has {reason}. Without the GPU, a local AI model fails to start \
+             (`failed to create command queue`) or runs slowly on the CPU."
         ),
-        allows: "Commands can open the GPU. It is a capability, not a path, so no folder \
-                 access changes; the GPU driver stack becomes reachable from sandboxed code."
-            .into(),
     })
 }
 
@@ -190,13 +200,86 @@ const DOD_HEADINGS: &[&str] = &[
     "verification",
 ];
 
+/// Words in a script's file name that say it writes: a script so named is
+/// never offered as one that "only reads sources". Matched as whole words of
+/// the name (`gen-proto.sh`, `format_all`), so `check-generated.sh` is not one
+/// unless it says `generate`.
+const WRITER_WORDS: &[&str] = &[
+    "gen",
+    "generate",
+    "regen",
+    "regenerate",
+    "codegen",
+    "fmt",
+    "format",
+    "fix",
+    "autofix",
+    "migrate",
+    "install",
+    "update",
+    "upgrade",
+    "bump",
+    "release",
+    "publish",
+    "deploy",
+    "setup",
+    "bootstrap",
+    "clean",
+    "sync",
+    "vendor",
+];
+
+/// Whether the file name of `script` says it writes (see [`WRITER_WORDS`]).
+fn name_says_it_writes(script: &str) -> bool {
+    let name = Path::new(script)
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| WRITER_WORDS.contains(&word))
+}
+
+/// How much of a script is read to judge it.
+const MAX_SCRIPT_BYTES: u64 = 64 * 1024;
+
+/// Whether a line of `path` is a command `rewrites_sources` calls a rewrite.
+/// Comments and blank lines are skipped; an unreadable script is judged by its
+/// name alone.
+fn body_rewrites(path: &Path, rewrites_sources: &dyn Fn(&str) -> bool) -> bool {
+    use std::io::Read;
+    let mut text = String::new();
+    let read =
+        std::fs::File::open(path).and_then(|f| f.take(MAX_SCRIPT_BYTES).read_to_string(&mut text));
+    if read.is_err() {
+        return false;
+    }
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .any(rewrites_sources)
+}
+
 /// Project scripts named in a "definition of done" section of AGENTS.md or
-/// CLAUDE.md that exist inside the project and are not yet declared readers.
-fn detect_source_readers(workspace: &Path, settings: &AhmaSettings) -> Vec<Detected> {
+/// CLAUDE.md that exist inside the project, are not yet declared readers, and
+/// show no sign of writing: neither their name nor any of their lines.
+fn detect_source_readers(
+    workspace: &Path,
+    settings: &AhmaSettings,
+    rewrites_sources: &dyn Fn(&str) -> bool,
+) -> Vec<Detected> {
     let Ok(root) = dunce::canonicalize(workspace) else {
         return Vec::new();
     };
-    let mut seen = Vec::<String>::new();
+    // A path inside this project belongs in this project's settings file, so it
+    // does not apply to every project with a script at that path. Setup never
+    // creates the `.ahma` directory (SPEC R-CFG10.6): without one, it is yours.
+    let file = if workspace.join(".ahma").is_dir() {
+        SettingsFile::Project
+    } else {
+        SettingsFile::User
+    };
+    let mut seen = Vec::<(String, &str)>::new();
     for name in INSTRUCTION_FILES {
         let Ok(text) = std::fs::read_to_string(workspace.join(name)) else {
             continue;
@@ -205,28 +288,28 @@ fn detect_source_readers(workspace: &Path, settings: &AhmaSettings) -> Vec<Detec
             let Some(script) = script_of(&command, &root) else {
                 continue;
             };
-            if !seen.contains(&script) && !settings.tools.source_readers.contains(&script) {
-                seen.push(script);
+            if seen.iter().any(|(s, _)| *s == script)
+                || settings.tools.source_readers.contains(&script)
+                || name_says_it_writes(&script)
+                || body_rewrites(&root.join(&script), rewrites_sources)
+            {
+                continue;
             }
+            seen.push((script, name));
         }
     }
     seen.into_iter()
-        .map(|script| Detected {
+        .map(|(script, named_in)| Detected {
             detector: "source-readers",
-            file: SettingsFile::User,
+            file,
             edit: Edit::AddToList {
                 key: "tools.source_readers",
                 item: script.clone(),
             },
-            title: format!("Let edits continue while `{script}` runs"),
             why: format!(
-                "AGENTS.md or CLAUDE.md names `{script}` as part of finishing work. Ahma cannot \
-                 tell that a project script only reads sources, so while it runs every edit is \
-                 refused."
-            ),
-            allows: format!(
-                "Edits to your sources are no longer held while a command starting with `{script}` \
-                 runs. Only declare a script that does not rewrite sources."
+                "Your {named_in} tells AI agents to run `{script}` when they finish work. ahma \
+                 cannot tell whether a script changes your code, so while it runs your agent's \
+                 edits in that folder wait until it ends."
             ),
         })
         .collect()
@@ -348,14 +431,9 @@ fn detect_profiles(files: &[PathBuf], settings: &AhmaSettings) -> Vec<Detected> 
                 key: "sandbox.profiles",
                 item: profile.to_string(),
             },
-            title: format!("Turn the `{profile}` toolchain profile back on"),
             why: format!(
-                "This project has {evidence}, but the `{profile}` profile is off, so its caches \
-                 and SDK folders are denied and builds fail with `Operation not permitted`."
-            ),
-            allows: format!(
-                "The `{profile}` profile's folders (see `ahma permissions list`): the toolchain's \
-                 caches and SDK, shared by every project on this machine."
+                "This project has {evidence}, but ahma's access to that toolchain's shared \
+                 folders is switched off, so its builds fail with `Operation not permitted`."
             ),
         })
         .collect()
@@ -528,6 +606,92 @@ mod tests {
              scripts/empty\n```\n",
         );
         assert_eq!(readers(dir.path()), ["scripts/check", "scripts/lint.SH"]);
+    }
+
+    /// Field case: AGENTS.md named `scripts/generate.sh`, and setup asked whether
+    /// it "only reads sources". A script whose name says it writes is not offered.
+    #[test]
+    fn a_script_whose_name_says_it_writes_is_not_offered_as_a_reader() {
+        let dir = project();
+        for name in [
+            "generate.sh",
+            "gen-proto.sh",
+            "fmt.sh",
+            "format_all.sh",
+            "fix",
+            "install-deps.sh",
+            "bump.sh",
+            "release.sh",
+            "codegen.sh",
+            "check.sh",
+        ] {
+            write(dir.path(), &format!("scripts/{name}"), "#!/bin/sh\n");
+        }
+        write(
+            dir.path(),
+            "AGENTS.md",
+            "## Definition of Done\n\n```\nscripts/generate.sh\nscripts/gen-proto.sh\n\
+             scripts/fmt.sh\nscripts/format_all.sh\nscripts/fix\nscripts/install-deps.sh\n\
+             scripts/bump.sh\nscripts/release.sh\nscripts/codegen.sh\nscripts/check.sh\n```\n",
+        );
+        assert_eq!(readers(dir.path()), ["scripts/check.sh"]);
+    }
+
+    /// A script one of whose lines the caller's classifier calls a rewrite is
+    /// not offered; the classifier is the edit guard's own (SPEC R-SETUP.3.4).
+    #[test]
+    fn a_script_with_a_rewriting_line_is_not_offered_as_a_reader() {
+        let dir = project();
+        write(
+            dir.path(),
+            "scripts/check.sh",
+            "#!/bin/sh\n# cargo fmt is mentioned in a comment only\ncargo fmt --check\ncargo test\n",
+        );
+        write(
+            dir.path(),
+            "scripts/verify.sh",
+            "#!/bin/sh\nset -e\ncargo fmt\ncargo test\n",
+        );
+        write(
+            dir.path(),
+            "AGENTS.md",
+            "## Definition of Done\n\n`scripts/check.sh` then `scripts/verify.sh`\n",
+        );
+        let rewrites = |line: &str| line == "cargo fmt";
+        let got: Vec<_> = detect_with(dir.path(), &AhmaSettings::default(), &rewrites)
+            .into_iter()
+            .filter(|d| d.detector == "source-readers")
+            .map(|d| match d.edit {
+                Edit::AddToList { item, .. } => item,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got, ["scripts/check.sh"]);
+    }
+
+    /// A project script is a path inside this project, so it goes in this
+    /// project's settings file when there is one, not in a file every project
+    /// shares; the reason names the file that asked for it.
+    #[test]
+    fn a_reader_goes_in_the_project_settings_file_when_there_is_one() {
+        let dir = project();
+        write(dir.path(), "scripts/check.sh", "#!/bin/sh\n");
+        write(
+            dir.path(),
+            "CLAUDE.md",
+            "## Definition of Done\n\n`scripts/check.sh`\n",
+        );
+        let found = |dir: &Path| {
+            detect(dir, &AhmaSettings::default())
+                .into_iter()
+                .find(|d| d.detector == "source-readers")
+                .expect("proposed")
+        };
+        let user = found(dir.path());
+        assert_eq!(user.file, SettingsFile::User, "no .ahma directory yet");
+        assert!(user.why.contains("CLAUDE.md"), "{}", user.why);
+        std::fs::create_dir_all(dir.path().join(".ahma")).unwrap();
+        assert_eq!(found(dir.path()).file, SettingsFile::Project);
     }
 
     #[test]

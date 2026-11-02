@@ -8898,16 +8898,15 @@ mod tests {
         // A folder that does not exist yet is a high-risk grant (a warning the
         // human must read), not a refusal.
         let missing = f.ws.path().join("not-yet-there");
-        let p = ahma_mcp::setup_plan::Proposal {
-            title: "Grant a folder".into(),
-            why: "w".into(),
-            allows: "a".into(),
-            change: ahma_mcp::setup_plan::Change::GrantPath {
+        let mut p = ahma_mcp::setup_plan::Proposal::new(
+            ahma_mcp::setup_plan::Change::GrantPath {
                 path: missing.clone(),
                 read_only: true,
             },
-            source: ahma_mcp::setup_plan::Source::User,
-        };
+            "w",
+            ahma_mcp::setup_plan::Source::User,
+        );
+        p.title = "Grant a folder".into();
         f.state.setup_view.add_proposals(vec![p], Vec::new());
         assert_eq!(
             setup_card_title(&f.state),
@@ -8959,7 +8958,7 @@ mod tests {
         assert!(f.state.setup_view.open);
         assert_eq!(
             setup_card_title(&f.state),
-            "Set tools.timeout_secs to 90",
+            "Change the setting `tools.timeout_secs` to 90?",
             "your own change is the one in front of you"
         );
 
@@ -8981,7 +8980,7 @@ mod tests {
 
         // Yes to the timeout, no to the rest.
         while f.state.setup_view.mode() == Mode::Review {
-            let key = if setup_card_title(&f.state) == "Set tools.timeout_secs to 90" {
+            let key = if setup_card_title(&f.state).contains("`tools.timeout_secs` to 90") {
                 'y'
             } else {
                 'n'
