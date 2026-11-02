@@ -47,6 +47,7 @@ impl Source {
             Self::Detector("source-readers") => {
                 "found in this project's instructions for AI agents".into()
             }
+            Self::Detector("held-edits") => "seen while your AI agent worked here".into(),
             Self::Detector(_) => "found in this project".into(),
             Self::Doctor => "found by ahma doctor".into(),
             Self::User => "you asked".into(),
@@ -384,6 +385,9 @@ pub struct Env {
     pub project_file: Option<PathBuf>,
     /// The folder being set up.
     pub workspace: PathBuf,
+    /// Where the edit guard keeps its per-workspace records, including which
+    /// of the project's scripts held an agent's edits (SPEC R-SETUP.3.4).
+    pub lock_dir: Option<PathBuf>,
 }
 
 impl Env {
@@ -396,6 +400,7 @@ impl Env {
                 .is_dir()
                 .then(|| ahma_common::config::project_settings_path(&project_dir)),
             workspace: workspace.to_path_buf(),
+            lock_dir: crate::adapter::workspace_queue::default_lock_dir(),
         })
     }
 
@@ -927,8 +932,15 @@ pub fn detected_proposals(env: &Env, fixes: Vec<Fix>, installs: bool) -> Vec<Pro
         crate::adapter::lane::classify_source_effect(line, &[])
             == crate::adapter::workspace_queue::SourceEffect::RewritesSources
     };
+    // The project's own scripts that actually held an agent's edits here, as
+    // the edit guard recorded them, keyed like the guard keys the workspace.
+    let held = {
+        use crate::adapter::workspace_queue::{WorkspaceQueue, workspace_key};
+        let key = workspace_key(&env.workspace, std::slice::from_ref(&env.workspace));
+        WorkspaceQueue::with_lock_dir(true, env.lock_dir.clone()).held_edit_programs(&key)
+    };
     let mut proposals: Vec<Proposal> =
-        ahma_common::setup_detect::detect_with(&env.workspace, &settings, &rewrites)
+        ahma_common::setup_detect::detect_with(&env.workspace, &settings, &rewrites, &held)
             .into_iter()
             .map(from_detected)
             .collect();
@@ -1700,6 +1712,7 @@ mod tests {
             user_file: home.path().join(".ahma").join("settings.toml"),
             project_file: Some(ws.path().join(".ahma").join("settings.toml")),
             workspace: ws.path().to_path_buf(),
+            lock_dir: Some(home.path().join("locks")),
         };
         Fixture {
             _home: home,
@@ -2452,6 +2465,54 @@ mod tests {
             .collect();
         assert!(keys[0].contains("allow_gpu"), "{keys:?}");
         assert!(render_plan(&plan).contains("(optional)"));
+    }
+
+    /// SPEC R-SETUP.3.4: a script the edit guard saw hold an agent's edits is
+    /// offered by name, with how often, though no instructions file names it.
+    #[test]
+    fn a_script_that_held_edits_is_proposed_from_the_guards_record() {
+        use crate::adapter::workspace_queue::{HolderInfo, WorkspaceQueue, workspace_key};
+        let f = fixture();
+        std::fs::create_dir_all(f.ws.path().join("scripts")).unwrap();
+        std::fs::write(
+            f.ws.path().join("scripts/coach-reference.sh"),
+            "#!/bin/sh\ncargo nextest run --run-ignored ignored-only\n",
+        )
+        .unwrap();
+        let queue = WorkspaceQueue::with_lock_dir(true, f.env.lock_dir.clone());
+        let key = workspace_key(&f.env.workspace, std::slice::from_ref(&f.env.workspace));
+        let run = HolderInfo::new(
+            "op_1",
+            "source ./.env && scripts/coach-reference.sh --set expert 2>&1 | tail -12",
+        );
+        queue.record_held(&key, &run);
+        queue.record_held(&key, &HolderInfo::new("op_2", run.title.clone()));
+
+        let plan = build_plan(&f.env, Vec::new(), false);
+        let item = plan
+            .items
+            .iter()
+            .find(|v| v.proposal.source == Source::Detector("held-edits"))
+            .unwrap_or_else(|| panic!("{}", render_plan(&plan)));
+        assert!(
+            item.proposal
+                .title
+                .contains("`scripts/coach-reference.sh` runs?")
+        );
+        assert!(
+            item.proposal.why.contains("2 times"),
+            "{}",
+            item.proposal.why
+        );
+        assert_eq!(
+            item.proposal.source.label(),
+            "seen while your AI agent worked here"
+        );
+        assert!(
+            item.proposal.risk.contains("only this project"),
+            "the project has .ahma, so it is saved there: {}",
+            item.proposal.risk
+        );
     }
 
     /// Who found it, in words: no detector ids.

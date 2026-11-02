@@ -165,6 +165,7 @@ A plan item looks like:
 |---|---|---|
 | `gpu` | a `.gguf`/`.ggml` file, or a manifest mentioning `llama.cpp`, `ggml`, `whisper-rs` | `sandbox.allow_gpu = true` |
 | `source-readers` | a script (a `#!` file, or one with a script extension) named in a "definition of done" section of `AGENTS.md`/`CLAUDE.md` that exists inside the project. Never one whose name says it writes (`generate.sh`, `fmt.sh`, `install-deps.sh`, …) or with a line ahma's edit guard calls a rewrite (`cargo fmt`, `go generate`, `sed -i`, `npm install`, …) | one `tools.source_readers` entry per script, in this project's `.ahma/settings.toml` (your own file if the project has no `.ahma` directory) |
+| `held-edits` | a project script that made an AI agent wait to edit files while it ran, as the edit guard recorded it, though no instructions file names it; the same checks as `source-readers` | the same entry, with how many runs it held edits |
 | `profile` | `Cargo.toml`, `package.json`, `go.mod`, Gradle/Android, Xcode/Swift whose profile is off | the profile, added to `sandbox.profiles` |
 | installation | an installed client's MCP entry that differs from the recommended one | refresh it |
 | `ahma doctor` | every finding that has a fix | that fix |

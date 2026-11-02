@@ -1277,6 +1277,44 @@ fn program_source_effect(program: &str, args: &[String]) -> SourceEffect {
     }
 }
 
+/// The project's own programs a command line runs, in order, each once: a
+/// relative path such as `scripts/check.sh` (a leading `./` dropped) at the
+/// head of any segment, after `VAR=value` assignments and wrappers. Never a
+/// bare program name, an absolute path, or the `gradlew`/`mvnw` wrappers every
+/// Gradle and Maven project ships: those are not a project's to vouch for. This
+/// is what a human can declare as a source reader (SPEC R2.7.8, R-SETUP.3.4).
+pub fn project_programs(command: &str) -> Vec<String> {
+    let Some(line) = parse_line(command.trim()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for seg in &line.segs {
+        let words: Vec<&String> = seg
+            .iter()
+            .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+            .collect();
+        let Some(program) = words.get(wrapper_len(&words)) else {
+            continue;
+        };
+        let program = program.strip_prefix("./").unwrap_or(program);
+        let base = program.rsplit('/').next().unwrap_or(program);
+        if program.contains('/')
+            && !program.starts_with('/')
+            && !matches!(base, "gradlew" | "mvnw")
+            && !out.iter().any(|p| p == program)
+        {
+            out.push(program.to_string());
+        }
+    }
+    out
+}
+
+/// Whether `path` names a dotenv file: `.env`, `.env.local`, `prod.env`.
+fn is_dotenv(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name == ".env" || name.starts_with(".env.") || name.ends_with(".env")
+}
+
 fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
     use SourceEffect::*;
     if is_declared_reader(seg, declared) {
@@ -1293,6 +1331,21 @@ fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
         return Unknown;
     };
     if program == "cd" && args.len() <= 1 {
+        return ReadsSources;
+    }
+    // Loading a dotenv file (`source ./.env && scripts/x.sh`) sets variables
+    // for what follows; a project's declared reader is so often run this way
+    // that leaving it unknown made declaring the reader useless (SPEC R2.7.8).
+    // Only a file named as an env file: sourcing anything else runs code.
+    if matches!(program.as_str(), "source" | ".") && args.len() == 1 && is_dotenv(&args[0]) {
+        return ReadsSources;
+    }
+    // `set -a`, `set -euo pipefail`: shell options, nothing on disk.
+    if program == "set"
+        && args
+            .iter()
+            .all(|a| a.starts_with('-') || a.starts_with('+'))
+    {
         return ReadsSources;
     }
     // `bash -c '<line>'`: what the line does.
@@ -1771,6 +1824,59 @@ mod source_effect_tests {
             "",
         ] {
             assert_eq!(effect(cmd), SourceEffect::Unknown, "{cmd}");
+        }
+    }
+
+    /// Field case: an agent ran `source ./.env && scripts/coach-reference.sh …
+    /// 2>&1 | tail -12`. Declaring the script must make that whole line a
+    /// reader: loading an env file and trimming the output read nothing.
+    #[test]
+    fn a_declared_wrapper_after_sourcing_an_env_file_reads_sources() {
+        let declared = vec!["scripts/coach-reference.sh".to_string()];
+        for cmd in [
+            "source ./.env && scripts/coach-reference.sh --set expert --run r 2>&1 | tail -12",
+            ". ./.env && scripts/coach-reference.sh",
+            "set -a && source .env && scripts/coach-reference.sh",
+        ] {
+            assert_eq!(
+                classify_source_effect(cmd, &declared),
+                SourceEffect::ReadsSources,
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            classify_source_effect("source ./.env && scripts/other.sh", &declared),
+            SourceEffect::Unknown,
+            "only the declared script is excused"
+        );
+        assert_eq!(
+            classify_source_effect(
+                "source ./scripts/prepare.sh && scripts/coach-reference.sh",
+                &declared
+            ),
+            SourceEffect::Unknown,
+            "sourcing anything but an env file runs code"
+        );
+    }
+
+    /// The project's own programs in a command line, wherever they stand: the
+    /// field case started with `source ./.env`, so its first word named nothing.
+    #[test]
+    fn a_command_lines_project_programs_are_found_in_every_segment() {
+        for (cmd, want) in [
+            (
+                "source ./.env && scripts/coach-reference.sh --set x 2>&1 | tail -12",
+                vec!["scripts/coach-reference.sh"],
+            ),
+            (
+                "FOO=1 ./scripts/a.sh && scripts/b.sh; scripts/a.sh",
+                vec!["scripts/a.sh", "scripts/b.sh"],
+            ),
+            ("cargo nextest run", vec![]),
+            ("./gradlew build", vec![]),
+            ("/usr/bin/python3 x.py", vec![]),
+        ] {
+            assert_eq!(project_programs(cmd), want, "{cmd}");
         }
     }
 

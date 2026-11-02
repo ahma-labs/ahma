@@ -29,7 +29,7 @@ pub enum Edit {
 /// so a detector, a model and a typed request are worded alike (SPEC R-SETUP.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detected {
-    /// Which detector (`gpu`, `source-readers`, `profile`).
+    /// Which detector (`gpu`, `source-readers`, `held-edits`, `profile`).
     pub detector: &'static str,
     /// Which settings file the edit belongs in.
     pub file: SettingsFile,
@@ -65,22 +65,30 @@ const MAX_ENTRIES: usize = 20_000;
 /// script's lines by its name and nothing else. Prefer [`detect_with`] and the
 /// edit guard's own classifier.
 pub fn detect(workspace: &Path, settings: &AhmaSettings) -> Vec<Detected> {
-    detect_with(workspace, settings, &|_| false)
+    detect_with(workspace, settings, &|_| false, &[])
 }
 
 /// Run every detector. `rewrites_sources` says whether one command line
 /// rewrites source files; it is the edit guard's classifier, passed in because
 /// it lives above this crate, so a script setup offers as a reader is judged by
 /// the same rule that holds edits back while it runs (SPEC R-SETUP.3.4).
+/// `held` are the project's own programs that held an agent's edits, with how
+/// many runs did, as the edit guard recorded them.
 pub fn detect_with(
     workspace: &Path,
     settings: &AhmaSettings,
     rewrites_sources: &dyn Fn(&str) -> bool,
+    held: &[(String, u32)],
 ) -> Vec<Detected> {
     let files = project_files(workspace);
     let mut out = Vec::new();
     out.extend(detect_gpu(workspace, &files, settings));
-    out.extend(detect_source_readers(workspace, settings, rewrites_sources));
+    out.extend(detect_source_readers(
+        workspace,
+        settings,
+        rewrites_sources,
+        held,
+    ));
     out.extend(detect_profiles(&files, settings));
     out
 }
@@ -301,7 +309,15 @@ fn detect_source_readers(
     workspace: &Path,
     settings: &AhmaSettings,
     rewrites_sources: &dyn Fn(&str) -> bool,
+    held: &[(String, u32)],
 ) -> Vec<Detected> {
+    /// What suggested a script.
+    enum Found {
+        /// Named in this instructions file's definition of done.
+        Instructions(&'static str),
+        /// Held an agent's edits in this many runs.
+        Held(u32),
+    }
     let Ok(root) = dunce::canonicalize(workspace) else {
         return Vec::new();
     };
@@ -313,38 +329,64 @@ fn detect_source_readers(
     } else {
         SettingsFile::User
     };
-    let mut seen = Vec::<(String, &str)>::new();
-    for name in INSTRUCTION_FILES {
-        let Ok(text) = std::fs::read_to_string(workspace.join(name)) else {
+    let named = INSTRUCTION_FILES.iter().flat_map(|name| {
+        std::fs::read_to_string(workspace.join(name))
+            .map(|text| dod_commands(&text))
+            .unwrap_or_default()
+            .into_iter()
+            .map(move |command| (command, Found::Instructions(name)))
+    });
+    let seen_running = held
+        .iter()
+        .map(|(command, times)| (command.clone(), Found::Held(*times)));
+    let mut seen = Vec::<(String, Found)>::new();
+    for (command, found) in named.chain(seen_running) {
+        let Some(script) = script_of(&command, &root) else {
             continue;
         };
-        for command in dod_commands(&text) {
-            let Some(script) = script_of(&command, &root) else {
-                continue;
-            };
-            if seen.iter().any(|(s, _)| *s == script)
-                || settings.tools.source_readers.contains(&script)
-                || name_says_it_writes(&script)
-                || body_rewrites(&root.join(&script), rewrites_sources)
-            {
-                continue;
-            }
-            seen.push((script, name));
+        if seen.iter().any(|(s, _)| *s == script)
+            || settings.tools.source_readers.contains(&script)
+            || name_says_it_writes(&script)
+            || body_rewrites(&root.join(&script), rewrites_sources)
+        {
+            continue;
         }
+        seen.push((script, found));
     }
+    let waits = "ahma cannot tell whether a script changes your code, so while it runs your \
+                 agent's edits in that folder wait until it ends.";
     seen.into_iter()
-        .map(|(script, named_in)| Detected {
-            detector: "source-readers",
-            file,
-            edit: Edit::AddToList {
-                key: "tools.source_readers",
-                item: script.clone(),
-            },
-            why: format!(
-                "Your {named_in} tells AI agents to run `{script}` when they finish work. ahma \
-                 cannot tell whether a script changes your code, so while it runs your agent's \
-                 edits in that folder wait until it ends."
-            ),
+        .map(|(script, found)| {
+            let (detector, why) = match found {
+                Found::Instructions(name) => (
+                    "source-readers",
+                    format!(
+                        "Your {name} tells AI agents to run `{script}` when they finish work. \
+                         {waits}"
+                    ),
+                ),
+                Found::Held(times) => (
+                    "held-edits",
+                    format!(
+                        "While your AI agent worked here, `{script}` made it wait to edit files \
+                         {}. {waits}",
+                        if times == 1 {
+                            "once".to_string()
+                        } else {
+                            format!("{times} times")
+                        }
+                    ),
+                ),
+            };
+            Detected {
+                detector,
+                file,
+                edit: Edit::AddToList {
+                    key: "tools.source_readers",
+                    item: script.clone(),
+                },
+                why,
+            }
         })
         .collect()
 }
@@ -692,7 +734,7 @@ mod tests {
             "## Definition of Done\n\n`scripts/check.sh` then `scripts/verify.sh`\n",
         );
         let rewrites = |line: &str| line == "cargo fmt";
-        let got: Vec<_> = detect_with(dir.path(), &AhmaSettings::default(), &rewrites)
+        let got: Vec<_> = detect_with(dir.path(), &AhmaSettings::default(), &rewrites, &[])
             .into_iter()
             .filter(|d| d.detector == "source-readers")
             .map(|d| match d.edit {
@@ -726,6 +768,60 @@ mod tests {
         assert!(user.why.contains("CLAUDE.md"), "{}", user.why);
         std::fs::create_dir_all(dir.path().join(".ahma")).unwrap();
         assert_eq!(found(dir.path()).file, SettingsFile::Project);
+    }
+
+    /// A project script that actually held an agent's edits is offered with how
+    /// often, whether or not the instructions name it; one that writes, or that
+    /// is not the project's, is not.
+    #[test]
+    fn a_script_that_held_edits_is_offered_with_how_often_it_did() {
+        let dir = project();
+        write(
+            dir.path(),
+            "scripts/coach-reference.sh",
+            "#!/bin/sh\ncargo nextest run\n",
+        );
+        write(dir.path(), "scripts/generate.sh", "#!/bin/sh\n");
+        write(dir.path(), "scripts/check.sh", "#!/bin/sh\n");
+        write(
+            dir.path(),
+            "AGENTS.md",
+            "## Definition of Done\n\n`scripts/check.sh`\n",
+        );
+        let held = [
+            ("scripts/coach-reference.sh".to_string(), 3),
+            ("scripts/generate.sh".to_string(), 5),
+            ("../elsewhere.sh".to_string(), 1),
+            ("scripts/check.sh".to_string(), 1),
+        ];
+        let found: Vec<_> = detect_with(dir.path(), &AhmaSettings::default(), &|_| false, &held)
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.edit,
+                    Edit::AddToList {
+                        key: "tools.source_readers",
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let got: Vec<_> = found
+            .iter()
+            .map(|d| match &d.edit {
+                Edit::AddToList { item, .. } => (d.detector, item.as_str()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("source-readers", "scripts/check.sh"),
+                ("held-edits", "scripts/coach-reference.sh"),
+            ],
+            "named once, by the instructions first; writers and outsiders never"
+        );
+        assert!(found[1].why.contains("3 times"), "{}", found[1].why);
     }
 
     /// What a model may read to advise on a reader: the script's own lines,
