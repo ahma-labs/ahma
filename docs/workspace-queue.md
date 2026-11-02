@@ -74,9 +74,12 @@ status()                                     → ── Finished since your last
   wrapper (`timeout 600 cargo nextest run`) is still a test run. A project declares its own
   source-reading scripts in `tools.source_readers`; an entry excuses its own command, not
   what is chained after it. The first refusal for a
-  command gives the reason; later ones are one line. When the holder is the project's own
-  script, the refusal ends with the line a human runs to declare it a source reader, for
-  example `ahma settings set tools.source_readers "['scripts/coach-reference.sh']"`. ahma's own file tools and the edit
+  command gives the reason; later ones are one line. When the holder runs one of the
+  project's own scripts (`source ./.env && scripts/coach-reference.sh …` counts: the script
+  need not be the first word), the refusal names it and tells the agent to ask you to run
+  [`ahma setup`](setup.md), which remembers the script held edits, checks it, and asks you in
+  plain words whether edits may continue while it runs. Loading a `.env` file and `set -a`
+  read nothing, so they do not stop a declared script from counting as a reader. ahma's own file tools and the edit
   guard for Claude Code, Codex, Copilot CLI, Cursor, Antigravity and VS Code decide the
   same way.
 

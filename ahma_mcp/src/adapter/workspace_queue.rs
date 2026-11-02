@@ -304,10 +304,11 @@ pub fn child_lease_env(key: &Path) -> String {
 /// R2.7.8). One wording for ahma's own file tools and the harness edit hook, so
 /// a model learns one rule.
 ///
-/// `declared` is the current `[tools] source_readers`: when the holder is a
-/// project's own program (its first word is a path), the refusal ends with the
-/// exact line a human runs so it stops blocking edits, merged with what is
-/// already declared.
+/// `declared` is the current `[tools] source_readers`. When the holder runs one
+/// of the project's own scripts that is not declared, the refusal tells the
+/// agent to send the human to `ahma setup`, which offers that script by name
+/// after checking it (R-SETUP.3.4); a setting name means nothing to the person
+/// who has to decide.
 pub fn edit_refusal(
     path: &Path,
     workspace: &Path,
@@ -321,50 +322,42 @@ pub fn edit_refusal(
         .and_then(|h| h.typical_secs)
         .map(|s| format!(" It usually takes {}.", format_duration_secs(s)))
         .unwrap_or_default();
+    let setup = holder
+        .and_then(|h| undeclared_project_program(&h.title, declared))
+        .map(|program| {
+            format!(
+                " If `{program}` only reads sources (a test or build wrapper), ask the user to run \
+                 `ahma setup`: after checking the script it offers to let edits continue while \
+                 it runs."
+            )
+        })
+        .unwrap_or_default();
     format!(
         "Not edited: {} is in workspace {}, where {who} is running and may rewrite source \
          files. An edit now could be overwritten, or change what that command sees partway \
          through.{usually} `await` it (or `cancel` it), then make the edit. Builds and tests do \
-         not block edits; if this command only reads sources (a test or build wrapper), a human \
-         can declare it in `[tools] source_readers` and edits will proceed while it runs.{fix}",
+         not block edits.{setup}",
         path.display(),
         workspace.display(),
-        fix = holder
-            .and_then(|h| source_reader_suggestion(&h.title, declared))
-            .unwrap_or_default(),
     )
 }
 
-/// ` The one line: …` for a holder whose program is the project's own (a
-/// path such as `scripts/coach-reference.sh`), or `None`. Never for a generic
-/// program (`python3`, `bash`, `make`): declaring one of those would excuse
-/// every command that starts with it, and a human asked to approve it would.
-fn source_reader_suggestion(title: &str, declared: &[String]) -> Option<String> {
-    let program = title.split_whitespace().next()?;
-    if !program.contains('/') || declared.iter().any(|d| d.trim() == program) {
-        return None;
-    }
-    let value = source_readers_value(declared, program)?;
-    Some(format!(
-        " If `{program}` only reads sources, the line a human runs is: \
-         ahma settings set tools.source_readers \"{value}\""
-    ))
+/// The first of the project's own programs in `title` that is not declared a
+/// source reader. Never a generic program (`python3`, `bash`, `make`):
+/// declaring one of those would excuse every command that starts with it.
+fn undeclared_project_program(title: &str, declared: &[String]) -> Option<String> {
+    crate::adapter::lane::project_programs(title)
+        .into_iter()
+        .find(|p| !declared.iter().any(|d| d.trim() == p))
 }
 
-/// `declared` plus `program` as a TOML array of literal strings, the value
-/// `ahma settings set` takes (it replaces the whole list). Literal strings
-/// survive every shell's quoting; `None` when an entry contains a `'`, which a
-/// literal string cannot hold.
-pub(crate) fn source_readers_value(declared: &[String], program: &str) -> Option<String> {
-    let mut entries: Vec<&str> = declared.iter().map(|d| d.trim()).collect();
-    if !entries.contains(&program) {
-        entries.push(program);
-    }
-    if entries.iter().any(|e| e.contains('\'')) {
-        return None;
-    }
-    let quoted: Vec<String> = entries.iter().map(|e| format!("'{e}'")).collect();
-    Some(format!("[{}]", quoted.join(", ")))
+/// The record of programs that held edits, or an empty one when it is missing
+/// or damaged (asking later is the safe failure).
+fn read_held(path: &Path) -> std::collections::BTreeMap<String, u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 /// The one-line form of [`edit_refusal`], for every refusal after the first
@@ -698,6 +691,7 @@ impl WorkspaceQueue {
         if self.already_refused(&workspace, &holder.op_id) {
             Some(edit_refusal_again(path, &holder))
         } else {
+            self.record_held(&workspace, &holder);
             Some(edit_refusal(
                 path,
                 &workspace,
@@ -705,6 +699,51 @@ impl WorkspaceQueue {
                 self.source_readers(),
             ))
         }
+    }
+
+    /// Remember that the project's own scripts in `holder` held an edit in
+    /// `workspace`, once per run (the first, full refusal), for `ahma setup` to
+    /// offer (SPEC R-SETUP.3.4). Best effort: a lost count only means setup
+    /// asks a little later.
+    pub(crate) fn record_held(&self, workspace: &Path, holder: &HolderInfo) {
+        let programs: Vec<String> = crate::adapter::lane::project_programs(&holder.title)
+            .into_iter()
+            .filter(|p| !self.source_readers.iter().any(|d| d.trim() == p))
+            .collect();
+        let Some(path) = self.held_path(workspace) else {
+            return;
+        };
+        if programs.is_empty() {
+            return;
+        }
+        let mut counts = read_held(&path);
+        for program in programs {
+            *counts.entry(program).or_default() += 1;
+        }
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| serde_json::to_string(&counts).map_err(std::io::Error::other))
+            .and_then(|text| std::fs::write(&tmp, text))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            tracing::debug!("could not remember a held edit in {}: {e}", path.display());
+        }
+    }
+
+    /// The project's own scripts that held an agent's edits in `workspace`,
+    /// with how many runs did, sorted by name (SPEC R-SETUP.3.4). Reads only.
+    pub fn held_edit_programs(&self, workspace: &Path) -> Vec<(String, u32)> {
+        self.held_path(workspace)
+            .map(|p| read_held(&p).into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn held_path(&self, key: &Path) -> Option<PathBuf> {
+        self.lock_dir
+            .as_ref()
+            .map(|d| d.join(format!("ws-{}.held.json", key_id(key))))
     }
 
     /// Record that `op_id` was named in a full refusal for `workspace`, and
@@ -976,45 +1015,41 @@ mod tests {
     /// declared because `settings set` replaces the whole list, and only for a
     /// path-like program a human can recognise as the project's own.
     #[test]
-    fn an_edit_refusal_names_the_merged_source_readers_line() {
-        let holder = HolderInfo::new("op_7", "scripts/coach-reference.sh --all > log 2>&1");
+    fn an_edit_refusal_sends_the_human_to_ahma_setup_for_the_projects_own_script() {
+        // Field case: the script was not the command's first word.
+        let holder = HolderInfo::new(
+            "op_7",
+            "source ./.env && scripts/coach-reference.sh --set expert 2>&1 | tail -12",
+        );
         let text = edit_refusal(
             Path::new("/ws/docs/a.md"),
             Path::new("/ws"),
             Some(&holder),
-            &["make check".to_string()],
+            &[],
         );
-        let line = "ahma settings set tools.source_readers \"['make check', 'scripts/coach-reference.sh']\"";
-        assert!(text.contains(line), "{text}");
+        assert!(
+            text.contains("ask the user to run `ahma setup`")
+                && text.contains("`scripts/coach-reference.sh`"),
+            "{text}"
+        );
+        assert!(!text.contains("source_readers"), "no setting names: {text}");
 
-        for title in ["python3 x.py", "cargo nextest run", "bash -c 'make'"] {
+        for title in ["python3 x.py", "cargo fmt", "bash -c 'make'"] {
             let holder = HolderInfo::new("op_8", title);
             let text = edit_refusal(Path::new("/ws/a.md"), Path::new("/ws"), Some(&holder), &[]);
             assert!(
-                !text.contains("ahma settings set"),
-                "never suggests a generic program: {title}: {text}"
+                !text.contains("ahma setup"),
+                "only a project's own script can be declared: {title}: {text}"
             );
         }
-    }
-
-    /// The suggested value is what `ahma settings set` actually accepts.
-    #[test]
-    fn the_suggested_source_readers_value_parses() {
-        let value =
-            source_readers_value(&["make check".to_string()], "scripts/x.sh").expect("a value");
-        let home = tempfile::tempdir().unwrap();
-        let file = home.path().join("settings.toml");
-        ahma_common::config::AhmaSettings::set_in_file(&file, "tools.source_readers", Some(&value))
-            .unwrap();
-        let settings = ahma_common::config::AhmaSettings::load_from_result(&file).unwrap();
-        assert_eq!(
-            settings.tools.source_readers,
-            vec!["make check".to_string(), "scripts/x.sh".to_string()]
+        // Already declared: it would not block, and is not suggested again.
+        let text = edit_refusal(
+            Path::new("/ws/a.md"),
+            Path::new("/ws"),
+            Some(&holder),
+            &["scripts/coach-reference.sh".into()],
         );
-        assert!(
-            source_readers_value(&["it's".to_string()], "scripts/x.sh").is_none(),
-            "an entry a literal string cannot hold gets no suggestion"
-        );
+        assert!(!text.contains("ahma setup"), "{text}");
     }
 
     use super::*;
@@ -1624,6 +1659,42 @@ mod edit_conflict_tests {
         assert!(!second.contains('\n'), "a repeat is one line: {second}");
         assert!(second.contains("op_7"), "{second}");
         assert!(second.len() < first.len() / 2, "{second}");
+    }
+
+    /// SPEC R-SETUP.3.4: a project script that held an agent's edits is
+    /// remembered for `ahma setup`, once per run that held them.
+    #[tokio::test]
+    async fn a_project_script_that_held_edits_is_remembered_once_per_run() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = dunce::canonicalize(td.path()).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        let queue = WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")));
+        let title = "source ./.env && scripts/coach-reference.sh --set expert";
+        {
+            let _lease = held(&queue, &repo, HolderInfo::new("op_1", title)).await;
+            assert!(queue.edit_conflict(&repo.join("docs/a.md"), &[]).is_some());
+            assert!(queue.edit_conflict(&repo.join("docs/b.md"), &[]).is_some());
+        }
+        assert_eq!(
+            queue.held_edit_programs(&repo),
+            [("scripts/coach-reference.sh".to_string(), 1)],
+            "two refusals in one run are one"
+        );
+        {
+            let _lease = held(&queue, &repo, HolderInfo::new("op_2", title)).await;
+            assert!(queue.edit_conflict(&repo.join("docs/a.md"), &[]).is_some());
+        }
+        assert_eq!(
+            queue.held_edit_programs(&repo),
+            [("scripts/coach-reference.sh".to_string(), 2)]
+        );
+        // A generic program is never recorded.
+        let other = repo.parent().unwrap().join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let _lease = held(&queue, &other, HolderInfo::new("op_3", "cargo fmt")).await;
+        assert!(queue.edit_conflict(&other.join("a.rs"), &[]).is_some());
+        assert!(queue.held_edit_programs(&other).is_empty());
     }
 }
 
