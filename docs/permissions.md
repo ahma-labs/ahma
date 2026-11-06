@@ -163,7 +163,7 @@ every copy of the question that is waiting (SPEC R-PERM.3.8):
   answer will cover its whole session.
 
 An answer never reaches across projects: a yes in one repository is never a grant in another.
-||||||| parent of abbc0ce2 (feat(mcp): tools/list carries MCP tool hints, and claims read-only only where it holds)
+
 ## Tool hints for your client
 
 Every ahma tool tells the client what it does, through MCP's tool hints
