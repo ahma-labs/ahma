@@ -163,6 +163,29 @@ every copy of the question that is waiting (SPEC R-PERM.3.8):
   answer will cover its whole session.
 
 An answer never reaches across projects: a yes in one repository is never a grant in another.
+||||||| parent of abbc0ce2 (feat(mcp): tools/list carries MCP tool hints, and claims read-only only where it holds)
+## Tool hints for your client
+
+Every ahma tool tells the client what it does, through MCP's tool hints
+(`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). Tools that only
+look, such as `status`, `await`, `logs_read` and the file readers, are marked read-only.
+Anything that changes the workspace, asks for a grant or reaches the network is not. A
+configured tool is read-only only when its definition says `"mutates": false`, or declares
+the read-only lane on a platform whose kernel enforces it. Tools ahma re-exports from other
+MCP servers carry no hints. The hints are advice to the client. ahma's sandbox and its own
+questions apply whatever the client does with them (SPEC R1.5.6).
+
+What a client does with them is its own choice. Measured 2026-11-07 with Claude Code
+2.1.319:
+
+| Permission mode | Read-only ahma tool | Same tool without the hint |
+|---|---|---|
+| plan | runs without asking | refused |
+| auto | runs (the classifier decides) | runs |
+| default | asks | asks |
+
+Plan mode is where the hints matter: Plan subagents can now check `status` or read logs
+without a prompt each.
 
 ## When a grant takes effect
 

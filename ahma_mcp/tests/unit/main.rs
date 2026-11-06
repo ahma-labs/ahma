@@ -83,6 +83,7 @@ mod tool_availability_coverage_test;
 mod tool_availability_integration_test;
 mod tool_config_schema_validation_test;
 mod tool_examples_execution_test;
+mod tool_hints_test;
 mod tool_suite;
 mod tripwire_budget_test;
 mod update_test;
