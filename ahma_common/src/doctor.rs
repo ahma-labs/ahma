@@ -58,6 +58,8 @@ pub struct Finding {
 pub enum Fix {
     /// Remove persistent scope grants whose folder no longer exists.
     RemoveMissingScopes(Vec<PathBuf>),
+    /// Remove saved grants of paths ahma refuses and so never applies.
+    RemoveRefusedScopes(Vec<PathBuf>),
     /// Forget approvals and trust recorded for folders that no longer exist.
     ForgetMissingWorkspaces(Vec<PathBuf>),
     /// Clean up bloated one-off and malformed grants in ~/.gemini configs, ensuring clean ahma command grants.
@@ -86,6 +88,12 @@ impl Fix {
                 paths.len(),
                 join_paths(paths)
             ),
+            Fix::RemoveRefusedScopes(paths) => format!(
+                "Remove {} saved grant(s) ahma refuses and never applies from \
+                 ~/.ahma/settings.toml: {}",
+                paths.len(),
+                join_paths(paths)
+            ),
             Fix::ForgetMissingWorkspaces(paths) => format!(
                 "Forget approvals recorded for {} folder(s) that no longer exist: {}",
                 paths.len(),
@@ -110,7 +118,9 @@ impl Fix {
     /// stamped `now` (RFC 3339, supplied by the caller).
     pub fn apply(&self, now: &str) -> anyhow::Result<String> {
         match self {
-            Fix::RemoveMissingScopes(paths) => apply_remove_missing_scopes(paths, now),
+            Fix::RemoveMissingScopes(paths) | Fix::RemoveRefusedScopes(paths) => {
+                apply_remove_missing_scopes(paths, now)
+            }
             Fix::ForgetMissingWorkspaces(paths) => apply_forget_missing_workspaces(paths, now),
             Fix::RestartDaemon { name } => apply_restart_daemon(name),
             Fix::StopProcess { name, pid } => apply_stop_process(name, *pid),
@@ -283,6 +293,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
     let settings = check_settings(input, &mut findings);
     if let Some(settings) = &settings {
         check_missing_scopes(settings, &mut findings);
+        check_refused_scopes(settings, &mut findings);
         check_global_scopes(settings, &mut findings);
         check_missing_workspaces(settings, &mut findings);
         check_trust(settings, &input.workspace, &mut findings);
@@ -612,6 +623,35 @@ fn check_missing_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
             join_paths(&missing)
         ),
         fix: Some(Fix::RemoveMissingScopes(missing)),
+    });
+}
+
+/// A saved grant of a path ahma now refuses (SPEC R-PERM.4.3) is never
+/// applied: every session skips it with a warning. Say so once, here, with
+/// the fix. Field case: `/bin/ps` saved read+write before the system program
+/// trees were refused.
+fn check_refused_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
+    let mut refused: Vec<PathBuf> = Vec::new();
+    let mut why = Vec::new();
+    for scope in &settings.sandbox.persistent_scopes {
+        if let Some(reason) = crate::scope_grant::refusal_reason(&scope.path)
+            && !refused.contains(&scope.path)
+        {
+            why.push(format!("{}: {reason}", scope.path.display()));
+            refused.push(scope.path.clone());
+        }
+    }
+    if refused.is_empty() {
+        return;
+    }
+    out.push(Finding {
+        level: Level::Warn,
+        title: "Saved grants that ahma refuses and never applies".into(),
+        detail: format!(
+            "Every session skips these and logs a warning. {}",
+            why.join(" ")
+        ),
+        fix: Some(Fix::RemoveRefusedScopes(refused)),
     });
 }
 
@@ -1266,6 +1306,37 @@ mod tests {
         );
         assert!(render(&findings).contains("fix 1: Remove 1 granted folder"));
         assert_eq!(findings[0].level, Level::Warn, "most serious first");
+    }
+
+    /// SPEC R-PERM.4.3: a grant saved before its path was refused (the field
+    /// case: `/bin/ps`, read+write) is reported with a fix, not left to warn
+    /// in every session's log.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_grant_ahma_refuses_is_reported_with_a_fix() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let mut settings = AhmaSettings::default();
+        settings.sandbox.persistent_scopes.push(PersistentScope {
+            path: PathBuf::from("/bin/ps"),
+            access: ScopeAccess::Rw,
+            workspace: Some(PathBuf::from("/Volumes/T7/github")),
+            granted_by: Some("harness dialog".into()),
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        });
+        settings
+            .save_to(&home.path().join("settings.toml"))
+            .unwrap();
+
+        let findings = run(&input(home.path(), ws.path()));
+        assert!(
+            fixes(&findings).contains(&Fix::RemoveRefusedScopes(vec![PathBuf::from("/bin/ps")])),
+            "{}",
+            render(&findings)
+        );
+        assert!(render(&findings).contains("ahma refuses and never applies"));
     }
 
     #[test]

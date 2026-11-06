@@ -2380,7 +2380,14 @@ fn ask_first_if_refused_before(
         &tool.command,
         &cfg.persistent_scopes,
     ) {
-        Some((question, token)) => (harness_ask::ask_reason(&question), token),
+        Some((question, token)) => {
+            let (workspace, binding) =
+                harness_ask::approval_binding(&question, Path::new(&cwd), &cfg.persistent_scopes);
+            (
+                harness_ask::ask_reason(&question, &workspace, &binding),
+                token,
+            )
+        }
         // A signature the SSH key broker refused (SPEC R-CRED.3).
         None => match harness_ask::next_ssh_ask(
             Path::new(&cwd),
