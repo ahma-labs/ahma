@@ -116,6 +116,9 @@ applies to a running server from its next command.
 
 Some refusals no grant or setting can change: opening an app with `open` (macOS runs it
 outside any sandbox), a setuid program such as `ps`, an operation the sandbox withholds.
+A setuid program is never offered as a grant either: `bash: /bin/ps: Operation not
+permitted` names the program, not a file to open, and nothing inside the system program
+trees (`/bin`, `/usr` except `/usr/local`, …) is ever granted (SPEC R6.2.8.1, R-PERM.4.3).
 When the kernel's own record says a hooked command hit one of those (macOS), the command's
 output says so. In Claude Code, run the same command again: ahma's dialog asks whether to
 run **that exact command once, outside the sandbox**. A yes runs it once, says so before it
@@ -152,7 +155,9 @@ next session; see
   you approve, in Claude Code's dialog, a directory already granted to a sibling
   checkout (`~/src/alt2/app` after `~/src/app`), the grant moves to the folder that
   holds both (`~/src`) and covers every checkout there — never your home folder or a
-  volume root (SPEC R5.4.11.1). `--global` is the explicit opt-out, and `ahma doctor` flags grants that
+  volume root (SPEC R5.4.11.1). Only a directory outside both checkouts is shared this
+  way (a cache or toolchain), never a single file, and the dialog says "every workspace
+  under `~/src`" before you answer. `--global` is the explicit opt-out, and `ahma doctor` flags grants that
   have no workspace.
 - **Tier**: at a prompt you can answer for this session only (`read-write-session`
   / `read-only-session`, or `y` / `r` in the TUI): applied now, audited, never

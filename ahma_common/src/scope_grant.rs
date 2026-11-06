@@ -960,6 +960,17 @@ fn check_grant_refusal(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> 
         ));
     }
 
+    // 6. Anything inside the trees holding the OS's own programs.
+    if let Some(tree) = system_program_tree(path) {
+        return Some(format!(
+            "'{}' is inside {tree}, which holds the operating system's own programs — every \
+             command already reads and runs them, and writing there is never needed for a \
+             build. A program refused there was refused for being run (a setuid program such \
+             as `ps`), which no grant changes",
+            path.display()
+        ));
+    }
+
     None
 }
 
@@ -1104,6 +1115,45 @@ pub fn is_system_dir(path: &Path) -> bool {
         .any(|d| path == Path::new(d) || lexical.as_deref() == Some(Path::new(d)))
 }
 
+/// The tree holding the OS's own programs and libraries that `path` lies in,
+/// if any (SPEC R-PERM.4.3). [`is_system_dir`] refuses only the directories
+/// themselves; this refuses everything inside them, so `/bin/ps` is never an
+/// ordinary grant. Every sandbox already reads and runs these trees (macOS
+/// confines no reads but credentials; Landlock grants them read+execute), so
+/// refusing a grant there loses nothing. `/usr/local` is the user's own and
+/// stays grantable, and `/dev`, `/etc` and `/var` are not trees of programs:
+/// a serial port or a device is a legitimate grant.
+pub fn system_program_tree(path: &Path) -> Option<&'static str> {
+    const UNIX_TREES: &[&str] = &[
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/libx32",
+        "/boot",
+        "/System",
+        "/Library/Apple",
+    ];
+    if cfg!(windows) {
+        // Case-insensitive, with or without the verbatim prefix.
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        let lower = lower.strip_prefix(r"\\?\").unwrap_or(&lower);
+        return (lower == r"c:\windows" || lower.starts_with(r"c:\windows\"))
+            .then_some(r"C:\Windows");
+    }
+    // `/System/Volumes/Data` is the data volume (macOS firmlinks `/Users`,
+    // `/opt` and the like into it, and `/home` resolves there), not the OS.
+    if path.starts_with("/usr/local") || path.starts_with("/System/Volumes/Data") {
+        return None;
+    }
+    UNIX_TREES
+        .iter()
+        .copied()
+        .find(|tree| path.starts_with(tree))
+}
+
 /// Whether `name` (a `~/<name>` hidden directory) is a well-known build cache,
 /// in which case a hidden-home-dir grant is unremarkable rather than elevated.
 pub fn is_known_cache_dir(name: &str) -> bool {
@@ -1178,10 +1228,17 @@ pub fn binding_for(
 ) -> (PathBuf, Vec<PathBuf>) {
     let mut binding = workspace.to_path_buf();
     let mut replaced = Vec::new();
+    // Only a directory a tool keeps outside the checkouts is shared: a single
+    // file (the field case was `/bin/ps`) or a path inside a workspace stays
+    // bound to the workspace that approved it.
+    if path.is_file() || path.starts_with(workspace) {
+        return (binding, replaced);
+    }
     for other in existing
         .iter()
         .filter(|s| crate::config::scope_paths_equiv(&s.path, path))
         .filter_map(|s| s.workspace.as_deref())
+        .filter(|other| !path.starts_with(other))
     {
         let Some(shared) = binding.ancestors().find(|a| other.starts_with(a)) else {
             continue;
@@ -1318,6 +1375,35 @@ mod tests {
             ),
             "and to every other clone under it"
         );
+    }
+
+    /// SPEC R5.4.11.1, field case: `/bin/ps`, a single file, approved in a
+    /// second clone, was rebound to the folder holding every repository on
+    /// the drive. Sharing through the parent folder is for a directory a tool
+    /// keeps outside the checkouts (a cache, a toolchain). A file, or a path
+    /// inside one of the two workspaces, keeps its own binding.
+    #[test]
+    fn only_a_directory_outside_both_workspaces_is_shared() {
+        let home = Some(Path::new("/Users/me"));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tool.lock");
+        std::fs::write(&file, "").unwrap();
+        let file = file.to_str().unwrap();
+        let (a, b) = ("/Volumes/T7/github/neubit4", "/Volumes/T7/github/ahma");
+        let existing = [scope_for(file, a)];
+        let (binding, replaced) = binding_for(Path::new(file), Path::new(b), &existing, home);
+        assert_eq!(binding, Path::new(b), "a single file is never shared");
+        assert!(replaced.is_empty());
+
+        let inside = "/Volumes/T7/github/neubit4/target";
+        let existing = [scope_for(inside, a)];
+        let (binding, replaced) = binding_for(Path::new(inside), Path::new(b), &existing, home);
+        assert_eq!(
+            binding,
+            Path::new(b),
+            "a path inside a workspace is never shared"
+        );
+        assert!(replaced.is_empty());
     }
 
     /// The folder holding both must be one a binding may name: never home or
@@ -2260,6 +2346,55 @@ mod denylist_by_prefix_tests {
             classify_grant_risk(path, Some(home), &[]),
             GrantRisk::Refused(_)
         )
+    }
+
+    /// SPEC R-PERM.4.3, field case: `/bin/ps` was offered as an ordinary
+    /// read+write grant (risk NORMAL) and approved, because only the exact
+    /// system directory was refused. Nothing inside the trees that hold the
+    /// OS's own programs is ever granted: every sandbox already reads and runs
+    /// them, and a write there is never needed for a build.
+    #[test]
+    fn nothing_inside_the_system_program_trees_is_granted() {
+        let home = tempfile::tempdir().unwrap();
+        let h = dunce::canonicalize(home.path()).unwrap();
+        let mut inside = vec![
+            "/bin/ps",
+            "/sbin/mount",
+            "/usr/bin/sudo",
+            "/usr/lib/libz.so",
+            "/usr/share/zoneinfo",
+            "/lib/modules",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/boot/vmlinuz",
+            "/System/Library",
+            "/Library/Apple/usr",
+        ];
+        if cfg!(windows) {
+            inside = vec![r"C:\Windows\System32", r"c:\windows\system32\drivers"];
+        }
+        for p in inside {
+            assert!(refused(Path::new(p), &h), "{p} must be refused");
+        }
+    }
+
+    /// The trees' own local corners stay grantable: `/usr/local` is where
+    /// Homebrew on Intel and hand-built tools live, and `/dev` holds the
+    /// serial ports and devices an embedded build talks to.
+    #[test]
+    fn local_and_device_paths_stay_grantable() {
+        let home = tempfile::tempdir().unwrap();
+        let h = dunce::canonicalize(home.path()).unwrap();
+        for p in [
+            "/usr/local/lib/node_modules",
+            "/usr/local",
+            "/dev/cu.usbserial-1",
+            "/opt/homebrew/var",
+            // macOS: `/home/u` canonicalizes into the data volume.
+            "/System/Volumes/Data/home/u/.cache/sccache",
+            "/System/Volumes/Data/Users/me/.cache",
+        ] {
+            assert!(!refused(Path::new(p), &h), "{p} must stay grantable");
+        }
     }
 
     /// SPEC R5.4.5: the credential directories are refused *with everything in

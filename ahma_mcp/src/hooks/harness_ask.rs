@@ -147,9 +147,31 @@ pub(super) fn next_ask(
     Some((question, token))
 }
 
-/// The dialog text for `question`: what was refused, what a yes grants and
-/// for how long, what a no means, and how to make it permanent.
-pub(super) fn ask_reason(question: &Question) -> String {
+/// The workspace a yes to `question` asked in `cwd` is approved in, and the
+/// binding the grant will be saved with: the same [`binding_for`] answer
+/// [`persist_approval`] reaches, so the dialog says what a yes really does
+/// (SPEC R5.4.11.1, R7).
+///
+/// [`binding_for`]: ahma_common::scope_grant::binding_for
+pub(super) fn approval_binding(
+    question: &Question,
+    cwd: &Path,
+    persistent: &[PersistentScope],
+) -> (PathBuf, PathBuf) {
+    let workspace = workspace_for(cwd);
+    let home = ahma_common::config::ahma_home_dir();
+    let (binding, _) = ahma_common::scope_grant::binding_for(
+        &question.dir,
+        &workspace,
+        persistent,
+        home.as_deref(),
+    );
+    (workspace, binding)
+}
+
+/// The dialog text for `question`: what was refused, what a yes grants, to
+/// which workspaces and for how long, what a no means, and how to undo it.
+pub(super) fn ask_reason(question: &Question, workspace: &Path, binding: &Path) -> String {
     let verb = if question.access.is_write() {
         "write"
     } else {
@@ -170,11 +192,18 @@ pub(super) fn ask_reason(question: &Question) -> String {
             ahma_common::scope_grant::GrantRisk::High(why) => format!(" Note: {}.", why.join("; ")),
             _ => String::new(),
         };
+    let whom = if binding == workspace {
+        "commands in this workspace".to_string()
+    } else {
+        format!(
+            "commands in every workspace under {} (it is already granted to another one there)",
+            binding.display()
+        )
+    };
     format!(
         "ahma: an earlier command here was refused {verb} access to {} ({}). Approve to let \
-         commands in this workspace {verb} it from now on (remembered; undo with `ahma sandbox \
-         revoke {}`), then run this command. Deny and ahma will not ask about it again this \
-         session.{risk}",
+         {whom} {verb} it from now on (remembered; undo with `ahma sandbox revoke {}`), then \
+         run this command. Deny and ahma will not ask about it again this session.{risk}",
         question.dir.display(),
         covers.join(", "),
         question.dir.display(),
@@ -750,6 +779,27 @@ mod tests {
         ));
     }
 
+    /// SPEC R5.4.11.1, R7: a yes that shares the grant with every workspace
+    /// under a parent folder must say so before it is given. The field case
+    /// asked about "this workspace" and then reported "every workspace under
+    /// /Volumes/T7/github".
+    #[test]
+    fn the_dialog_names_a_shared_binding_before_the_yes() {
+        let q = Question {
+            dir: PathBuf::from("/Volumes/T7/caches/swiftpm"),
+            access: ScopeAccess::Rw,
+            covers: vec![PathBuf::from("/Volumes/T7/caches/swiftpm/manifests")],
+        };
+        let ws = PathBuf::from("/Volumes/T7/github/ahma");
+        let shared = PathBuf::from("/Volumes/T7/github");
+        let r = ask_reason(&q, &ws, &shared);
+        assert!(
+            r.contains("commands in every workspace under /Volumes/T7/github"),
+            "{r}"
+        );
+        assert!(!r.contains("commands in this workspace"), "{r}");
+    }
+
     #[test]
     fn the_dialog_says_what_yes_and_no_mean() {
         let q = Question {
@@ -757,7 +807,9 @@ mod tests {
             access: ScopeAccess::Rw,
             covers: vec![PathBuf::from("/opt/neubit-cache/heavy.lock.holder")],
         };
-        let r = ask_reason(&q);
+        let ws = PathBuf::from("/Volumes/T7/github/neubit4");
+        let r = ask_reason(&q, &ws, &ws);
+        assert!(r.contains("commands in this workspace"), "{r}");
         assert!(
             r.contains("refused write access to /opt/neubit-cache"),
             "{r}"

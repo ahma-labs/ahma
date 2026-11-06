@@ -98,6 +98,13 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
     let mut recent_path: Option<(PathBuf, usize)> = None;
 
     for line in stderr.lines() {
+        // A setuid program the shell could not run is no denial a grant can
+        // fix (SPEC R6.2.8): skip it, and never let a later line borrow its
+        // path. `setuid_denial_note` explains it instead.
+        if super::setuid::refused_exec_program(line).is_some() {
+            continue;
+        }
+
         // Shape 1: keyword and path on the same line (most specific).
         if let Some(hit) = scan_line(line) {
             return Some(hit);
@@ -427,6 +434,41 @@ pub fn scan_signal_denial(output: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R6.2.8, field case: `bash: /bin/ps: Operation not permitted` was
+    /// read as a refused **write** of `/bin/ps`, offered as a read+write grant,
+    /// and approved. A setuid program is refused for being run, which no grant
+    /// changes, so the line is no denial to offer — not even as the path a
+    /// later keyword-only line borrows. Unix only: setuid is a Unix bit. A
+    /// real system program, because a sandboxed test cannot set the bit.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_setuid_exec_is_never_a_grant() {
+        let Some(prog) = super::super::setuid::a_setuid_program() else {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            panic!("macOS and Linux always ship a setuid program");
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            return;
+        };
+        let line = format!("bash: {}: Operation not permitted", prog.display());
+        assert_eq!(scan_denial_streams(&line, ""), None);
+        assert_eq!(scan_denial_streams("", &line), None, "merged into stdout");
+        let borrowed = format!("{line}\nCaused by:\n  Operation not permitted (os error 1)");
+        assert_eq!(scan_denial(&borrowed), None, "nor borrowed by a later line");
+    }
+
+    /// The same shell message for a redirect into an ordinary file stays the
+    /// refused write it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_redirect_is_still_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        let line = format!("bash: {}: Operation not permitted", out.display());
+        let hit = scan_denial_streams(&line, "").expect("a refused write");
+        assert_eq!(hit.path, out);
+        assert_eq!(hit.access, ScopeAccess::Rw);
+    }
 
     /// macOS reports a refused *read* as "Operation not permitted" too. Reads
     /// are refused only on the credential set, so a refusal there is a read:

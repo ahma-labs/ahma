@@ -141,3 +141,82 @@ async fn adapter_sync_denial_on_symlinked_target_returns_runtime_denial() {
         other => panic!("expected RuntimeDenial, got: {:?}", other),
     }
 }
+
+/// SPEC R6.2.8, field case: a hooked `ps` failed with `bash: /bin/ps:
+/// Operation not permitted`, came back as a refused **write** of `/bin/ps`
+/// with a read+write grant offered, and the grant was approved. A setuid
+/// program is refused for being run; the result must say so and offer no
+/// grant. A script prints the shell's exact line for a real setuid program
+/// (a sandboxed test cannot make one: the kernel drops the bit). Unix only:
+/// setuid is a Unix permission bit.
+#[cfg(unix)]
+#[tokio::test]
+async fn adapter_sync_refused_setuid_exec_is_a_note_not_a_grant() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(program) = [
+        "/bin/ps",
+        "/usr/bin/passwd",
+        "/usr/bin/su",
+        "/bin/su",
+        "/usr/bin/sudo",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .find(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o6000 != 0)) else {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        panic!("macOS and Linux always ship a setuid program");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        return;
+    };
+
+    let ws = tempfile::tempdir().expect("ws");
+    let ws_canon = dunce::canonicalize(ws.path()).unwrap();
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![ws_canon.clone()],
+            ahma_mcp::sandbox::SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+    let operation_monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(5),
+    )));
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig {
+        command_timeout: Duration::from_secs(5),
+    }));
+    let adapter = Adapter::new(operation_monitor, shell_pool, sandbox).expect("adapter");
+
+    std::fs::write(
+        ws_canon.join("fail.sh"),
+        format!(
+            "printf 'bash: {}: Operation not permitted\\n' >&2\nexit 126\n",
+            program.display()
+        ),
+    )
+    .unwrap();
+    let res = adapter
+        .execute_sync_in_dir(
+            "sh fail.sh",
+            None,
+            &ws_canon.to_string_lossy(),
+            Some(5),
+            None,
+        )
+        .await;
+
+    let text = match &res {
+        Ok(out) => out.clone(),
+        Err(e) => {
+            if let Some(ahma_mcp::sandbox::SandboxError::RuntimeDenial { path, access, .. }) =
+                e.downcast_ref::<ahma_mcp::sandbox::SandboxError>()
+            {
+                panic!("a refused setuid exec offered a {access:?} grant on {path:?}");
+            }
+            format!("{e:#}")
+        }
+    };
+    assert!(text.contains("not a path to grant"), "{text}");
+}
