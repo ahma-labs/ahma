@@ -250,6 +250,87 @@ impl BuiltinTool {
     }
 }
 
+/// A tool's MCP hints (`ToolAnnotations`): advisory metadata a client may use
+/// to decide whether to ask before a call (SPEC R1.5.6). Never a gate of
+/// ahma's own: the sandbox, the grant tools' human question and the egress
+/// gate hold whatever a client does with these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolHints {
+    /// Changes nothing and sends nothing off this machine.
+    pub read_only: bool,
+    /// May destroy or overwrite something (meaningful only when not read-only).
+    pub destructive: bool,
+    /// Calling it again with the same arguments has no further effect.
+    pub idempotent: bool,
+    /// Reaches beyond this machine (the network, a remote model).
+    pub open_world: bool,
+}
+
+impl ToolHints {
+    const fn new(read_only: bool, destructive: bool, idempotent: bool, open_world: bool) -> Self {
+        Self {
+            read_only,
+            destructive,
+            idempotent,
+            open_world,
+        }
+    }
+
+    /// The rmcp annotations carrying these hints, for `tools/list`.
+    pub fn annotations(self) -> rmcp::model::ToolAnnotations {
+        rmcp::model::ToolAnnotations::new()
+            .read_only(self.read_only)
+            .destructive(self.destructive)
+            .idempotent(self.idempotent)
+            .open_world(self.open_world)
+    }
+}
+
+impl BuiltinTool {
+    /// This built-in's MCP hints (SPEC R1.5.6).
+    ///
+    /// Read-only means it changes nothing *and* sends nothing off the machine:
+    /// a client that honours the hint may run it without asking, so anything
+    /// that [mutates](Self::is_mutating), [crosses the sandbox
+    /// boundary](Self::crosses_sandbox_boundary) or reaches the network is
+    /// never read-only. `todo_write` only replaces ahma's in-memory checklist,
+    /// but that is still a change. `fetch_webpage` is a GET, and a GET can
+    /// carry data out in its URL.
+    pub const fn hints(self) -> ToolHints {
+        match self {
+            // Inspect operations, logs, files or help, and nothing else.
+            BuiltinTool::Await
+            | BuiltinTool::Status
+            | BuiltinTool::LogsList
+            | BuiltinTool::LogsRead
+            | BuiltinTool::LogsSearch
+            | BuiltinTool::ReadFile
+            | BuiltinTool::ListDir
+            | BuiltinTool::FileSearch
+            | BuiltinTool::GrepSearch
+            | BuiltinTool::AhmaHelp => ToolHints::new(true, false, true, false),
+            // Change ahma's own state, only after a human said yes (the grant
+            // tools), or only its checklist (`todo_write`).
+            BuiltinTool::TodoWrite
+            | BuiltinTool::SandboxGrant
+            | BuiltinTool::NetworkGrant
+            | BuiltinTool::LogsApprove => ToolHints::new(false, false, true, false),
+            BuiltinTool::FetchWebpage => ToolHints::new(false, false, true, true),
+            // Starts an operation that sends log lines to a model.
+            BuiltinTool::LogMonitor => ToolHints::new(false, false, false, true),
+            // Runs a whole agent loop: edits, commands, a model.
+            BuiltinTool::Agent => ToolHints::new(false, true, false, true),
+            BuiltinTool::RunTerminalCommand => ToolHints::new(false, true, false, true),
+            BuiltinTool::Restart => ToolHints::new(false, true, false, false),
+            BuiltinTool::Cancel => ToolHints::new(false, true, true, false),
+            BuiltinTool::WriteFile => ToolHints::new(false, true, true, false),
+            BuiltinTool::ReplaceInFile | BuiltinTool::MultiEdit | BuiltinTool::ApplyPatch => {
+                ToolHints::new(false, true, false, false)
+            }
+        }
+    }
+}
+
 impl BuiltinTool {
     /// Whether this built-in's effect reaches **outside** the workspace sandbox,
     /// so a trusted folder (SPEC R-PERM.1.3) must not auto-approve it.
@@ -312,6 +393,49 @@ impl BuiltinTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R1.5.6: every built-in states its MCP tool hints, and the table is
+    /// pinned here so a change to one is a deliberate edit of this test.
+    #[test]
+    fn every_builtin_declares_its_hints() {
+        use BuiltinTool::*;
+        // (read_only, destructive, idempotent, open_world)
+        let expected = |t: BuiltinTool| match t {
+            Await | Status | LogsList | LogsRead | LogsSearch | ReadFile | ListDir | FileSearch
+            | GrepSearch | AhmaHelp => (true, false, true, false),
+            TodoWrite | SandboxGrant | NetworkGrant | LogsApprove => (false, false, true, false),
+            FetchWebpage => (false, false, true, true),
+            LogMonitor => (false, false, false, true),
+            Agent => (false, true, false, true),
+            RunTerminalCommand => (false, true, false, true),
+            Restart => (false, true, false, false),
+            Cancel => (false, true, true, false),
+            WriteFile => (false, true, true, false),
+            ReplaceInFile | MultiEdit | ApplyPatch => (false, true, false, false),
+        };
+        for tool in BuiltinTool::ALL {
+            let h = tool.hints();
+            assert_eq!(
+                (h.read_only, h.destructive, h.idempotent, h.open_world),
+                expected(*tool),
+                "{}",
+                tool.name()
+            );
+        }
+    }
+
+    /// SPEC R1.5.6: a hint can let a client skip its own prompt, so nothing
+    /// that changes the workspace, crosses the sandbox boundary, or sends
+    /// data off the machine may claim to be read-only.
+    #[test]
+    fn nothing_that_mutates_or_crosses_the_boundary_is_read_only() {
+        for tool in BuiltinTool::ALL {
+            let h = tool.hints();
+            if tool.is_mutating() || tool.crosses_sandbox_boundary() || h.open_world {
+                assert!(!h.read_only, "{} must not be read-only", tool.name());
+            }
+        }
+    }
 
     /// The bridge gates on a list it can see without depending on this crate
     /// (SPEC R-HELP.1); this is what keeps it equal to the source of truth.

@@ -223,6 +223,20 @@ may change.
   still cross the sandbox boundary so trusting a folder never answers for them
   (R-PERM.1.3), and they carry `_meta["anthropic/requiresUserInteraction"]` so a
   harness never auto-approves them (R5.4.5).
+* **R1.5.6**: **Tool hints say only what holds.** Every tool in `tools/list` that ahma can
+  vouch for carries MCP `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`), so a client may skip its own prompt for a tool that only looks. A hint
+  is advisory: the sandbox, the grant tools' human question (R1.5.5) and the egress gate
+  hold whatever a client does with it. Built-ins: one exhaustive table
+  (`BuiltinTool::hints`); read-only means it changes nothing **and** sends nothing off the
+  machine, so nothing that mutates, crosses the sandbox boundary or reaches the network
+  (`fetch_webpage`, `log_monitor`, `agent`) is read-only. Configured tools: read-only only
+  when the author declared `mutates: false`, or declared the read-only lane and this sandbox
+  can enforce it (`Sandbox::can_enforce_read_only`, R2.7.4), never from the lane alone where
+  no kernel enforces it (Windows, Test mode); otherwise no hint, leaving the spec's cautious
+  defaults, and `openWorldHint` is never set for them. Tools re-exported from external MCP
+  servers (`server::tool`) carry **no** hints: an upstream server's claim to be read-only
+  must not buy it a skipped prompt through ahma (R-PERM.1.3).
 * **R1.5.4**: The `instructions` field of the MCP `initialize` response directs the model to
   use `run_terminal_command` for command execution and describes the session's actual
   execution mode (R2.1).

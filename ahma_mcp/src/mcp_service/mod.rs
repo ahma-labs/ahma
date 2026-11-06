@@ -595,7 +595,9 @@ impl AhmaMcpService {
                 ),
             ),
         };
-        let mut built = self_titled_tool(tool.name(), description, input_schema);
+        // SPEC R1.5.6: advisory hints for clients; ahma's own gates still hold.
+        let mut built = self_titled_tool(tool.name(), description, input_schema)
+            .with_annotations(tool.hints().annotations());
         if matches!(
             tool,
             BuiltinTool::SandboxGrant | BuiltinTool::NetworkGrant | BuiltinTool::LogsApprove
@@ -1104,7 +1106,34 @@ impl AhmaMcpService {
         let base_name = &tool_config.name;
         let description = self.tool_description(tool_config, base_name);
         let input_schema = schema::generate_schema_for_tool_config(tool_config);
-        self_titled_tool(base_name.clone(), description, input_schema)
+        let tool = self_titled_tool(base_name.clone(), description, input_schema);
+        self.with_config_hints(tool, tool_config.mutates, tool_config.concurrency)
+    }
+
+    /// A configured tool's read-only hint (SPEC R1.5.6): only what holds. Its
+    /// author said `mutates: false` (the statement the agent loop's approval
+    /// gate already trusts), or it declared the read-only lane and this
+    /// sandbox has a kernel to enforce it (R2.7.4). Nothing else is claimed:
+    /// with no hint, a client keeps the spec's cautious defaults, and
+    /// `openWorld` is never set, because nothing in a tool definition says
+    /// whether it reaches the network.
+    fn with_config_hints(
+        &self,
+        tool: Tool,
+        mutates: Option<bool>,
+        lane: Option<crate::adapter::workspace_queue::Lane>,
+    ) -> Tool {
+        let enforced_read_only = lane == Some(crate::adapter::workspace_queue::Lane::ReadOnly)
+            && self.adapter.sandbox().can_enforce_read_only();
+        if mutates == Some(false) || enforced_read_only {
+            tool.with_annotations(
+                rmcp::model::ToolAnnotations::new()
+                    .read_only(true)
+                    .destructive(false),
+            )
+        } else {
+            tool
+        }
     }
 
     fn flattened_subcommand_description(
@@ -1133,7 +1162,15 @@ impl AhmaMcpService {
             tool_config,
             &(sub_path.to_string(), subcommand_config),
         ));
-        self_titled_tool(flat_name, description, input_schema)
+        let tool = self_titled_tool(flat_name, description, input_schema);
+        // The leaf's lane already carries the tool's, pushed down at parse
+        // time (`with_inherited_concurrency`); `mutates` is resolved here,
+        // as `non_mutating_tool_names` does.
+        self.with_config_hints(
+            tool,
+            subcommand_config.mutates.or(tool_config.mutates),
+            subcommand_config.concurrency,
+        )
     }
 
     /// Creates MCP Tools from a ToolConfig.
