@@ -344,6 +344,8 @@ fn persist_workspace_grant(
 
     // Strict load on the write path: never clobber a settings file we cannot
     // parse — it holds every other permission the user has granted.
+    let _settings_lock =
+        ahma_common::config::lock_settings_for_write(&path).map_err(std::io::Error::other)?;
     let mut settings = AhmaSettings::load_from_result(&path).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,

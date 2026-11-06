@@ -146,6 +146,24 @@ asked at once; one made with `a` in `ahma tui` reaches sandboxed log monitors fr
 next session; see
 [Live log monitoring](live-log-monitoring.md#log-files-that-link-outside-the-workspace).
 
+## One answer for every agent waiting on it
+
+Agents often hit the same wall together: Claude Code runs subagents in parallel, and two
+sessions in one project may need the same cache. ahma asks once and lets one answer settle
+every copy of the question that is waiting (SPEC R-PERM.3.8):
+
+- Parallel commands of one Claude Code session get **one** dialog for a refused folder,
+  not one each. After a yes, the others' next commands are covered.
+- In the TUI, answering a question also answers its copies from other sessions in the same
+  project, at the same tier. A grant covers the same folder and everything under it; a no
+  covers exactly the same question.
+- An answer given in an agent's own client (its MCP prompt) settles the copies waiting in
+  the TUI too.
+- An agent that asks again while the question is open is told it is waiting, and that the
+  answer will cover its whole session.
+
+An answer never reaches across projects: a yes in one repository is never a grant in another.
+
 ## When a grant takes effect
 
 - **Scope**: a filesystem grant is bound to the workspace it was approved for

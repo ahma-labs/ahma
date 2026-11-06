@@ -124,6 +124,7 @@ pub fn active_sessions(dir: &Path, now: u64, pid_alive: &dyn Fn(u32) -> bool) ->
 
 /// Save an `always` or lease grant to the settings file, and audit it.
 pub fn persist(settings_file: &Path, grant: SshSignGrant, surface: &str) -> Result<()> {
+    let _settings_lock = crate::config::lock_settings_for_write(settings_file)?;
     let mut settings = crate::config::AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!(e))
         .with_context(|| {

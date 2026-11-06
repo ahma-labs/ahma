@@ -408,12 +408,71 @@ pub enum GrantStatus {
     Closed,
 }
 
+/// Whether `decision`, given to the question `answered`, also settles the
+/// waiting question `waiting` (SPEC R-PERM.3.8: one answer settles every
+/// waiting copy).
+///
+/// Only within one workspace: a yes in one repository is never a grant in
+/// another, and a question whose workspace is unknown is never settled for
+/// it. A grant settles what it covers, its path and everything under it, a
+/// read under a write; a no settles exactly the same path and access.
+/// Log-target questions and filesystem questions are told apart, since their
+/// answers are different grants. Paths compare by whole components.
+pub fn answer_settles(
+    answered: &ScopeGrantRequest,
+    decision: GrantDecision,
+    waiting: &ScopeGrantRequest,
+) -> bool {
+    if answered.decision_id == waiting.decision_id {
+        return false;
+    }
+    let workspace = |r: &ScopeGrantRequest| {
+        r.context
+            .requester
+            .as_ref()
+            .and_then(|q| q.workspace.as_deref())
+            .map(canonicalize_best_effort)
+    };
+    match (workspace(answered), workspace(waiting)) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return false,
+    }
+    let log_target = |r: &ScopeGrantRequest| r.reason == GrantReason::LogTarget;
+    if log_target(answered) != log_target(waiting) {
+        return false;
+    }
+    match decision.access() {
+        None => waiting.path == answered.path && waiting.access == answered.access,
+        Some(granted) => {
+            waiting.path.starts_with(&answered.path)
+                && (granted.is_write() || !waiting.access.is_write())
+        }
+    }
+}
+
 /// Coordinates in-flight scope-grant decisions across surfaces. Cheap to share
 /// behind an `Arc`; all state is behind one mutex.
 #[derive(Debug, Default)]
 pub struct GrantCoordinator {
     inner: Mutex<Inner>,
+    /// Signalled when an answer lands in [`Inner::answered`], so the hub
+    /// reporter can pass it on without polling.
+    answered_signal: tokio::sync::Notify,
 }
+
+/// A question and the answer it got, as an instance reports it to the hub so
+/// the same answer can settle every other waiting copy (SPEC R-PERM.3.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnsweredQuestion {
+    /// The question as it was raised.
+    pub request: ScopeGrantRequest,
+    /// The answer, already held to what the question offered.
+    pub decision: GrantDecision,
+}
+
+/// Answers held for the hub reporter at most; with no reporter (no hub), the
+/// oldest are dropped rather than kept for ever.
+const ANSWERED_OUTBOX_CAP: usize = 64;
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -441,6 +500,8 @@ struct Inner {
     /// When each budgeted question in flight was charged, so a question that
     /// reached nobody can be refunded ([`GrantCoordinator::cancel_unseen`]).
     charged: HashMap<String, u64>,
+    /// Answers not yet passed to the hub, oldest first (SPEC R-PERM.3.8).
+    answered: std::collections::VecDeque<AnsweredQuestion>,
 }
 
 /// At most this many automatic prompts per [`PROMPT_WINDOW_SECS`] per session;
@@ -670,6 +731,15 @@ impl GrantCoordinator {
             .remove(decision_id)
             .map(|t| t.elapsed().as_millis() as u64);
 
+        if inner.answered.len() >= ANSWERED_OUTBOX_CAP {
+            inner.answered.pop_front();
+        }
+        inner.answered.push_back(AnsweredQuestion {
+            request: req.clone(),
+            decision,
+        });
+        self.answered_signal.notify_one();
+
         let Some(access) = decision.access() else {
             // Deny: suppress re-asking exactly this (path, access).
             inner.dismissed.insert((req.path.clone(), req.access));
@@ -692,6 +762,38 @@ impl GrantCoordinator {
             time_to_decision_ms,
             reason: req.reason,
         }
+    }
+
+    /// Whether a question that `access` to `path` would be settled by is
+    /// waiting for a human right now: the same path at the same access, or at
+    /// read-write for a read (SPEC R-PERM.3.8).
+    pub fn is_waiting(&self, path: &Path, access: ScopeAccess) -> bool {
+        let canonical = canonicalize_best_effort(path);
+        let inner = self.inner.lock();
+        inner.active_keys.contains(&(canonical.clone(), access))
+            || (!access.is_write() && inner.active_keys.contains(&(canonical, ScopeAccess::Rw)))
+    }
+
+    /// Take the answer `decision_id` got, if it is still waiting to be passed
+    /// to the hub.
+    pub fn take_answered(&self, decision_id: &str) -> Option<AnsweredQuestion> {
+        let mut inner = self.inner.lock();
+        let at = inner
+            .answered
+            .iter()
+            .position(|a| a.request.decision_id == decision_id)?;
+        inner.answered.remove(at)
+    }
+
+    /// Take every answer still waiting to be passed to the hub, oldest first.
+    pub fn drain_answered(&self) -> Vec<AnsweredQuestion> {
+        self.inner.lock().answered.drain(..).collect()
+    }
+
+    /// Wait until an answer is recorded. A signal sent while nobody waited is
+    /// kept for the next waiter, so an answer is never slept through.
+    pub async fn answered(&self) {
+        self.answered_signal.notified().await;
     }
 
     /// Cancel a decision without an answer (e.g. the asking session terminated).
@@ -762,7 +864,7 @@ impl GrantCoordinator {
 /// symlinks and `..` so two spellings of the same directory share one key and a
 /// spoofed stderr path cannot masquerade. Mirrors the parent-canonicalize fallback
 /// used by `path_security::validate_path` for paths that do not exist yet.
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+pub fn canonicalize_best_effort(path: &Path) -> PathBuf {
     let expanded = expand_home(path);
     // Canonicalize the deepest ancestor that exists and re-attach the rest.
     // Stopping one level up, as this once did, left a path two levels below a
@@ -1299,6 +1401,7 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
             canonical.display()
         );
     }
+    let _settings_lock = crate::config::lock_settings_for_write(settings_file)?;
     let mut settings = AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!(e))
         .with_context(|| {
@@ -1336,6 +1439,114 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
 }
 
 #[cfg(test)]
+mod answer_settles_tests {
+    use super::*;
+
+    fn asked(
+        id: &str,
+        path: &str,
+        access: ScopeAccess,
+        workspace: Option<&str>,
+    ) -> ScopeGrantRequest {
+        ScopeGrantRequest {
+            decision_id: id.into(),
+            path: PathBuf::from(path),
+            access,
+            reason: GrantReason::StderrHeuristic,
+            tool: None,
+            context: GrantContext {
+                requester: Some(GrantRequester {
+                    workspace: workspace.map(PathBuf::from),
+                    ..GrantRequester::default()
+                }),
+                ..GrantContext::default()
+            },
+        }
+    }
+
+    const WS: Option<&str> = Some("/w/app");
+
+    /// SPEC R-PERM.3.8: one answer settles every waiting copy of the same
+    /// question in the same workspace, from any session.
+    #[test]
+    fn a_grant_settles_the_same_question_in_the_same_workspace() {
+        let a = asked("a", "/c/cache", ScopeAccess::Rw, WS);
+        let b = asked("b", "/c/cache", ScopeAccess::Rw, WS);
+        assert!(answer_settles(&a, GrantDecision::GrantRw, &b));
+        assert!(answer_settles(&a, GrantDecision::GrantRwSession, &b));
+        assert!(
+            answer_settles(&a, GrantDecision::GrantRwOnce, &b),
+            "once, each its own"
+        );
+        assert!(
+            !answer_settles(&a, GrantDecision::GrantRw, &a),
+            "not itself"
+        );
+    }
+
+    /// A grant covers what it reaches: a child path, and a read under a write.
+    #[test]
+    fn a_grant_settles_what_it_covers_and_no_more() {
+        let a = asked("a", "/c/cache", ScopeAccess::Rw, WS);
+        let child_ro = asked("b", "/c/cache/sub", ScopeAccess::Ro, WS);
+        assert!(answer_settles(&a, GrantDecision::GrantRw, &child_ro));
+        let child_rw = asked("c", "/c/cache/sub", ScopeAccess::Rw, WS);
+        assert!(
+            !answer_settles(&a, GrantDecision::GrantRo, &child_rw),
+            "a read covers no write"
+        );
+        let sibling = asked("d", "/c/cache2", ScopeAccess::Ro, WS);
+        assert!(
+            !answer_settles(&a, GrantDecision::GrantRw, &sibling),
+            "components, not prefixes"
+        );
+        let parent = asked("e", "/c", ScopeAccess::Ro, WS);
+        assert!(!answer_settles(&a, GrantDecision::GrantRw, &parent));
+    }
+
+    /// Never across workspaces: a yes in one repository is no grant in another.
+    /// A question with no known workspace is never settled for it.
+    #[test]
+    fn nothing_is_settled_across_workspaces() {
+        let a = asked("a", "/c/cache", ScopeAccess::Rw, WS);
+        let other = asked("b", "/c/cache", ScopeAccess::Rw, Some("/w/other"));
+        assert!(!answer_settles(&a, GrantDecision::GrantRw, &other));
+        let unknown = asked("c", "/c/cache", ScopeAccess::Rw, None);
+        assert!(!answer_settles(&a, GrantDecision::GrantRw, &unknown));
+        let from_unknown = asked("d", "/c/cache", ScopeAccess::Rw, None);
+        assert!(!answer_settles(
+            &from_unknown,
+            GrantDecision::GrantRw,
+            &unknown
+        ));
+    }
+
+    /// A no settles exactly the same question, so N agents do not re-ask what
+    /// the human just refused, and refuses nothing it was not asked.
+    #[test]
+    fn a_no_settles_exactly_the_same_question() {
+        let a = asked("a", "/c/cache", ScopeAccess::Rw, WS);
+        let same = asked("b", "/c/cache", ScopeAccess::Rw, WS);
+        assert!(answer_settles(&a, GrantDecision::Deny, &same));
+        let read = asked("c", "/c/cache", ScopeAccess::Ro, WS);
+        assert!(!answer_settles(&a, GrantDecision::Deny, &read));
+        let child = asked("d", "/c/cache/sub", ScopeAccess::Rw, WS);
+        assert!(!answer_settles(&a, GrantDecision::Deny, &child));
+    }
+
+    /// A log-target question and a filesystem question for one path are
+    /// different questions: their answers are different grants.
+    #[test]
+    fn a_log_target_answer_settles_only_log_target_questions() {
+        let mut log = asked("a", "/c/logs", ScopeAccess::Ro, WS);
+        log.reason = GrantReason::LogTarget;
+        let fs = asked("b", "/c/logs", ScopeAccess::Ro, WS);
+        assert!(!answer_settles(&log, GrantDecision::GrantRo, &fs));
+        assert!(!answer_settles(&fs, GrantDecision::GrantRo, &log));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1348,6 +1559,60 @@ mod tests {
             granted_at: None,
             note: None,
             expires_at: None,
+        }
+    }
+
+    /// SPEC R-PERM.3.8: one answer fanned out to several waiting sessions
+    /// makes concurrent writes of the settings file normal. Each writer read,
+    /// changed and wrote it with no lock, all through one temp file name, so
+    /// two grants at once could lose one. Every grant written at once survives.
+    #[test]
+    fn concurrent_grants_are_all_saved() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("settings.toml");
+        let paths: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let p = home.path().join(format!("cache{i}"));
+                std::fs::create_dir_all(&p).unwrap();
+                dunce::canonicalize(p).unwrap()
+            })
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(paths.len()));
+        let handles: Vec<_> = paths
+            .iter()
+            .cloned()
+            .map(|p| {
+                let (file, barrier) = (file.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    persist_grant(
+                        &file,
+                        NewGrant {
+                            path: &p,
+                            access: ScopeAccess::Rw,
+                            granted_by: None,
+                            granted_at: None,
+                            note: None,
+                            surface: "test",
+                            live_scopes: &[],
+                            workspace: None,
+                            expires_at: None,
+                        },
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let saved = AhmaSettings::load_from_result(&file).unwrap();
+        for p in &paths {
+            assert!(
+                saved.sandbox.persistent_scopes.iter().any(|s| &s.path == p),
+                "{} was lost",
+                p.display()
+            );
         }
     }
 
@@ -1429,6 +1694,38 @@ mod tests {
 
     fn coord() -> GrantCoordinator {
         GrantCoordinator::new()
+    }
+
+    /// SPEC R-PERM.3.8: a second asker is told a question for the same path
+    /// is already waiting, and that its answer covers this session, rather
+    /// than "not raised". A waiting write covers a read asked after it.
+    #[test]
+    fn a_waiting_question_is_known_to_a_second_asker() {
+        let c = coord();
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        assert!(!c.is_waiting(p, ScopeAccess::Rw));
+        let req = c
+            .begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+            .unwrap();
+        assert!(c.is_waiting(p, ScopeAccess::Rw));
+        assert!(
+            c.is_waiting(p, ScopeAccess::Ro),
+            "a waiting write covers a read"
+        );
+        c.resolve(&req.decision_id, GrantDecision::Deny);
+        assert!(
+            !c.is_waiting(p, ScopeAccess::Rw),
+            "answered, so no longer waiting"
+        );
+        let ro = c
+            .begin(p, ScopeAccess::Ro, GrantReason::PreExecViolation, None)
+            .unwrap();
+        assert!(
+            !c.is_waiting(p, ScopeAccess::Rw),
+            "a waiting read covers no write"
+        );
+        c.cancel(&ro.decision_id);
     }
 
     #[test]

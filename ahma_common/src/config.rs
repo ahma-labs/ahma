@@ -1179,6 +1179,16 @@ impl PersistentScope {
     }
 }
 
+/// Hold the cross-process lock every read-change-write of the settings file
+/// at `path` takes (SPEC R-PERM.3.8). Writers used to load, change and save
+/// with no lock, so two grants saved at once could lose one; answering one
+/// question for every session waiting on it makes that concurrency normal.
+/// Take it **before** loading, and hold it until the save is done.
+pub fn lock_settings_for_write(path: &Path) -> Result<crate::fs_lock::FsLock> {
+    crate::fs_lock::FsLock::acquire(&path.with_extension("toml.lock"))
+        .with_context(|| format!("lock {} for writing", path.display()))
+}
+
 /// Unix seconds now.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -2439,8 +2449,10 @@ impl AhmaSettings {
         Self::update_at(&path, change)
     }
 
-    /// [`Self::update`] against an explicit path.
+    /// [`Self::update`] against an explicit path, under the settings write
+    /// lock ([`lock_settings_for_write`]).
     pub fn update_at(path: &Path, change: impl FnOnce(&mut Self)) -> Result<Self> {
+        let _lock = lock_settings_for_write(path)?;
         let mut settings = match std::fs::read_to_string(path) {
             Ok(contents) => Self::parse(&contents).map_err(|e| {
                 anyhow::anyhow!(
@@ -2494,8 +2506,13 @@ impl AhmaSettings {
         }
         let toml_text = self.render_documented();
 
-        // Atomic write: temp file → rename
-        let tmp_path = path.with_extension("toml.tmp");
+        // Atomic write: temp file → rename. The temp name is this writer's
+        // own: one shared name let two writers interleave in one file.
+        let tmp_path = path.with_extension(format!(
+            "toml.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::write(&tmp_path, toml_text)
             .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
         std::fs::rename(&tmp_path, path).with_context(|| {

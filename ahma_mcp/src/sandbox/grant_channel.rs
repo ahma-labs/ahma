@@ -216,6 +216,13 @@ pub trait ScopeGrantNotifier: Send + Sync + std::fmt::Debug {
     /// Whether the session's automatic prompt budget is spent (SPEC R-PERM.4.5).
     fn budget_exhausted(&self) -> bool;
 
+    /// Whether a question whose answer would settle `access` to `path` is
+    /// waiting for a human now (SPEC R-PERM.3.8), so a second asker is told
+    /// to wait for it rather than that nothing was raised.
+    fn is_waiting(&self, _path: &Path, _access: ScopeAccess) -> bool {
+        false
+    }
+
     /// Where a question this notifier raised stands, so the surface that asked
     /// on the agent's behalf can tell it the answer rather than a guess
     /// (SPEC R-PERM.9).
@@ -431,6 +438,10 @@ impl ScopeGrantNotifier for LoggingGrantNotifier {
 
     fn budget_exhausted(&self) -> bool {
         self.coordinator.budget_exhausted()
+    }
+
+    fn is_waiting(&self, path: &Path, access: ScopeAccess) -> bool {
+        self.coordinator.is_waiting(path, access)
     }
 
     /// A log line is not a surface anyone answers: a question this notifier

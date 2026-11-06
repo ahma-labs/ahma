@@ -553,6 +553,13 @@ async fn run_reporter_loop(
         if !resent {
             continue;
         }
+        // Answers given while no hub was connected are not passed on: a
+        // question waiting elsewhere now was asked after them, and a session
+        // answer must never settle a question its human did not see
+        // (SPEC R-PERM.3.8).
+        if let Some(coord) = grant_coordinator.as_ref() {
+            coord.drain_answered();
+        }
 
         // ── Event loop: forward the unified operation event stream ───────────
         let mut closed = false;
@@ -617,6 +624,26 @@ async fn run_reporter_loop(
                         }
                         // Sender dropped — stop polling a dead receiver.
                         None => grant_req_rx = None,
+                    }
+                }
+
+                // 2b'. Answers given elsewhere (the MCP client's own prompt), so
+                // the hub can settle every other waiting copy (SPEC R-PERM.3.8).
+                // Answers the TUI routed here are reported where they are
+                // resolved, which takes them out of this outbox first.
+                () = answered_signal(grant_coordinator.as_ref()) => {
+                    if let Some(coord) = grant_coordinator.as_ref() {
+                        for answer in coord.drain_answered() {
+                            let msg = ClientMsg::ScopeGrantResolved {
+                                decision_id: answer.request.decision_id.clone(),
+                                answer: Some(answer),
+                            };
+                            if send_msg(&mut writer, &msg).await.is_err() {
+                                debug!("hub_reporter: send ScopeGrantResolved failed, reconnecting");
+                                closed = true;
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -934,6 +961,14 @@ async fn deliver_approval(
     }
 }
 
+/// Wait for an answer to be recorded in `coord`; never, without one.
+async fn answered_signal(coord: Option<&Arc<GrantCoordinator>>) {
+    match coord {
+        Some(coord) => coord.answered().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// `SubmitScopeGrant`: resolve the decision against the coordinator, persisting
 /// an approved grant. Every *terminal* outcome then dismisses any twin modal on
 /// other TUIs; an already-resolved or unknown decision id changes nothing.
@@ -1018,7 +1053,17 @@ async fn resolve_scope_grant(
         }
         GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => return,
     }
-    let _ = send_msg(writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
+    // The answer travels with it, so the hub can settle every other waiting
+    // copy of this question (SPEC R-PERM.3.8).
+    let answer = coord.take_answered(&decision_id);
+    let _ = send_msg(
+        writer,
+        &ClientMsg::ScopeGrantResolved {
+            decision_id,
+            answer,
+        },
+    )
+    .await;
 }
 
 /// `ReRaiseScopeGrant`: reopen a question this session already refused, because
@@ -2638,7 +2683,7 @@ mod tests {
         .await
         .expect("send Deny SubmitScopeGrant");
         match read_client_msg(&mut server_reader).await {
-            ClientMsg::ScopeGrantResolved { decision_id } => assert_eq!(decision_id, did),
+            ClientMsg::ScopeGrantResolved { decision_id, .. } => assert_eq!(decision_id, did),
             other => panic!("expected ScopeGrantResolved after Deny, got {other:?}"),
         }
 

@@ -2869,6 +2869,39 @@ fn sync_harness_asks(
     }
 }
 
+/// Take out of the grant questions every copy that `decision`, given to
+/// `answered`, also settles (SPEC R-PERM.3.8), and return their ids so the
+/// same answer is sent for each. The hub settles them too once the owning
+/// instance reports its answer; sending them from here as well means an
+/// instance too old to report it does not leave copies waiting. A
+/// terminal-hook question stays: the TUI applies its answer itself.
+fn take_settled_copies(
+    state: &mut crate::state::AppState,
+    answered: &ahma_common::scope_grant::ScopeGrantRequest,
+    decision: ahma_common::scope_grant::GrantDecision,
+) -> Vec<String> {
+    let settles = |g: &crate::state::ScopeGrantGate| {
+        g.harness.is_none()
+            && ahma_common::scope_grant::answer_settles(answered, decision, &g.request)
+    };
+    let mut settled = Vec::new();
+    if state.scope_grant.as_ref().is_some_and(settles) {
+        settled.extend(state.scope_grant.take().map(|g| g.decision_id));
+    }
+    state.scope_grant_queue.retain(|g| {
+        if settles(g) {
+            settled.push(g.decision_id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if state.scope_grant.is_none() {
+        show_next_scope_grant(state);
+    }
+    settled
+}
+
 /// Resolve the pending scope-grant prompt: send the decision to the hub, where
 /// the owning instance applies it to its live session (and writes it at the
 /// `always` tier, bound to that session's workspace), and log it.
@@ -2911,6 +2944,15 @@ fn resolve_scope_grant(
 
     let advice_line = gate.advice.as_ref().map(|a| a.line());
     let advice_followed = gate.advice.as_ref().map(|a| a.matches(decision));
+    for copy in take_settled_copies(state, &gate.request, decision) {
+        send_incoming(ahma_common::hub::ClientMsg::SubmitScopeGrant {
+            decision_id: copy,
+            decision,
+            target_instance_id: None,
+            advice: None,
+            advice_followed: None,
+        });
+    }
     send_incoming(ahma_common::hub::ClientMsg::SubmitScopeGrant {
         decision_id: gate.decision_id,
         decision,
@@ -8280,6 +8322,61 @@ mod tests {
         let mut request = test_scope_grant_gate().request;
         request.decision_id = id.to_string();
         crate::state::ScopeGrantGate::from_request(request)
+    }
+
+    /// SPEC R-PERM.3.8: answering one question settles its copies waiting in
+    /// the queue (the same folder from another session of the same
+    /// workspace): they leave the queue at once, and their ids are returned so
+    /// the same answer is sent for each. A copy from another workspace, and a
+    /// terminal-hook question the TUI applies itself, stay.
+    #[test]
+    fn an_answer_takes_its_waiting_copies_with_it() {
+        use ahma_common::scope_grant::{GrantContext, GrantDecision, GrantRequester};
+        let in_ws = |id: &str, ws: &str| {
+            let mut g = gate_with_id(id);
+            g.request.context = GrantContext {
+                requester: Some(GrantRequester {
+                    workspace: Some(std::path::PathBuf::from(ws)),
+                    ..GrantRequester::default()
+                }),
+                ..GrantContext::default()
+            };
+            g
+        };
+        let mut state = crate::state::AppState::new("http://localhost:3000", "HTTP", true);
+        let answered = in_ws("a", "/w/app").request;
+        state.scope_grant = Some(in_ws("b", "/w/app"));
+        state
+            .scope_grant_queue
+            .push_back(in_ws("other", "/w/other"));
+        state.scope_grant_queue.push_back(in_ws("c", "/w/app"));
+        let mut hook = in_ws("hook", "/w/app");
+        hook.harness = Some(crate::harness_asks::HarnessAsk {
+            workspace: std::path::PathBuf::from("/w/app"),
+            question: ahma_common::harness_asks::Question {
+                dir: hook.request.path.clone(),
+                access: hook.request.access,
+                covers: Vec::new(),
+            },
+            harness_pid: 1,
+        });
+        state.scope_grant_queue.push_back(hook);
+
+        let settled =
+            super::take_settled_copies(&mut state, &answered, GrantDecision::GrantRwSession);
+
+        assert_eq!(settled, vec!["b".to_string(), "c".to_string()]);
+        assert_eq!(
+            state.scope_grant.as_ref().map(|g| g.decision_id.as_str()),
+            Some("other"),
+            "the next question that is not a copy comes up"
+        );
+        let left: Vec<_> = state
+            .scope_grant_queue
+            .iter()
+            .map(|g| g.decision_id.as_str())
+            .collect();
+        assert_eq!(left, vec!["hook"]);
     }
 
     /// A second question waits behind the open one instead of replacing it;

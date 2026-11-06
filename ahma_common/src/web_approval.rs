@@ -183,6 +183,12 @@ impl WebApprovalCoordinator {
         Some(req)
     }
 
+    /// Whether a question for `domain` is waiting for a human right now, so a
+    /// second request is told to wait for its answer (SPEC R-PERM.3.8).
+    pub fn is_waiting(&self, domain: &str) -> bool {
+        self.inner.lock().active_domains.contains(&norm(domain))
+    }
+
     /// Resolve a decision with the human's answer. First-answer-wins and
     /// idempotent: a second call for the same `decision_id` returns
     /// [`WebResolveOutcome::AlreadyResolved`].
@@ -262,6 +268,7 @@ impl WebApprovalCoordinator {
 /// (SPEC R-PERM.2.1), so no caller can write the allow list unrecorded.
 pub fn persist_web_allow(settings_file: &Path, domain: &str, surface: &str) -> Result<bool> {
     let domain = norm(domain);
+    let _settings_lock = crate::config::lock_settings_for_write(settings_file)?;
     let mut settings = AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!(e))
         .with_context(|| {
@@ -300,6 +307,20 @@ mod tests {
 
     fn coord() -> WebApprovalCoordinator {
         WebApprovalCoordinator::new()
+    }
+
+    /// SPEC R-PERM.3.8: a second fetch of a domain whose question is waiting
+    /// can tell that it is waiting, and stops waiting once it is answered.
+    #[test]
+    fn a_waiting_domain_is_known_to_a_second_fetch() {
+        let c = WebApprovalCoordinator::new();
+        assert!(!c.is_waiting("Example.com"));
+        let req = c
+            .begin("example.com", "https://example.com/", None)
+            .unwrap();
+        assert!(c.is_waiting("EXAMPLE.com"));
+        c.resolve(&req.decision_id, WebApprovalDecision::Deny);
+        assert!(!c.is_waiting("example.com"));
     }
 
     #[test]

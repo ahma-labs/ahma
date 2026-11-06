@@ -239,6 +239,7 @@ impl NetApprovalCoordinator {
 /// (SPEC R-PERM.2.1), so no caller can write the allow list unrecorded.
 pub fn persist_net_allow(settings_file: &Path, domain: &str, surface: &str) -> Result<bool> {
     let domain = norm(domain);
+    let _settings_lock = crate::config::lock_settings_for_write(settings_file)?;
     let mut settings = AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!(e))
         .with_context(|| {

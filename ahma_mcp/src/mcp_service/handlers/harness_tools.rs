@@ -250,6 +250,12 @@ impl AhmaMcpService {
             .web_approval
             .begin(domain, url, Some("fetch_webpage".to_string()))
         else {
+            // One question per domain: when it is the same question waiting,
+            // say so, so the agent waits for the answer instead of reading a
+            // refusal (SPEC R-PERM.3.8).
+            if self.web_approval.is_waiting(domain) {
+                return FetchAction::Deny(waiting_for_web_answer(domain));
+            }
             return deny();
         };
 
@@ -906,3 +912,14 @@ pub fn replace_in_file_schema() -> Arc<Map<String, Value>> {
 #[cfg(test)]
 #[path = "harness_tools_tests.rs"]
 mod tests;
+
+/// The answer to a fetch of a domain whose approval question is already in
+/// front of the human (SPEC R-PERM.3.8).
+fn waiting_for_web_answer(domain: &str) -> String {
+    format!(
+        "web egress waiting: a question about '{domain}' is already in front of the human, and \
+         their answer applies to this whole session. This request was not asked again; retry \
+         the fetch after they answer. If nobody can answer it, a human can allow the domain \
+         with:\n  ahma web allow {domain}"
+    )
+}

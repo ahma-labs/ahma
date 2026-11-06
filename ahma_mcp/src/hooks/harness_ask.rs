@@ -105,7 +105,6 @@ pub(super) fn next_ask(
     let dir = harness_asks::default_dir()?;
     let workspace = workspace_for(cwd);
     let now = ahma_common::session_grants::now_secs();
-    let mut asks = harness_asks::load(&dir, &workspace, now);
     // A command that cannot write (the write queue's read-only lane, R2.7.4)
     // could not use a write grant: asking before a `git status` would be noise.
     let may_write = !matches!(
@@ -115,36 +114,36 @@ pub(super) fn next_ask(
     // Asked before the refused command, or one running the same program,
     // runs again: a "no" then stops only the retry it was about, never an
     // unrelated command (SPEC R-PERM.10, R-PERM.10.1).
-    asks.refusals
-        .retain(|r| (may_write || !r.access.is_write()) && harness_asks::refused_for(r, command));
-    if asks.refusals.is_empty() {
-        return None;
-    }
+    let consider = |r: &harness_asks::Refusal| {
+        (may_write || !r.access.is_write()) && harness_asks::refused_for(r, command)
+    };
     let scopes = super::resolve_hook_sandbox_scopes(cwd);
     let mut granted = persistent.to_vec();
     granted.extend(crate::sandbox::session_scopes_for(&scopes));
     let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
     let is_covered =
         |p: &Path, a: ScopeAccess| harness_asks::grant_covers(&granted, &workspace, p, a);
-    let question =
-        harness_asks::next_question(&asks, session_id, &is_covered, home.as_deref(), &scopes)?;
-    // A grant must outlive this hook: without the harness's pid nothing can
-    // bound it, so nothing is asked and the one-line note stays the answer.
-    // The harness asking now is the one whose dialog shows the question, so
-    // its life bounds the grant. A stored pid is only a fallback: it may be a
-    // harness that has exited, or another window on the same workspace.
-    let pid = harness_pid().or_else(|| asks.refusals.iter().find_map(|r| r.harness_pid))?;
-    let token = harness_asks::mark_asked(
+    // A grant must outlive this hook: the harness asking now is the one whose
+    // dialog shows the question, so its life bounds the grant; a pid a
+    // refusal recorded is only the fallback (it may be a harness that has
+    // exited, or another window on the same workspace). With neither, nothing
+    // is asked and the one-line note stays the answer. Choosing the question
+    // and recording it asked is one locked step, so parallel hooks of one
+    // session raise one dialog (SPEC R-PERM.3.8).
+    harness_asks::ask_next(
         &dir,
         &workspace,
         session_id,
-        &question,
+        &consider,
+        &is_covered,
+        home.as_deref(),
+        &scopes,
         command,
-        Some(pid),
+        harness_pid(),
         now,
     )
-    .ok()?;
-    Some((question, token))
+    .ok()
+    .flatten()
 }
 
 /// The workspace a yes to `question` asked in `cwd` is approved in, and the
@@ -425,6 +424,7 @@ fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Res
     // After the wider grant is written, so a failure here leaves more
     // granted than asked for in one more place, never less.
     if !replaced.is_empty() {
+        let _settings_lock = ahma_common::config::lock_settings_for_write(&file)?;
         let mut settings = AhmaSettings::load_from_checked(&file)
             .map_err(|e| anyhow::anyhow!("{}", e.summary()))?;
         for old in &replaced {
