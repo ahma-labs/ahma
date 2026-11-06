@@ -1711,6 +1711,15 @@ lifetime.
   sessions. The option list is an allowlist and an unknown name is refused, not ignored.
   Settings that govern the hub as a whole — bearer tokens, rate limits, handshake and idle
   timeouts — are deliberately not settable per session.
+  - **R-HUB.4.1 — The worker sees the real client.** The frontend **must** hand the worker the
+    client's own `clientInfo` and capabilities, whichever handshake the client used. When it
+    answers a 2026-07-28 `server/discover` probe and builds the `initialize` itself, it reads
+    them from `_meta` under the namespaced keys (`io.modelcontextprotocol/clientInfo`,
+    `io.modelcontextprotocol/clientCapabilities`; the plain keys are accepted too). It guesses
+    a client name only when the probe carries none. Claude Code 2.1.319 sends only the
+    namespaced keys (wire capture, 2026-11-06). Reading the plain key alone classified every
+    Claude Code session behind the hub as Antigravity, so it was offered the harness file tools
+    R26 withholds, and its parallel subagents each raised a permission prompt for them.
 
 - **R-HUB.5 — Upgrade by draining.** A **strictly newer** build asks the hub to **drain**: hand
   over to the new build without ending anyone's work. It never tears down sessions that belong

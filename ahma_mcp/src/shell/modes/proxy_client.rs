@@ -803,15 +803,25 @@ fn detect_modern_client_name() -> &'static str {
     "Antigravity"
 }
 
+/// One client field of a `server/discover` probe. The 2026-07-28 protocol puts
+/// it in `_meta` under a namespaced key (`io.modelcontextprotocol/clientInfo`,
+/// as Claude Code sends it); the plain `_meta` key and a top-level `params`
+/// field are accepted too (SPEC R-HUB.4.1).
+fn discover_client_field<'a>(
+    val: &'a serde_json::Value,
+    meta_key: &str,
+    params_key: &str,
+) -> Option<&'a serde_json::Value> {
+    let params = val.get("params")?;
+    let meta = params.get("_meta");
+    meta.and_then(|m| m.get(format!("io.modelcontextprotocol/{meta_key}")))
+        .or_else(|| meta.and_then(|m| m.get(meta_key)))
+        .or_else(|| params.get(params_key))
+}
+
 /// Synthesizes a standard `initialize` JSON-RPC message from a `server/discover` probe.
 fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
-    let client_info = val
-        .get("params")
-        .and_then(|p| {
-            p.get("_meta")
-                .and_then(|m| m.get("clientInfo"))
-                .or_else(|| p.get("clientInfo"))
-        })
+    let client_info = discover_client_field(val, "clientInfo", "clientInfo")
         .cloned()
         .unwrap_or_else(|| {
             serde_json::json!({
@@ -820,13 +830,7 @@ fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
             })
         });
 
-    let client_capabilities = val
-        .get("params")
-        .and_then(|p| {
-            p.get("_meta")
-                .and_then(|m| m.get("clientCapabilities"))
-                .or_else(|| p.get("capabilities"))
-        })
+    let client_capabilities = discover_client_field(val, "clientCapabilities", "capabilities")
         .cloned()
         .unwrap_or_else(|| {
             serde_json::json!({
@@ -2946,6 +2950,68 @@ mod tests {
             state.closed.load(Ordering::SeqCst),
             1,
             "forwarded_any == true -> close() must still be attempted"
+        );
+    }
+
+    /// Claude Code 2.1.319's `server/discover` probe, captured on the wire
+    /// (2026-11-06). The 2026-07-28 protocol carries the client's identity in
+    /// `_meta` under namespaced keys. Missing them made the proxy guess the
+    /// client from its parent processes, which fell through to "Antigravity",
+    /// so every Claude Code session behind the hub was offered ahma's harness
+    /// file tools (`grep_search`, …) and lost its `elicitation` capability.
+    #[test]
+    fn synthesized_initialize_keeps_namespaced_client_info_from_discover() {
+        let probe = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "server-discover-probe-1",
+            "method": "server/discover",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "claude-code", "title": "Claude Code", "version": "2.1.319"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "roots": {"listChanged": true},
+                    "elicitation": {"form": {}, "url": {}}
+                }
+            }}
+        });
+
+        let init = synthesize_initialize_request(&probe);
+
+        assert_eq!(
+            init["params"]["clientInfo"]["name"], "claude-code",
+            "{init:#}"
+        );
+        assert_eq!(
+            init["params"]["capabilities"]["elicitation"],
+            serde_json::json!({"form": {}, "url": {}}),
+            "{init:#}"
+        );
+        let name = init["params"]["clientInfo"]["name"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            crate::client_type::McpClientType::from_client_name(name).has_native_file_tools(),
+            "a Claude Code session must not be offered ahma's harness file tools"
+        );
+    }
+
+    /// The un-namespaced spellings the proxy already understood keep working.
+    #[test]
+    fn synthesized_initialize_keeps_plain_client_info_from_discover() {
+        let probe = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": {
+                "clientInfo": {"name": "cursor-vscode", "version": "1"},
+                "clientCapabilities": {"roots": {}}
+            }}
+        });
+        let init = synthesize_initialize_request(&probe);
+        assert_eq!(init["params"]["clientInfo"]["name"], "cursor-vscode");
+        assert_eq!(
+            init["params"]["capabilities"],
+            serde_json::json!({"roots": {}})
         );
     }
 
