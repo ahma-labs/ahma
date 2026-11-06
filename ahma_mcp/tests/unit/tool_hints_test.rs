@@ -54,10 +54,10 @@ async fn builtins_carry_their_hints_on_the_wire() -> Result<()> {
 }
 
 /// A configured tool is read-only when its author said `mutates: false`, or
-/// when its declared read-only lane is enforced by the kernel. The Test-mode
-/// sandbox this helper builds enforces nothing (as on Windows), so there a
-/// declared lane alone must not claim read-only. A tool that says nothing
-/// carries no hint, leaving the spec's cautious defaults.
+/// when its declared read-only lane is enforced by the kernel, which this
+/// sandbox reports. A declared lane alone must not claim read-only where it is
+/// not enforced. A tool that says nothing carries no hint, leaving the spec's
+/// cautious defaults.
 #[tokio::test]
 async fn configured_tools_claim_read_only_only_when_it_holds() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -82,10 +82,14 @@ async fn configured_tools_claim_read_only_only_when_it_holds() -> Result<()> {
     let tools = mcp.client.list_all_tools().await?;
 
     assert_eq!(read_only(find(&tools, "probe_said")), Some(true));
-    assert_ne!(
-        read_only(find(&tools, "probe_lane")),
-        Some(true),
-        "no kernel enforces the lane here"
+    // The lane earns the hint exactly where this sandbox can enforce it:
+    // Linux with Landlock can; macOS nested in a sandbox, Windows and Test
+    // mode cannot.
+    let enforced = mcp.service.adapter.sandbox().can_enforce_read_only();
+    assert_eq!(
+        read_only(find(&tools, "probe_lane")) == Some(true),
+        enforced,
+        "the lane claims read-only only where the kernel enforces it (enforced: {enforced})"
     );
     assert!(find(&tools, "probe_silent").annotations.is_none());
     Ok(())
