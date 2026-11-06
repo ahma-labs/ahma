@@ -834,13 +834,17 @@ pub fn grant_covers(
     path: &Path,
     access: ScopeAccess,
 ) -> bool {
+    // Both sides canonical: a refusal recorded through a symlink (macOS
+    // `/tmp` is `/private/tmp`) must meet the grant of its real folder.
+    let canonical = crate::scope_grant::canonicalize_best_effort;
+    let path = canonical(path);
+    let workspace = canonical(workspace);
     granted.iter().any(|g| {
         let applies = g
             .workspace
             .as_deref()
-            .is_none_or(|w| workspace.starts_with(w));
-        let root = crate::config::expand_home(&g.path);
-        let root = dunce::canonicalize(&root).unwrap_or(root);
+            .is_none_or(|w| workspace.starts_with(canonical(w)));
+        let root = canonical(&crate::config::expand_home(&g.path));
         applies && (g.access.is_write() || !access.is_write()) && path.starts_with(&root)
     })
 }
@@ -942,6 +946,52 @@ pub fn mark_answered(
         harness_pid,
     };
     update(dir, workspace, now, |asks| asks.answered.push(answered))
+}
+
+/// Choose the next question to put to the human before `command` runs in
+/// `session_id`, and record it as asked, in **one** locked step; returns it
+/// with the one-use token the approved command will carry.
+///
+/// [`next_question`] then [`mark_asked`] were two steps with the lock taken
+/// only for the second, so parallel hooks of one session (Claude Code runs
+/// subagents side by side) could all see "not asked yet" and each raise a
+/// dialog for the same question (SPEC R-PERM.3.8). Under the lock, the first
+/// marks it and every other sees it asked.
+///
+/// `consider` picks the refusals that apply to this command; the others stay
+/// on record for the commands they do apply to. The grant a yes gives must be
+/// bounded by a harness process: `harness_pid`, else one a refusal recorded;
+/// with neither, nothing is asked.
+#[allow(clippy::too_many_arguments)]
+pub fn ask_next(
+    dir: &Path,
+    workspace: &Path,
+    session_id: &str,
+    consider: &dyn Fn(&Refusal) -> bool,
+    covered: &dyn Fn(&Path, ScopeAccess) -> bool,
+    home: Option<&Path>,
+    scopes: &[PathBuf],
+    command: &str,
+    harness_pid: Option<u32>,
+    now: u64,
+) -> Result<Option<(Question, String)>> {
+    update(dir, workspace, now, |asks| {
+        let mut view = asks.clone();
+        view.refusals.retain(|r| consider(r));
+        let question = next_question(&view, session_id, covered, home, scopes)?;
+        let pid = harness_pid.or_else(|| view.refusals.iter().find_map(|r| r.harness_pid))?;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        asks.asked.push(Asked {
+            session_id: session_id.to_string(),
+            question: question.clone(),
+            token: token.clone(),
+            command_digest: command_digest(command),
+            asked_at: now,
+            harness_pid: Some(pid),
+            used: false,
+        });
+        Some((question, token))
+    })
 }
 
 /// Record that `question` was put to the human in `session_id` for `command`,
@@ -1201,6 +1251,130 @@ mod tests {
         let ws = root.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         (root, dir, ws)
+    }
+
+    /// A refusal recorded through a symlink (macOS `/tmp` is
+    /// `/private/tmp`) is covered by a grant of the same folder by its real
+    /// path: both sides are compared canonical, or a covered question keeps
+    /// coming back. Unix only: it needs a symlink without privileges.
+    #[cfg(unix)]
+    #[test]
+    fn a_grant_covers_a_refusal_recorded_through_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let granted = [PersistentScope {
+            path: dunce::canonicalize(&real).unwrap(),
+            access: ScopeAccess::Rw,
+            workspace: Some(link.join("..").join("ws")),
+            granted_by: None,
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        }];
+        assert!(grant_covers(
+            &granted,
+            &ws,
+            &link.join("sub/f.lock"),
+            ScopeAccess::Rw
+        ));
+    }
+
+    /// SPEC R-PERM.3.8, field case: three Plan subagents of one Claude Code
+    /// session hit the same refused folder at once. Each hook checked "not
+    /// asked yet" and then marked it asked, in two separate steps, so all
+    /// three could pass the check and three dialogs appeared for one
+    /// question. Choosing and marking is one locked step: exactly one wins.
+    #[test]
+    fn parallel_hooks_of_one_session_raise_one_dialog() {
+        let (root, dir, ws) = store();
+        let home = root.path().join("home");
+        let cache = home.join(".cache/neubit");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut r = refusal(&cache.join("heavy.lock.holder"), ScopeAccess::Rw);
+        r.harness_pid = Some(4242);
+        record_refusal(&dir, &ws, r).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (dir, ws, home, barrier) =
+                    (dir.clone(), ws.clone(), home.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ask_next(
+                        &dir,
+                        &ws,
+                        "s1",
+                        &|_: &Refusal| true,
+                        &|_: &Path, _: ScopeAccess| false,
+                        Some(&home),
+                        std::slice::from_ref(&ws),
+                        "make heavy",
+                        Some(4242),
+                        200,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let asked: Vec<_> = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(asked.len(), 1, "one dialog for one question: {asked:?}");
+        assert_eq!(asked[0].0.dir, cache);
+    }
+
+    /// A refusal the caller filters out is not asked, and is not dropped
+    /// from the record either: another command may still need it.
+    #[test]
+    fn ask_next_filters_without_forgetting() {
+        let (root, dir, ws) = store();
+        let home = root.path().join("home");
+        let cache = home.join(".cache/neubit");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut r = refusal(&cache.join("x.lock"), ScopeAccess::Rw);
+        r.harness_pid = Some(1);
+        record_refusal(&dir, &ws, r).unwrap();
+        let none = |_: &Path, _: ScopeAccess| false;
+        let skip_all = |_: &Refusal| false;
+        let scopes = std::slice::from_ref(&ws);
+        let asked = ask_next(
+            &dir,
+            &ws,
+            "s1",
+            &skip_all,
+            &none,
+            Some(&home),
+            scopes,
+            "c",
+            Some(1),
+            200,
+        );
+        assert!(asked.unwrap().is_none());
+        assert_eq!(load(&dir, &ws, 201).refusals.len(), 1);
+        let take_all = |_: &Refusal| true;
+        let asked = ask_next(
+            &dir,
+            &ws,
+            "s1",
+            &take_all,
+            &none,
+            Some(&home),
+            scopes,
+            "c",
+            None,
+            200,
+        );
+        assert!(
+            asked.unwrap().is_some(),
+            "the refusal's own pid bounds the grant"
+        );
     }
 
     #[test]

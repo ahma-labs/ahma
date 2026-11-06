@@ -195,6 +195,9 @@ impl AhmaMcpService {
             None if self.adapter.grant_budget_exhausted() => {
                 not_raised_text(&path, access, &settings_file, NotRaised::BudgetSpent)
             }
+            None if self.adapter.grant_question_waiting(&path, access) => {
+                not_raised_text(&path, access, &settings_file, NotRaised::AlreadyWaiting)
+            }
             None => not_raised_text(&path, access, &settings_file, NotRaised::Suppressed),
             Some(req) => match self.adapter.grant_status(&req.decision_id) {
                 GrantStatus::Decided(decision) => match decision.access() {
@@ -375,6 +378,9 @@ enum NotRaised {
     BudgetSpent,
     /// Already asked this session, refused outright, or no surface is wired.
     Suppressed,
+    /// The same question is already waiting for a human; its answer covers
+    /// this session too (SPEC R-PERM.3.8).
+    AlreadyWaiting,
 }
 
 /// Message when the request never became a question.
@@ -388,6 +394,11 @@ fn not_raised_text(
         NotRaised::BudgetSpent => {
             "Not raised: this session has used its prompt budget. Stop requesting grants; tell \
              the human in conversation what you need and why, and continue with what you have."
+        }
+        NotRaised::AlreadyWaiting => {
+            "Already waiting: the same question is in front of the human now, and their answer \
+             applies to this whole session, so this request was not raised a second time. Do \
+             not ask again; retry the command after they answer."
         }
         NotRaised::Suppressed => {
             "Not raised: this path was already asked about this session, is refused outright, or \

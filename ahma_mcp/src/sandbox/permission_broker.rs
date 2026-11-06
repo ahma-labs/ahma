@@ -745,6 +745,10 @@ impl ScopeGrantNotifier for PermissionBroker {
         self.coordinator.budget_exhausted()
     }
 
+    fn is_waiting(&self, path: &std::path::Path, access: ScopeAccess) -> bool {
+        self.coordinator.is_waiting(path, access)
+    }
+
     fn status(&self, decision_id: &str) -> GrantStatus {
         self.coordinator.status(decision_id)
     }

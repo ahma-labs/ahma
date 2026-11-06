@@ -2201,6 +2201,7 @@ mod tests {
             rx,
             ClientMsg::ScopeGrantResolved {
                 decision_id: "d1".to_string(),
+                answer: None,
             },
         )
         .await

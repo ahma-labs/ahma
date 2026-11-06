@@ -662,6 +662,18 @@ impl Adapter {
             .is_some_and(|n| n.budget_exhausted())
     }
 
+    /// Whether a grant question that would settle `access` to `path` is
+    /// waiting for a human now (SPEC R-PERM.3.8).
+    pub fn grant_question_waiting(
+        &self,
+        path: &std::path::Path,
+        access: ahma_common::config::ScopeAccess,
+    ) -> bool {
+        self.scope_grant_notifier
+            .as_ref()
+            .is_some_and(|n| n.is_waiting(path, access))
+    }
+
     /// Where a grant question this adapter raised stands: still awaiting a
     /// human, answered (and how), or closed with nobody asked (SPEC R-PERM.9).
     /// `Closed` when no notifier is wired.

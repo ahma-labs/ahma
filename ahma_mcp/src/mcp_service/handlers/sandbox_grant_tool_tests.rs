@@ -528,7 +528,16 @@ fn not_raised_text_names_the_reason() {
         NotRaised::BudgetSpent,
     );
     assert!(text.contains("prompt budget"), "{text}");
-    assert!(text.contains("tell the human in conversation"), "{text}");
+    assert!(text.contains("tell the human in conversation"), "{text}"); // SPEC R-PERM.3.8: a second asker is told to wait for the one question.
+    let text = not_raised_text(
+        Path::new("/cache/x"),
+        ScopeAccess::Rw,
+        Path::new(SETTINGS),
+        NotRaised::AlreadyWaiting,
+    );
+    assert!(text.contains("Already waiting"), "{text}");
+    assert!(text.contains("applies to this whole session"), "{text}");
+    assert!(!text.contains("Not raised"), "{text}");
 }
 
 #[test]

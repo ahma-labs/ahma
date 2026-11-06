@@ -812,6 +812,9 @@ async fn approve_web_egress_dedup_denies_second_concurrent_request() {
         .await;
     match action {
         FetchAction::Deny(msg) => {
+            // SPEC R-PERM.3.8: told the question is waiting, with the CLI way
+            // out kept for when nobody answers it.
+            assert!(msg.contains("already in front of the human"), "{msg}");
             assert!(msg.contains("ahma web allow dedup.example"), "{msg}");
         }
         other => panic!("expected Deny for an in-flight duplicate, got {other:?}"),
@@ -1452,5 +1455,18 @@ async fn fetch_webpage_redirect_policy_mode_has_no_approver() {
             .ask("cdn.example", "https://cdn.example/f")
             .await
             .is_err()
+    );
+}
+
+/// SPEC R-PERM.3.8: a fetch of a domain whose question is already waiting is
+/// told to wait for that answer, not that the domain is refused.
+#[test]
+fn a_second_fetch_is_told_the_question_is_waiting() {
+    let text = super::waiting_for_web_answer("example.com");
+    assert!(text.contains("already in front of the human"), "{text}");
+    assert!(text.contains("applies to this whole session"), "{text}");
+    assert!(
+        text.contains("ahma web allow example.com"),
+        "the way out stays: {text}"
     );
 }

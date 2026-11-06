@@ -532,7 +532,14 @@ pub enum ClientMsg {
     },
     /// An instance announcing a scope-grant decision is resolved, so the hub can
     /// dismiss the prompt on any other TUI showing the same `decision_id`.
-    ScopeGrantResolved { decision_id: String },
+    ScopeGrantResolved {
+        decision_id: String,
+        /// The question and its answer, so the hub can send the same answer to
+        /// every other waiting copy (SPEC R-PERM.3.8). Absent from older
+        /// instances, and for a question closed without an answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<crate::scope_grant::AnsweredQuestion>,
+    },
     /// A TUI asking an instance to raise the grant question again for a path it
     /// already refused this session (SPEC R-PERM.7.1). Sent when the user picks
     /// a denied operation and confirms — an explicit human action, which is why
@@ -2419,6 +2426,51 @@ async fn resolve_target(hub: &Hub, target: Option<&str>) -> Option<String> {
     }
 }
 
+/// Send `answer` to every other waiting scope-grant question it settles
+/// (SPEC R-PERM.3.8: one answer settles every waiting copy), each under its
+/// own `decision_id` to the instance that raised it, and take those questions
+/// down from every TUI at once. Each instance applies the answer as if a human
+/// had given it there, and reports back; by then its question is no longer
+/// waiting here, so nothing is sent twice. What settles what is
+/// [`crate::scope_grant::answer_settles`]: never across workspaces.
+async fn settle_waiting_copies(hub: &Arc<Hub>, answer: &crate::scope_grant::AnsweredQuestion) {
+    let settled: Vec<(String, String)> = {
+        let mut pending = hub.pending_questions.lock().await;
+        let mut settled = Vec::new();
+        pending.retain(|q| {
+            let HubRelay::ScopeGrantRequested { request } = &q.relay else {
+                return true;
+            };
+            if !crate::scope_grant::answer_settles(&answer.request, answer.decision, request) {
+                return true;
+            }
+            settled.push((q.decision_id.clone(), q.instance_id.clone()));
+            false
+        });
+        settled
+    };
+    for (decision_id, instance_id) in settled {
+        info!(
+            "hub: answer to {} also settles {decision_id} (same question, same workspace)",
+            answer.request.decision_id
+        );
+        route_to_instance(
+            hub,
+            Some(instance_id),
+            HubMsg::SubmitScopeGrant {
+                decision_id: decision_id.clone(),
+                decision: answer.decision,
+                advice: None,
+                advice_followed: None,
+            },
+        )
+        .await;
+        let _ = hub
+            .broadcast
+            .send(HubMsg::ScopeGrantDismiss { decision_id });
+    }
+}
+
 /// Which instance raised `decision_id`, so its answer goes back to the session
 /// that asked rather than to whichever one happens to be first.
 async fn instance_for_decision(hub: &Hub, decision_id: &str) -> Option<String> {
@@ -2549,10 +2601,16 @@ async fn serve_instance<R, W>(
                         // Liveness confirmed — nothing else to do for now.
                         debug!("hub: pong received from id={id}");
                     }
-                    Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
+                    Ok(ClientMsg::ScopeGrantResolved {
+                        decision_id,
+                        answer,
+                    }) => {
                         hub.pending_decisions.lock().await.remove(&decision_id);
                         hub.forget_question(&decision_id).await;
                         let _ = hub.broadcast.send(HubMsg::ScopeGrantDismiss { decision_id });
+                        if let Some(answer) = answer {
+                            settle_waiting_copies(hub, &answer).await;
+                        }
                     }
                     Ok(ClientMsg::WebApprovalResolved { decision_id }) => {
                         hub.pending_decisions.lock().await.remove(&decision_id);
@@ -3490,6 +3548,7 @@ mod tests {
             },
             ClientMsg::ScopeGrantResolved {
                 decision_id: "dec-42".into(),
+                answer: None,
             },
         ] {
             let json = serde_json::to_string(&msg).unwrap();
@@ -3626,6 +3685,139 @@ mod tests {
         }
     }
 
+    /// SPEC R-PERM.3.8: one answer settles every waiting copy. Two sessions
+    /// in one workspace wait on the same folder; the human answers one. The
+    /// hub sends the same answer to the other session, under that session's
+    /// own question, and takes both down from every TUI. A question from
+    /// another workspace is left waiting.
+    #[tokio::test]
+    async fn one_answer_settles_every_waiting_copy_in_the_workspace() {
+        use crate::scope_grant::{
+            AnsweredQuestion, GrantContext, GrantDecision, GrantReason, GrantRequester,
+            ScopeGrantRequest,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+        let wait = crate::timeouts::TestTimeouts::get(crate::timeouts::TimeoutCategory::Quick);
+
+        let req = |id: &str, ws: &str| ScopeGrantRequest {
+            decision_id: id.into(),
+            path: std::path::PathBuf::from("/opt/cache"),
+            access: crate::config::ScopeAccess::Rw,
+            reason: GrantReason::StderrHeuristic,
+            tool: Some("cargo".into()),
+            context: GrantContext {
+                requester: Some(GrantRequester {
+                    workspace: Some(std::path::PathBuf::from(ws)),
+                    ..GrantRequester::default()
+                }),
+                ..GrantContext::default()
+            },
+        };
+        let ask =
+            |r: ScopeGrantRequest| ClientMsg::Relay(HubRelay::ScopeGrantRequested { request: r });
+
+        let a = connect_to_hub_at(&sock).await.unwrap();
+        let (_ar, mut aw) = tokio::io::split(a);
+        send_msg(&mut aw, &test_register_msg()).await.unwrap();
+        let b = connect_to_hub_at(&sock).await.unwrap();
+        let (br, mut bw) = tokio::io::split(b);
+        let mut brdr = BufReader::new(br);
+        send_msg(&mut bw, &test_register_msg()).await.unwrap();
+
+        send_msg(&mut aw, &ask(req("qa", "/w/app"))).await.unwrap();
+        send_msg(&mut bw, &ask(req("qb", "/w/app"))).await.unwrap();
+        send_msg(&mut bw, &ask(req("qother", "/w/other")))
+            .await
+            .unwrap();
+
+        // A TUI that has seen all three is the sync point: the hub holds them.
+        let tui = connect_to_hub_at(&sock).await.unwrap();
+        let (tr, mut tw) = tokio::io::split(tui);
+        let mut trdr = BufReader::new(tr);
+        send_msg(&mut tw, &ClientMsg::Subscribe).await.unwrap();
+        tokio::time::timeout(wait, async {
+            let mut seen = std::collections::HashSet::new();
+            while seen.len() < 3 {
+                if let HubMsg::Relay(HubRelay::ScopeGrantRequested { request }) =
+                    recv_msg::<_, HubMsg>(&mut trdr).await.unwrap()
+                {
+                    seen.insert(request.decision_id);
+                }
+            }
+        })
+        .await
+        .expect("the TUI is shown all three questions");
+
+        // Session A's client answered its own copy.
+        send_msg(
+            &mut aw,
+            &ClientMsg::ScopeGrantResolved {
+                decision_id: "qa".into(),
+                answer: Some(AnsweredQuestion {
+                    request: req("qa", "/w/app"),
+                    decision: GrantDecision::GrantRwSession,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let routed = tokio::time::timeout(wait, async {
+            loop {
+                if let HubMsg::SubmitScopeGrant {
+                    decision_id,
+                    decision,
+                    ..
+                } = recv_msg::<_, HubMsg>(&mut brdr).await.unwrap()
+                {
+                    return (decision_id, decision);
+                }
+            }
+        })
+        .await
+        .expect("session B is sent the answer");
+        assert_eq!(routed, ("qb".to_string(), GrantDecision::GrantRwSession));
+
+        let dismissed = tokio::time::timeout(wait, async {
+            let mut gone = std::collections::HashSet::new();
+            while gone.len() < 2 {
+                if let HubMsg::ScopeGrantDismiss { decision_id } =
+                    recv_msg::<_, HubMsg>(&mut trdr).await.unwrap()
+                {
+                    gone.insert(decision_id);
+                }
+            }
+            gone
+        })
+        .await
+        .expect("both copies are taken down");
+        assert!(
+            dismissed.contains("qa") && dismissed.contains("qb"),
+            "{dismissed:?}"
+        );
+        assert!(!dismissed.contains("qother"));
+
+        // The other workspace's question is still waiting for a late TUI.
+        let late = connect_to_hub_at(&sock).await.unwrap();
+        let (lr, mut lw) = tokio::io::split(late);
+        let mut lrdr = BufReader::new(lr);
+        send_msg(&mut lw, &ClientMsg::Subscribe).await.unwrap();
+        let replayed = tokio::time::timeout(wait, async {
+            loop {
+                if let HubMsg::Relay(HubRelay::ScopeGrantRequested { request }) =
+                    recv_msg::<_, HubMsg>(&mut lrdr).await.unwrap()
+                {
+                    return request.decision_id;
+                }
+            }
+        })
+        .await
+        .expect("a question is replayed");
+        assert_eq!(replayed, "qother");
+    }
+
     /// A TUI that opens while a question waits is shown it; an answered
     /// question is not replayed; and when the asking instance goes, every TUI
     /// is told to take its questions down (SPEC R-PERM.3.7).
@@ -3680,6 +3872,7 @@ mod tests {
             &mut iw,
             &ClientMsg::ScopeGrantResolved {
                 decision_id: "answered".into(),
+                answer: None,
             },
         )
         .await
@@ -5516,6 +5709,7 @@ mod tests {
             &mut iw,
             &ClientMsg::ScopeGrantResolved {
                 decision_id: "d9".into(),
+                answer: None,
             },
         )
         .await
