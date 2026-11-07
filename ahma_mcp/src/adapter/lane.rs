@@ -861,6 +861,11 @@ pub struct RunSite<'a> {
 ///   target the shell would expand (`$X`, a glob, `~`), a relative target
 ///   after a `cd`, or a program that writes through its arguments.
 pub fn classify_shell_command_at(command: &str, site: &RunSite<'_>) -> Lane {
+    // A quoted heredoc is inert text on stdin (R2.7.4): judge the line
+    // without it, so `cat > <outside> <<'EOF'` is the write it looks like.
+    if let Some(line) = without_quoted_heredoc(command) {
+        return classify_shell_command_at(&line, site);
+    }
     let Some((line, reading)) = read_line(command) else {
         return Lane::Exclusive;
     };
@@ -1106,6 +1111,37 @@ fn is_known_writer(word: &str) -> bool {
         ".sh", ".bash", ".zsh", ".py", ".rb", ".js", ".mjs", ".ts", ".pl", ".ps1",
     ];
     script.iter().any(|ext| name.ends_with(ext)) || KNOWN_WRITERS.contains(&name.as_str())
+}
+
+/// `command` without its heredoc, when that heredoc cannot run anything: one
+/// `<<'WORD'` or `<<"WORD"` (quoted, so the shell expands nothing in the
+/// body), on the first line, whose body ends at the last line with `WORD`
+/// and nowhere earlier, with nothing after it. The body is then only text on
+/// the program's stdin, and the first line alone says what runs and what it
+/// writes: `python3 - <<'EOF'` still runs the body, and stays exclusive as an
+/// unknown program would. `None` for every other shape (SPEC R2.7.4).
+fn without_quoted_heredoc(command: &str) -> Option<String> {
+    let command = command.trim_end();
+    let (first, body) = command.split_once('\n')?;
+    let at = first.find("<<")?;
+    if first[at + 2..].contains("<<") {
+        return None;
+    }
+    let rest = first[at + 2..].trim_start();
+    let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let close = rest[1..].find(quote)? + 1;
+    let word = &rest[1..close];
+    if word.is_empty() || word.contains(char::is_whitespace) {
+        return None;
+    }
+    let (inner, last) = match body.rsplit_once('\n') {
+        Some((inner, last)) => (inner, last),
+        None => ("", body),
+    };
+    if last != word || inner.lines().any(|l| l == word) {
+        return None;
+    }
+    Some(format!("{}{}", &first[..at], &rest[close + 1..]))
 }
 
 /// The path a redirection target names, read the way the shell would without
@@ -2924,6 +2960,33 @@ mod doubt_tests {
         assert_eq!(at("gh release list --limit 3"), Lane::ReadOnly);
         assert_eq!(at("[ -t 0 ] && echo tty || echo not-tty"), Lane::ReadOnly);
         assert_eq!(at("gh release create v1"), Lane::Exclusive);
+    }
+
+    /// SPEC R2.7.4 (field case): `cat > <scratch>/file <<'EOF' … EOF` waited
+    /// five minutes behind a build, though it wrote nothing in the workspace.
+    /// A quoted heredoc expands nothing, so the line is judged without it.
+    #[test]
+    fn a_quoted_heredoc_into_a_file_outside_the_workspace_takes_no_lease() {
+        let body = "CH=\"/Applications/Google Chrome.app\"\nrm -rf /ws\n$(touch /ws/x)";
+        assert_eq!(
+            at(&format!("cat > /tmp/s/render.sh <<'EOF'\n{body}\nEOF")),
+            Lane::Service
+        );
+        assert_eq!(
+            at(&format!("cat <<\"END\" > /tmp/s/notes.md\n{body}\nEND\n")),
+            Lane::Service
+        );
+        for still_waits in [
+            format!("cat > /ws/render.sh <<'EOF'\n{body}\nEOF"),
+            format!("cat > /tmp/s/r.sh <<EOF\n{body}\nEOF"),
+            "python3 - <<'EOF'\nprint(1)\nEOF".to_string(),
+            "cat <<'EOF' | sh\nrm -rf /ws\nEOF".to_string(),
+            format!("cat > /tmp/s/r.sh <<'EOF'\n{body}\nEOF\nchmod +x /ws/r.sh"),
+            "cat > /tmp/s/r.sh <<'EOF'\nEOF\nEOF\nrm -rf /ws\nEOF".to_string(),
+            "cat > /tmp/s/r.sh <<'EOF' <<'TWO'\na\nEOF\nb\nTWO".to_string(),
+        ] {
+            assert_eq!(at(&still_waits), Lane::Exclusive, "{still_waits}");
+        }
     }
 
     #[test]

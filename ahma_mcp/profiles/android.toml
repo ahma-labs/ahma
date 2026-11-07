@@ -124,12 +124,30 @@ access = "rx"
 path = "~/.android/avd"
 access = "rw"
 
-# The debug signing keystore is *created* by the first debug assembly, so a
-# read-only ~/.android fails `assembleDebug` on a fresh machine. One file.
+# The debug signing keystore. AGP's `validateSigningDebug` runs on every debug
+# build that uses the default keystore, before it looks for the file: it checks
+# that ~/.android itself can be written (`File.canWrite`), then takes the lock
+# `debug.keystore.lock` beside it, and creates the keystore only if it is
+# missing. So the folder itself is writable (`kind = "folder"`: the folder, not
+# what is in it), and so are those two files; the adb key pair and everything
+# else in ~/.android stay read-only. Field case: with only the keystore file
+# writable, every sandboxed debug build failed with "Unable to create debug
+# keystore in ~/.android because it is not writable" (SPEC R-PERM.5.6).
+[[rules]]
+path = "~/.android"
+access = "rw"
+kind = "folder"
+
 [[rules]]
 path = "~/.android/debug.keystore"
 access = "rw"
 kind = "file"
+
+[[rules]]
+path = "~/.android/debug.keystore.lock"
+access = "rw"
+kind = "file"
+precreate = true
 
 # The Kotlin compiler daemon's cache (macOS location); Gradle's Kotlin plugin
 # writes it on every build.
