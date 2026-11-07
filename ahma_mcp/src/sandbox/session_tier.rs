@@ -30,24 +30,23 @@ pub fn pid_alive(pid: u32) -> bool {
 /// edits in `workspace` honour it for as long as `owner_pid` lives (at most
 /// [`session_grants::MAX_AGE_SECS`]). Callers have already passed the hard
 /// denylist ([`super::Sandbox::add_live_grant`] refuses before they get here).
-/// Best-effort: a write failure is logged, never fatal.
+/// Best-effort: a write failure is logged, never fatal. Returns the file
+/// written, so a grant that turns out not to help can be withdrawn.
 pub fn record_session_grant(
     path: &Path,
     access: ScopeAccess,
     workspace: Option<&Path>,
     owner_pid: u32,
     granted_by: &str,
-) {
+) -> Option<std::path::PathBuf> {
     let Some(workspace) = workspace else {
         tracing::debug!(
             path = %path.display(),
             "session grant not shared with hooks: no workspace to bind it to"
         );
-        return;
+        return None;
     };
-    let Some(dir) = session_grants::default_dir() else {
-        return;
-    };
+    let dir = session_grants::default_dir()?;
     let grant = SessionGrant {
         path: dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
         access,
@@ -57,14 +56,20 @@ pub fn record_session_grant(
         granted_by: Some(granted_by.to_string()),
     };
     match session_grants::record(&dir, &grant) {
-        Ok(file) => tracing::info!(
-            path = %grant.path.display(),
-            access = access.label(),
-            workspace = %grant.workspace.display(),
-            "session grant recorded for terminal hooks and the edit guard: {}",
-            file.display()
-        ),
-        Err(e) => tracing::warn!("could not record session grant: {e:#}"),
+        Ok(file) => {
+            tracing::info!(
+                path = %grant.path.display(),
+                access = access.label(),
+                workspace = %grant.workspace.display(),
+                "session grant recorded for terminal hooks and the edit guard: {}",
+                file.display()
+            );
+            Some(file)
+        }
+        Err(e) => {
+            tracing::warn!("could not record session grant: {e:#}");
+            None
+        }
     }
 }
 

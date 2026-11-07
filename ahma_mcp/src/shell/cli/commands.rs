@@ -868,26 +868,44 @@ fn run_sandbox_list(file: &std::path::Path) -> Result<()> {
 /// Print one persistent grant: its path and access, then whichever provenance
 /// fields the grant actually carries.
 fn print_persistent_scope(s: &ahma_common::config::PersistentScope) {
-    println!("• {}  ({})", s.path.display(), s.access.label());
+    for line in persistent_scope_lines(s) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_persistent_scope`] prints. A grant on a path where
+/// nothing exists says so (SPEC R-PERM.10.3): it may be a folder a tool has
+/// yet to create, or one cut from a misread path, which nothing will.
+fn persistent_scope_lines(s: &ahma_common::config::PersistentScope) -> Vec<String> {
+    let mut lines = vec![format!("• {}  ({})", s.path.display(), s.access.label())];
     match &s.workspace {
-        Some(ws) => println!("    workspace:  {}", ws.display()),
-        None => println!(
+        Some(ws) => lines.push(format!("    workspace:  {}", ws.display())),
+        None => lines.push(
             "    workspace:  GLOBAL (legacy) — applies to every workspace; re-grant it from \
              the project that needs it to narrow it"
+                .to_string(),
         ),
     }
+    if !s.path.exists() {
+        lines.push(format!(
+            "    missing:    nothing exists here; unless a tool will create it, remove it with \
+             `ahma sandbox revoke {}` (or `ahma doctor`)",
+            s.path.display()
+        ));
+    }
     if let Some(by) = &s.granted_by {
-        println!("    granted by: {by}");
+        lines.push(format!("    granted by: {by}"));
     }
     if let Some(at) = &s.granted_at {
-        println!("    granted on: {at}");
+        lines.push(format!("    granted on: {at}"));
     }
     if let Some(note) = &s.note {
-        println!("    note:       {note}");
+        lines.push(format!("    note:       {note}"));
     }
     if let Some(line) = lease_line(s.expires_at) {
-        println!("    {line}");
+        lines.push(format!("    {line}"));
     }
+    lines
 }
 
 fn run_sandbox_revoke(
@@ -2951,6 +2969,33 @@ mod tests {
     }
 
     // ── sandbox ─────────────────────────────────────────────────────────────
+
+    /// SPEC R-PERM.10.3: a saved grant on a path where nothing exists is
+    /// pointed out where the human reads the list. Field case: a grant on
+    /// `/Applications/Google`, cut from "Google Chrome.app", sat in
+    /// settings.toml doing nothing.
+    #[test]
+    fn a_grant_on_nothing_is_pointed_out_in_the_list() {
+        let tmp = TempDir::new().unwrap();
+        let scope = |path: PathBuf| ahma_common::config::PersistentScope {
+            path,
+            access: ahma_common::config::ScopeAccess::Rw,
+            workspace: Some(tmp.path().to_path_buf()),
+            granted_by: None,
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        };
+        let gone = tmp.path().join("Google");
+        let lines = persistent_scope_lines(&scope(gone.clone())).join("\n");
+        assert!(lines.contains("missing:"), "{lines}");
+        assert!(
+            lines.contains(&format!("ahma sandbox revoke {}", gone.display())),
+            "{lines}"
+        );
+        let there = persistent_scope_lines(&scope(tmp.path().to_path_buf())).join("\n");
+        assert!(!there.contains("missing:"), "{there}");
+    }
 
     #[test]
     fn sandbox_grant_list_revoke_lifecycle() {

@@ -79,6 +79,18 @@ pub fn record(dir: &Path, grant: &SessionGrant) -> Result<PathBuf> {
     Ok(file)
 }
 
+/// Remove the session grant recorded in `file` (from [`record`]): a grant
+/// the run it was approved for showed did not help (SPEC R-PERM.10.3).
+/// A file already gone is fine.
+pub fn remove(file: &Path) -> Result<()> {
+    match std::fs::remove_file(file) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("remove {}", file.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn file_name(grant: &SessionGrant) -> String {
     let key = format!("{}\0{}", grant.path.display(), grant.access.short());
     format!(

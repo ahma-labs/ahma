@@ -1780,11 +1780,13 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     {
         return run_command_once_unsandboxed(&payload, &refusal.why).await;
     }
+    let mut trial = None;
     if let Some(token) = approval
-        && let Some(line) =
+        && let Some(approval) =
             harness_ask::apply_approval(&token, Path::new(&payload.cwd), &payload.command)
     {
-        eprintln!("{line}");
+        eprintln!("{}", approval.line);
+        trial = approval.trial;
     }
     let mut hook_scopes = resolve_hook_sandbox_scopes(Path::new(&payload.cwd));
     // Session-tier grants a human approved at the TUI or a harness prompt apply
@@ -2003,6 +2005,15 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // absent or slow costs this much and no more.
     flush_hook_report(reporter).await;
 
+    // A grant approved for this run is remembered only if the run shows it
+    // helped (SPEC R-PERM.10.3).
+    if let Some(trial) = trial {
+        eprintln!(
+            "{}",
+            harness_ask::finish_trial(trial, trial_outcome(&result))
+        );
+    }
+
     match result {
         Ok(output) => {
             // Not `println!` (SPEC R5.6.1): the hook's stdout is a pipe to the
@@ -2035,6 +2046,28 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             Some(stopped) => Err(anyhow!(time_limit_message(stopped, limit))),
             None => report_shell_execution_error(e, &requester, Path::new(&payload.cwd)),
         },
+    }
+}
+
+/// How a hooked run ended, for the grant it was approved with.
+fn trial_outcome(result: &Result<String>) -> harness_ask::TrialOutcome {
+    use crate::sandbox::SandboxError;
+    use harness_ask::TrialOutcome;
+    let Err(e) = result else {
+        return TrialOutcome::Succeeded;
+    };
+    if e.downcast_ref::<crate::adapter::time_limit::LimitReached>()
+        .is_some()
+    {
+        return TrialOutcome::Stopped;
+    }
+    match e.downcast_ref::<SandboxError>() {
+        Some(SandboxError::Unfixable { .. }) => TrialOutcome::Unrunnable,
+        Some(SandboxError::RuntimeDenial { path, .. })
+        | Some(SandboxError::PathOutsideSandbox { path, .. }) => {
+            TrialOutcome::Refused(path.clone())
+        }
+        _ => TrialOutcome::Failed,
     }
 }
 
