@@ -36,7 +36,10 @@ status()                                     → ── Finished since your last
   so a misclassified command fails instead of writing. A braced variable (`sed -n ${n}p`)
   and the wrappers `timeout`, `time`, `nice`, `caffeinate` and `env NAME=…` are judged by
   the command they run.
-- **What still makes a line wait.** A heredoc (`<<`), a backtick (inside double quotes too),
+- **A quoted heredoc into a file outside the workspace does not wait.** `cat > <scratch>/notes.md <<'EOF' … EOF`
+  is judged as `cat > <scratch>/notes.md`: a quoted heredoc expands nothing, so its body is only text. An
+  unquoted heredoc, an interpreter reading one (`python3 - <<'EOF'`), or a target in the workspace still waits.
+- **What still makes a line wait.** Any other heredoc (`<<`), a backtick (inside double quotes too),
   grouping (`( … )`, `{ … }`), an escape, a line break, or a program ahma does not know
   only reads (a project script, `python3`). And on a Mac where ahma itself runs inside
   another sandbox (macOS refuses to nest Seatbelt profiles), there is no read-only lane at

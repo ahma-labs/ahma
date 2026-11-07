@@ -1319,7 +1319,11 @@ fn print_profile_entry(
             ProfileAccess::Rx => "read+execute",
             ProfileAccess::Rw => "read+write",
         };
-        println!("      {}  ({access})", r.path.display());
+        let what = match r.kind {
+            crate::sandbox::profiles::RuleKind::Folder => " — the folder itself, not what is in it",
+            _ => "",
+        };
+        println!("      {}  ({access}{what})", r.path.display());
     }
     let here = std::env::current_dir().unwrap_or_default();
     for line in profile_env_lines(&profile.name, &here) {

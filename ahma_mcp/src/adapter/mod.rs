@@ -2298,9 +2298,31 @@ fn explain_ungrantable_failure(
         });
     }
     if notes.is_empty() {
+        // Reads like a refusal, but nothing above could name it (SPEC
+        // R-DENY.4): say where to look, so the agent does not guess that the
+        // human must run it outside the sandbox.
+        if reads_like_a_refusal(stderr) || reads_like_a_refusal(stdout) {
+            return result.map_err(|e| anyhow::anyhow!("{e}\n\n{QUIET_REFUSAL_NOTE}"));
+        }
         return result;
     }
     result.map_err(|e| anyhow::anyhow!("{e}\n\n{}", notes.join("\n\n")))
+}
+
+/// The line a failure that reads like a refusal gets when ahma could name
+/// nothing to grant (SPEC R-DENY.4).
+const QUIET_REFUSAL_NOTE: &str = "ahma: this failure reads like a refusal, but ahma's sandbox \
+     recorded nothing it can grant. Before asking the human to run anything outside the \
+     sandbox, run `ahma explain blocked`: a helper started elsewhere (a Gradle or Kotlin \
+     daemon, sccache), a path inside the workspace, or a missing setting is the usual cause.";
+
+/// Whether `text` complains of a refused operation in the words tools use.
+fn reads_like_a_refusal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("operation not permitted")
+        || lower.contains("permission denied")
+        || lower.contains("read-only file system")
+        || sandbox::denial_scan::says_not_writable(&lower)
 }
 
 /// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
@@ -3100,6 +3122,7 @@ async fn record_failure_diagnostics(
         None
     };
 
+    let mut explained = target_and_access.is_some();
     if target_and_access.is_none()
         && let Some(note) = sandbox::signal_denial_note(stderr_str, stdout_str)
             .or_else(|| sandbox::gpu_denial_note(stderr_str, stdout_str))
@@ -3107,6 +3130,7 @@ async fn record_failure_diagnostics(
             .or_else(|| sandbox::launch_services_denial_note(stderr_str, stdout_str))
     {
         op_monitor.append_alert(op_id, note).await;
+        explained = true;
     }
 
     if let Some((target, access)) = target_and_access {
@@ -3136,6 +3160,7 @@ async fn record_failure_diagnostics(
                 remediation
             );
             op_monitor.append_alert(op_id, remediation).await;
+            explained = true;
         }
     }
 
@@ -3150,6 +3175,14 @@ async fn record_failure_diagnostics(
             cap
         );
         op_monitor.append_alert(op_id, disclosure).await;
+        explained = true;
+    }
+
+    // Reads like a refusal, but nothing above named one (SPEC R-DENY.4).
+    if !explained && (reads_like_a_refusal(stderr_str) || reads_like_a_refusal(stdout_str)) {
+        op_monitor
+            .append_alert(op_id, QUIET_REFUSAL_NOTE.to_string())
+            .await;
     }
 }
 
@@ -3457,6 +3490,34 @@ mod tests {
         );
         assert!(fatal_unrunnable(Ok("fine".into()), &stderr, "").is_err());
         assert!(fatal_unrunnable(Err(anyhow::anyhow!("x")), "cat: /x: nope", "").is_err());
+    }
+
+    /// SPEC R-DENY.4: a failure that reads like a refusal ahma could not
+    /// name gets one line, so the agent looks before it sends the human
+    /// outside the sandbox. Field case: AGP's "not writable" came back with
+    /// nothing from ahma, and the agent told the human to build in their own
+    /// terminal.
+    #[test]
+    fn a_refusal_ahma_cannot_name_still_gets_a_line() {
+        let err = explain_ungrantable_failure(
+            Err(anyhow::anyhow!("exit 1")),
+            "error: failed to open lockfile: Operation not permitted (os error 1)",
+            "",
+            &|h| h.remediation.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ahma explain blocked"), "{err}");
+        assert!(err.contains("outside the sandbox"), "{err}");
+        let plain = explain_ungrantable_failure(
+            Err(anyhow::anyhow!("exit 1")),
+            "test result: FAILED. 1 passed; 1 failed",
+            "",
+            &|h| h.remediation.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!plain.contains("ahma explain"), "{plain}");
     }
 
     #[test]

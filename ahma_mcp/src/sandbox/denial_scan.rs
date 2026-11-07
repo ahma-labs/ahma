@@ -181,6 +181,7 @@ fn denial_keyword_access(line: &str) -> Option<ScopeAccess> {
     if lower.contains("read-only file system")
         || lower.contains("read-only path")
         || lower.contains("operation not permitted")
+        || says_not_writable(&lower)
     {
         return Some(ScopeAccess::Rw);
     }
@@ -229,7 +230,8 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     let lower = line.to_ascii_lowercase();
     if (lower.contains("read-only file system")
         || lower.contains("read-only path")
-        || lower.contains("operation not permitted"))
+        || lower.contains("operation not permitted")
+        || says_not_writable(&lower))
         && let Some(path) = extract_path(line)
     {
         return Some(DenialHit {
@@ -273,6 +275,15 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     }
 
     None
+}
+
+/// A tool's own words for a write it refused before trying (SPEC R6.2.8.3):
+/// AGP's "… in ~/.android because it is not writable", "cannot write …",
+/// "Permission to write … denied". `lower` is the line in lower case.
+pub(crate) fn says_not_writable(lower: &str) -> bool {
+    lower.contains("not writable")
+        || lower.contains("cannot write")
+        || lower.contains("permission to write")
 }
 
 /// Pull the first candidate path token out of a line, trimming surrounding
@@ -563,6 +574,34 @@ mod tests {
             root.join("x").display()
         );
         assert_eq!(scan_denial_streams(&line, "").unwrap().path, root.join("x"));
+    }
+
+    /// A tool that checks before it writes says so in its own words, with no
+    /// errno: AGP's `java.io.IOException: Unable to create debug keystore in
+    /// ~/.android because it is not writable.` ahma printed nothing for it,
+    /// and the agent told the human to build outside the sandbox. A wrong
+    /// match now costs one trial grant, never a saved one (SPEC R6.2.8.3).
+    #[test]
+    fn a_tools_own_not_writable_is_a_refused_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let android = dunce::canonicalize(dir.path()).unwrap().join(".android");
+        std::fs::create_dir_all(&android).unwrap();
+        let agp = format!(
+            "> java.io.IOException: Unable to create debug keystore in {} because it is not \
+             writable.",
+            android.display()
+        );
+        let hit = scan_denial_streams(&agp, "").expect("a refused write");
+        assert_eq!(hit.path, android);
+        assert_eq!(hit.access, ScopeAccess::Rw);
+        for line in [
+            format!("error: cannot write {}/x.lock", android.display()),
+            format!("Permission to write {} was denied", android.display()),
+        ] {
+            let hit = scan_denial_streams(&line, "").unwrap_or_else(|| panic!("{line}"));
+            assert_eq!(hit.access, ScopeAccess::Rw, "{line}");
+        }
+        assert_eq!(scan_denial_streams("the cache is not writable", ""), None);
     }
 
     /// Chrome's `sandbox_extension_issue_file_to_process failed for <app>`

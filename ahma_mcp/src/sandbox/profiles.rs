@@ -79,6 +79,22 @@ pub enum RuleKind {
     Dir,
     /// A single file (cargo's cross-process lock files are the motivating case).
     File,
+    /// A directory itself, not what is beneath it: writing it lets a tool see
+    /// the folder as writable (`access(W_OK)`, Java's `File.canWrite`) and
+    /// nothing more, since creating or changing a file inside needs a rule of
+    /// its own. Seatbelt only; Landlock cannot express it and skips it.
+    Folder,
+}
+
+impl RuleKind {
+    /// Whether a rule of this kind on `rule_path` reaches `path`: a directory
+    /// rule covers its subtree, a file or folder rule only itself.
+    pub fn covers(self, rule_path: &Path, path: &Path) -> bool {
+        match self {
+            RuleKind::Dir => path.starts_with(rule_path),
+            RuleKind::File | RuleKind::Folder => path == rule_path,
+        }
+    }
 }
 
 /// One rule as written in a profile's TOML.
@@ -438,6 +454,8 @@ fn precreate(rule: &ResolvedRule) {
                 tracing::debug!("could not pre-create {}: {e}", rule.path.display());
             }
         }
+        // A folder rule is about an existing folder; it creates none.
+        RuleKind::Folder => {}
     }
 }
 
@@ -1109,13 +1127,47 @@ mod tests {
             let writable = rules
                 .iter()
                 .filter(|r| r.access.is_write())
-                .any(|r| denied.starts_with(&r.path));
+                .any(|r| r.kind.covers(&r.path, &denied));
             assert!(
                 !writable,
                 "{} must never be writable — it holds credentials or executables",
                 denied.display()
             );
         }
+    }
+
+    /// SPEC R-PERM.5.6 (field case): AGP's `validateSigningDebug` checks that
+    /// `~/.android` itself can be written, then locks
+    /// `~/.android/debug.keystore.lock`, on every debug build that uses the
+    /// default keystore — before it looks for the keystore. With only the
+    /// keystore file writable, every sandboxed debug build failed with
+    /// "Unable to create debug keystore in ~/.android because it is not
+    /// writable", and an agent told the human to build outside the sandbox.
+    #[test]
+    fn an_android_debug_build_can_check_and_lock_its_keystore() {
+        let Some(home) = ahma_common::config::ahma_home_dir() else {
+            return;
+        };
+        let android = home.join(".android");
+        let rules = resolved_rules(&["android".to_string()], true);
+        let rule = |path: &Path| rules.iter().find(|r| r.path == path);
+        let folder = rules
+            .iter()
+            .find(|r| r.path == android && r.kind == RuleKind::Folder)
+            .expect("the folder itself is writable");
+        assert_eq!(folder.access, ProfileAccess::Rw);
+        for file in ["debug.keystore", "debug.keystore.lock"] {
+            let r = rule(&android.join(file)).expect(file);
+            assert_eq!(
+                (r.kind, r.access),
+                (RuleKind::File, ProfileAccess::Rw),
+                "{file}"
+            );
+        }
+        // The folder rule reaches nothing beneath it: the adb key pair stays
+        // read-only (see `no_profile_ever_makes_credentials_or_bin_writable`).
+        assert!(!RuleKind::Folder.covers(&android, &android.join("adbkey")));
+        assert!(RuleKind::Dir.covers(&android, &android.join("adbkey")));
     }
 
     #[test]

@@ -459,7 +459,9 @@ impl Sandbox {
         for rule in applicable_rules(enabled, self.package_cache_write) {
             let target = match rule.kind {
                 RuleKind::Dir => format!("(subpath \"{}\")", rule.path.display()),
-                RuleKind::File => format!("(literal \"{}\")", rule.path.display()),
+                RuleKind::File | RuleKind::Folder => {
+                    format!("(literal \"{}\")", rule.path.display())
+                }
             };
             // Read and write go out as *separate* rules rather than one combined
             // `(allow file-read* file-write* …)`. Semantically identical, but this

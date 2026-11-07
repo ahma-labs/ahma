@@ -1787,3 +1787,56 @@ fn sandboxed_pgrep_and_ahma_ps_can_list_processes() {
         "a setuid binary cannot run under any sandbox; if this starts passing, drop `ahma ps`"
     );
 }
+
+/// SPEC R-PERM.5.6: a profile rule of `kind = "folder"` is a Seatbelt
+/// `literal` write on the folder itself. That is what makes the folder pass
+/// `access(W_OK)` — the check AGP's `validateSigningDebug` runs on
+/// `~/.android` before every debug build (Java's `File.canWrite`) — while a
+/// new file inside it, or an existing one with no rule of its own, stays
+/// refused. Measured on a stand-in folder outside every writable root: a
+/// control profile without the folder rule must refuse `test -w`.
+#[test]
+fn a_folder_rule_makes_the_folder_writable_and_nothing_in_it() {
+    skip_if_nested_sandbox!();
+    let temp = TempDir::new().expect("tempdir");
+    let android = std::fs::canonicalize(temp.path())
+        .unwrap()
+        .join("dot-android");
+    std::fs::create_dir_all(&android).unwrap();
+    for f in ["debug.keystore", "debug.keystore.lock", "adbkey"] {
+        std::fs::write(android.join(f), "x").unwrap();
+    }
+    let d = android.display();
+    let base = format!(
+        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow file-read*)\n\
+         (allow file-write* (literal \"/dev/null\"))\n\
+         (allow file-write* (literal \"{d}/debug.keystore\"))\n\
+         (allow file-write* (literal \"{d}/debug.keystore.lock\"))\n"
+    );
+    let probe = format!(
+        "D='{d}'; test -w \"$D\" && echo DIR_WRITABLE; \
+         : >> \"$D/debug.keystore.lock\" 2>/dev/null && echo LOCK_WRITTEN; \
+         : > \"$D/new-file\" 2>/dev/null && echo NEW_FILE_WRITTEN; \
+         : >> \"$D/adbkey\" 2>/dev/null && echo ADBKEY_WRITTEN; true"
+    );
+    let run = |profile: &str| {
+        let out = Command::new("sandbox-exec")
+            .args(["-p", profile, "/bin/sh", "-c", &probe])
+            .output()
+            .expect("sandbox-exec");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let with_folder = run(&format!("{base}(allow file-write* (literal \"{d}\"))\n"));
+    assert!(with_folder.contains("DIR_WRITABLE"), "{with_folder}");
+    assert!(with_folder.contains("LOCK_WRITTEN"), "{with_folder}");
+    assert!(!with_folder.contains("NEW_FILE_WRITTEN"), "{with_folder}");
+    assert!(!with_folder.contains("ADBKEY_WRITTEN"), "{with_folder}");
+    assert!(!android.join("new-file").exists());
+
+    // The control: without the folder rule the folder is not writable, which
+    // is the AGP failure.
+    let without = run(&base);
+    assert!(!without.contains("DIR_WRITABLE"), "{without}");
+    assert!(without.contains("LOCK_WRITTEN"), "{without}");
+}

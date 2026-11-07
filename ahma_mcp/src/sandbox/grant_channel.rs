@@ -875,6 +875,7 @@ fn looks_refused(text: &str) -> bool {
     ]
     .iter()
     .any(|w| lower.contains(w))
+        || super::denial_scan::says_not_writable(&lower)
 }
 
 /// What [`kernel_denial_lines`] found.

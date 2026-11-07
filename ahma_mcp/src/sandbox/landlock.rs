@@ -346,8 +346,8 @@ fn add_landlock_profile_rules(
     access_all: landlock::BitFlags<landlock::AccessFs>,
     package_cache_write: bool,
 ) -> Result<()> {
-    use super::profiles::{ProfileAccess, applicable_rules, enabled_profile_names};
-    use landlock::{AccessFs, PathBeneath, PathFd, RulesetCreatedAttr};
+    use super::profiles::{ProfileAccess, RuleKind, applicable_rules, enabled_profile_names};
+    use landlock::{ABI, AccessFs, PathBeneath, PathFd, RulesetCreatedAttr};
 
     // Loaded once per process (see `enabled_profile_names`): sandbox
     // configuration cannot change mid-session, and this runs per spawn.
@@ -359,6 +359,16 @@ fn add_landlock_profile_rules(
             ProfileAccess::Ro => access_read,
             ProfileAccess::Rx => access_read_execute,
             ProfileAccess::Rw => access_all,
+        };
+        let access = match rule.kind {
+            // Landlock grants a directory's rights to everything beneath it,
+            // so "the folder itself" cannot be said; and Landlock does not
+            // gate `access(W_OK)`, which is what such a rule is for.
+            RuleKind::Folder => continue,
+            // Directory rights on a file make the rule invalid: keep the
+            // ones a file can carry.
+            RuleKind::File if rule.path.is_file() => access & AccessFs::from_file(ABI::V2),
+            _ => access,
         };
         if let Ok(fd) = PathFd::new(&rule.path) {
             tracing::debug!(
