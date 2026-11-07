@@ -805,12 +805,19 @@ pub async fn kernel_denial_lines(
     let mut grant = None;
     let mut unfixable = false;
     let mut asked = false;
+    // A refused Mach registration ends the program at startup (SPEC
+    // R6.2.13): a path refused in the same run did not cause the failure,
+    // so it is listed but neither offered nor asked about.
+    let fatal = records.iter().any(|d| d.operation == "mach-register");
     for denial in &records {
         let class = classify(denial);
         unfixable |= matches!(class, DenialClass::Unfixable { .. });
         let line = one_line(denial, &class);
         if !lines.contains(&line) {
             lines.push(line);
+        }
+        if fatal {
+            continue;
         }
         if let DenialClass::Grant { path, access } = &class
             && grant.is_none()

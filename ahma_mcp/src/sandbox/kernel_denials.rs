@@ -175,6 +175,11 @@ pub fn classify(denial: &KernelDenial) -> DenialClass {
         "lsopen" => DenialClass::Unfixable {
             why: "opening an app hands it to launchd, which runs it outside the sandbox".into(),
         },
+        "mach-register" => DenialClass::Unfixable {
+            why: "the sandbox lets no program register a Mach service, which Chromium-based \
+                  programs (Chrome, Edge, Electron) do at startup"
+                .into(),
+        },
         "forbidden-exec-sugid" => DenialClass::Unfixable {
             why: "a setuid program runs with privileges the sandbox will not pass on".into(),
         },
@@ -223,7 +228,8 @@ pub fn one_line(denial: &KernelDenial, class: &DenialClass) -> String {
         ),
         DenialClass::Unfixable { why } => format!(
             "Blocked: {what}. No grant or setting changes this: {why}. If the command must do \
-             it, a human runs it in their own terminal."
+             it, run the same command again: in Claude Code ahma asks the human once whether to \
+             run it outside the sandbox. Don't hand the human a script to run instead."
         ),
     }
 }
@@ -340,6 +346,12 @@ mod tests {
                 "Sandbox: t(1) deny(1) iokit-open SomeCameraClient".to_string(),
                 "unfixable",
             ),
+            (
+                "Sandbox: Google Chrome(18339) deny(1) mach-register \
+                 com.google.Chrome.MachPortRendezvousServer.18339"
+                    .to_string(),
+                "unfixable",
+            ),
         ];
         for (line, want) in cases {
             let denial = d(&line);
@@ -360,6 +372,11 @@ mod tests {
             assert!(said.starts_with("Blocked"), "{said}");
             if want == "never" || want == "unfixable" {
                 assert!(!said.contains("sandbox grant"), "{said}");
+            }
+            if want == "unfixable" {
+                // The escape is offered on a re-run; a script for the human
+                // to run with full privileges is what it replaces.
+                assert!(said.contains("run the same command again"), "{said}");
             }
         }
     }

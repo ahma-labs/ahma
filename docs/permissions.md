@@ -115,7 +115,10 @@ applies to a running server from its next command.
 ## When nothing can allow it: one run outside the sandbox
 
 Some refusals no grant or setting can change: opening an app with `open` (macOS runs it
-outside any sandbox), a setuid program such as `ps`, an operation the sandbox withholds.
+outside any sandbox), a setuid program such as `ps`, a Chromium-based program such as
+headless Chrome (macOS refuses it the Mach service it registers at startup; SPEC R6.2.13),
+an operation the sandbox withholds. When such a refusal ended a command, ahma offers no grant
+for a path refused in the same run: that path did not cause the failure.
 A setuid program is never offered as a grant either: `bash: /bin/ps: Operation not
 permitted` names the program, not a file to open, and nothing inside the system program
 trees (`/bin`, `/usr` except `/usr/local`, …) is ever granted (SPEC R6.2.8.1, R-PERM.4.3).

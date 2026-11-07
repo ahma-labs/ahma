@@ -1102,6 +1102,16 @@ impl Adapter {
                 result: kernel_report_result(&self.sandbox, report, result, op_id, command).await,
             };
         }
+        let result = match fatal_unrunnable(result, stderr, stdout) {
+            Ok(fatal) => {
+                return SyncRun {
+                    outcome: audit::Outcome::Failed,
+                    exit_code,
+                    result: Err(fatal),
+                };
+            }
+            Err(result) => result,
+        };
         sandbox::grant_channel::raise_stderr_denial_question(
             &self.sandbox,
             self.scope_grant_notifier.as_ref(),
@@ -2200,6 +2210,29 @@ async fn kernel_report_result(
 const NESTED_SANDBOX_BLOCKED: &str = "Blocked: ahma's kernel sandbox refused a nested \
      `sandbox-exec` (macOS does not allow nested sandboxes).";
 
+/// A failed command's result when it died of something no grant opens, even
+/// though other lines of its output name a refused path (SPEC R6.2.13): a
+/// refused Mach registration ends a Chromium-based program at startup, and
+/// any path also refused in that run is incidental. `Ok` carries that error;
+/// `Err` hands the result back unchanged when the run succeeded or shows no
+/// such refusal, so the path scan goes on as before.
+#[allow(clippy::result_large_err)]
+fn fatal_unrunnable(
+    result: Result<String, anyhow::Error>,
+    stderr: &str,
+    stdout: &str,
+) -> Result<anyhow::Error, Result<String, anyhow::Error>> {
+    let service = match (&result, sandbox::mach::refused_mach_service(stderr, stdout)) {
+        (Err(_), Some(service)) => service,
+        _ => return Err(result),
+    };
+    let error = result.err().map(|e| e.to_string()).unwrap_or_default();
+    Ok(sandbox::SandboxError::Unfixable {
+        details: format!("{error}\n\n{}", sandbox::mach::remediation(&service)),
+    }
+    .into())
+}
+
 /// A failed command's result when no grantable path explains it.
 ///
 /// A nested-sandbox refusal is [`sandbox::SandboxError::Unfixable`]: no grant
@@ -3004,6 +3037,14 @@ async fn record_failure_diagnostics(
         }
         return;
     }
+    // A refused Mach registration ended the program; any path in the same
+    // output is incidental and is not offered (SPEC R6.2.13).
+    if let Some(service) = sandbox::mach::refused_mach_service(stderr_str, stdout_str) {
+        op_monitor
+            .append_alert(op_id, sandbox::mach::remediation(&service))
+            .await;
+        return;
+    }
     // Asked, not awaited (SPEC R-PERM.3.9): the caller still holds the
     // workspace and the operation is not yet finished.
     sandbox::grant_channel::raise_stderr_denial_question(
@@ -3329,6 +3370,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(quiet, "ok");
+    }
+
+    /// Field case: headless Chrome died on a refused Mach registration, and
+    /// a path from a neighbouring line (Crashpad's settings file) was offered
+    /// as the grant instead. The registration decides: no path is offered.
+    #[test]
+    fn a_refused_mach_registration_outranks_every_path_in_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("Application Support").join("settings.dat");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "").unwrap();
+        let stderr = format!(
+            "[ERROR:file_io_posix.cc:208] open {}: Operation not permitted (1)\n\
+             [FATAL:mach_port_rendezvous_mac.cc:159] Check failed: kr == KERN_SUCCESS. \
+             bootstrap_check_in com.google.Chrome.MachPortRendezvousServer.18339: Permission \
+             denied (1100)",
+            settings.display()
+        );
+        let err =
+            fatal_unrunnable(Err(anyhow::anyhow!("exit 133")), &stderr, "").expect("unrunnable");
+        let Some(sandbox::SandboxError::Unfixable { details }) =
+            err.downcast_ref::<sandbox::SandboxError>()
+        else {
+            panic!("expected Unfixable, got {err:?}");
+        };
+        assert!(details.starts_with("exit 133\n\n"), "{details}");
+        // The hook quotes the `Blocked: ` line in the escape dialog.
+        assert!(
+            details
+                .lines()
+                .any(|l| l.starts_with("Blocked: Google Chrome can't run")),
+            "{details}"
+        );
+        assert!(fatal_unrunnable(Ok("fine".into()), &stderr, "").is_err());
+        assert!(fatal_unrunnable(Err(anyhow::anyhow!("x")), "cat: /x: nope", "").is_err());
     }
 
     #[test]
