@@ -77,8 +77,13 @@ result, not the dialog (SPEC R-PERM.10.2). The directory is the tool's own folde
 `~/Library/Caches/com.apple.python`, whatever the tool keeps beneath), never a
 folder many tools share (`~/.cache`, `~/Library`, a cache folder, a volume root, the
 system temp directory), your home folder, a folder of projects, or anything holding
-credentials. **Yes** grants it, runs the command, and is **remembered**: the dialog
-names the `ahma sandbox revoke` that undoes it. **No** runs nothing, and ahma does not
+credentials. **Yes** grants it and runs the command. The grant is **remembered** only if
+that run shows it helped: the run succeeded, or got past the refusal (that folder was not
+refused again, and it exists). Otherwise ahma withdraws it, saves nothing, and says why,
+so a yes to a question that turned out to be wrong leaves nothing behind. A run stopped
+by its time limit decides nothing: the grant lasts for this session only. The dialog
+names the `ahma sandbox revoke` that undoes a kept grant, and `ahma sandbox list` marks a
+saved grant on a path where nothing exists (SPEC R-PERM.10.3). **No** runs nothing, and ahma does not
 ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).
 When the command **succeeded** despite the refusal — an optional cache, a lock or
 history file it can do without — ahma adds one line to its output naming the grant

@@ -202,8 +202,9 @@ pub(super) fn ask_reason(question: &Question, workspace: &Path, binding: &Path) 
             _ => String::new(),
         };
     format!(
-        "ahma: {who} was refused {refused} {dir}. Yes: let {whom} {verb} it from now on (undo: \
-         `ahma sandbox revoke {}`). No: don't ask again this session.{risk}",
+        "ahma: {who} was refused {refused} {dir}. Yes: let {whom} {verb} it, kept from now on \
+         only if it fixes this run (undo: `ahma sandbox revoke {}`). No: don't ask again this \
+         session.{risk}",
         question.dir.display(),
     )
 }
@@ -354,36 +355,100 @@ pub(super) fn take_escape(
         .map(|asked| asked.refusal)
 }
 
+/// What spending an approval token did: the line to show before the run,
+/// and, for a folder grant, the trial its run decides (SPEC R-PERM.10.3).
+pub(super) struct Approval {
+    pub line: String,
+    pub trial: Option<Trial>,
+}
+
+/// A folder grant on trial for one run: in force as a session grant now,
+/// remembered only if the run shows it helped.
+pub(super) struct Trial {
+    question: Question,
+    workspace: PathBuf,
+    session_file: Option<PathBuf>,
+}
+
+/// How the approved run ended, as far as a grant is concerned.
+#[derive(Debug)]
+pub(super) enum TrialOutcome {
+    /// It exited 0.
+    Succeeded,
+    /// It failed, refused nothing, and could run in the sandbox.
+    Failed,
+    /// It failed on a refused path.
+    Refused(PathBuf),
+    /// It failed on something no grant opens (R6.2.13, R-ESCAPE).
+    Unrunnable,
+    /// It was stopped (a time limit) before it showed anything.
+    Stopped,
+}
+
+/// What a trial's run says about the grant.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TrialVerdict {
+    Keep,
+    Drop(&'static str),
+    Undecided,
+}
+
+/// Keep a grant on `dir` when the run succeeded, or failed past it: not on
+/// `dir` again, not unrunnable, and `dir` exists (it was there, or the run
+/// made it). Drop it when the same folder was refused again, the command
+/// cannot run in any sandbox, or nothing exists there. A stopped run decides
+/// nothing.
+pub(super) fn trial_verdict(dir: &Path, outcome: TrialOutcome) -> TrialVerdict {
+    let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    match outcome {
+        TrialOutcome::Succeeded => TrialVerdict::Keep,
+        TrialOutcome::Stopped => TrialVerdict::Undecided,
+        TrialOutcome::Unrunnable => {
+            TrialVerdict::Drop("the command cannot run inside the sandbox at all")
+        }
+        TrialOutcome::Refused(path) if canonical(&path).starts_with(canonical(dir)) => {
+            TrialVerdict::Drop("the same folder was refused again")
+        }
+        TrialOutcome::Refused(_) | TrialOutcome::Failed if dir.exists() => TrialVerdict::Keep,
+        TrialOutcome::Refused(_) | TrialOutcome::Failed => {
+            TrialVerdict::Drop("nothing exists there, and the run did not create it")
+        }
+    }
+}
+
 /// Spend an approval `token` for `command` in `cwd`: apply the session grant
-/// the human approved in the harness dialog, and say so in one line. `None`
+/// the human approved in the harness dialog, for this run, and say so in one
+/// line. `None`
 /// when the token is unknown, spent, expired, for another command, or the
 /// grant is now refused; then the command runs without it.
-pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<String> {
+pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<Approval> {
     let dir = harness_asks::default_dir()?;
     let workspace = workspace_for(cwd);
     let now = ahma_common::session_grants::now_secs();
+    let line_only = |line: String| Approval { line, trial: None };
     let Some(asked) = harness_asks::take_approved(&dir, &workspace, token, command, now) else {
         if let Some(asked) = harness_asks::take_ssh_approved(&dir, &workspace, token, command, now)
         {
-            return Some(apply_ssh_approval(&asked, &workspace, now));
+            return Some(line_only(apply_ssh_approval(&asked, &workspace, now)));
         }
-        return Some(
+        return Some(line_only(
             "ahma: the approval this command carries is unknown, already used or expired; it \
              runs without a new grant."
                 .to_string(),
-        );
+        ));
     };
-    let q = &asked.question;
+    let q = asked.question;
     if let Some(why) = ahma_common::scope_grant::refusal_reason(&q.dir) {
-        return Some(format!(
+        return Some(line_only(format!(
             "ahma: {} cannot be granted ({why}); the command runs without it.",
             q.dir.display()
-        ));
+        )));
     }
     let owner = asked.harness_pid?;
     // The session grant reaches this very command: its settings were read
-    // before the token was spent. The persisted one reaches every later one.
-    crate::sandbox::record_session_grant(
+    // after the token was spent. It is remembered only if the run shows it
+    // helped (SPEC R-PERM.10.3).
+    let session_file = crate::sandbox::record_session_grant(
         &q.dir,
         q.access,
         Some(&workspace),
@@ -391,23 +456,65 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<S
         "harness dialog",
     );
     let verb = if q.access.is_write() { "write" } else { "read" };
-    Some(match persist_approval(q, &workspace) {
-        Ok(binding) if binding == workspace => format!(
-            "ahma: approved — commands in this workspace may {verb} {} from now on.",
+    Some(Approval {
+        line: format!(
+            "ahma: approved — this command may {verb} {}; it is remembered only if this run \
+             shows it helped.",
             q.dir.display()
         ),
-        Ok(binding) => format!(
-            "ahma: approved — commands in every workspace under {} may {verb} {} from now on.",
-            binding.display(),
-            q.dir.display()
-        ),
-        Err(e) => format!(
-            "ahma: approved for this session — commands in this workspace may {verb} {}. It \
-             could not be remembered ({e:#}); to keep it, run `ahma sandbox grant {}`.",
+        trial: Some(Trial {
+            question: q,
+            workspace,
+            session_file,
+        }),
+    })
+}
+
+/// Decide a trial from its run (SPEC R-PERM.10.3), and say what became of
+/// the grant in one line: remembered, withdrawn, or this session only.
+pub(super) fn finish_trial(trial: Trial, outcome: TrialOutcome) -> String {
+    let q = &trial.question;
+    let verb = if q.access.is_write() { "write" } else { "read" };
+    match trial_verdict(&q.dir, outcome) {
+        TrialVerdict::Keep => match persist_approval(q, &trial.workspace) {
+            Ok(binding) if binding == trial.workspace => format!(
+                "ahma: remembered — the run got past the refusal, so commands in this workspace \
+                 may {verb} {} from now on (undo: `ahma sandbox revoke {}`).",
+                q.dir.display(),
+                q.dir.display()
+            ),
+            Ok(binding) => format!(
+                "ahma: remembered — the run got past the refusal, so commands in every \
+                 workspace under {} may {verb} {} from now on (undo: `ahma sandbox revoke {}`).",
+                binding.display(),
+                q.dir.display(),
+                q.dir.display()
+            ),
+            Err(e) => format!(
+                "ahma: the grant helped, but could not be remembered ({e:#}); it applies for \
+                 this session. To keep it, run `ahma sandbox grant {}`.",
+                q.dir.display()
+            ),
+        },
+        TrialVerdict::Drop(why) => {
+            if let Some(file) = &trial.session_file
+                && let Err(e) = ahma_common::session_grants::remove(file)
+            {
+                tracing::warn!("could not withdraw the session grant: {e:#}");
+            }
+            format!(
+                "ahma: the grant on {} did not help ({why}), so it was withdrawn and nothing \
+                 was saved.",
+                q.dir.display()
+            )
+        }
+        TrialVerdict::Undecided => format!(
+            "ahma: the run ended before it showed whether the grant on {} helped; it applies \
+             for this session only. To keep it, run `ahma sandbox grant {}`.",
             q.dir.display(),
             q.dir.display()
         ),
-    })
+    }
 }
 
 /// Remember a grant the human approved in the harness dialog (SPEC
@@ -569,8 +676,9 @@ mod tests {
             next_ssh_ask(&ws, "session-1", "git push", None).is_none(),
             "once per harness session"
         );
-        let line = apply_approval(&token, &ws, "git push").expect("a line");
-        assert!(line.contains("approved"), "{line}");
+        let approval = apply_approval(&token, &ws, "git push").expect("a line");
+        assert!(approval.line.contains("approved"), "{}", approval.line);
+        assert!(approval.trial.is_none(), "a signature is no folder grant");
         assert_eq!(consent.decide(&request).await, Decision::Allow);
     }
 
@@ -702,8 +810,8 @@ mod tests {
             "asked once per session, whatever the answer"
         );
 
-        let line = apply_approval(&token, &ws, "make heavy").expect("a line");
-        assert!(line.contains("approved"), "{line}");
+        let approval = apply_approval(&token, &ws, "make heavy").expect("a line");
+        assert!(approval.line.contains("approved"), "{}", approval.line);
         let granted =
             crate::sandbox::session_scopes_for(&super::super::resolve_hook_sandbox_scopes(&ws));
         assert!(
@@ -713,20 +821,60 @@ mod tests {
             "the yes became a session grant: {granted:?}"
         );
         let file = ahma_common::config::settings_path().unwrap();
-        let saved = ahma_common::config::AhmaSettings::load_from_checked(&file).unwrap();
+        let remembered = || {
+            ahma_common::config::AhmaSettings::load_from_checked(&file)
+                .map(|s| {
+                    s.sandbox.persistent_scopes.iter().any(|s| {
+                        s.path == cache
+                            && s.access.is_write()
+                            && s.workspace.as_deref() == Some(ws.as_path())
+                    })
+                })
+                .unwrap_or(false)
+        };
+        // SPEC R-PERM.10.3: a yes is a trial; nothing is saved before the run.
+        assert!(!remembered(), "saved before the run showed it helped");
+        let trial = approval.trial.expect("a folder grant is a trial");
+        let line = finish_trial(trial, TrialOutcome::Succeeded);
+        assert!(line.contains("remembered"), "{line}");
         assert!(
-            saved
-                .sandbox
-                .persistent_scopes
-                .iter()
-                .any(|s| s.path == cache
-                    && s.access.is_write()
-                    && s.workspace.as_deref() == Some(ws.as_path())),
-            "and is remembered, bound to this workspace: {:?}",
-            saved.sandbox.persistent_scopes
+            remembered(),
+            "kept once the run succeeded, bound to this workspace"
         );
         let again = apply_approval(&token, &ws, "make heavy").unwrap();
-        assert!(again.contains("already used"), "{again}");
+        assert!(again.line.contains("already used"), "{}", again.line);
+    }
+
+    /// SPEC R-PERM.10.3: a grant is kept only when the run shows it helped.
+    /// Field case: a yes saved a grant on `/Applications/Google`, a folder
+    /// that does not exist, for a program that could not run in any sandbox;
+    /// it stayed in settings.toml for good.
+    #[test]
+    fn a_grant_is_kept_only_when_the_run_shows_it_helped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("cache");
+        let missing = tmp.path().join("Google");
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = tmp.path().join("other");
+        let cases: [(&Path, TrialOutcome, &str); 8] = [
+            (&dir, TrialOutcome::Succeeded, "keep"),
+            (&missing, TrialOutcome::Succeeded, "keep"),
+            (&dir, TrialOutcome::Failed, "keep"),
+            (&dir, TrialOutcome::Refused(elsewhere.clone()), "keep"),
+            (&dir, TrialOutcome::Refused(dir.join("x.lock")), "drop"),
+            (&dir, TrialOutcome::Unrunnable, "drop"),
+            (&missing, TrialOutcome::Failed, "drop"),
+            (&dir, TrialOutcome::Stopped, "undecided"),
+        ];
+        for (dir, outcome, want) in cases {
+            let label = format!("{outcome:?}");
+            let got = match trial_verdict(dir, outcome) {
+                TrialVerdict::Keep => "keep",
+                TrialVerdict::Drop(_) => "drop",
+                TrialVerdict::Undecided => "undecided",
+            };
+            assert_eq!(got, want, "{} {label}", dir.display());
+        }
     }
 
     /// The question's grant is bound to the harness asking now, never to a
@@ -856,7 +1004,9 @@ mod tests {
             "{r}"
         );
         assert!(
-            r.contains("Yes: let commands in neubit4 write it from now on"),
+            r.contains(
+                "Yes: let commands in neubit4 write it, kept from now on only if it fixes this run"
+            ),
             "{r}"
         );
         assert!(
@@ -892,7 +1042,7 @@ mod tests {
             ),
             "{r}"
         );
-        assert!(r.contains("read it from now on"), "{r}");
+        assert!(r.contains("read it, kept from now on"), "{r}");
     }
 
     /// SPEC R-PERM.10.2, R-ESCAPE.2: the escape says in plain words what
