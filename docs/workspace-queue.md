@@ -31,7 +31,7 @@ status()                                     → ── Finished since your last
 - **Writers run one at a time, in arrival order.** A command that may write the workspace
   waits for every earlier one. If its call returns before it starts, the result says
   `NOT started — queued behind …` and names who it waits for; it runs by itself.
-- **Readers never wait.** `git status/diff/log/show/ls-remote`, the listing forms of `git branch/tag/remote/config/stash/worktree` (also after `git -C <dir>`), `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl`, `sleep`, the diagnostics you run to see why a job is slow (`uptime`, `sysctl -n`, `vm_stat`, `top -l 1`, `lsof`) and similar — and **pipelines, lists and loops of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`, `FOO=1 gh pr checks 87`, `S=/path; grep … $S`, `for f in a b; do grep -c x $f; done`, `until gh pr checks 87; do sleep 60; done`) —
+- **Readers never wait.** `git status/diff/log/show/ls-remote`, the listing forms of `git branch/tag/remote/config/stash/worktree` (also after `git -C <dir>`), `rg`, `grep`, `ls`, `cat`, `pgrep`, `ahma ps`, `sed -n`, `gh pr view`, `curl`, `gh release view`, `sleep`, the diagnostics you run to see why a job is slow (`uptime`, `sysctl -n`, `vm_stat`, `top -l 1`, `lsof`) and similar — and **pipelines, lists and loops of them** (`grep … | head`, `cd src && ls`, `2>&1`, `>/dev/null`, `FOO=1 gh pr checks 87`, `S=/path; grep … $S`, `for f in a b; do grep -c x $f; done`, `until gh pr checks 87; do sleep 60; done`) —
   plain reads skip the queue — under a sandbox that grants the workspace **no write access**,
   so a misclassified command fails instead of writing. A braced variable (`sed -n ${n}p`)
   and the wrappers `timeout`, `time`, `nice`, `caffeinate` and `env NAME=…` are judged by
@@ -43,9 +43,21 @@ status()                                     → ── Finished since your last
   all, so every command takes its turn. A waiting command says which:
   `NOT started — `git status` is waiting for the workspace; op `op_12` (`cargo nextest run`,
   41s) holds it. Queued because …`.
-- **Watching CI never holds the workspace.** `gh run watch`, `gh pr checks --watch` and
+- **Watching CI does not hold the workspace.** `gh run watch`, `gh pr checks --watch` and
   `tail -f` read until their subject ends, which can be most of an hour. They take no lease:
-  read-only where the kernel enforces that lane, `service` where it does not.
+  read-only where the kernel enforces that lane, `service` where it does not. The whole line
+  counts, though: a watcher chained with a program ahma does not know (or writing into the
+  workspace) makes the line wait its turn, and then the next rule applies.
+- **Doubt holds the workspace for 30 seconds, not for the whole run.** A line that waits only
+  because ahma cannot prove it reads — every program in it is one ahma does not know, with
+  no redirection, no heredoc and no reader writing through its arguments — takes the lease
+  and hands it on after 30 seconds while it keeps running. A waiter is told the holder is
+  "not known to write, so it hands the workspace on within 30s". Builds, tests, package
+  managers, interpreters, shells, `git`, `sed`, file movers, formatters, wrappers such as
+  `timeout`, and any program named by a path (`./scripts/build.sh`) hold it until they end,
+  as before. A wrong guess costs the next writer 30 seconds, and `changed_during_run` names
+  any file that changed meanwhile (SPEC R2.7.11). Field case: a CI watch followed by
+  `gh release view` held a workspace for ten minutes and a build failed waiting for it.
 - **`git fetch` and `git push` never wait behind a build.** They write only git's own
   metadata, which git locks itself and no build touches, so they run in the `service`
   lane. A push that may run a pre-push hook (the repository has `hooks/pre-push`, or a git

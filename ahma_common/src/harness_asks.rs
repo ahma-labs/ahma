@@ -107,19 +107,12 @@ const RUNS_THE_NEXT: &[&str] = &["env", "time", "nice", "nohup", "exec", "comman
 /// gets wrong costs one extra question or one missed one, never a grant.
 pub fn command_programs(command: &str) -> Vec<String> {
     let mut programs = Vec::new();
-    for segment in shell_segments(command) {
-        let mut words = segment.iter().skip_while(|w| {
-            (w.contains('=') && !w.starts_with('-'))
-                || RUNS_THE_NEXT.contains(&w.as_str())
-                || w.starts_with('-')
-        });
-        let Some(word) = words.next() else {
-            continue;
-        };
+    for word in command_words(command) {
         // `"$CH"` runs whatever the variable holds: no name to match on.
         if word.contains(['$', '`']) {
             continue;
         }
+        let word = word.as_str();
         let name = Path::new(word)
             .file_name()
             .and_then(|f| f.to_str())
@@ -132,6 +125,24 @@ pub fn command_programs(command: &str) -> Vec<String> {
         }
     }
     programs
+}
+
+/// The program word of each command a shell line runs, as written (quotes
+/// removed): past `VAR=value` assignments and wrappers that run the next
+/// word (`env`, `time`, `nohup`, `sudo`, …); heredoc bodies, strings and comments run nothing and
+/// give none. Unlike [`command_programs`] it keeps paths, variables and
+/// navigation words, for callers that judge the word itself.
+pub fn command_words(command: &str) -> Vec<String> {
+    shell_segments(command)
+        .into_iter()
+        .filter_map(|segment| {
+            segment.into_iter().find(|w| {
+                !((w.contains('=') && !w.starts_with('-'))
+                    || RUNS_THE_NEXT.contains(&w.as_str())
+                    || w.starts_with('-'))
+            })
+        })
+        .collect()
 }
 
 /// The words of each command a shell line runs, split at unquoted `&`, `|`,
