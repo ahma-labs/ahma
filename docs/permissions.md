@@ -66,8 +66,12 @@ mid-command, where no prompt is possible. When the command **failed**, ahma reme
 the refusal, and before
 the refused command — or any later one running the same program, `xcodebuild` with
 different flags, say — runs again in that workspace, Claude Code shows its own
-permission dialog with ahma's question: which directory, which refused paths it
-covers, and what yes and no mean. The directory is the tool's own folder
+permission dialog with ahma's question in a few plain sentences: which program was
+refused which folder, what yes allows and for which workspace, how to undo it, and what
+no means. Above it, the dialog shows your command as the agent wrote it, under one line
+of ahma's (`ahma hooks run-shell … --command-stdin <<'AHMA_CMD_…'`), not re-quoted into
+ahma's arguments. The evidence and the full list of refused paths are in the agent's
+result, not the dialog (SPEC R-PERM.10.2). The directory is the tool's own folder
 (`/Volumes/T7/caches/swiftpm`, not the deepest folder that was refused; under
 `~/Library/Caches`, `~/.cache` and the like, the folder directly inside it, such as
 `~/Library/Caches/com.apple.python`, whatever the tool keeps beneath), never a

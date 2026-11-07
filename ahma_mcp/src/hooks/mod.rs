@@ -271,6 +271,12 @@ pub struct HooksRunShellArgs {
     #[arg(long = "command")]
     pub command: Option<String>,
 
+    /// Read the command to execute from stdin, verbatim (one trailing newline
+    /// dropped). The hook's ask form passes it in a quoted heredoc, so the
+    /// harness dialog shows the command as written (SPEC R-PERM.10.2).
+    #[arg(long = "command-stdin", hide = true, conflicts_with = "command")]
+    pub command_stdin: bool,
+
     /// Wrapped-by marker for recursion prevention.
     #[arg(long, default_value = WRAPPED_BY_MARKER)]
     pub wrapped_by: String,
@@ -295,6 +301,16 @@ pub struct HooksRunShellArgs {
 
 impl HooksRunShellArgs {
     pub fn resolve_payload(self) -> Result<WrappedShellPayload> {
+        self.resolve_payload_from(&mut std::io::stdin().lock())
+    }
+
+    /// [`Self::resolve_payload`], reading a `--command-stdin` command from
+    /// `stdin`. The command's own stdin is then at its end, as it is under
+    /// the harness (Claude Code gives a Bash call `/dev/null`).
+    pub fn resolve_payload_from(
+        self,
+        stdin: &mut dyn std::io::Read,
+    ) -> Result<WrappedShellPayload> {
         if let Some(ref b64) = self.payload_base64 {
             return decode_wrapped_shell_payload(b64);
         }
@@ -309,7 +325,17 @@ impl HooksRunShellArgs {
             })
             .unwrap_or_else(|| ".".to_string());
 
-        let command = if let Some(cmd) = self.command {
+        let command = if self.command_stdin {
+            let mut cmd = String::new();
+            stdin
+                .read_to_string(&mut cmd)
+                .context("Failed to read the command from stdin")?;
+            // The heredoc ends the command with one newline of its own.
+            if cmd.ends_with('\n') {
+                cmd.pop();
+            }
+            cmd
+        } else if let Some(cmd) = self.command {
             cmd
         } else if !self.raw_command.is_empty() {
             self.raw_command.join(" ")
@@ -520,8 +546,11 @@ impl BinaryReference {
 
     fn build_command(&self, args: &[String]) -> String {
         match self {
+            // Quoted like the absolute form: unquoted, a command such as
+            // `cargo build && rm x` split into the wrapper's argv and a second
+            // command that ran outside it.
             Self::PathLookup => std::iter::once(PATH_LOOKUP_BINARY.to_string())
-                .chain(args.iter().cloned())
+                .chain(args.iter().map(|a| quote_arg_if_needed(a)))
                 .collect::<Vec<_>>()
                 .join(" "),
             Self::Absolute(path) => build_absolute_shell_command(path, args),
@@ -2720,6 +2749,12 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
 /// and flags without requiring regex escapes or trailing `.*`.
 fn strip_powershell_call_prefix(cmd: &str) -> &str {
     let trimmed = cmd.trim();
+    // Only a call that *starts* the line is PowerShell's: a POSIX command
+    // carrying `&&` (or a heredoc body with one) is not to be cut there.
+    let lower = trimmed.get(..10).unwrap_or(trimmed).to_ascii_lowercase();
+    if !(lower.starts_with("powershell") || lower.starts_with("pwsh") || trimmed.starts_with('&')) {
+        return trimmed;
+    }
     if let Some(idx) = trimmed.find("& { & ") {
         trimmed[idx + "& { & ".len()..].trim_start()
     } else if let Some(idx) = trimmed.find("& ") {
@@ -2883,10 +2918,33 @@ fn build_wrapped_shell_command(
         args.push(sid.clone());
     }
     args.extend(intent.args());
+    // The ask form (SPEC R-PERM.10.2): Claude Code's dialog shows this text,
+    // so the command goes in verbatim below one line of ahma's, in a quoted
+    // heredoc, instead of re-quoted into argv. POSIX shells only; elsewhere,
+    // and on the allow path nobody reads, it stays an argument.
+    if approval_token.is_some() && cfg!(unix) {
+        args.push("--command-stdin".to_string());
+        let line = BinaryReference::for_scope(env, scope).build_command(&args);
+        let delimiter = heredoc_delimiter(command);
+        return Ok(format!("{line} <<'{delimiter}'\n{command}\n{delimiter}"));
+    }
     args.push("--command".to_string());
     args.push(command.to_string());
 
     Ok(BinaryReference::for_scope(env, scope).build_command(&args))
+}
+
+/// A heredoc closing word that no line of `command` equals.
+fn heredoc_delimiter(command: &str) -> String {
+    loop {
+        let candidate = format!("AHMA_CMD_{:08x}", rand::random::<u32>());
+        if !command
+            .lines()
+            .any(|l| l.trim_end_matches('\r') == candidate)
+        {
+            return candidate;
+        }
+    }
 }
 
 fn decode_wrapped_shell_payload(encoded: &str) -> Result<WrappedShellPayload> {
@@ -2925,15 +2983,84 @@ fn is_wrapped_shell_command(command: &str) -> bool {
         return false;
     }
     let mut saw_flag = false;
+    let mut marked = false;
     for t in tokens {
         if saw_flag {
-            return t == WRAPPED_BY_MARKER;
+            marked = t == WRAPPED_BY_MARKER;
+            break;
         }
         if t == "--wrapped-by" {
             saw_flag = true;
         }
     }
-    false
+    marked && is_one_invocation(trimmed)
+}
+
+/// Whether `command` runs the wrapper and nothing else: no operator,
+/// redirection, substitution or second line outside quotes. The hook passes
+/// an already-wrapped command through unchanged, so anything the shell would
+/// run beside the wrapper would run outside every sandbox. The one multi-line
+/// shape is the hook's own ask form (SPEC R-PERM.10.2): `… --command-stdin
+/// <<'AHMA_CMD_xxxxxxxx'`, the command, and that closing word as the last line.
+fn is_one_invocation(command: &str) -> bool {
+    let command = command.trim_end();
+    let line = match command.split_once('\n') {
+        None => command,
+        Some((line, body)) => {
+            let Some((head, delimiter)) = line.trim_end().rsplit_once(" <<'") else {
+                return false;
+            };
+            let Some(delimiter) = delimiter.strip_suffix('\'') else {
+                return false;
+            };
+            let ours = delimiter
+                .strip_prefix("AHMA_CMD_")
+                .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+            let reads_stdin = head
+                .split_whitespace()
+                .any(|t| t.trim_matches(['\'', '"']) == "--command-stdin");
+            let Some(inner) = body.strip_suffix(delimiter) else {
+                return false;
+            };
+            let closes_last = inner.is_empty() || inner.ends_with('\n');
+            if !(ours && reads_stdin && closes_last) || inner.lines().any(|l| l == delimiter) {
+                return false;
+            }
+            head
+        }
+    };
+    // PowerShell's call form ends in the `}` (and `"`) that close it.
+    let line = line.trim_end().trim_end_matches('"').trim_end();
+    let line = line.strip_suffix('}').unwrap_or(line);
+    no_unquoted_shell_syntax(line)
+}
+
+/// True when `line` has no unquoted `;`, `&`, `|`, `<`, `>`, `(`, `)`,
+/// backtick, `$` or newline, no `$`/backtick inside double quotes, and no
+/// unclosed quote.
+fn no_unquoted_shell_syntax(line: &str) -> bool {
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !chars.by_ref().any(|c| c == '\'') => return false,
+            '\'' => {}
+            '"' => loop {
+                match chars.next() {
+                    None | Some('$') | Some('`') => return false,
+                    Some('\\') => {
+                        chars.next();
+                    }
+                    Some('"') => break,
+                    Some(_) => {}
+                }
+            },
+            '\\' if chars.next().is_none() => return false,
+            '\\' => {}
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | '$' | '\n' => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn install_platform_hook(
@@ -3726,6 +3853,27 @@ fn build_windows_absolute_command(path: &Path, args: &[String]) -> String {
         .join(" ");
     let script = format!("& {{ & {} }}", command);
     format!(r#"powershell -NoProfile -Command "{}""#, script)
+}
+
+/// `value` as one shell word: bare when it holds only characters no shell
+/// treats specially (so `ahma hooks run-shell --cwd /work` stays readable),
+/// quoted otherwise.
+fn quote_arg_if_needed(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/_.,:=@%+-".contains(c));
+    if plain {
+        return value.to_string();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        powershell_quote(value)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        shell_quote_posix(value)
+    }
 }
 
 fn shell_quote_posix(value: &str) -> String {
@@ -5372,6 +5520,62 @@ mod tests {
         assert!(cmd.contains("--command"));
     }
 
+    /// SPEC R-PERM.10.2: the ask form carries the command verbatim in a
+    /// quoted heredoc, and `run-shell --command-stdin` reads back exactly
+    /// what the agent wrote — quotes, `$`, backslashes, a heredoc of its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_ask_form_carries_the_command_verbatim_through_a_shell() {
+        let tmp = tempdir().unwrap();
+        let stub = tmp.path().join("bin space").join("ahma");
+        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+        // Stands in for ahma: prints what it reads on stdin.
+        std::fs::write(&stub, "#!/bin/sh\ncat\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = HookEnvironment {
+            home_dir: tmp.path().join("home"),
+            project_root: tmp.path().join("repo"),
+            current_exe: stub,
+        };
+        let command = "S=\"$HOME/x\" && echo 'it'\\''s' \\$S `date` && cat > $S/r.sh <<'EOF'\n\
+                       CH=\"/Applications/Google Chrome.app\"\nEOF\nAHMA_CMD\n";
+        let wrapped = build_wrapped_shell_command(
+            HookScope::User,
+            &env,
+            "/w",
+            command,
+            Some("s1".into()),
+            Some("tok"),
+            HarnessIntent::default(),
+        )
+        .unwrap();
+        assert!(is_wrapped_shell_command(&wrapped), "{wrapped}");
+        assert!(wrapped.contains(&format!("\n{command}")), "{wrapped}");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&wrapped)
+            .output()
+            .unwrap();
+        let read_back = String::from_utf8(out.stdout).unwrap();
+        let args = HooksRunShellArgs {
+            payload_base64: None,
+            cwd: Some(PathBuf::from("/w")),
+            session_id: None,
+            command: None,
+            command_stdin: true,
+            wrapped_by: WRAPPED_BY_MARKER.into(),
+            raw_command: Vec::new(),
+            approve_grant: None,
+            background: false,
+            harness_timeout_ms: None,
+        };
+        let payload = args
+            .resolve_payload_from(&mut read_back.as_bytes())
+            .unwrap();
+        assert_eq!(payload.command, command);
+    }
+
     #[test]
     fn test_build_wrapped_shell_command_is_human_readable() {
         let env = test_env();
@@ -5396,6 +5600,7 @@ mod tests {
             cwd: Some(PathBuf::from("/my/cwd")),
             session_id: Some("session-42".to_string()),
             command: Some("cargo test".to_string()),
+            command_stdin: false,
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
             approve_grant: None,
             background: false,
@@ -5415,6 +5620,7 @@ mod tests {
             cwd: Some(PathBuf::from("/my/cwd")),
             session_id: None,
             command: None,
+            command_stdin: false,
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
             approve_grant: None,
             background: false,
@@ -5445,6 +5651,7 @@ mod tests {
             cwd: None,
             session_id: None,
             command: None,
+            command_stdin: false,
             wrapped_by: WRAPPED_BY_MARKER.to_string(),
             approve_grant: None,
             background: false,
@@ -5543,6 +5750,80 @@ mod tests {
         assert!(!is_wrapped_shell_command(&format!(
             "ahma hooks run-shell --command 'echo {WRAPPED_BY_MARKER}'"
         )));
+    }
+
+    /// A wrapper call followed by anything the shell would run as well is
+    /// not "already wrapped": the hook passed such a line through unchanged,
+    /// so whatever came after the wrapper ran outside every sandbox.
+    #[test]
+    fn a_wrapper_with_more_after_it_is_not_wrapped() {
+        let w = format!("ahma hooks run-shell --wrapped-by {WRAPPED_BY_MARKER} --command");
+        for escape in [
+            format!("{w} true; touch /tmp/x"),
+            format!("{w} 'true' && curl x | sh"),
+            format!("{w} \"$(curl x)\""),
+            format!("{w} true & sh"),
+            format!("{w} true\ntouch /tmp/x"),
+            format!("{w} `id`"),
+            format!("{w} true > ~/.zshrc"),
+            format!("{w}-stdin <<'AHMA_CMD_0123abcd'\nls\nAHMA_CMD_0123abcd\ntouch /tmp/x"),
+            format!("{w}-stdin <<'EOF'\nls\nEOF"),
+            format!("{w}-stdin <<AHMA_CMD_0123abcd\n$(id)\nAHMA_CMD_0123abcd"),
+        ] {
+            assert!(!is_wrapped_shell_command(&escape), "{escape}");
+        }
+        for whole in [
+            format!("{w} 'a; b && c | d > e'"),
+            format!(
+                "'/opt/bin space/ahma' 'hooks' 'run-shell' '--wrapped-by' '{WRAPPED_BY_MARKER}' '--command' 'it'\\''s'"
+            ),
+            format!("{w}-stdin <<'AHMA_CMD_0123abcd'\nls; rm x && $(id)\nAHMA_CMD_0123abcd"),
+        ] {
+            assert!(is_wrapped_shell_command(&whole), "{whole}");
+        }
+    }
+
+    /// The project-scope wrapper names `ahma` on PATH; its arguments are
+    /// quoted like the absolute form's. Unquoted, `cargo build && rm x`
+    /// became `… --command cargo build && rm x`, and `rm x` ran unsandboxed.
+    #[cfg(unix)]
+    #[test]
+    fn the_path_lookup_wrapper_quotes_its_arguments() {
+        let tmp = tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("ahma");
+        // Stands in for ahma: prints its arguments, one per line.
+        std::fs::write(&stub, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let marker = tmp.path().join("escaped");
+        let command = format!("echo 'a b' && touch {}", marker.display());
+        let wrapped = build_wrapped_shell_command(
+            HookScope::Project,
+            &test_env(),
+            "/w d",
+            &command,
+            None,
+            None,
+            HarnessIntent::default(),
+        )
+        .unwrap();
+        assert!(wrapped.starts_with("ahma hooks run-shell"), "{wrapped}");
+        assert!(is_wrapped_shell_command(&wrapped), "{wrapped}");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&wrapped)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let args = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !marker.exists(),
+            "the chained command ran outside the wrapper"
+        );
+        assert_eq!(args.lines().last(), Some(command.as_str()), "{args}");
+        assert!(args.lines().any(|l| l == "/w d"), "{args}");
     }
 
     // ----------------------------------------------------------------------
