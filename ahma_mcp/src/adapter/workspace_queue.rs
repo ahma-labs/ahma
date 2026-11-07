@@ -127,6 +127,10 @@ pub struct HolderInfo {
     /// How long the same command usually runs, for "usually takes …".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typical_secs: Option<u64>,
+    /// Held only out of doubt: the workspace is handed on after this many
+    /// seconds while the command runs on (SPEC R2.7.11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_hold_secs: Option<u64>,
 }
 
 impl HolderInfo {
@@ -140,6 +144,7 @@ impl HolderInfo {
             since_unix: unix_now(),
             footprint: None,
             typical_secs: None,
+            soft_hold_secs: None,
         }
     }
 
@@ -184,7 +189,17 @@ impl HolderInfo {
 
     /// `op X (`title`, 3m12s)` — the canonical way every message names a holder.
     pub fn describe(&self) -> String {
-        format!("op `{}` (`{}`, {})", self.op_id, self.title, self.age())
+        match self.soft_hold_secs {
+            // SPEC R2.7.11: say the wait is short, and why.
+            Some(secs) => format!(
+                "op `{}` (`{}`, {}; not known to write, so it hands the workspace on within \
+                 {secs}s)",
+                self.op_id,
+                self.title,
+                self.age()
+            ),
+            None => format!("op `{}` (`{}`, {})", self.op_id, self.title, self.age()),
+        }
     }
 }
 
@@ -598,6 +613,7 @@ impl WorkspaceQueue {
             holder,
             done: false,
             reason: None,
+            soft_hold: None,
         })
     }
 
@@ -830,6 +846,9 @@ pub struct Ticket {
     /// waits. `None` where there is nothing to explain (an MTDF tool that
     /// declared itself exclusive, a PTY or session command).
     reason: Option<String>,
+    /// Held only out of doubt: hand the workspace on after this long
+    /// (SPEC R2.7.11).
+    soft_hold: Option<Duration>,
 }
 
 impl Ticket {
@@ -847,6 +866,26 @@ impl Ticket {
     #[must_use]
     pub fn with_reason(mut self, reason: Option<String>) -> Self {
         self.reason = reason;
+        self
+    }
+
+    /// Hold the workspace for at most `hold` once granted, then hand it on
+    /// while the command runs on: for a line held only out of doubt (SPEC
+    /// R2.7.11). Recorded with the holder, so a waiter is told.
+    #[must_use]
+    pub fn with_soft_hold(mut self, hold: Option<Duration>) -> Self {
+        self.soft_hold = hold;
+        self.holder.soft_hold_secs = hold.map(|d| d.as_secs());
+        if let Some(entry) = self
+            .lane
+            .state
+            .lock()
+            .entries
+            .iter_mut()
+            .find(|e| e.seq == self.seq)
+        {
+            entry.holder.soft_hold_secs = self.holder.soft_hold_secs;
+        }
         self
     }
 }
@@ -957,17 +996,23 @@ impl Ticket {
 
         self.lane.mark_granted(self.seq);
         self.done = true;
-        Ok(Lease {
-            lane: self.lane.clone(),
-            seq: self.seq,
+        let lease = Lease {
             key: self.key.clone(),
-            holder_path: if fs_lock.is_some() {
-                self.holder_path.clone()
-            } else {
-                None
-            },
-            _fs_lock: fs_lock,
-        })
+            held: Arc::new(Mutex::new(Some(Held {
+                lane: self.lane.clone(),
+                seq: self.seq,
+                holder_path: if fs_lock.is_some() {
+                    self.holder_path.clone()
+                } else {
+                    None
+                },
+                _fs_lock: fs_lock,
+            }))),
+        };
+        if let Some(hold) = self.soft_hold {
+            lease.release_after(hold);
+        }
+        Ok(lease)
     }
 }
 
@@ -980,12 +1025,19 @@ impl Drop for Ticket {
 }
 
 /// The right to run an exclusive operation in a workspace. Held for the life of
-/// the process tree; dropping it hands the workspace to the next in line.
+/// the process tree; dropping it hands the workspace to the next in line. A
+/// line held only out of doubt hands it on sooner ([`Lease::release_after`]).
 #[derive(Debug)]
 pub struct Lease {
+    key: PathBuf,
+    held: Arc<Mutex<Option<Held>>>,
+}
+
+/// What a lease holds while it holds the workspace.
+#[derive(Debug)]
+struct Held {
     lane: Arc<LaneQueue>,
     seq: u64,
-    key: PathBuf,
     holder_path: Option<PathBuf>,
     _fs_lock: Option<FsLock>,
 }
@@ -994,9 +1046,33 @@ impl Lease {
     pub fn key(&self) -> &Path {
         &self.key
     }
+
+    /// Whether this lease still holds the workspace.
+    pub fn is_held(&self) -> bool {
+        self.held.lock().is_some()
+    }
+
+    /// Hand the workspace on after `after` while the command keeps running
+    /// (SPEC R2.7.11). Dropping the lease sooner releases it as usual.
+    pub fn release_after(&self, after: Duration) {
+        let held = Arc::downgrade(&self.held);
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            if let Some(held) = held.upgrade() {
+                let released = held.lock().take();
+                if released.is_some() {
+                    tracing::info!(
+                        "workspace handed on after {}s: the command holding it is not known \
+                         to write (SPEC R2.7.11)",
+                        after.as_secs()
+                    );
+                }
+            }
+        });
+    }
 }
 
-impl Drop for Lease {
+impl Drop for Held {
     fn drop(&mut self) {
         // Order matters: withdraw the published holder *before* the kernel lock
         // is released (field drop, after this body), so it can never erase the
@@ -1154,6 +1230,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lease.key(), td.path());
+    }
+
+    /// SPEC R2.7.11: a line held only out of doubt hands the workspace on
+    /// after its soft hold, while it still runs; any other holds it until it
+    /// ends.
+    #[tokio::test]
+    async fn a_soft_hold_hands_the_workspace_on_while_it_runs() {
+        let td = tempdir().unwrap();
+        let q = queue(td.path());
+        let key = td.path().to_path_buf();
+        let hold = Duration::from_millis(200);
+        let first = q
+            .enqueue(&key, HolderInfo::new("op1", "gh release view v1"))
+            .unwrap()
+            .with_soft_hold(Some(hold));
+        let second = q
+            .enqueue(&key, HolderInfo::new("op2", "cargo build"))
+            .unwrap();
+        assert_eq!(second.ahead()[0].soft_hold_secs, Some(0));
+        let running = first
+            .acquire(&CancellationToken::new(), &no_observe)
+            .await
+            .unwrap();
+        let next = tokio::time::timeout(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            second.acquire(&CancellationToken::new(), &no_observe),
+        )
+        .await
+        .expect("handed on after the soft hold")
+        .unwrap();
+        assert!(!running.is_held(), "the first command still runs, unheld");
+        assert!(next.is_held());
+
+        // Without a soft hold, the next waits for as long as it runs.
+        let third = q
+            .enqueue(&key, HolderInfo::new("op3", "sed -i x f"))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                hold * 3,
+                third.acquire(&CancellationToken::new(), &no_observe)
+            )
+            .await
+            .is_err(),
+            "a known writer keeps the workspace"
+        );
+        drop(running);
     }
 
     #[tokio::test]

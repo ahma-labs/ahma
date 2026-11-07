@@ -448,6 +448,24 @@ impl Adapter {
         }
     }
 
+    /// How long an exclusive shell line holds the workspace when it holds it
+    /// only out of doubt (SPEC R2.7.11): nothing in it is known to write. A
+    /// lane a tool declared, and every other line, holds it until it ends.
+    fn soft_hold_for(
+        &self,
+        args: Option<&Map<String, serde_json::Value>>,
+        subcommand_config: Option<&crate::config::SubcommandConfig>,
+        lane: workspace_queue::Lane,
+    ) -> Option<Duration> {
+        if lane != workspace_queue::Lane::Exclusive
+            || subcommand_config.and_then(|s| s.concurrency).is_some()
+        {
+            return None;
+        }
+        let line = shell_command_line(args)?;
+        lane::held_only_for_doubt(line).then_some(lane::SOFT_HOLD)
+    }
+
     /// Take a place in the workspace line for an exclusive operation, now —
     /// at arrival — so arrival order is execution order (SPEC R2.7.1).
     fn enqueue_exclusive(
@@ -781,9 +799,10 @@ impl Adapter {
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
         let timeout =
             self.sync_timeout(timeout_seconds.or_else(|| self.declared_timeout(args.as_ref())));
+        let soft_hold = self.soft_hold_for(args.as_ref(), subcommand_config, lane);
         let lease = match self
             .enqueue_exclusive(lane, &safe_wd, &op_id, &title)
-            .map(|t| t.with_reason(queue_reason))
+            .map(|t| t.with_reason(queue_reason).with_soft_hold(soft_hold))
         {
             Some(ticket) => Some(self.acquire_for_sync(ticket, timeout).await?),
             None => None,
@@ -1390,9 +1409,10 @@ impl Adapter {
             .clone()
             .or_else(|| operation.title.clone())
             .unwrap_or_else(|| command.to_string());
+        let soft_hold = self.soft_hold_for(args.as_ref(), subcommand_config, lane);
         let ticket = self
             .enqueue_exclusive(lane, &safe_wd, &op_id, &holder_title)
-            .map(|t| t.with_reason(queue_reason));
+            .map(|t| t.with_reason(queue_reason).with_soft_hold(soft_hold));
         let display_command = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| command.to_string());
@@ -3375,6 +3395,38 @@ mod tests {
     /// Field case: headless Chrome died on a refused Mach registration, and
     /// a path from a neighbouring line (Crashpad's settings file) was offered
     /// as the grant instead. The registration decides: no path is offered.
+    /// SPEC R2.7.11: a shell line of programs nothing vouches for is held
+    /// only out of doubt; a known writer, a declared lane, or any other lane
+    /// is held as before.
+    #[test]
+    fn only_a_doubtful_exclusive_line_gets_a_soft_hold() {
+        let (adapter, _td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let line = shell_args;
+        use workspace_queue::Lane;
+        let doubt = line("gh release create v1");
+        assert_eq!(
+            adapter.soft_hold_for(Some(&doubt), None, Lane::Exclusive),
+            Some(lane::SOFT_HOLD)
+        );
+        assert_eq!(
+            adapter.soft_hold_for(Some(&doubt), None, Lane::Service),
+            None
+        );
+        let writer = line("cargo build");
+        assert_eq!(
+            adapter.soft_hold_for(Some(&writer), None, Lane::Exclusive),
+            None
+        );
+        let declared = crate::config::SubcommandConfig {
+            concurrency: Some(Lane::Exclusive),
+            ..Default::default()
+        };
+        assert_eq!(
+            adapter.soft_hold_for(Some(&doubt), Some(&declared), Lane::Exclusive),
+            None
+        );
+    }
+
     #[test]
     fn a_refused_mach_registration_outranks_every_path_in_the_run() {
         let dir = tempfile::tempdir().unwrap();

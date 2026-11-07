@@ -97,6 +97,7 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "host",
     "nslookup",
     "test",
+    "[",
     "false",
     "xxd",
     "cal",
@@ -422,6 +423,8 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
                 (Some("run"), Some("view" | "list" | "watch")) => true,
                 (Some("issue"), Some("view" | "list")) => true,
                 (Some("repo"), Some("view")) => true,
+                (Some("release"), Some("view" | "list")) => true,
+                (Some("workflow"), Some("view" | "list")) => true,
                 (Some("api"), Some(_)) => gh_api_reads(&args[1..]),
                 (Some("--version"), _) | (Some("auth"), Some("status")) => true,
                 _ => false,
@@ -902,6 +905,207 @@ fn classify_targetless_reader(reading: &Reading, read_only_enforced: bool) -> La
     } else {
         Lane::Exclusive
     }
+}
+
+/// Programs that write, or run another program that may: a line holding one
+/// of these keeps the workspace for as long as it runs (SPEC R2.7.11). Matched
+/// on the program's file name. Builds, tests, package managers, interpreters,
+/// shells, file movers and formatters, version control, and the wrappers
+/// that run whatever follows them.
+const KNOWN_WRITERS: &[&str] = &[
+    "cargo",
+    "rustc",
+    "rustup",
+    "rustfmt",
+    "make",
+    "gmake",
+    "cmake",
+    "ninja",
+    "meson",
+    "bazel",
+    "buck",
+    "gradle",
+    "gradlew",
+    "mvn",
+    "mvnw",
+    "ant",
+    "sbt",
+    "xcodebuild",
+    "xcrun",
+    "swift",
+    "swiftc",
+    "clang",
+    "clang++",
+    "gcc",
+    "g++",
+    "cc",
+    "c++",
+    "ld",
+    "go",
+    "gofmt",
+    "zig",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "deno",
+    "node",
+    "tsc",
+    "vite",
+    "webpack",
+    "esbuild",
+    "python",
+    "python3",
+    "pip",
+    "pip3",
+    "pipx",
+    "uv",
+    "poetry",
+    "pdm",
+    "pytest",
+    "tox",
+    "ruby",
+    "gem",
+    "bundle",
+    "bundler",
+    "rake",
+    "perl",
+    "php",
+    "composer",
+    "dotnet",
+    "java",
+    "javac",
+    "kotlin",
+    "kotlinc",
+    "flutter",
+    "dart",
+    "stack",
+    "cabal",
+    "ghc",
+    "mix",
+    "elixir",
+    "git",
+    "hg",
+    "svn",
+    "sed",
+    "awk",
+    "gawk",
+    "rm",
+    "rmdir",
+    "mv",
+    "cp",
+    "mkdir",
+    "touch",
+    "chmod",
+    "chown",
+    "chgrp",
+    "ln",
+    "install",
+    "tar",
+    "unzip",
+    "zip",
+    "gzip",
+    "gunzip",
+    "bzip2",
+    "xz",
+    "7z",
+    "rsync",
+    "scp",
+    "patch",
+    "tee",
+    "dd",
+    "truncate",
+    "shred",
+    "split",
+    "prettier",
+    "eslint",
+    "black",
+    "ruff",
+    "isort",
+    "clang-format",
+    "pre-commit",
+    "just",
+    "task",
+    "docker",
+    "podman",
+    "terraform",
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "source",
+    ".",
+    "eval",
+    "exec",
+    "xargs",
+    "find",
+    "parallel",
+    "timeout",
+    "gtimeout",
+    "caffeinate",
+    "nohup",
+    "watch",
+    "env",
+    "sudo",
+    "doas",
+    "nice",
+    "ionice",
+    "time",
+    "command",
+    "builtin",
+    "curl",
+    "wget",
+    "sqlite3",
+    "brew",
+    "apt",
+    "apt-get",
+    "dnf",
+    "yum",
+    "pacman",
+    "nix",
+    "defaults",
+    "osascript",
+    "open",
+    "code",
+    "cursor",
+];
+
+/// Whether an exclusive `line` holds the workspace only out of doubt: it
+/// writes no file by redirection and runs nothing known to write — only
+/// programs this module cannot vouch for (`gh release view`, `xcrun simctl
+/// list`'s cousins, a tool it has never seen). Such a line keeps the lease
+/// for [`SOFT_HOLD`] at most, then hands the workspace on while it runs
+/// (SPEC R2.7.11): a wrong guess costs the next writer that much, never an
+/// afternoon. A program named by a path (`./build.sh`, `scripts/gen`) or a
+/// variable is the project's own and counts as a writer.
+pub fn held_only_for_doubt(line: &str) -> bool {
+    if line.contains('>') || line.contains("<<") {
+        return false;
+    }
+    // A reader that writes through its own arguments (`sort -o`, `curl -o`,
+    // `sed`) is a known writer here.
+    if read_line(line).is_some_and(|(_, reading)| reading.writes_through_args) {
+        return false;
+    }
+    let words = ahma_common::harness_asks::command_words(line);
+    !words.is_empty() && words.iter().all(|w| !is_known_writer(w))
+}
+
+/// How long a line held only for doubt keeps the workspace (SPEC R2.7.11).
+pub const SOFT_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn is_known_writer(word: &str) -> bool {
+    if word.contains(['/', '\\', '$', '`', '~']) {
+        return true;
+    }
+    let name = word.to_ascii_lowercase();
+    let script = [
+        ".sh", ".bash", ".zsh", ".py", ".rb", ".js", ".mjs", ".ts", ".pl", ".ps1",
+    ];
+    script.iter().any(|ext| name.ends_with(ext)) || KNOWN_WRITERS.contains(&name.as_str())
 }
 
 /// The path a redirection target names, read the way the shell would without
@@ -2685,6 +2889,72 @@ mod queue_reason_tests {
             "cd x && scripts/audition ask",
         ] {
             assert!(long_running_entry(cmd, &entries).is_none(), "{cmd}");
+        }
+    }
+}
+
+/// SPEC R2.7.11 (field case): a CI watch followed by `gh release view` held
+/// the workspace for ten minutes and a build waited behind it, because
+/// `gh release view` was no known reader and the line took the lease for its
+/// whole run.
+#[cfg(test)]
+mod doubt_tests {
+    use super::*;
+
+    const INCIDENT: &str = "cd /ws; gh run watch 42300293966 --exit-status --interval 60 > \
+                            /dev/null 2>&1; echo \"exit=$?\"; gh release view v0.22.11 --json \
+                            tagName,publishedAt,assets -q \
+                            '\"\\(.tagName) \\(.publishedAt) assets=\\(.assets|length)\"' 2>&1";
+
+    fn at(cmd: &str) -> Lane {
+        let inside = |p: &Path| p.starts_with("/ws");
+        classify_shell_command_at(
+            cmd,
+            &RunSite {
+                cwd: Path::new("/ws"),
+                read_only_enforced: true,
+                writes_workspace: &inside,
+            },
+        )
+    }
+
+    #[test]
+    fn the_incident_line_reads_only() {
+        assert_eq!(at(INCIDENT), Lane::ReadOnly, "{INCIDENT}");
+        assert_eq!(at("gh release list --limit 3"), Lane::ReadOnly);
+        assert_eq!(at("[ -t 0 ] && echo tty || echo not-tty"), Lane::ReadOnly);
+        assert_eq!(at("gh release create v1"), Lane::Exclusive);
+    }
+
+    #[test]
+    fn a_line_of_unknown_programs_is_held_only_for_doubt() {
+        for doubt in [
+            "gh release create v1 --notes x",
+            "xcrun-helper list; adb devices",
+            "osascript-ish 'display notification'",
+            "cd /ws && mytool status",
+        ] {
+            assert!(held_only_for_doubt(doubt), "{doubt}");
+        }
+        for certain in [
+            "cargo build",
+            "timeout 600 cargo nextest run",
+            "./scripts/generate.sh --debug",
+            "scripts/coach-reference.sh --against x",
+            "python3 tools/gen.py",
+            "mytool status > out.txt",
+            "cat > render.sh <<'EOF'\necho hi\nEOF",
+            "\"$CH\" --headless",
+            "git checkout main",
+            "sed -i s/a/b/ f",
+            "find . -name x -delete",
+            "xargs rm < list",
+            "bash -c 'anything'",
+            "mytool status && npm install",
+            "sort -o out.txt in.txt",
+            "uniq a b",
+        ] {
+            assert!(!held_only_for_doubt(certain), "{certain}");
         }
     }
 }
