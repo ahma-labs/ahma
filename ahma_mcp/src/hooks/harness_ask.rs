@@ -168,45 +168,61 @@ pub(super) fn approval_binding(
     (workspace, binding)
 }
 
-/// The dialog text for `question`: what was refused, what a yes grants, to
-/// which workspaces and for how long, what a no means, and how to undo it.
+/// The dialog text for `question` (SPEC R-PERM.10.2): who was refused what,
+/// what a yes allows for whom and how to undo it, what a no means — a few
+/// plain sentences. The evidence and the tiers are in the agent's result and
+/// `ahma explain`, not here: a paragraph under ahma's own wrapper was what a
+/// human once approved without being able to read it.
 pub(super) fn ask_reason(question: &Question, workspace: &Path, binding: &Path) -> String {
-    let verb = if question.access.is_write() {
-        "write"
+    let (refused, verb) = if question.access.is_write() {
+        ("writing", "write")
     } else {
-        "read"
+        ("reading", "read")
     };
-    let mut covers: Vec<String> = question
-        .covers
-        .iter()
-        .take(4)
-        .map(|p| p.display().to_string())
-        .collect();
-    if question.covers.len() > 4 {
-        covers.push(format!("and {} more", question.covers.len() - 4));
-    }
     let home = ahma_common::config::ahma_home_dir();
-    let risk =
-        match ahma_common::scope_grant::classify_grant_risk(&question.dir, home.as_deref(), &[]) {
-            ahma_common::scope_grant::GrantRisk::High(why) => format!(" Note: {}.", why.join("; ")),
-            _ => String::new(),
-        };
+    let dir = display_path(&question.dir, home.as_deref());
+    let who = match question.programs.as_slice() {
+        [] => "a command here".to_string(),
+        [one] => one.clone(),
+        [first, ..] => format!("{first} (and {} more)", question.programs.len() - 1),
+    };
     let whom = if binding == workspace {
-        "commands in this workspace".to_string()
+        format!("commands in {}", short_name(workspace))
     } else {
         format!(
-            "commands in every workspace under {} (it is already granted to another one there)",
-            binding.display()
+            "commands in every workspace under {} (another there has it already)",
+            display_path(binding, home.as_deref())
         )
     };
+    let risk =
+        match ahma_common::scope_grant::classify_grant_risk(&question.dir, home.as_deref(), &[]) {
+            ahma_common::scope_grant::GrantRisk::High(why) => {
+                format!(" Caution: {}.", why.join("; "))
+            }
+            _ => String::new(),
+        };
     format!(
-        "ahma: an earlier command here was refused {verb} access to {} ({}). Approve to let \
-         {whom} {verb} it from now on (remembered; undo with `ahma sandbox revoke {}`), then \
-         run this command. Deny and ahma will not ask about it again this session.{risk}",
-        question.dir.display(),
-        covers.join(", "),
+        "ahma: {who} was refused {refused} {dir}. Yes: let {whom} {verb} it from now on (undo: \
+         `ahma sandbox revoke {}`). No: don't ask again this session.{risk}",
         question.dir.display(),
     )
+}
+
+/// `path` as a human reads it: under home, with `~`.
+fn display_path(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// A workspace by its folder name, the way its owner calls it.
+fn short_name(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.display().to_string())
 }
 
 /// The SSH signature to ask about before `command` runs in `cwd`, with the
@@ -307,16 +323,19 @@ pub(super) fn next_escape_ask(
     Some((refusal, token))
 }
 
-/// The dialog text for an escape (SPEC R-ESCAPE.2): what was refused, that a
-/// yes runs this exact command once **without** ahma's sandbox, and that it
-/// is recorded.
+/// The dialog text for an escape (SPEC R-ESCAPE.2, R-PERM.10.2): what could
+/// not run, in its first sentence, and that a yes runs this one command with
+/// the human's own full access.
 pub(super) fn escape_ask_reason(refusal: &harness_asks::EscapeRefusal) -> String {
+    let why = refusal.why.trim();
+    let why = why.strip_prefix("Blocked: ").unwrap_or(why);
+    let first = why
+        .find(". ")
+        .map_or(why, |end| &why[..end])
+        .trim_end_matches('.');
     format!(
-        "ahma: this exact command was refused something no grant or setting can allow ({}). \
-         Approve to run it ONCE OUTSIDE ahma's sandbox: its writes are not confined to the \
-         workspace, and the run is recorded in the audit log. Deny to keep it sandboxed; ahma \
-         will not ask again this session.",
-        refusal.why
+        "ahma: {first}. Yes: run this one command outside the sandbox, with your full access \
+         (recorded in the audit log). No: keep it sandboxed; ahma won't ask again this session."
     )
 }
 
@@ -570,7 +589,7 @@ mod tests {
         let (refusal, token) = next_escape_ask(&ws, "s1", cmd).expect("asked");
         let reason = escape_ask_reason(&refusal);
         assert!(
-            reason.contains("ONCE OUTSIDE")
+            reason.contains("run this one command outside the sandbox")
                 && reason.contains("audit log")
                 && reason.contains("lsopen"),
             "{reason}"
@@ -662,6 +681,15 @@ mod tests {
             "{out}"
         );
         let command = hs["updatedInput"]["command"].as_str().unwrap().to_string();
+        // SPEC R-PERM.10.2: the dialog shows the command that will run, as the
+        // agent wrote it, under one line of ahma's — not re-quoted into argv.
+        #[cfg(unix)]
+        {
+            let (first, body) = command.split_once('\n').expect("a heredoc");
+            assert!(first.contains("--command-stdin"), "{command}");
+            assert!(!first.contains("make heavy"), "{command}");
+            assert!(body.starts_with("make heavy\n"), "{command}");
+        }
         let token = command
             .split_whitespace()
             .skip_while(|t| t.trim_matches('\'') != APPROVE_FLAG)
@@ -789,39 +817,122 @@ mod tests {
             dir: PathBuf::from("/Volumes/T7/caches/swiftpm"),
             access: ScopeAccess::Rw,
             covers: vec![PathBuf::from("/Volumes/T7/caches/swiftpm/manifests")],
+            programs: vec!["swift".into()],
         };
         let ws = PathBuf::from("/Volumes/T7/github/ahma");
         let shared = PathBuf::from("/Volumes/T7/github");
         let r = ask_reason(&q, &ws, &shared);
         assert!(
-            r.contains("commands in every workspace under /Volumes/T7/github"),
+            r.contains("every workspace under /Volumes/T7/github"),
             "{r}"
         );
-        assert!(!r.contains("commands in this workspace"), "{r}");
+        assert!(!r.contains("commands in ahma"), "{r}");
     }
 
+    /// SPEC R-PERM.10.2: who needs what, what a yes and a no mean, how to
+    /// undo it — and nothing more. The field case's dialog was a paragraph
+    /// under ahma's own wrapper argv; the human said yes to a folder that did
+    /// not exist.
     #[test]
-    fn the_dialog_says_what_yes_and_no_mean() {
+    fn the_dialog_says_who_needs_what_in_a_few_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("neubit-cache");
+        std::fs::create_dir_all(&cache).unwrap();
         let q = Question {
-            dir: PathBuf::from("/opt/neubit-cache"),
+            dir: cache.clone(),
             access: ScopeAccess::Rw,
-            covers: vec![PathBuf::from("/opt/neubit-cache/heavy.lock.holder")],
+            covers: vec![cache.join("heavy.lock.holder")],
+            programs: vec!["gradle".into()],
         };
         let ws = PathBuf::from("/Volumes/T7/github/neubit4");
         let r = ask_reason(&q, &ws, &ws);
-        assert!(r.contains("commands in this workspace"), "{r}");
         assert!(
-            r.contains("refused write access to /opt/neubit-cache"),
+            r.starts_with(&format!(
+                "ahma: gradle was refused writing {}.",
+                cache.display()
+            )),
             "{r}"
         );
-        assert!(r.contains("heavy.lock.holder"), "{r}");
-        // SPEC R-PERM.10.1: a yes is remembered, and says how to undo it.
-        assert!(r.contains("from now on (remembered"), "{r}");
-        assert!(r.contains("ahma sandbox revoke /opt/neubit-cache"), "{r}");
         assert!(
-            r.contains("will not ask about it again this session"),
+            r.contains("Yes: let commands in neubit4 write it from now on"),
             "{r}"
         );
+        assert!(
+            r.contains(&format!("ahma sandbox revoke {}", cache.display())),
+            "{r}"
+        );
+        assert!(r.contains("No: don't ask again this session."), "{r}");
+        assert!(!r.contains('\n'), "{r}");
+        let plumbing = 2 * cache.display().to_string().chars().count();
+        let len = r.chars().count() - plumbing;
+        assert!(len <= 200, "{len} chars besides the paths: {r}");
+    }
+
+    /// Without a program name (a record from an older ahma) it says "a
+    /// command"; a path under home is written with `~`.
+    #[test]
+    fn the_dialog_without_a_program_and_under_home() {
+        let Some(home) = ahma_common::config::ahma_home_dir() else {
+            return;
+        };
+        let dir = home.join("Library/Application Support/Google/Chrome");
+        let q = Question {
+            dir: dir.clone(),
+            access: ScopeAccess::Ro,
+            covers: vec![dir.join("Crashpad")],
+            programs: Vec::new(),
+        };
+        let ws = PathBuf::from("/w/neubit4");
+        let r = ask_reason(&q, &ws, &ws);
+        assert!(
+            r.starts_with(
+                "ahma: a command here was refused reading ~/Library/Application Support/Google/Chrome."
+            ),
+            "{r}"
+        );
+        assert!(r.contains("read it from now on"), "{r}");
+    }
+
+    /// SPEC R-PERM.10.2, R-ESCAPE.2: the escape says in plain words what
+    /// failed and what a yes gives away.
+    #[test]
+    fn the_escape_dialog_is_plain() {
+        let refusal = harness_asks::EscapeRefusal {
+            command_digest: "d".into(),
+            why: crate::sandbox::mach::blocked_line("com.google.Chrome.MachPortRendezvousServer"),
+            at: 0,
+            harness_pid: None,
+        };
+        let r = escape_ask_reason(&refusal);
+        assert!(
+            r.starts_with("ahma: Google Chrome can't run inside ahma's sandbox"),
+            "{r}"
+        );
+        assert!(
+            r.contains("Yes: run this one command outside the sandbox, with your full access"),
+            "{r}"
+        );
+        assert!(r.contains("No: keep it sandboxed"), "{r}");
+        assert!(!r.contains("Blocked:"), "{r}");
+        assert!(r.chars().count() <= 360, "{} chars: {r}", r.chars().count());
+        // A kernel record's line is cut to its first sentence.
+        let kernel = harness_asks::EscapeRefusal {
+            why: "Blocked: ahma's kernel sandbox refused `lsopen` on /x/App.app by open (12). No \
+                  grant or setting changes this: opening an app hands it to launchd. If the \
+                  command must do it, run the same command again."
+                .into(),
+            ..refusal
+        };
+        let r = escape_ask_reason(&kernel);
+        assert!(
+            r.starts_with(
+                "ahma: ahma's kernel sandbox refused `lsopen` on /x/App.app by open (12)."
+            ),
+            "{r}"
+        );
+        assert!(!r.contains("No grant or setting"), "{r}");
     }
 
     /// SPEC R-PERM.10: a refusal the command shrugged off is said in one
@@ -1007,7 +1118,7 @@ mod tests {
             "Nested sandbox refusal offers escape ask on re-run: {decision:?}"
         );
         if let HooksDecision::AskGrant { reason, .. } = decision {
-            assert!(reason.contains("ONCE OUTSIDE"));
+            assert!(reason.contains("outside the sandbox"));
         }
     }
 }

@@ -468,6 +468,10 @@ pub struct Question {
     pub access: ScopeAccess,
     /// The refused paths this one grant would cover, for the dialog text.
     pub covers: Vec<PathBuf>,
+    /// The programs whose commands were refused, so the dialog can say who
+    /// needs it (SPEC R-PERM.10.2). Empty for records of an older ahma.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<String>,
 }
 
 /// A question a human answered at another surface (the TUI) before the
@@ -744,6 +748,7 @@ pub fn group(refusals: &[Refusal], home: Option<&Path>, scopes: &[PathBuf]) -> V
             dir: r.grant_dir.clone(),
             access: r.access,
             covers: vec![r.path.clone()],
+            programs: r.programs.clone(),
         })
         .collect();
     loop {
@@ -777,6 +782,11 @@ pub fn group(refusals: &[Refusal], home: Option<&Path>, scopes: &[PathBuf]) -> V
         for path in absorbed.covers {
             if !into.covers.contains(&path) {
                 into.covers.push(path);
+            }
+        }
+        for program in absorbed.programs {
+            if !into.programs.contains(&program) {
+                into.programs.push(program);
             }
         }
     }

@@ -8357,6 +8357,7 @@ mod tests {
                 dir: hook.request.path.clone(),
                 access: hook.request.access,
                 covers: Vec::new(),
+                programs: Vec::new(),
             },
             harness_pid: 1,
         });
@@ -8722,6 +8723,7 @@ mod tests {
                 dir: root.join(format!("cache-{n}")),
                 access: ahma_common::config::ScopeAccess::Rw,
                 covers: vec![root.join(format!("cache-{n}")).join("x.lock")],
+                programs: Vec::new(),
             },
             harness_pid: std::process::id(),
         }
