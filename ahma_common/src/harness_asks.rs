@@ -107,17 +107,19 @@ const RUNS_THE_NEXT: &[&str] = &["env", "time", "nice", "nohup", "exec", "comman
 /// gets wrong costs one extra question or one missed one, never a grant.
 pub fn command_programs(command: &str) -> Vec<String> {
     let mut programs = Vec::new();
-    let segments = command.split(['&', '|', ';', '\n', '(', ')']);
-    for segment in segments {
-        let mut words = segment.split_whitespace().skip_while(|w| {
+    for segment in shell_segments(command) {
+        let mut words = segment.iter().skip_while(|w| {
             (w.contains('=') && !w.starts_with('-'))
-                || RUNS_THE_NEXT.contains(w)
+                || RUNS_THE_NEXT.contains(&w.as_str())
                 || w.starts_with('-')
         });
         let Some(word) = words.next() else {
             continue;
         };
-        let word = word.trim_matches(|c| c == '"' || c == '\'');
+        // `"$CH"` runs whatever the variable holds: no name to match on.
+        if word.contains(['$', '`']) {
+            continue;
+        }
         let name = Path::new(word)
             .file_name()
             .and_then(|f| f.to_str())
@@ -130,6 +132,132 @@ pub fn command_programs(command: &str) -> Vec<String> {
         }
     }
     programs
+}
+
+/// The words of each command a shell line runs, split at unquoted `&`, `|`,
+/// `;`, newlines and parentheses. Quotes are removed and keep their contents
+/// one word (`"/Applications/Google Chrome.app/…"`); heredoc bodies and
+/// comments are dropped, since they run nothing. Still a heuristic, not a
+/// shell: it only has to tell what runs from what is merely written down.
+fn shell_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
+    let mut word = String::new();
+    let mut in_word = false;
+    // Heredocs announced on the current line: (closing word, strip tabs).
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+    let end_word = |segments: &mut Vec<Vec<String>>, word: &mut String, in_word: &mut bool| {
+        if *in_word {
+            segments
+                .last_mut()
+                .expect("one segment")
+                .push(std::mem::take(word));
+            *in_word = false;
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' => {
+                in_word = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    word.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '"' => {
+                in_word = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    word.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '\\' if i + 1 < chars.len() => {
+                in_word = true;
+                i += 1;
+                if chars[i] != '\n' {
+                    word.push(chars[i]);
+                }
+            }
+            '#' if !in_word => {
+                while i + 1 < chars.len() && chars[i + 1] != '\n' {
+                    i += 1;
+                }
+            }
+            '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
+                end_word(&mut segments, &mut word, &mut in_word);
+                i += 2;
+                let strip_tabs = chars.get(i) == Some(&'-');
+                if strip_tabs {
+                    i += 1;
+                }
+                while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    i += 1;
+                }
+                let mut delimiter = String::new();
+                while let Some(&d) = chars.get(i) {
+                    if d.is_whitespace() || matches!(d, ';' | '&' | '|' | '(' | ')' | '<' | '>') {
+                        break;
+                    }
+                    if !matches!(d, '\'' | '"' | '\\') {
+                        delimiter.push(d);
+                    }
+                    i += 1;
+                }
+                if !delimiter.is_empty() {
+                    heredocs.push((delimiter, strip_tabs));
+                }
+                continue;
+            }
+            '\n' => {
+                end_word(&mut segments, &mut word, &mut in_word);
+                segments.push(Vec::new());
+                // Skip the bodies of the heredocs this line announced.
+                for (delimiter, strip_tabs) in std::mem::take(&mut heredocs) {
+                    loop {
+                        let start = i + 1;
+                        if start >= chars.len() {
+                            i = chars.len();
+                            break;
+                        }
+                        let end = chars[start..]
+                            .iter()
+                            .position(|c| *c == '\n')
+                            .map_or(chars.len(), |p| start + p);
+                        let line: String = chars[start..end].iter().collect();
+                        i = end;
+                        let line = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line.as_str()
+                        };
+                        if line == delimiter {
+                            break;
+                        }
+                    }
+                }
+            }
+            '&' | '|' | ';' | '(' | ')' => {
+                end_word(&mut segments, &mut word, &mut in_word);
+                segments.push(Vec::new());
+            }
+            c if c.is_whitespace() => end_word(&mut segments, &mut word, &mut in_word),
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+        i += 1;
+    }
+    end_word(&mut segments, &mut word, &mut in_word);
+    segments.retain(|s| !s.is_empty());
+    segments
 }
 
 /// The digest a command is recorded and matched under: of the command with
@@ -1705,6 +1833,43 @@ mod tests {
         );
         assert_eq!(command_programs("time cargo build && ls"), ["cargo"]);
         assert!(command_programs("cd x && ls && echo hi").is_empty());
+    }
+
+    /// SPEC R-PERM.10.1 (field case): a command that only *mentions* a
+    /// program — in a heredoc body, a string — does not run it. A script
+    /// written with `cat > render.sh <<'EOF'` whose body named Chrome's path
+    /// was taken to run the program `Google`, and raised the Chrome question
+    /// on an unrelated command.
+    #[test]
+    fn a_program_named_in_a_heredoc_or_a_string_is_not_run() {
+        let incident = "S=/tmp/s && cat > $S/render.sh <<'EOF'\n#!/bin/sh\n\
+                        CH=\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\"\n\
+                        \"$CH\" --headless=new --print-to-pdf=\"$OUT\"\nopen -R \"$OUT\"\nEOF\n\
+                        chmod +x $S/render.sh && echo ok";
+        assert_eq!(command_programs(incident), ["chmod"]);
+        // A quoted path is one word; a variable is no program we can name.
+        assert_eq!(
+            command_programs(
+                "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" --headless 2>&1 | tail -5"
+            ),
+            ["Google Chrome"]
+        );
+        assert!(command_programs("CH=x && \"$CH\" --headless").is_empty());
+        assert_eq!(command_programs("echo 'a; rm -rf x' && make"), ["make"]);
+        assert_eq!(
+            command_programs("git log --format='%h | %s' ; cargo fmt"),
+            ["git", "cargo"]
+        );
+        // `<<-` strips leading tabs from the closing word.
+        assert_eq!(
+            command_programs("cat <<-END\n\tnot-a-program\n\tEND\nnpm test"),
+            ["npm"]
+        );
+        // A comment runs nothing.
+        assert_eq!(
+            command_programs("# xcodebuild later\nswift build"),
+            ["swift"]
+        );
     }
 
     /// SPEC R-PERM.10.1 (field case): an agent changes the command before it

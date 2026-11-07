@@ -62,6 +62,7 @@ pub mod kernel_denials;
 #[cfg(target_os = "linux")]
 mod landlock;
 pub mod launch_services;
+pub mod mach;
 pub mod permission_broker;
 mod prerequisites;
 pub mod profiles;

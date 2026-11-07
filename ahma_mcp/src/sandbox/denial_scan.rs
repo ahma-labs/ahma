@@ -104,6 +104,12 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
         if super::setuid::refused_exec_program(line).is_some() {
             continue;
         }
+        // Chrome's own sandbox failing to hand a helper an extension
+        // (`sandbox_extension_issue_file_to_process failed for <app>`) is no
+        // refusal of ahma's, and no grant changes it (SPEC R6.2.13).
+        if line.contains("sandbox_extension") {
+            continue;
+        }
 
         // Shape 1: keyword and path on the same line (most specific).
         if let Some(hit) = scan_line(line) {
@@ -276,10 +282,13 @@ fn scan_line(line: &str) -> Option<DenialHit> {
 /// Returns `None` when the line has no plausible path.
 fn extract_path(line: &str) -> Option<PathBuf> {
     // Pass 1: Absolute paths (Unix or Windows) - most specific
-    for raw in line.split_whitespace() {
+    let tokens = whitespace_tokens(line);
+    for (i, &(_, raw)) in tokens.iter().enumerate() {
         let token = trim_path_token(raw);
         if (token.len() > 1 && token.starts_with('/')) || is_windows_abs(token) {
-            return Some(PathBuf::from(token));
+            return Some(
+                path_across_spaces(line, &tokens[i..]).unwrap_or_else(|| PathBuf::from(token)),
+            );
         }
     }
 
@@ -298,6 +307,65 @@ fn extract_path(line: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// The whitespace-separated words of `line`, each with its byte offset.
+fn whitespace_tokens(line: &str) -> Vec<(usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (i, c) in line.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                tokens.push((s, &line[s..i]));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        tokens.push((s, &line[s..]));
+    }
+    tokens
+}
+
+/// How many following words a path with spaces may take in.
+const MAX_PATH_WORDS: usize = 8;
+
+/// The absolute path starting at `tokens[0]` when it runs on across spaces
+/// (`/Applications/Google Chrome.app`, `~/Library/Application Support/…`).
+///
+/// Splitting on whitespace alone cut such paths at the first space and
+/// offered a grant on a folder that does not exist (SPEC R6.2.8.2). A longer
+/// reading is taken only on evidence: it exists, or the path was quoted, the
+/// quote closes there, and its folder exists. `None` keeps the first word,
+/// as before.
+fn path_across_spaces(line: &str, tokens: &[(usize, &str)]) -> Option<PathBuf> {
+    let (start, first) = *tokens.first()?;
+    if ends_path(first) {
+        return None;
+    }
+    let quoted = first.starts_with(['\'', '"', '`']);
+    let mut found = None;
+    for &(offset, raw) in tokens.iter().skip(1).take(MAX_PATH_WORDS) {
+        let candidate = PathBuf::from(trim_path_token(&line[start..offset + raw.len()]));
+        let closes = ends_path(raw);
+        if candidate.exists()
+            || (quoted && closes && candidate.parent().is_some_and(std::path::Path::exists))
+        {
+            found = Some(candidate);
+        }
+        if closes {
+            break;
+        }
+    }
+    found
+}
+
+/// Whether a word ends the path it belongs to: `path:`, `'path'`, `path,`.
+fn ends_path(raw: &str) -> bool {
+    let raw = raw.trim_end_matches(['.', ')', ']', ';']);
+    raw.ends_with(':') || raw.ends_with(',') || raw.ends_with(['\'', '"', '`'])
 }
 
 fn trim_path_token(raw: &str) -> &str {
@@ -455,6 +523,57 @@ mod tests {
         assert_eq!(scan_denial_streams("", &line), None, "merged into stdout");
         let borrowed = format!("{line}\nCaused by:\n  Operation not permitted (os error 1)");
         assert_eq!(scan_denial(&borrowed), None, "nor borrowed by a later line");
+    }
+
+    /// A path with a space in it is read whole. Field case: Chrome's
+    /// `…/Google Chrome.app` came back as `/Applications/Google`, and
+    /// `…/Application Support/…` as `…/Library/Application`: folders that do
+    /// not exist, offered as grants, approved, and saved for good.
+    #[test]
+    fn a_path_with_spaces_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let app = root.join("Google Chrome.app");
+        std::fs::create_dir_all(&app).unwrap();
+        let support = root.join("Application Support").join("Google");
+        std::fs::create_dir_all(&support).unwrap();
+        let settings = support.join("settings.dat");
+        std::fs::write(&settings, "").unwrap();
+
+        let line = format!(
+            "[1107/084514.297003:ERROR:file_io_posix.cc:208] open {}: Operation not permitted (1)",
+            settings.display()
+        );
+        assert_eq!(scan_denial_streams(&line, "").unwrap().path, settings);
+
+        let line = format!("cp: {}: Operation not permitted", app.display());
+        assert_eq!(scan_denial_streams(&line, "").unwrap().path, app);
+
+        // Not there yet, but quoted whole and in an existing folder.
+        let new = root.join("new folder");
+        let line = format!(
+            "mkdir: cannot create directory '{}': Permission denied",
+            new.display()
+        );
+        assert_eq!(scan_denial_streams(&line, "").unwrap().path, new);
+
+        // An unquoted path that does not exist never swallows the words after it.
+        let line = format!(
+            "touch {} failed: Operation not permitted",
+            root.join("x").display()
+        );
+        assert_eq!(scan_denial_streams(&line, "").unwrap().path, root.join("x"));
+    }
+
+    /// Chrome's `sandbox_extension_issue_file_to_process failed for <app>`
+    /// is Chrome's own sandbox failing to hand a helper an extension, not a
+    /// write ahma refused: no surface offers a grant for it.
+    #[test]
+    fn a_failed_sandbox_extension_is_no_grant() {
+        let line = "sandbox_extension_issue_file_to_process failed for /Applications/Google \
+                    Chrome.app: 1 (Operation not permitted)";
+        assert_eq!(scan_denial_streams(line, ""), None);
+        assert_eq!(scan_denial_streams("", line), None);
     }
 
     /// The same shell message for a redirect into an ordinary file stays the
