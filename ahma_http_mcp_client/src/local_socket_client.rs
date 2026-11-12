@@ -446,7 +446,7 @@ impl StreamableHttpClient for LocalSocketHttpClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -456,7 +456,7 @@ impl StreamableHttpClient for LocalSocketHttpClient {
             .base_request_builder(
                 Method::GET,
                 uri.as_ref(),
-                Some(session_id.as_ref()),
+                session_id.as_deref(),
                 auth_token,
                 custom_headers,
             )?

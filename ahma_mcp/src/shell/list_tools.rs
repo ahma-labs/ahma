@@ -241,10 +241,13 @@ pub async fn list_tools_stdio_with_env(
         .with_context(|| "Failed to connect to MCP server via stdio")?;
 
     // Get server info from peer_info
-    let server_info_output = client.peer_info().map(|info| ServerInfoOutput {
-        name: info.server_info.name.clone(),
-        version: Some(info.server_info.version.clone()),
-    });
+    let server_info_output = client
+        .peer_info()
+        .and_then(|info| info.server_info.clone())
+        .map(|server| ServerInfoOutput {
+            name: server.name.clone(),
+            version: Some(server.version.clone()),
+        });
 
     // List tools
     let tools = client.list_tools(None).await?;
@@ -273,10 +276,13 @@ pub async fn list_tools_http(url: &str) -> Result<ToolListResult> {
     let client = ().serve(transport).await.with_context(|| "Failed to connect to HTTP MCP server")?;
 
     // Get server info
-    let server_info_output = client.peer_info().map(|info| ServerInfoOutput {
-        name: info.server_info.name.clone(),
-        version: Some(info.server_info.version.clone()),
-    });
+    let server_info_output = client
+        .peer_info()
+        .and_then(|info| info.server_info.clone())
+        .map(|server| ServerInfoOutput {
+            name: server.name.clone(),
+            version: Some(server.version.clone()),
+        });
 
     // List tools
     let tools_result = client.list_tools(None).await?;

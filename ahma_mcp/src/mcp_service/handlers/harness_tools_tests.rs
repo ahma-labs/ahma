@@ -17,8 +17,8 @@ use crate::{
 use ahma_harness_tools::{DirEntryInfo, GrepMatch, WebFetchResult};
 use anyhow::Result;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
-    ElicitationAction, ElicitationCapability, FormElicitationCapability, Implementation,
+    ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult, ElicitationAction,
+    ElicitationCapability, FormElicitationCapability, Implementation,
 };
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::async_rw::AsyncRwTransport;
@@ -963,9 +963,9 @@ impl ClientHandler for ScriptedElicitClient {
 
     async fn create_elicitation(
         &self,
-        _request: CreateElicitationRequestParams,
+        _request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
+    ) -> Result<ElicitResult, rmcp::ErrorData> {
         let reply = self
             .replies
             .lock()
@@ -979,7 +979,7 @@ impl ClientHandler for ScriptedElicitClient {
             ElicitReply::Decline => (ElicitationAction::Decline, None),
             ElicitReply::Cancel => (ElicitationAction::Cancel, None),
         };
-        let mut result = CreateElicitationResult::new(action);
+        let mut result = ElicitResult::new(action);
         result.content = content;
         Ok(result)
     }
