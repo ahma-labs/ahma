@@ -158,6 +158,9 @@ pub enum ContaminationKind {
     /// inside ahma's profile: `sandbox_apply: Operation not permitted`. A
     /// capability refusal, not a path; no grant can fix it (SPEC R7.7).
     NestedSandbox,
+    /// Xcode's Metal Toolchain is installed but not mounted, and the sandbox
+    /// refused the mount, so `metal` reports it "missing" (SPEC R6.2.14).
+    MetalToolchainMount,
 }
 
 /// True for a token that looks like a Rust build artifact path (the things a
@@ -194,6 +197,13 @@ fn looks_like_nested_sandbox_refusal(line: &str) -> bool {
         || (line.contains("swift-plugin-server") && line.contains("malformed response"))
 }
 
+/// Xcode reports an installed but unmounted Metal Toolchain as missing, and logs
+/// the refused remount separately; either line is the signature (SPEC R6.2.14).
+fn looks_like_unmounted_metal_toolchain(line: &str) -> bool {
+    line.contains("due to missing Metal Toolchain")
+        || line.contains("Failed to remount the Metal Toolchain")
+}
+
 fn looks_like_https_auth_failure(line: &str) -> bool {
     line.contains("could not read Username for 'https://")
         || line.contains("could not read Password for 'https://")
@@ -226,6 +236,12 @@ pub fn diagnose_streams(stderr: &str, stdout: &str) -> Option<ContaminationHint>
             return Some(ContaminationHint {
                 kind: ContaminationKind::NestedSandbox,
                 remediation: NESTED_SANDBOX_REMEDIATION.to_string(),
+            });
+        }
+        if looks_like_unmounted_metal_toolchain(line) {
+            return Some(ContaminationHint {
+                kind: ContaminationKind::MetalToolchainMount,
+                remediation: METAL_TOOLCHAIN_REMEDIATION.to_string(),
             });
         }
         if looks_like_ssh_publickey_failure(line) {
@@ -318,6 +334,16 @@ com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES` once. Swif
 \"swift-plugin-server produced malformed response\") are the same limit: add \
 `'OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox'` to the xcodebuild command, or `-disable-sandbox` \
 to swiftc.";
+
+const METAL_TOOLCHAIN_REMEDIATION: &str = "Xcode's Metal Toolchain is installed but not \
+mounted, so `metal` reports it as missing (`cannot execute tool 'metal' due to missing Metal \
+Toolchain`). Since Xcode 26 the toolchain is a disk image that Xcode mounts on first use after \
+each boot, and this sandboxed command could not mount it. It is a mount, not a path: do not \
+request a directory grant, and do not run the command the error suggests yourself, because inside \
+the sandbox it fails the same way. Fix: a human runs `xcodebuild -downloadComponent \
+MetalToolchain` once, in a terminal that is not inside any sandbox. With the toolchain already \
+installed it downloads nothing; it mounts it, until the next reboot. Then re-run the same command, \
+and sandboxed builds compile `.metal` files again.";
 
 const BUILD_SCRIPT_COPY_REMEDIATION: &str = "Build failed with `Operation not permitted` while a \
 dependency's build script copied a file (e.g. `aws-lc-sys` copying its include headers). On macOS \
@@ -764,5 +790,61 @@ mod nested_and_sccache_tests {
             prov.remediation_for(Some(std::path::Path::new("/p")), &|_| true),
             prov.remediation
         );
+    }
+}
+
+#[cfg(test)]
+mod metal_toolchain_tests {
+    use super::*;
+
+    /// Since Xcode 26 the Metal Toolchain is a disk image Xcode mounts on first
+    /// use after each boot. Inside ahma's sandbox that mount fails, and Xcode
+    /// reports the *installed* toolchain as missing (field case, SPEC R6.2.14:
+    /// an iOS build stopped at its first `.metal` file). The hint must say it
+    /// is installed and name the one command, run by a human outside the
+    /// sandbox, that mounts it.
+    #[test]
+    fn a_missing_metal_toolchain_is_an_unmounted_one() {
+        let stdout = "CompileMetalFile /p/Orb.metal (in target 'Neubit' from project 'Neubit')\n\
+            error: error: cannot execute tool 'metal' due to missing Metal Toolchain; use: \
+            xcodebuild -downloadComponent MetalToolchain";
+        let hit = diagnose_streams("", stdout).expect("xcodebuild prints this on stdout");
+        assert_eq!(hit.kind, ContaminationKind::MetalToolchainMount);
+        assert!(hit.remediation.contains("installed"), "{}", hit.remediation);
+        // Measured: run outside the sandbox, the error's own command mounts
+        // the installed toolchain, and sandboxed builds then compile `.metal`.
+        assert!(
+            hit.remediation.contains(
+                "`xcodebuild -downloadComponent MetalToolchain` once, in a terminal that is \
+                 not inside any sandbox"
+            ),
+            "{}",
+            hit.remediation
+        );
+        assert!(
+            hit.remediation
+                .contains("do not run the command the error suggests yourself"),
+            "inside the sandbox it fails the same way: {}",
+            hit.remediation
+        );
+    }
+
+    /// The other form of the same failure: Xcode's own log line when the
+    /// sandbox refuses the mount point under `~/Library/Developer/DVTDownloads`.
+    #[test]
+    fn a_refused_metal_toolchain_remount_is_recognised() {
+        let stderr = "IDEDownloadableMetalToolchainCoordinator: Failed to remount the Metal \
+            Toolchain: You don\u{2019}t have permission to save the file \
+            \u{201c}e5b5544bf11850c8bd817f7702339b202c00661b\u{201d} in the folder \u{201c}mounts\u{201d}.";
+        let hit = diagnose(stderr).expect("the remount refusal should match");
+        assert_eq!(hit.kind, ContaminationKind::MetalToolchainMount);
+    }
+
+    /// A compile error in a shader is the code's, not the sandbox's.
+    #[test]
+    fn an_ordinary_metal_compile_error_is_ignored() {
+        let stdout = "/p/Orb.metal:12:5: error: use of undeclared identifier 'glow'\n\
+            ** BUILD FAILED **";
+        assert!(diagnose_streams("", stdout).is_none());
     }
 }

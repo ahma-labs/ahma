@@ -17,7 +17,9 @@ description = "Apple toolchain: Xcode DerivedData, SwiftPM and CocoaPods caches,
 cost = """Xcode's DerivedData (~/Library/Developer/Xcode/DerivedData) and the SwiftPM and CocoaPods \
 caches under ~/Library are shared by every Apple project on this machine, and this profile makes \
 them writable. SwiftPM compiles the package sources it has cached, so an agent working in one \
-project can edit a cached package checkout that is then built into an unrelated project. Turn it \
+project can edit a cached package checkout that is then built into an unrelated project. It also \
+makes Xcode's Metal Toolchain mount points (~/Library/Developer/DVTDownloads/MetalToolchain) \
+writable, so a build can mount the toolchain; the downloaded toolchain itself stays read-only. Turn it \
 off with `--no-package-cache-write` (or `[sandbox] package_cache_write = false`), which downgrades \
 these caches to read-only and leaves the toolchain runnable (SPEC R-HANDOFF.8)."""
 
@@ -60,6 +62,16 @@ access = "rx"
 [[rules]]
 path = "~/Library/Caches/CocoaPods"
 access = "rw"
+
+# The Metal Toolchain (SPEC R6.2.14). Since Xcode 26 it is a downloaded disk
+# image that Xcode mounts on first use after each boot, under a mount point it
+# creates in `mounts/`. Without this, every sandboxed build of an app with a
+# `.metal` file failed with "missing Metal Toolchain", though it is installed.
+# Only the mount points: the downloaded assets beside it stay read-only.
+[[rules]]
+path = "~/Library/Developer/DVTDownloads/MetalToolchain"
+access = "rw"
+precreate = true
 
 # Simulators: runtimes and device images are read to build *for* the simulator.
 # Booting a device and running tests writes device state under
