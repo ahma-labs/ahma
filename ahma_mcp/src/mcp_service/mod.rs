@@ -60,9 +60,9 @@ use parking_lot::RwLock;
 use rmcp::{
     handler::server::ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ErrorData as McpError,
-        Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ServerCapabilities, ServerInfo, Tool, ToolsCapability,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
+        ErrorData as McpError, Implementation, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
     },
     service::{NotificationContext, Peer, RequestContext, RoleServer},
 };
@@ -613,7 +613,7 @@ impl AhmaMcpService {
                 "anthropic/requiresUserInteraction".to_string(),
                 serde_json::Value::Bool(true),
             );
-            built.meta = Some(rmcp::model::Meta(meta));
+            built.meta = Some(rmcp::model::MetaObject(meta));
         }
         built
     }
@@ -1794,11 +1794,7 @@ impl ServerHandler for AhmaMcpService {
             let external_mgr = self.mcp_connections.read().await;
             append_external_mcp_tools(&mut tools, &external_mgr);
 
-            Ok(ListToolsResult {
-                meta: None,
-                tools,
-                next_cursor: None,
-            })
+            Ok(ListToolsResult::with_all_items(tools))
         }
     }
 
@@ -1806,7 +1802,7 @@ impl ServerHandler for AhmaMcpService {
         &self,
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         self.last_received_signal.store(
             ahma_common::keepalive::current_timestamp_ms(),
             std::sync::atomic::Ordering::Relaxed,
@@ -1825,7 +1821,7 @@ impl ServerHandler for AhmaMcpService {
             if is_guard_active
                 && let Some(early) = self.harness_guard_preprocess(&mut tool_name, &mut tool_args)
             {
-                return Ok(early);
+                return Ok(early.into());
             }
 
             // The loop detector is the only consumer of the (possibly healed)
@@ -1839,7 +1835,6 @@ impl ServerHandler for AhmaMcpService {
             let mut run_params = CallToolRequestParams::new(tool_name.clone());
             run_params.arguments = tool_args;
             run_params.meta = params.meta;
-            run_params.task = params.task;
 
             // Every tool call gates on the scope being settled (SPEC R5.1.2) —
             // here, once, rather than in each handler. The built-in file tools
@@ -1866,7 +1861,7 @@ impl ServerHandler for AhmaMcpService {
                 );
             }
 
-            result
+            result.map(CallToolResponse::from)
         }
         .instrument(span)
     }

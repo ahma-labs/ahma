@@ -101,7 +101,7 @@ opentelemetry-otlp = { version = "0.32.0", features = [
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false }
-rmcp = { version = "2.2.0", features = [
+rmcp = { version = "3.9.0", features = [
     "server",
     "client",
     "macros",
@@ -126,7 +126,7 @@ socket2 = "0.6.5"
 subtle = "2.6"
 tempfile = "3.27"
 thiserror = "2.0"
-tokio = { version = "1.53.1", features = [
+tokio = { version = "1.54.1", features = [
     "macros",
     "rt-multi-thread",
     "process",
@@ -134,8 +134,8 @@ tokio = { version = "1.53.1", features = [
     "signal",
 ] }
 tokio-util = "0.7.20"
-toml = "1.1"
-uuid = { version = "1.26.1", features = ["v4"] }
+toml = "1.2"
+uuid = { version = "1.29.2", features = ["v4"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-opentelemetry = "0.33.0"
