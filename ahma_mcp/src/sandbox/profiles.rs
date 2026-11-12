@@ -1170,6 +1170,30 @@ mod tests {
         assert!(RuleKind::Dir.covers(&android, &android.join("adbkey")));
     }
 
+    /// Since Xcode 26 the Metal Toolchain is a disk image Xcode mounts on first
+    /// use after each boot, under a mount point it creates in
+    /// `~/Library/Developer/DVTDownloads/MetalToolchain/mounts`. Without that
+    /// directory writable, every sandboxed iOS build stopped at its first
+    /// `.metal` file with "missing Metal Toolchain" (SPEC R6.2.14).
+    #[test]
+    fn an_xcode_build_can_mount_its_metal_toolchain() {
+        let Some(home) = ahma_common::config::ahma_home_dir() else {
+            return;
+        };
+        let metal = home.join("Library/Developer/DVTDownloads/MetalToolchain");
+        let rules = resolved_rules(&["apple".to_string()], true);
+        let rule = rules
+            .iter()
+            .find(|r| r.path == metal)
+            .expect("the apple profile covers the Metal Toolchain's mount points");
+        assert_eq!((rule.kind, rule.access), (RuleKind::Dir, ProfileAccess::Rw));
+        assert!(rule.precreate, "Xcode creates it only on first mount");
+        // Nothing broader: the rest of DVTDownloads (downloaded assets, their
+        // personalization manifests) stays read-only.
+        let downloads = home.join("Library/Developer/DVTDownloads");
+        assert!(!rules.iter().any(|r| r.path == downloads));
+    }
+
     #[test]
     fn node_and_go_toolchains_are_read_execute_never_write() {
         let rules = resolved_rules(&names(), true);
