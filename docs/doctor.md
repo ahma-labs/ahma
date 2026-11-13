@@ -49,6 +49,8 @@ Example report:
 | Settings file parses | problem if not | none — the message names the line; ahma never overwrites a file it cannot read |
 | Granted folders (`[sandbox] persistent_scopes`) that no longer exist | warn | remove them |
 | Tool approvals for folders that no longer exist | info | forget them |
+| A grant letting a workspace write **another repository** that a dialog's yes saved and no human confirmed (SPEC R-PERM.11) | warn | revoke it (keep it instead with the `ahma sandbox grant … --workspace …` the finding names) |
+| Grants into other repositories that you made yourself | info | none — a deliberate setup is listed, never questioned |
 | Hub running a different build than this binary | warn | none — quit ahma sessions and the next one starts the new build |
 | Whether this folder is trusted, and what is always allowed here | info | none — `/settings trust` |
 | Log size, and the most repeated warnings in the newest log | info / warn | none |

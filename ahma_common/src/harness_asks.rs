@@ -271,6 +271,111 @@ fn shell_segments(command: &str) -> Vec<Vec<String>> {
     segments
 }
 
+/// The folders a shell line names, resolved against `cwd`: every `cd` target (later segments
+/// run from there), every `-C` argument (`git -C`, `make -C`), and every word written as an
+/// absolute or home path. Words holding `$`, a backtick or a glob are skipped: nothing reliable
+/// names a folder there. A heuristic over the text, for the question SPEC R-PERM.11 asks before a
+/// command that works in another repository; what it misses is asked about at the first
+/// refusal, as before.
+pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let expand = |word: &str, base: &Path| -> Option<PathBuf> {
+        if word.is_empty() || word.contains(['$', '`', '*', '?', '[']) {
+            return None;
+        }
+        let path = if word == "~" {
+            home?.to_path_buf()
+        } else if let Some(rest) = word.strip_prefix("~/") {
+            home?.join(rest)
+        } else {
+            base.join(word)
+        };
+        Some(path)
+    };
+    let mut paths = Vec::new();
+    let mut here = cwd.to_path_buf();
+    #[cfg(windows)]
+    let segments = literal_segments(command);
+    #[cfg(not(windows))]
+    let segments = shell_segments(command);
+    for segment in segments {
+        let mut words = segment.iter().map(String::as_str).peekable();
+        let mut first = true;
+        while let Some(word) = words.next() {
+            if first && word == "cd" {
+                if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
+                    here = target.clone();
+                    paths.push(target);
+                }
+                break;
+            }
+            first = false;
+            if word == "-C" {
+                if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
+                    paths.push(target);
+                }
+            } else if (word.starts_with('/')
+                || Path::new(word).is_absolute()
+                || word == "~"
+                || word.starts_with("~/"))
+                && let Some(p) = expand(word, &here)
+            {
+                paths.push(p);
+            }
+        }
+    }
+    paths
+}
+
+/// The words of each command a line runs, split at unquoted `&`, `|`, `;` and newlines, with
+/// quotes removed and a backslash kept as written: a Windows path (`cd C:\Users\me\repo`) is
+/// one word, where [`shell_segments`]' POSIX escapes would read `C:Usersmerepo`. Used for the
+/// folders a command names on Windows ([`command_paths`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn literal_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '&' | '|' | ';' | '\n') => {
+                if in_word {
+                    segments
+                        .last_mut()
+                        .expect("one segment")
+                        .push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+                segments.push(Vec::new());
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    segments
+                        .last_mut()
+                        .expect("one segment")
+                        .push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        segments.last_mut().expect("one segment").push(word);
+    }
+    segments.retain(|s| !s.is_empty());
+    segments
+}
+
 /// The digest a command is recorded and matched under: of the command with
 /// surrounding whitespace trimmed, so a re-run that differs only by a
 /// trailing newline is still "the same command" (SPEC R-PERM.10).
@@ -613,6 +718,28 @@ pub fn take_escape_approved(
     .flatten()
 }
 
+/// A question put to the human before a command that works in another repository (SPEC
+/// R-PERM.11), with the one-use token the approved command carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedRepo {
+    pub session_id: String,
+    /// The other repository's root.
+    pub repo: PathBuf,
+    pub token: String,
+    pub command_digest: String,
+    pub asked_at: u64,
+    #[serde(default)]
+    pub used: bool,
+}
+
+/// A human's yes to working in another repository from this workspace, for one harness session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoAck {
+    pub session_id: String,
+    pub repo: PathBuf,
+    pub at: u64,
+}
+
 /// Everything recorded for one workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceAsks {
@@ -638,6 +765,73 @@ pub struct WorkspaceAsks {
     /// Those questions, put to the human through the harness dialog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub escapes_asked: Vec<AskedEscape>,
+    /// Questions about working in another repository (SPEC R-PERM.11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_asked: Vec<AskedRepo>,
+    /// The yeses to them, per harness session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_acknowledged: Vec<RepoAck>,
+}
+
+/// Whether the human said yes, in `session_id`, to this workspace working in `repo`.
+pub fn repo_acknowledged(asks: &WorkspaceAsks, session_id: &str, repo: &Path) -> bool {
+    asks.repos_acknowledged
+        .iter()
+        .any(|a| a.session_id == session_id && a.repo == repo)
+}
+
+/// Record that working in `repo` was asked about before `command` in `session_id`, returning the
+/// one-use token the approved command carries. Every command in `repo` is asked about until one
+/// is approved: a no stops that command, and the next one asks again.
+pub fn mark_repo_asked(
+    dir: &Path,
+    workspace: &Path,
+    session_id: &str,
+    repo: &Path,
+    command: &str,
+    now: u64,
+) -> Result<String> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let asked = AskedRepo {
+        session_id: session_id.to_string(),
+        repo: repo.to_path_buf(),
+        token: token.clone(),
+        command_digest: command_digest(command),
+        asked_at: now,
+        used: false,
+    };
+    update(dir, workspace, now, |asks| asks.repos_asked.push(asked))?;
+    Ok(token)
+}
+
+/// Spend a repository `token` for exactly `command`, as [`take_approved`] does for a path, and
+/// remember the yes for its session.
+pub fn take_repo_approved(
+    dir: &Path,
+    workspace: &Path,
+    token: &str,
+    command: &str,
+    now: u64,
+) -> Option<AskedRepo> {
+    let digest = command_digest(command);
+    update(dir, workspace, now, |asks| {
+        let asked = asks.repos_asked.iter_mut().find(|a| {
+            a.token == token
+                && !a.used
+                && a.command_digest == digest
+                && now.saturating_sub(a.asked_at) <= TOKEN_TTL_SECS
+        })?;
+        asked.used = true;
+        let asked = asked.clone();
+        asks.repos_acknowledged.push(RepoAck {
+            session_id: asked.session_id.clone(),
+            repo: asked.repo.clone(),
+            at: now,
+        });
+        Some(asked)
+    })
+    .ok()
+    .flatten()
 }
 
 /// One signature the SSH key broker refused a hooked command because no grant
@@ -866,6 +1060,10 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
         .retain(|r| now.saturating_sub(r.at) <= MAX_AGE_SECS);
     asks.escapes_asked
         .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
+    asks.repos_asked
+        .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
+    asks.repos_acknowledged
+        .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
 }
 
 /// Remember that the SSH key broker refused a hooked command in `workspace`.
@@ -1206,6 +1404,57 @@ fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R-PERM.11: the folders a line names, for the question before a command that works in
+    /// another repository. The incident's first command was `cd /…/neubit4 && git fetch …`.
+    /// PR #259's Windows leg: `cd C:\Users\…\neubit4` named no folder, because the POSIX
+    /// splitter read each backslash as an escape.
+    #[test]
+    fn a_windows_path_stays_one_word() {
+        assert_eq!(
+            literal_segments(r#"cd C:\Users\me\neubit4 && git -C "C:\a b\x" status"#),
+            vec![
+                vec!["cd".to_string(), r"C:\Users\me\neubit4".to_string()],
+                vec![
+                    "git".to_string(),
+                    "-C".to_string(),
+                    r"C:\a b\x".to_string(),
+                    "status".to_string()
+                ]
+            ]
+        );
+    }
+
+    #[test]
+    fn the_folders_a_command_names_are_found() {
+        let cwd = Path::new("/w/ahma");
+        let home = Some(Path::new("/Users/me"));
+        let p = |c: &str| command_paths(c, cwd, home);
+        assert_eq!(
+            p("cd /w/neubit4 && git fetch -q origin main && ls rust"),
+            [PathBuf::from("/w/neubit4")]
+        );
+        assert_eq!(
+            p("cd ../neubit4; ls"),
+            [PathBuf::from("/w/ahma/../neubit4")]
+        );
+        assert_eq!(p("git -C /w/neubit4 status"), [PathBuf::from("/w/neubit4")]);
+        assert_eq!(
+            p("cat ~/notes/a.md '/w/other repo/x'"),
+            [
+                PathBuf::from("/Users/me/notes/a.md"),
+                PathBuf::from("/w/other repo/x")
+            ]
+        );
+        assert!(p("cargo build && ls src").is_empty());
+        assert!(p("ls $HOME/x /w/*/y `pwd`").is_empty());
+        // A heredoc is a POSIX shell's; on Windows the line is split literally.
+        #[cfg(not(windows))]
+        assert!(
+            p("cat <<EOF\n/w/neubit4\nEOF").is_empty(),
+            "a heredoc body names nothing"
+        );
+    }
 
     /// SPEC R-CRED.3 through R-PERM.10: a refused signature is asked about
     /// once per harness session, and its token approves only the command it

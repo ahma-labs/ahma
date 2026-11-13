@@ -132,6 +132,32 @@ pub fn active(dir: &Path, now: u64, pid_alive: &dyn Fn(u32) -> bool) -> Vec<Sess
     out
 }
 
+/// End the session grants of `path` approved for `workspace` (every workspace when `None`), as a
+/// revoke of the saved grant does (SPEC R-PERM.11): the undo takes effect now, not when the session
+/// ends. Paths compare as the session grant stored them, canonical. Returns how many ended.
+pub fn revoke_matching(dir: &Path, path: &Path, workspace: Option<&Path>) -> usize {
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (path, workspace) = (canon(path), workspace.map(canon));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut ended = 0;
+    for file in entries.flatten().map(|e| e.path()) {
+        let grant = std::fs::read(&file)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<SessionGrant>(&raw).ok());
+        let Some(grant) = grant else { continue };
+        let matches = canon(&grant.path) == path
+            && workspace
+                .as_deref()
+                .is_none_or(|ws| canon(&grant.workspace) == ws);
+        if matches && remove(&file).is_ok() {
+            ended += 1;
+        }
+    }
+    ended
+}
+
 /// The active grants that apply to a command whose sandbox scopes are `scopes`:
 /// the grant's workspace is one of the scopes, or encloses one of them.
 pub fn applying_to(
@@ -183,6 +209,34 @@ mod tests {
             granted_at: at,
             granted_by: Some("tui".into()),
         }
+    }
+
+    /// SPEC R-PERM.11: the undo ahma prints ends the grant now, not at the session's end. A
+    /// revoke removed only the saved grant and left the session grant the dialog's yes made in
+    /// force for up to 12 hours.
+    #[test]
+    fn a_revoke_ends_the_session_grants_of_that_folder_and_workspace() {
+        let td = tempdir().unwrap();
+        let dir = td.path().join("session-grants");
+        let (repo, other) = (Path::new("/github/neubit4"), Path::new("/cache/x"));
+        let (ahma, alt) = (Path::new("/github/ahma"), Path::new("/github/alt"));
+        record(&dir, &grant(repo, ahma, 1, 1_000)).unwrap();
+        record(&dir, &grant(repo, alt, 2, 1_000)).unwrap();
+        record(&dir, &grant(other, ahma, 1, 1_000)).unwrap();
+        assert_eq!(revoke_matching(&dir, repo, Some(ahma)), 1);
+        let left: Vec<_> = active(&dir, 1_100, &|_| true)
+            .into_iter()
+            .map(|g| (g.path, g.workspace))
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                (other.to_path_buf(), ahma.to_path_buf()),
+                (repo.to_path_buf(), alt.to_path_buf())
+            ]
+        );
+        // With no workspace (a `--global` revoke), every session grant of the folder ends.
+        assert_eq!(revoke_matching(&dir, repo, None), 1);
     }
 
     #[test]

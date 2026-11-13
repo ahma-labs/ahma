@@ -146,6 +146,73 @@ pub(super) fn next_ask(
     .flatten()
 }
 
+/// The question to put before `command` runs in `cwd` when it works in another repository (SPEC
+/// R-PERM.11): the repository, the workspace, and the token a yes carries. `None` when the command
+/// names no other repository, or the human already said yes to it this session, or a human
+/// granted this workspace that repository (a deliberate setup is never asked about). A repository
+/// under a hidden folder (`~/.cargo`, `~/.gradle`) is a tool's cache, not a project, and asks
+/// nothing. Read or write: the point is to ask while the human is still at the keyboard.
+pub(super) fn next_repo_ask(
+    cwd: &Path,
+    session_id: &str,
+    command: &str,
+    persistent: &[PersistentScope],
+) -> Option<(PathBuf, PathBuf, String)> {
+    use ahma_common::scope_grant::{GRANTED_BY_HARNESS_DIALOG, grant_applies, other_repository};
+    let dir = harness_asks::default_dir()?;
+    let workspace = workspace_for(cwd);
+    let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
+    let now = ahma_common::session_grants::now_secs();
+    let scopes = super::resolve_hook_sandbox_scopes(cwd);
+    let mut granted = persistent.to_vec();
+    granted.extend(crate::sandbox::session_scopes_for(&scopes));
+    let granted_by_a_human = |repo: &Path| {
+        granted.iter().any(|g| {
+            g.granted_by.as_deref() != Some(GRANTED_BY_HARNESS_DIALOG)
+                && grant_applies(g.workspace.as_deref(), std::slice::from_ref(&workspace))
+                && (repo.starts_with(&g.path) || g.path.starts_with(repo))
+        })
+    };
+    // A tool's cache under a hidden folder of home (`~/.cargo/git/checkouts/…`).
+    let hidden = |repo: &Path| {
+        home.as_deref()
+            .and_then(|h| repo.strip_prefix(h).ok())
+            .is_some_and(|rel| {
+                rel.components().any(|c| {
+                    matches!(c, std::path::Component::Normal(n)
+                        if n.to_string_lossy().starts_with('.'))
+                })
+            })
+    };
+    let asks = harness_asks::load(&dir, &workspace, now);
+    let repo = harness_asks::command_paths(command, cwd, home.as_deref())
+        .into_iter()
+        .filter_map(|p| {
+            let existing = p.ancestors().find(|a| a.exists())?;
+            other_repository(existing, &workspace, home.as_deref())
+        })
+        .find(|repo| {
+            !hidden(repo)
+                && !granted_by_a_human(repo)
+                && !harness_asks::repo_acknowledged(&asks, session_id, repo)
+        })?;
+    let token =
+        harness_asks::mark_repo_asked(&dir, &workspace, session_id, &repo, command, now).ok()?;
+    Some((repo, workspace, token))
+}
+
+/// The dialog text before a command that works in another repository (SPEC R-PERM.11): a few
+/// plain sentences (R-PERM.10.2) that name the mismatch while the human can still act on it.
+pub(super) fn repo_ask_reason(repo: &Path, workspace: &Path) -> String {
+    format!(
+        "This session works in {ws}. This command works in {repo}, a different repository. If \
+         you typed this task in the wrong terminal, choose No and give it to a session in \
+         {repo}. Yes lets this session keep working there; writing there still asks first.",
+        ws = short_name(workspace),
+        repo = short_name(repo),
+    )
+}
+
 /// The workspace a yes to `question` asked in `cwd` is approved in, and the
 /// binding the grant will be saved with: the same [`binding_for`] answer
 /// [`persist_approval`] reaches, so the dialog says what a yes really does
@@ -431,6 +498,15 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
         {
             return Some(line_only(apply_ssh_approval(&asked, &workspace, now)));
         }
+        if let Some(asked) = harness_asks::take_repo_approved(&dir, &workspace, token, command, now)
+        {
+            return Some(line_only(format!(
+                "ahma: noted — this session works in {} as well as {}. Nothing was granted: a \
+                 write there still asks first, and is never remembered by a yes alone.",
+                asked.repo.display(),
+                workspace.display()
+            )));
+        }
         return Some(line_only(
             "ahma: the approval this command carries is unknown, already used or expired; it \
              runs without a new grant."
@@ -475,20 +551,37 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
 pub(super) fn finish_trial(trial: Trial, outcome: TrialOutcome) -> String {
     let q = &trial.question;
     let verb = if q.access.is_write() { "write" } else { "read" };
+    let home = ahma_common::config::ahma_home_dir();
+    let other_repo =
+        ahma_common::scope_grant::other_repository(&q.dir, &trial.workspace, home.as_deref());
     match trial_verdict(&q.dir, outcome) {
+        // Another repository (SPEC R-PERM.11): a yes in a dialog is often a task typed into the
+        // wrong terminal, so it never becomes permanent here. A human keeps it by typing the grant.
+        TrialVerdict::Keep if other_repo.is_some() => format!(
+            "ahma: {} is another repository, so the grant applies for this session only and \
+             nothing was saved. If this session should keep working there, a human runs `ahma \
+             sandbox grant {} --workspace {}`; if the task was meant for a session in that \
+             repository, hand it over there.",
+            q.dir.display(),
+            q.dir.display(),
+            trial.workspace.display()
+        ),
         TrialVerdict::Keep => match persist_approval(q, &trial.workspace) {
             Ok(binding) if binding == trial.workspace => format!(
                 "ahma: remembered — the run got past the refusal, so commands in this workspace \
-                 may {verb} {} from now on (undo: `ahma sandbox revoke {}`).",
+                 may {verb} {} from now on (undo: `ahma sandbox revoke {} --workspace {}`).",
                 q.dir.display(),
-                q.dir.display()
+                q.dir.display(),
+                binding.display()
             ),
             Ok(binding) => format!(
                 "ahma: remembered — the run got past the refusal, so commands in every \
-                 workspace under {} may {verb} {} from now on (undo: `ahma sandbox revoke {}`).",
+                 workspace under {} may {verb} {} from now on (undo: `ahma sandbox revoke {} \
+                 --workspace {}`).",
                 binding.display(),
                 q.dir.display(),
-                q.dir.display()
+                q.dir.display(),
+                binding.display()
             ),
             Err(e) => format!(
                 "ahma: the grant helped, but could not be remembered ({e:#}); it applies for \
@@ -537,7 +630,7 @@ fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Res
         NewGrant {
             path: &q.dir,
             access: q.access,
-            granted_by: Some("harness dialog".to_string()),
+            granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string()),
             granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
             note: None,
             surface: "harness",
@@ -843,6 +936,157 @@ mod tests {
         );
         let again = apply_approval(&token, &ws, "make heavy").unwrap();
         assert!(again.line.contains("already used"), "{}", again.line);
+    }
+
+    /// SPEC R-PERM.11 (field case 2026-11-13): the agent worked in `neubit4` for many minutes
+    /// from the `ahma` session before its first write was refused, by which time the owner had
+    /// moved on. The first command that works in another repository asks, read or write; every
+    /// command there asks until one is approved; then nothing more is asked this session. A
+    /// repository a human granted this workspace is never asked about.
+    #[test]
+    fn the_first_command_in_another_repository_asks_until_one_is_approved() {
+        use super::super::{
+            HookEnvironment, HookPlatform, HookScope, HooksDecision, HooksExecArgs,
+            ask_first_if_refused_before, build_exec_output, compute_exec_decision_internal,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ahma");
+        let other = tmp.path().join("neubit4");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join("rust")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let other = dunce::canonicalize(&other).unwrap();
+        let env = HookEnvironment {
+            home_dir: tmp.path().join("home"),
+            project_root: ws.clone(),
+            current_exe: PathBuf::from("/usr/local/bin/ahma"),
+        };
+        let args = HooksExecArgs {
+            platform: HookPlatform::Claude,
+            scope: HookScope::Project,
+            managed_id: super::super::MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
+        };
+        let decide_with = |command: &str, cfg: &crate::shell::cli::AppConfig| {
+            let input = serde_json::json!({
+                "session_id": "session-r",
+                "cwd": ws.display().to_string(),
+                "tool_input": { "command": command }
+            });
+            let d = compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+            ask_first_if_refused_before(d, &input, &args, &env, cfg)
+        };
+        let cfg = crate::shell::cli::AppConfig::default();
+        let decide = |command: &str| decide_with(command, &cfg);
+        let token_of = |d: HooksDecision| {
+            let out = build_exec_output(d, HookPlatform::Claude);
+            let hs = &out["hookSpecificOutput"];
+            assert_eq!(hs["permissionDecision"], "ask", "{out}");
+            let reason = hs["permissionDecisionReason"].as_str().unwrap().to_string();
+            let command = hs["updatedInput"]["command"].as_str().unwrap().to_string();
+            let token = command
+                .split_whitespace()
+                .skip_while(|t| t.trim_matches('\'') != APPROVE_FLAG)
+                .nth(1)
+                .map(|t| t.trim_matches('\'').to_string())
+                .expect("the rewritten command carries a token");
+            (reason, token)
+        };
+
+        assert!(
+            matches!(
+                decide("cargo build && ls src"),
+                HooksDecision::AllowRewrite { .. }
+            ),
+            "work in the workspace asks nothing"
+        );
+        assert!(
+            matches!(decide("ls /usr/bin"), HooksDecision::AllowRewrite { .. }),
+            "a folder in no repository asks nothing"
+        );
+
+        let first = format!("cd {} && ls rust", other.display());
+        let (reason, _) = token_of(decide(&first));
+        assert!(reason.contains("neubit4"), "{reason}");
+        assert!(reason.contains("different repository"), "{reason}");
+        assert!(reason.contains("wrong terminal"), "{reason}");
+
+        // A no stops that command; the next one there asks again.
+        let second = format!("git -C {} status", other.display());
+        let (_, token) = token_of(decide(&second));
+        let approval = apply_approval(&token, &ws, &second).expect("a line");
+        assert!(approval.line.contains("neubit4"), "{}", approval.line);
+        assert!(approval.trial.is_none(), "a yes here grants nothing");
+        assert!(
+            matches!(decide(&first), HooksDecision::AllowRewrite { .. }),
+            "approved once, asked no more this session"
+        );
+
+        // A repository a human granted this workspace is a deliberate setup: never asked.
+        let elsewhere = tmp.path().join("tools");
+        std::fs::create_dir_all(elsewhere.join(".git")).unwrap();
+        let elsewhere = dunce::canonicalize(&elsewhere).unwrap();
+        let mut granted = crate::shell::cli::AppConfig::default();
+        granted.persistent_scopes.push(PersistentScope {
+            path: elsewhere.clone(),
+            access: ScopeAccess::Rw,
+            workspace: Some(ws.clone()),
+            granted_by: Some("cli".into()),
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        });
+        let cmd = format!("ls {}", elsewhere.display());
+        assert!(matches!(
+            decide_with(&cmd, &granted),
+            HooksDecision::AllowRewrite { .. }
+        ));
+        assert!(
+            matches!(token_of(decide(&cmd)), (_, _)),
+            "ungranted, it asks"
+        );
+    }
+
+    /// SPEC R-PERM.11 (field case 2026-11-13): a Neubit task typed into the `ahma` session's
+    /// terminal. The owner said yes to one write into `neubit4`, the run succeeded, and the yes
+    /// became a grant "from now on". A yes in a dialog never makes a grant into another
+    /// repository permanent: it stays for this session, and the result names the one command a
+    /// human types to keep it.
+    #[test]
+    fn a_yes_into_another_repository_is_never_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ahma");
+        let other = tmp.path().join("neubit4");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let other = dunce::canonicalize(&other).unwrap();
+        let trial = Trial {
+            question: Question {
+                dir: other.clone(),
+                access: ScopeAccess::Rw,
+                covers: vec![other.join(".git/FETCH_HEAD")],
+                programs: vec!["git".into()],
+            },
+            workspace: ws.clone(),
+            session_file: None,
+        };
+        let line = finish_trial(trial, TrialOutcome::Succeeded);
+        assert!(line.contains("another repository"), "{line}");
+        assert!(line.contains("this session"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "ahma sandbox grant {} --workspace {}",
+                other.display(),
+                ws.display()
+            )),
+            "{line}"
+        );
+        let file = ahma_common::config::settings_path().unwrap();
+        let saved = ahma_common::config::AhmaSettings::load_from_checked(&file)
+            .map(|s| s.sandbox.persistent_scopes.iter().any(|s| s.path == other))
+            .unwrap_or(false);
+        assert!(!saved, "nothing saved for another repository");
     }
 
     /// SPEC R-PERM.10.3: a grant is kept only when the run shows it helped.

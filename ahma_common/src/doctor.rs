@@ -77,6 +77,9 @@ pub enum Fix {
     /// Gradle or Kotlin daemon, …): the next build starts a fresh, unconfined
     /// one. Only ever offered, never applied without the user's `y`.
     StopProcess { name: String, pid: u32 },
+    /// Revoke saved grants, each `(path, workspace)`, and end their session grants: grants into
+    /// another repository that a dialog's yes made and no human confirmed (SPEC R-PERM.11).
+    RevokeScopes(Vec<(PathBuf, PathBuf)>),
 }
 
 impl Fix {
@@ -107,6 +110,14 @@ impl Fix {
                 "Stop the sandboxed {name} daemon (pid {pid}) so the next build starts a fresh one \
                  outside any sandbox"
             ),
+            Fix::RevokeScopes(keys) => format!(
+                "Revoke {} grant(s) into another repository from ~/.ahma/settings.toml: {}",
+                keys.len(),
+                keys.iter()
+                    .map(|(p, w)| format!("{} (from {})", p.display(), w.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Fix::RepairAntigravityPermissions { .. } => {
                 "Clean up bloated one-off and malformed grants in ~/.gemini configs, and repair Antigravity MCP settings".to_string()
             }
@@ -124,6 +135,7 @@ impl Fix {
             Fix::ForgetMissingWorkspaces(paths) => apply_forget_missing_workspaces(paths, now),
             Fix::RestartDaemon { name } => apply_restart_daemon(name),
             Fix::StopProcess { name, pid } => apply_stop_process(name, *pid),
+            Fix::RevokeScopes(keys) => apply_revoke_scopes(keys, now),
             Fix::RepairAntigravityPermissions {
                 cli_settings,
                 config_file,
@@ -158,6 +170,38 @@ fn apply_remove_missing_scopes(paths: &[PathBuf], now: &str) -> anyhow::Result<S
         ));
     }
     Ok(format!("Removed {} granted folder(s)", paths.len()))
+}
+
+/// Remove the saved grants `keys` names, each `(path, workspace)`; another workspace's grant of
+/// the same path is never touched.
+pub fn revoke_scope_keys(settings: &mut AhmaSettings, keys: &[(PathBuf, PathBuf)]) {
+    for (path, workspace) in keys {
+        settings.sandbox.revoke_scope(path, Some(workspace));
+    }
+}
+
+fn apply_revoke_scopes(keys: &[(PathBuf, PathBuf)], now: &str) -> anyhow::Result<String> {
+    AhmaSettings::update(|s| revoke_scope_keys(s, keys))?;
+    if let Some(dir) = crate::session_grants::default_dir() {
+        for (path, workspace) in keys {
+            crate::session_grants::revoke_matching(&dir, path, Some(workspace));
+        }
+    }
+    for (path, workspace) in keys {
+        append_audit(&audit_entry(
+            now.to_string(),
+            AuditAction::Revoke,
+            GrantKind::FsScope,
+            path.display().to_string(),
+            None,
+            GrantTier::Always,
+            Some(format!("doctor: from {}", workspace.display())),
+        ));
+    }
+    Ok(format!(
+        "Revoked {} grant(s) into another repository",
+        keys.len()
+    ))
 }
 
 fn apply_forget_missing_workspaces(paths: &[PathBuf], now: &str) -> anyhow::Result<String> {
@@ -295,6 +339,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
         check_missing_scopes(settings, &mut findings);
         check_refused_scopes(settings, &mut findings);
         check_global_scopes(settings, &mut findings);
+        check_cross_repo_grants(settings, input.home_dir.as_deref(), &mut findings);
         check_missing_workspaces(settings, &mut findings);
         check_trust(settings, &input.workspace, &mut findings);
     }
@@ -679,6 +724,69 @@ fn check_global_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
         ),
         fix: None,
     });
+}
+
+/// Saved grants that let one workspace's commands write another repository (SPEC R-PERM.11).
+/// One a dialog's yes made, which no human typed or confirmed, may be a task given to the wrong
+/// terminal: a warning, with the revoke as the fix and the grant command as the way to keep it.
+/// One a human typed is a deliberate setup: one line of information, never a question.
+fn check_cross_repo_grants(settings: &AhmaSettings, home: Option<&Path>, out: &mut Vec<Finding>) {
+    let mut unconfirmed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut confirmed: Vec<String> = Vec::new();
+    for scope in &settings.sandbox.persistent_scopes {
+        let Some(ws) = scope.workspace.as_deref() else {
+            continue;
+        };
+        if !scope.path.exists()
+            || crate::scope_grant::other_repository(&scope.path, ws, home).is_none()
+        {
+            continue;
+        }
+        if scope.granted_by.as_deref() == Some(crate::scope_grant::GRANTED_BY_HARNESS_DIALOG) {
+            unconfirmed.push((scope.path.clone(), ws.to_path_buf()));
+        } else {
+            confirmed.push(format!("{} from {}", scope.path.display(), ws.display()));
+        }
+    }
+    if !unconfirmed.is_empty() {
+        let lines: Vec<String> = unconfirmed
+            .iter()
+            .map(|(path, ws)| {
+                let on = settings
+                    .sandbox
+                    .persistent_scopes
+                    .iter()
+                    .find(|s| &s.path == path && s.workspace.as_deref() == Some(ws.as_path()))
+                    .and_then(|s| s.granted_at.as_deref())
+                    .map(|d| format!(" on {d}"))
+                    .unwrap_or_default();
+                format!(
+                    "Commands in {} may write {}, another repository: a yes in a dialog \
+                     granted this{on}, and no one has confirmed it. If that task was typed into \
+                     the wrong terminal, revoke it. To keep it, run `ahma sandbox grant {} \
+                     --workspace {}`.",
+                    ws.display(),
+                    path.display(),
+                    path.display(),
+                    ws.display()
+                )
+            })
+            .collect();
+        out.push(Finding {
+            level: Level::Warn,
+            title: "A dialog let a workspace write another repository".into(),
+            detail: lines.join(" "),
+            fix: Some(Fix::RevokeScopes(unconfirmed)),
+        });
+    }
+    if !confirmed.is_empty() {
+        out.push(Finding {
+            level: Level::Info,
+            title: "Workspaces that may write other repositories".into(),
+            detail: format!("Granted by you: {}.", confirmed.join("; ")),
+            fix: None,
+        });
+    }
 }
 
 fn check_missing_workspaces(settings: &AhmaSettings, out: &mut Vec<Finding>) {
@@ -1306,6 +1414,83 @@ mod tests {
         );
         assert!(render(&findings).contains("fix 1: Remove 1 granted folder"));
         assert_eq!(findings[0].level, Level::Warn, "most serious first");
+    }
+
+    /// SPEC R-PERM.11 (field case 2026-11-13): a yes in the harness dialog, given to a task typed
+    /// into the wrong terminal, saved "commands in ahma may write neubit4" for good, and the doctor
+    /// said nothing. A grant into another repository made by a dialog is a warning with a revoke;
+    /// one a human typed, or kept here, is one line of information and never a question.
+    #[test]
+    fn a_grant_into_another_repository_is_confirmed_or_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let github = dunce::canonicalize(t.path()).unwrap();
+        for name in ["ahma", "neubit4", "tools"] {
+            std::fs::create_dir_all(github.join(name).join(".git")).unwrap();
+        }
+        let (ahma, neubit, tools) = (
+            github.join("ahma"),
+            github.join("neubit4"),
+            github.join("tools"),
+        );
+        let grant = |path: &Path, by: &str| PersistentScope {
+            path: path.to_path_buf(),
+            access: ScopeAccess::Rw,
+            workspace: Some(ahma.clone()),
+            granted_by: Some(by.into()),
+            granted_at: Some("2026-11-13".into()),
+            note: None,
+            expires_at: None,
+        };
+        let mut settings = AhmaSettings::default();
+        settings.sandbox.persistent_scopes = vec![
+            grant(&neubit, crate::scope_grant::GRANTED_BY_HARNESS_DIALOG),
+            grant(&tools, "cli"),
+        ];
+        settings
+            .save_to(&home.path().join("settings.toml"))
+            .unwrap();
+
+        let findings = run(&input(home.path(), &ahma));
+        let report = render(&findings);
+        let warn = findings
+            .iter()
+            .find(|f| f.level == Level::Warn && f.title.contains("another repository"))
+            .unwrap_or_else(|| panic!("{report}"));
+        assert!(warn.detail.contains("neubit4"), "{report}");
+        assert!(!warn.detail.contains("tools"), "{report}");
+        assert!(
+            warn.detail.contains(&format!(
+                "ahma sandbox grant {} --workspace {}",
+                neubit.display(),
+                ahma.display()
+            )),
+            "the way to keep it: {report}"
+        );
+        assert_eq!(
+            warn.fix,
+            Some(Fix::RevokeScopes(vec![(neubit.clone(), ahma.clone())]))
+        );
+        let info = findings
+            .iter()
+            .find(|f| f.level == Level::Info && f.title.contains("other repositories"))
+            .unwrap_or_else(|| panic!("{report}"));
+        assert!(
+            info.detail.contains("tools") && info.fix.is_none(),
+            "{report}"
+        );
+
+        let mut after = settings.clone();
+        revoke_scope_keys(&mut after, &[(neubit.clone(), ahma.clone())]);
+        assert_eq!(
+            after
+                .sandbox
+                .persistent_scopes
+                .iter()
+                .map(|s| s.path.clone())
+                .collect::<Vec<_>>(),
+            vec![tools]
+        );
     }
 
     /// SPEC R-PERM.4.3: a grant saved before its path was refused (the field

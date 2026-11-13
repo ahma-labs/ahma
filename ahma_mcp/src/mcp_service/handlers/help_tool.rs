@@ -343,7 +343,11 @@ fn blocked(facts: &HelpFacts) -> String {
          restart.\n\
          \n\
          Some things no grant can unlock (credentials, ahma's own settings). The refusal says \
-         so; do not look for a way around it.\n"
+         so; do not look for a way around it.\n\
+         \n\
+         Working in another git repository than this session's asks the human first (SPEC \
+         R-PERM.11). If the answer is no, the task may have been typed into the wrong \
+         terminal: stop, and ask the human before doing anything more for that repository.\n"
     )
 }
 
