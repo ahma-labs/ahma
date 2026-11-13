@@ -1448,6 +1448,8 @@ mod tests {
         );
         assert!(p("cargo build && ls src").is_empty());
         assert!(p("ls $HOME/x /w/*/y `pwd`").is_empty());
+        // A heredoc is a POSIX shell's; on Windows the line is split literally.
+        #[cfg(not(windows))]
         assert!(
             p("cat <<EOF\n/w/neubit4\nEOF").is_empty(),
             "a heredoc body names nothing"
