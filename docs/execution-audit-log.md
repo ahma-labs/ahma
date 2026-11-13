@@ -64,8 +64,11 @@ committed a scope yet.
 Written by `ahma hooks exec` for **every** native shell command a harness hands it
 (Claude Code's Bash, Cursor's terminal, …), whatever it decided: `rewrite` (the
 command runs in ahma's sandbox), `unchanged` (hooks inactive, or the command was
-already wrapped), `deny_pending_consent`, or `allow_unsandboxed` (the user's
-session consent, SPEC R5.5.3). A pass-through used to leave no trace, which is how
+already wrapped), `deny_pending_consent`, `allow_unsandboxed` (the user's
+session consent, SPEC R5.5.3), `ask_grant`, `refuse_unrunnable` (a `sudo` command a harness
+that cannot ask is told to hand to the human, SPEC R-ESCAPE.4), or
+`unsandboxed-once-approved` (a command the human approved running once outside the sandbox,
+SPEC R-ESCAPE.3; a `sudo` appears with the `-A` that asks for its password in a dialog). A pass-through used to leave no trace, which is how
 a session that ran unsandboxed for days could not be reconstructed afterwards.
 
 ```json

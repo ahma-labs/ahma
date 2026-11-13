@@ -1457,6 +1457,119 @@ mod tests {
         assert_eq!(refusal.key, "SHA256:mcpkey");
     }
 
+    /// SPEC R-ESCAPE.4 (field case 2026-11-13): an agent handed the human `! sudo log collect …`,
+    /// which failed because `!` has no terminal for the password, and `sudo` could never run in
+    /// the sandbox either. In Claude Code a `sudo` command asks at once to run once outside the
+    /// sandbox, with no doomed sandboxed run first; another harness gets the reason straight away.
+    #[test]
+    fn a_sudo_command_asks_to_run_once_outside_before_it_runs() {
+        use super::super::{
+            HookEnvironment, HookPlatform, HookScope, HooksDecision, HooksExecArgs,
+            ask_first_if_refused_before, compute_exec_decision_internal, explain_sudo_elsewhere,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let env = HookEnvironment {
+            home_dir: tmp.path().join("home"),
+            project_root: ws.clone(),
+            current_exe: PathBuf::from("/usr/local/bin/ahma"),
+        };
+        let cmd = "sudo log collect --device-udid X --last 2m --output /tmp/x.logarchive";
+        let input = serde_json::json!({
+            "session_id": "s-sudo",
+            "cwd": ws.display().to_string(),
+            "tool_input": { "command": cmd }
+        });
+        let cfg = crate::shell::cli::AppConfig::default();
+        let args = |platform| HooksExecArgs {
+            platform,
+            scope: HookScope::Project,
+            managed_id: super::super::MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
+        };
+        let d = compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+        match ask_first_if_refused_before(d, &input, &args(HookPlatform::Claude), &env, &cfg) {
+            HooksDecision::AskGrant { reason, .. } => {
+                assert!(reason.contains("outside the sandbox"), "{reason}");
+                assert!(reason.contains("sudo"), "{reason}");
+            }
+            other => panic!("expected the escape question, got {other:?}"),
+        }
+
+        let d = compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+        match explain_sudo_elsewhere(d, &input, &args(HookPlatform::Cursor)) {
+            HooksDecision::Explain { reason } => {
+                assert!(reason.contains("own terminal"), "{reason}");
+                assert!(reason.contains("`!`"), "never a `!` line: {reason}");
+            }
+            other => panic!("expected an explanation, got {other:?}"),
+        }
+        let plain = serde_json::json!({
+            "session_id": "s-sudo",
+            "cwd": ws.display().to_string(),
+            "tool_input": { "command": "echo sudo" }
+        });
+        let d = compute_exec_decision_internal(&plain, HookScope::Project, &env, true, false);
+        assert!(matches!(
+            explain_sudo_elsewhere(d, &plain, &args(HookPlatform::Cursor)),
+            HooksDecision::AllowRewrite { .. }
+        ));
+    }
+
+    #[test]
+    /// SPEC R-ESCAPE.1 (field case 2026-11-13): `log collect` refused itself inside the sandbox;
+    /// the re-run asks to run it once outside, quoting the program's own refusal.
+    fn a_self_refusing_program_asks_to_run_once_outside_on_rerun() {
+        use super::super::{
+            HookEnvironment, HookPlatform, HookScope, HooksDecision, HooksExecArgs,
+            ask_first_if_refused_before, compute_exec_decision_internal,
+            report_shell_execution_error,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let cmd = "log collect --device-udid X --last 2m --output /tmp/x.logarchive";
+        let who = crate::sandbox::grant_channel::HookRequester {
+            harness: Some("claude".into()),
+            session_id: Some("s-log".into()),
+            scopes: vec![ws.clone()],
+            command: Some(cmd.into()),
+        };
+        let err = crate::sandbox::SandboxError::Unfixable {
+            details: format!(
+                "exit 64\n\n{}",
+                crate::sandbox::self_refusal::remediation("log")
+            ),
+        };
+        assert!(report_shell_execution_error(err.into(), &who, &ws).is_err());
+        let env = HookEnvironment {
+            home_dir: tmp.path().join("home"),
+            project_root: ws.clone(),
+            current_exe: PathBuf::from("/usr/local/bin/ahma"),
+        };
+        let args = HooksExecArgs {
+            platform: HookPlatform::Claude,
+            scope: HookScope::Project,
+            managed_id: super::super::MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
+        };
+        let input = serde_json::json!({
+            "session_id": "s-log",
+            "cwd": ws.display().to_string(),
+            "tool_input": { "command": cmd }
+        });
+        let d = compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+        let cfg = crate::shell::cli::AppConfig::default();
+        match ask_first_if_refused_before(d, &input, &args, &env, &cfg) {
+            HooksDecision::AskGrant { reason, .. } => {
+                assert!(reason.contains("outside the sandbox"), "{reason}");
+                assert!(reason.contains("`log` refuses"), "{reason}");
+            }
+            other => panic!("expected the escape question, got {other:?}"),
+        }
+    }
+
     #[test]
     fn nested_sandbox_records_escape_and_asks_on_rerun() {
         use super::super::{

@@ -28,6 +28,12 @@ use ahma_mcp::utils::logging::{
 const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    // `sudo`'s password dialog (SPEC R-ESCAPE.4 (b)): before arguments are parsed or settings
+    // read, since a prompt must not depend on either.
+    let mut args = std::env::args();
+    if args.nth(1).as_deref() == Some(ahma_mcp::askpass::SUBCOMMAND) {
+        std::process::exit(ahma_mcp::askpass::run(args.next()));
+    }
     let worker = std::thread::Builder::new()
         // Keep the name: log lines and panic messages say `main`.
         .name("main".to_string())

@@ -27,7 +27,10 @@ pub fn setuid_denial_note(stderr: &str, stdout: &str) -> Option<String> {
     Some(format!(
         "`{}` cannot run inside the sandbox: it is a setuid or setgid program, and no sandbox \
          may run one (SPEC R6.2.8). This is not a path to grant, and no grant would change it. \
-         If its result is needed, ask the human to run it in their own terminal.",
+         If its result is needed, run this exact command again: in Claude Code, ahma asks the \
+         human once whether to run it outside the sandbox, and a `sudo` there asks for the \
+         password in a dialog (SPEC R-ESCAPE.4). Elsewhere, ask the human to run it in their \
+         own terminal window, not as a `!` line, which has no terminal for a password.",
         program.display()
     ))
 }
@@ -190,6 +193,21 @@ mod tests {
         assert_eq!(refused_exec_program(&line), Some(prog.clone()));
         let note = setuid_denial_note(&line, "").expect("a note");
         assert!(note.contains("not a path to grant"), "{note}");
+    }
+
+    /// SPEC R-ESCAPE.4 (field case 2026-11-13): the way on for a refused `sudo` is the escape
+    /// dialog, never a `!` line, which has no terminal for a password.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_sudo_points_to_the_escape_never_to_a_bang_line() {
+        let sudo = Path::new("/usr/bin/sudo");
+        if !sudo.exists() || !is_setuid_or_setgid(sudo) {
+            return;
+        }
+        let note =
+            setuid_denial_note("bash: /usr/bin/sudo: Operation not permitted", "").expect("a note");
+        assert!(note.contains("run this exact command again"), "{note}");
+        assert!(note.contains("not as a `!` line"), "{note}");
     }
 
     /// The same message for a redirect into an ordinary file is a refused

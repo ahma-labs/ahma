@@ -70,6 +70,7 @@ mod scope_lock;
 mod scopes;
 #[cfg(target_os = "macos")]
 mod seatbelt;
+pub mod self_refusal;
 pub mod session_tier;
 pub mod setuid;
 pub mod signals;
