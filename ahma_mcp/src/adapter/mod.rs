@@ -1103,6 +1103,18 @@ impl Adapter {
         denial_tag: Option<&str>,
         ran_for: Duration,
     ) -> SyncRun {
+        // A program that refuses any sandbox by its own check outranks every record (SPEC
+        // R-ESCAPE.1): the kernel refused nothing that mattered.
+        let result = match self_refused(result, stderr, stdout) {
+            Ok(fatal) => {
+                return SyncRun {
+                    outcome: audit::Outcome::Failed,
+                    exit_code,
+                    result: Err(fatal),
+                };
+            }
+            Err(result) => result,
+        };
         // The kernel's own record decides where it can be read (SPEC R-DENY).
         if let Some(report) = sandbox::grant_channel::kernel_denial_lines(
             &self.sandbox,
@@ -2253,6 +2265,33 @@ fn fatal_unrunnable(
     .into())
 }
 
+/// A failed command's result when the program refused to run inside any sandbox by its own
+/// check (`log: Cannot run while sandboxed`, SPEC R-ESCAPE.1): unrunnable, whatever the run's
+/// kernel records hold, since the kernel refused nothing that mattered. `Ok` carries that error;
+/// `Err` hands the result back unchanged.
+#[allow(clippy::result_large_err)]
+fn self_refused(
+    result: Result<String, anyhow::Error>,
+    stderr: &str,
+    stdout: &str,
+) -> Result<anyhow::Error, Result<String, anyhow::Error>> {
+    let program = match (
+        &result,
+        sandbox::self_refusal::refused_inside_sandbox(stderr, stdout),
+    ) {
+        (Err(_), Some(program)) => program,
+        _ => return Err(result),
+    };
+    let error = result.err().map(|e| e.to_string()).unwrap_or_default();
+    Ok(sandbox::SandboxError::Unfixable {
+        details: format!(
+            "{error}\n\n{}",
+            sandbox::self_refusal::remediation(&program)
+        ),
+    }
+    .into())
+}
+
 /// A failed command's result when no grantable path explains it.
 ///
 /// A nested-sandbox refusal is [`sandbox::SandboxError::Unfixable`]: no grant
@@ -3056,6 +3095,13 @@ async fn record_failure_diagnostics(
         Some((tag, ran)) => (Some(tag), ran),
         None => (None, Duration::default()),
     };
+    // A program that refuses any sandbox by its own check (SPEC R-ESCAPE.1).
+    if let Some(program) = sandbox::self_refusal::refused_inside_sandbox(stderr_str, stdout_str) {
+        op_monitor
+            .append_alert(op_id, sandbox::self_refusal::remediation(&program))
+            .await;
+        return;
+    }
     if let Some(report) = sandbox::grant_channel::kernel_denial_lines(
         sandbox,
         scope_grant_notifier,
@@ -3458,6 +3504,33 @@ mod tests {
             adapter.soft_hold_for(Some(&doubt), Some(&declared), Lane::Exclusive),
             None
         );
+    }
+
+    /// SPEC R-ESCAPE.1 (field case 2026-11-13): Apple's `log` checks for a sandbox itself and
+    /// prints `log: Cannot run while sandboxed`. No grant helps, so it is unrunnable here and the
+    /// escape is asked on the re-run, whatever else the run's kernel records hold.
+    #[test]
+    fn a_program_that_refuses_any_sandbox_is_unrunnable() {
+        let err = self_refused(
+            Err(anyhow::anyhow!("exit 64")),
+            "log: Cannot run while sandboxed\n",
+            "",
+        )
+        .expect("unrunnable");
+        let Some(sandbox::SandboxError::Unfixable { details }) =
+            err.downcast_ref::<sandbox::SandboxError>()
+        else {
+            panic!("expected Unfixable, got {err:?}");
+        };
+        assert!(details.starts_with("exit 64\n\n"), "{details}");
+        assert!(
+            details
+                .lines()
+                .any(|l| l.starts_with("Blocked: `log` refuses to run inside any sandbox")),
+            "{details}"
+        );
+        assert!(self_refused(Ok("fine".into()), "log: Cannot run while sandboxed", "").is_err());
+        assert!(self_refused(Err(anyhow::anyhow!("x")), "cat: /x: nope", "").is_err());
     }
 
     #[test]

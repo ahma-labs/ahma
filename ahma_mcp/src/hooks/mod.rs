@@ -88,6 +88,10 @@ enum HooksDecision {
     /// **Refuse**: the command is one only the hook may write (an approval
     /// token the agent tried to pass itself).
     Refuse { reason: String },
+    /// **Explain**: a command no sandbox can run, said before it runs, on a harness whose hook
+    /// contract cannot ask (SPEC R-ESCAPE.4): `sudo`, which is setuid, and which also has no
+    /// terminal for its password here.
+    Explain { reason: String },
     /// **Fail closed**: ahma cannot tell which sandbox applies — a settings
     /// file was read but does not parse, or the hook itself failed — so the
     /// call is refused with what to fix, rather than let through unsandboxed
@@ -105,6 +109,7 @@ impl HooksDecision {
             HooksDecision::AllowWithWarning { .. } => "allow_unsandboxed",
             HooksDecision::AskGrant { .. } => "ask_grant",
             HooksDecision::Refuse { .. } => "refuse_forged_approval",
+            HooksDecision::Explain { .. } => "refuse_unrunnable",
             HooksDecision::FailClosed { .. } => "refuse_fail_closed",
         }
     }
@@ -1367,6 +1372,7 @@ async fn run_exec(args: HooksExecArgs, cfg: &AppConfig) -> Result<()> {
 
     let decision = compute_exec_decision(&stdin, args.scope, &env);
     let decision = ask_first_if_refused_before(decision, &stdin, &args, &env, cfg);
+    let decision = explain_sudo_elsewhere(decision, &stdin, &args);
     // SPEC R5.4.10 / R-HANDOFF.10: every decision leaves a trace. A pass-through
     // that no one can find afterwards is how a session ran unsandboxed for days.
     let command = extract_tool_args(&stdin)
@@ -2239,10 +2245,24 @@ async fn run_command_once_unsandboxed(payload: &WrappedShellPayload, why: &str) 
         "\n⚠️  ahma: running this command ONCE OUTSIDE the sandbox, as approved in the dialog \
          ({why}). Its writes are not confined to the workspace.\n"
     );
+    // `sudo` asks for its password in a dialog: this shell has no terminal (SPEC R-ESCAPE.4 (b)).
+    let (mut command, askpass) = crate::askpass::for_unsandboxed_run(&payload.command);
+    let launcher = askpass
+        .then(|| {
+            let dir = ahma_common::hub::runtime_dir()?.join("askpass");
+            let ahma = std::env::current_exe().ok()?;
+            crate::askpass::write_launcher(&dir, &ahma)
+                .map_err(|e| tracing::warn!("no password dialog for sudo: {e:#}"))
+                .ok()
+        })
+        .flatten();
+    if askpass && launcher.is_none() {
+        command = payload.command.clone();
+    }
     crate::adapter::audit::record_hook_decision(
         "unsandboxed-once-approved",
         Some(&payload.cwd),
-        &payload.command,
+        &command,
         payload.session_id.as_deref(),
         "claude",
     )
@@ -2250,15 +2270,14 @@ async fn run_command_once_unsandboxed(payload: &WrappedShellPayload, why: &str) 
     let shell = crate::shell_pool::platform_shell_program();
     let mut cmd = tokio::process::Command::new(shell);
     cmd.current_dir(&payload.cwd).kill_on_drop(true);
+    if let Some(launcher) = &launcher {
+        cmd.env("SUDO_ASKPASS", launcher)
+            .env(crate::askpass::COMMAND_ENV, &payload.command);
+    }
     #[cfg(target_os = "windows")]
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &payload.command,
-    ]);
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
     #[cfg(not(target_os = "windows"))]
-    cmd.args(["-c", &payload.command]);
+    cmd.args(["-c", &command]);
     let status = cmd
         .status()
         .await
@@ -2413,6 +2432,40 @@ fn extract_command_and_key(args_obj: &Map<String, Value>) -> Option<(&str, &str)
 /// runs, instead of letting it fail the same way. Claude Code only: its hook
 /// contract has `ask` with a rewritten input. Anything else, or nothing to
 /// ask, leaves `decision` as it was.
+/// The `Blocked: ` line a `sudo` command's escape question quotes (SPEC R-ESCAPE.4).
+const SUDO_BLOCKED: &str = "Blocked: `sudo` can't run inside any sandbox: it is setuid, and the \
+     kernel never runs a setuid program in one.";
+
+/// On a harness whose hook contract cannot ask (everything but Claude Code), a `sudo` command is
+/// answered before it runs with what to do instead (SPEC R-ESCAPE.4): no sandbox runs it, and an
+/// agent's shell has no terminal for its password, so the human runs it in their own terminal
+/// window, never as a `!` line, which has no terminal either.
+fn explain_sudo_elsewhere(
+    decision: HooksDecision,
+    input: &Value,
+    args: &HooksExecArgs,
+) -> HooksDecision {
+    if args.platform == HookPlatform::Claude
+        || !matches!(decision, HooksDecision::AllowRewrite { .. })
+    {
+        return decision;
+    }
+    let Ok(Some(tool)) = extract_tool_args(input) else {
+        return decision;
+    };
+    if !ahma_common::harness_asks::runs_sudo(&tool.command) {
+        return decision;
+    }
+    HooksDecision::Explain {
+        reason: format!(
+            "{SUDO_BLOCKED} An agent's shell also has no terminal for its password. Ask the human \
+             to run this exact command in their own terminal window (not as a `!` line, which has \
+             no terminal either), and to tell you when it is done: {}",
+            tool.command
+        ),
+    }
+}
+
 fn ask_first_if_refused_before(
     decision: HooksDecision,
     input: &Value,
@@ -2436,6 +2489,15 @@ fn ask_first_if_refused_before(
     let Ok(cwd) = extract_command_cwd(input, &tool.tool_input) else {
         return decision;
     };
+    // `sudo` is setuid, so no sandbox runs it, and it has no terminal for its password here:
+    // ask at once to run the command once outside the sandbox, with no doomed run first
+    // (SPEC R-ESCAPE.4). Asked once per command per harness session, as every escape is.
+    let sudo_ask = if ahma_common::harness_asks::runs_sudo(&tool.command) {
+        harness_ask::record_escape(Path::new(&cwd), &tool.command, SUDO_BLOCKED);
+        harness_ask::next_escape_ask(Path::new(&cwd), session_id, &tool.command)
+    } else {
+        None
+    };
     // A command that works in another repository asks first, read or write (SPEC R-PERM.11).
     let repo_ask = harness_ask::next_repo_ask(
         Path::new(&cwd),
@@ -2451,9 +2513,12 @@ fn ask_first_if_refused_before(
             &cfg.persistent_scopes,
         )
     };
-    let (reason, token) = match repo_ask {
-        Some((repo, workspace, token)) => (harness_ask::repo_ask_reason(&repo, &workspace), token),
-        None => match next_grant_ask() {
+    let (reason, token) = match (sudo_ask, repo_ask) {
+        (Some((refusal, token)), _) => (harness_ask::escape_ask_reason(&refusal), token),
+        (None, Some((repo, workspace, token))) => {
+            (harness_ask::repo_ask_reason(&repo, &workspace), token)
+        }
+        (None, None) => match next_grant_ask() {
             Some((question, token)) => {
                 let (workspace, binding) = harness_ask::approval_binding(
                     &question,
@@ -2730,6 +2795,7 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
         // reading of a question this contract cannot ask.
         HooksDecision::AskGrant { reason, .. }
         | HooksDecision::Refuse { reason }
+        | HooksDecision::Explain { reason }
         | HooksDecision::FailClosed { reason } => json!({
             "permission": "deny",
             "user_message": reason,
@@ -2782,6 +2848,7 @@ fn build_antigravity_hook_output(decision: HooksDecision) -> Value {
         // Never built for Antigravity (see the Cursor builder).
         HooksDecision::AskGrant { reason, .. }
         | HooksDecision::Refuse { reason }
+        | HooksDecision::Explain { reason }
         | HooksDecision::FailClosed { reason } => json!({
             "decision": "deny",
             "reason": reason,
@@ -2926,7 +2993,9 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
             }),
             None,
         ),
-        HooksDecision::Refuse { reason } | HooksDecision::FailClosed { reason } => (
+        HooksDecision::Refuse { reason }
+        | HooksDecision::Explain { reason }
+        | HooksDecision::FailClosed { reason } => (
             json!({
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",

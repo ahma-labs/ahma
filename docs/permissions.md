@@ -151,6 +151,16 @@ runs, and records it in the execution audit log; a no keeps it sandboxed, and ah
 ask again that session. Nothing is offered for a path you could grant, a credential, a GPU
 or a host. SPEC [R-ESCAPE](../SPEC.md).
 
+Two cases are asked about even without a kernel record. A program that checks for a
+sandbox itself and prints `<program>: Cannot run while sandboxed` (Apple's `log`, for
+example `log collect --device-udid … --start …` to read an iPhone's past log) gets the
+same offer on its re-run. A command that runs `sudo` is asked about **before** it runs,
+since `sudo` is setuid and no sandbox can run it. On macOS a yes then shows the system
+password dialog, naming the command: an agent's shell has no terminal, and neither does
+Claude Code's `!` prefix, so `sudo` could never ask you for the password there. ahma never
+sees or stores the password. In other harnesses a `sudo` command is refused with the
+advice to run it in your own terminal window (SPEC R-ESCAPE.4).
+
 ## Kinds of permission
 
 `ahma permissions list` groups every grant by kind; `--kind` and `revoke` take the

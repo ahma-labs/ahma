@@ -376,6 +376,98 @@ fn literal_segments(command: &str) -> Vec<Vec<String>> {
     segments
 }
 
+/// Words that run the next word of a segment, for [`runs_sudo`] and [`with_sudo_askpass`]: what
+/// [`RUNS_THE_NEXT`] lists, without `sudo` itself.
+const BEFORE_SUDO: &[&str] = &["env", "time", "nice", "nohup", "exec", "command"];
+
+/// Whether a shell line runs `sudo` as the program of any segment (past `VAR=value` assignments
+/// and wrappers such as `env`). `sudo` is setuid, so no sandbox can run it (SPEC R-ESCAPE.4);
+/// `echo sudo`, a heredoc body or a comment runs nothing of the kind.
+pub fn runs_sudo(command: &str) -> bool {
+    shell_segments(command).iter().any(|segment| {
+        segment
+            .iter()
+            .find(|w| {
+                !((w.contains('=') && !w.starts_with('-'))
+                    || BEFORE_SUDO.contains(&w.as_str())
+                    || w.starts_with('-'))
+            })
+            .is_some_and(|w| w == "sudo" || w.ends_with("/sudo"))
+    })
+}
+
+/// `command` with every `sudo` that starts a segment given `-A`, so it reads its password from
+/// `SUDO_ASKPASS` (SPEC R-ESCAPE.4 (b)): neither Claude Code's shell nor its `!` prefix has a
+/// terminal, so a plain `sudo` fails with "a terminal is required to read the password". Text is
+/// kept byte for byte otherwise; quoted text, a `sudo` that is an argument, and everything from a
+/// heredoc (`<<`) on are left alone. A `sudo` already given `-A` is not given another.
+pub fn with_sudo_askpass(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len() + 8);
+    let mut quote: Option<char> = None;
+    let mut at_start = true;
+    let mut i = 0;
+    let ends_word = |c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            } else if c == '\\' && q == '"' && i + 1 < chars.len() {
+                i += 1;
+                out.push(chars[i]);
+            }
+            i += 1;
+            continue;
+        }
+        if c == '<' && chars.get(i + 1) == Some(&'<') {
+            out.extend(&chars[i..]);
+            break;
+        }
+        if at_start {
+            if c.is_whitespace() && c != '\n' {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            let end = (i..chars.len())
+                .find(|&j| ends_word(chars[j]))
+                .unwrap_or(chars.len());
+            let word: String = chars[i..end].iter().collect();
+            let assignment =
+                word.contains('=') && !word.starts_with('-') && !word.contains(['"', '\'']);
+            if assignment || BEFORE_SUDO.contains(&word.as_str()) {
+                out.push_str(&word);
+                i = end;
+                continue;
+            }
+            at_start = false;
+            if word == "sudo" {
+                out.push_str("sudo");
+                let next: String = chars[end..]
+                    .iter()
+                    .skip_while(|c| **c == ' ' || **c == '\t')
+                    .take_while(|c| !c.is_whitespace())
+                    .collect();
+                if next != "-A" {
+                    out.push_str(" -A");
+                }
+                i = end;
+                continue;
+            }
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            ';' | '&' | '|' | '(' | '\n' => at_start = true,
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// The digest a command is recorded and matched under: of the command with
 /// surrounding whitespace trimmed, so a re-run that differs only by a
 /// trailing newline is still "the same command" (SPEC R-PERM.10).
@@ -1404,6 +1496,48 @@ fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R-ESCAPE.4: `sudo` is setuid, so no sandbox runs it; the hook asks to run the command
+    /// once outside the sandbox before trying.
+    #[test]
+    fn a_command_that_runs_sudo_is_found() {
+        for yes in [
+            "sudo log collect --last 2m",
+            "cd /tmp && sudo ls",
+            "FOO=1 sudo -E make install",
+            "echo hi; sudo -A true",
+            "env X=1 sudo true",
+        ] {
+            assert!(runs_sudo(yes), "{yes}");
+        }
+        for no in [
+            "echo sudo",
+            "pseudo x",
+            "grep sudo /etc/hosts",
+            "cat <<EOF\nsudo rm -rf /\nEOF",
+            "ls # sudo later",
+        ] {
+            assert!(!runs_sudo(no), "{no}");
+        }
+    }
+
+    /// SPEC R-ESCAPE.4 (b): an approved `sudo` asks for the password through `SUDO_ASKPASS`,
+    /// since neither Claude Code's shell nor its `!` has a terminal.
+    #[test]
+    fn sudo_is_rewritten_to_ask_for_its_password_in_a_dialog() {
+        assert_eq!(with_sudo_askpass("sudo x"), "sudo -A x");
+        assert_eq!(
+            with_sudo_askpass("cd d && sudo x; echo sudo"),
+            "cd d && sudo -A x; echo sudo"
+        );
+        assert_eq!(with_sudo_askpass("FOO=1 sudo -E y"), "FOO=1 sudo -A -E y");
+        assert_eq!(with_sudo_askpass("sudo -A z"), "sudo -A z", "already asks");
+        assert_eq!(with_sudo_askpass("ls sudo"), "ls sudo");
+        assert_eq!(
+            with_sudo_askpass("sudo log collect --start \"2026-11-13 16:20:00\""),
+            "sudo -A log collect --start \"2026-11-13 16:20:00\""
+        );
+    }
 
     /// SPEC R-PERM.11: the folders a line names, for the question before a command that works in
     /// another repository. The incident's first command was `cd /…/neubit4 && git fetch …`.

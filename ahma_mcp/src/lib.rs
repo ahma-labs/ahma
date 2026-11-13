@@ -126,6 +126,8 @@
 // Public modules
 /// Core adapter for tool execution.
 pub mod adapter;
+/// `sudo`'s password in a dialog, for a command approved to run once outside the sandbox.
+pub mod askpass;
 /// The names of ahma's built-in tools, and which of them run without a sandbox scope.
 pub mod builtin_tool;
 /// Client helpers for talking to Ahma.

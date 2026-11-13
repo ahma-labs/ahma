@@ -345,6 +345,11 @@ fn blocked(facts: &HelpFacts) -> String {
          Some things no grant can unlock (credentials, ahma's own settings). The refusal says \
          so; do not look for a way around it.\n\
          \n\
+         A command that needs root: write it with `sudo` as usual. In Claude Code ahma asks the \
+         human once to run it outside the sandbox, and macOS then asks for the password in a \
+         dialog (SPEC R-ESCAPE.4). Never hand the human a `!` line that needs a password: `!` \
+         has no terminal.\n\
+         \n\
          Working in another git repository than this session's asks the human first (SPEC \
          R-PERM.11). If the answer is no, the task may have been typed into the wrong \
          terminal: stop, and ask the human before doing anything more for that repository.\n"
