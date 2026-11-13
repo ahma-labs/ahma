@@ -293,7 +293,11 @@ pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Path
     };
     let mut paths = Vec::new();
     let mut here = cwd.to_path_buf();
-    for segment in shell_segments(command) {
+    #[cfg(windows)]
+    let segments = literal_segments(command);
+    #[cfg(not(windows))]
+    let segments = shell_segments(command);
+    for segment in segments {
         let mut words = segment.iter().map(String::as_str).peekable();
         let mut first = true;
         while let Some(word) = words.next() {
@@ -309,7 +313,10 @@ pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Path
                 if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
                     paths.push(target);
                 }
-            } else if (word.starts_with('/') || word == "~" || word.starts_with("~/"))
+            } else if (word.starts_with('/')
+                || Path::new(word).is_absolute()
+                || word == "~"
+                || word.starts_with("~/"))
                 && let Some(p) = expand(word, &here)
             {
                 paths.push(p);
@@ -317,6 +324,56 @@ pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Path
         }
     }
     paths
+}
+
+/// The words of each command a line runs, split at unquoted `&`, `|`, `;` and newlines, with
+/// quotes removed and a backslash kept as written: a Windows path (`cd C:\Users\me\repo`) is
+/// one word, where [`shell_segments`]' POSIX escapes would read `C:Usersmerepo`. Used for the
+/// folders a command names on Windows ([`command_paths`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn literal_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '&' | '|' | ';' | '\n') => {
+                if in_word {
+                    segments
+                        .last_mut()
+                        .expect("one segment")
+                        .push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+                segments.push(Vec::new());
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    segments
+                        .last_mut()
+                        .expect("one segment")
+                        .push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        segments.last_mut().expect("one segment").push(word);
+    }
+    segments.retain(|s| !s.is_empty());
+    segments
 }
 
 /// The digest a command is recorded and matched under: of the command with
@@ -1350,6 +1407,24 @@ mod tests {
 
     /// SPEC R-PERM.11: the folders a line names, for the question before a command that works in
     /// another repository. The incident's first command was `cd /…/neubit4 && git fetch …`.
+    /// PR #259's Windows leg: `cd C:\Users\…\neubit4` named no folder, because the POSIX
+    /// splitter read each backslash as an escape.
+    #[test]
+    fn a_windows_path_stays_one_word() {
+        assert_eq!(
+            literal_segments(r#"cd C:\Users\me\neubit4 && git -C "C:\a b\x" status"#),
+            vec![
+                vec!["cd".to_string(), r"C:\Users\me\neubit4".to_string()],
+                vec![
+                    "git".to_string(),
+                    "-C".to_string(),
+                    r"C:\a b\x".to_string(),
+                    "status".to_string()
+                ]
+            ]
+        );
+    }
+
     #[test]
     fn the_folders_a_command_names_are_found() {
         let cwd = Path::new("/w/ahma");
