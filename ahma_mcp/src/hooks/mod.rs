@@ -2436,36 +2436,52 @@ fn ask_first_if_refused_before(
     let Ok(cwd) = extract_command_cwd(input, &tool.tool_input) else {
         return decision;
     };
-    let (reason, token) = match harness_ask::next_ask(
+    // A command that works in another repository asks first, read or write (SPEC R-PERM.11).
+    let repo_ask = harness_ask::next_repo_ask(
         Path::new(&cwd),
         session_id,
         &tool.command,
         &cfg.persistent_scopes,
-    ) {
-        Some((question, token)) => {
-            let (workspace, binding) =
-                harness_ask::approval_binding(&question, Path::new(&cwd), &cfg.persistent_scopes);
-            (
-                harness_ask::ask_reason(&question, &workspace, &binding),
-                token,
-            )
-        }
-        // A signature the SSH key broker refused (SPEC R-CRED.3).
-        None => match harness_ask::next_ssh_ask(
+    );
+    let next_grant_ask = || {
+        harness_ask::next_ask(
             Path::new(&cwd),
             session_id,
             &tool.command,
-            cfg.settings_origin.user_settings_file().as_deref(),
-        ) {
-            Some((refusal, token)) => (harness_ask::ssh_ask_reason(&refusal), token),
-            // This exact command was refused what nothing allows: offer one
-            // run outside the sandbox (SPEC R-ESCAPE).
-            None => {
-                match harness_ask::next_escape_ask(Path::new(&cwd), session_id, &tool.command) {
-                    Some((refusal, token)) => (harness_ask::escape_ask_reason(&refusal), token),
-                    None => return decision,
-                }
+            &cfg.persistent_scopes,
+        )
+    };
+    let (reason, token) = match repo_ask {
+        Some((repo, workspace, token)) => (harness_ask::repo_ask_reason(&repo, &workspace), token),
+        None => match next_grant_ask() {
+            Some((question, token)) => {
+                let (workspace, binding) = harness_ask::approval_binding(
+                    &question,
+                    Path::new(&cwd),
+                    &cfg.persistent_scopes,
+                );
+                (
+                    harness_ask::ask_reason(&question, &workspace, &binding),
+                    token,
+                )
             }
+            // A signature the SSH key broker refused (SPEC R-CRED.3).
+            None => match harness_ask::next_ssh_ask(
+                Path::new(&cwd),
+                session_id,
+                &tool.command,
+                cfg.settings_origin.user_settings_file().as_deref(),
+            ) {
+                Some((refusal, token)) => (harness_ask::ssh_ask_reason(&refusal), token),
+                // This exact command was refused what nothing allows: offer one
+                // run outside the sandbox (SPEC R-ESCAPE).
+                None => {
+                    match harness_ask::next_escape_ask(Path::new(&cwd), session_id, &tool.command) {
+                        Some((refusal, token)) => (harness_ask::escape_ask_reason(&refusal), token),
+                        None => return decision,
+                    }
+                }
+            },
         },
     };
     match build_wrapped_shell_command(

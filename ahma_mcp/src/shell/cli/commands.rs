@@ -914,8 +914,28 @@ fn run_sandbox_revoke(
     workspace: Option<PathBuf>,
 ) -> Result<()> {
     let mut settings = load_sandbox_settings(file)?;
+    // A session grant for the same folder ends now too (SPEC R-PERM.11): the harness dialog's yes
+    // makes one before anything is saved, and it outlived the revoke by up to 12 hours.
+    let ended = ahma_common::session_grants::default_dir()
+        .map(|d| {
+            ahma_common::session_grants::revoke_matching(
+                &d,
+                &ahma_common::config::expand_home(&dir),
+                workspace.as_deref(),
+            )
+        })
+        .unwrap_or(0);
+    if ended > 0 {
+        println!(
+            "✓ Ended {ended} session grant{} for {}",
+            if ended == 1 { "" } else { "s" },
+            dir.display()
+        );
+    }
     let Some(removed) = settings.sandbox.revoke_scope(&dir, workspace.as_deref()) else {
-        print_revoke_not_found(&settings, &dir, workspace.as_deref(), "ahma sandbox revoke");
+        if ended == 0 {
+            print_revoke_not_found(&settings, &dir, workspace.as_deref(), "ahma sandbox revoke");
+        }
         return Ok(());
     };
 

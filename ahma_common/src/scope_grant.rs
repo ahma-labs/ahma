@@ -976,6 +976,60 @@ fn resolve_worktree_main_repo(dir: &Path, git_file: &Path) -> Option<PathBuf> {
     Some(dunce::canonicalize(main).unwrap_or_else(|_| main.to_path_buf()))
 }
 
+/// `granted_by` of a grant the harness dialog's yes made (SPEC R-PERM.10). A saved grant into
+/// another repository with this mark was never typed or confirmed by a human (R-PERM.11): the
+/// doctor reports it, and a human's `ahma sandbox grant` of the same folder replaces the mark.
+pub const GRANTED_BY_HARNESS_DIALOG: &str = "harness dialog";
+
+/// The git root `path` lies in: the nearest ancestor (or `path` itself) holding a `.git`
+/// directory or file. Never `home` itself: a dotfiles repository in `$HOME` would otherwise make
+/// every folder under it one repository.
+fn git_root_of(path: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let canon = canonicalize_best_effort(path);
+    let home = home.map(canonicalize_best_effort);
+    canon
+        .ancestors()
+        .filter(|dir| home.as_deref() != Some(*dir))
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// The repository a git root belongs to: itself, or for a linked worktree the main checkout its
+/// `.git` file points at.
+fn repository_identity(root: &Path) -> PathBuf {
+    let git = root.join(".git");
+    if git.is_file() {
+        resolve_worktree_main_repo(root, &git).unwrap_or_else(|| root.to_path_buf())
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// Another repository (SPEC R-PERM.11): the root of the git repository `target` lies in, when
+/// that is not the `workspace`'s own. `None` when `target` is in no repository, lies inside the
+/// workspace (a vendored or nested repository included), lies in the repository that holds the
+/// workspace, or is another worktree of the same repository. Path-based, like every other grant
+/// rule: nothing in a repository's contents decides it.
+///
+/// A session that works in another repository is usually a task typed into the wrong terminal
+/// (2026-11-13: a Neubit task given to the session in `ahma`); every surface asks this one function
+/// before treating such work like any other folder.
+#[must_use]
+pub fn other_repository(target: &Path, workspace: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let workspace = canonicalize_best_effort(workspace);
+    let target = canonicalize_best_effort(target);
+    if target.starts_with(&workspace) {
+        return None;
+    }
+    let target_root = git_root_of(&target, home)?;
+    if workspace.starts_with(&target_root) {
+        return None;
+    }
+    let same = git_root_of(&workspace, home)
+        .is_some_and(|ws_root| repository_identity(&ws_root) == repository_identity(&target_root));
+    (!same).then_some(target_root)
+}
+
 /// Check if `candidate_parent` is the enclosing git repository root (or main repo of a worktree)
 /// of `scope`. When true, granting `candidate_parent` is not widening above the workspace;
 /// it is granting the workspace root itself.
@@ -1107,6 +1161,16 @@ fn collect_grant_warnings(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) 
     // becomes a future execution.
     if let Some(w) = auto_execution_warning(path, home) {
         warnings.push(w);
+    }
+
+    // Another repository (R-PERM.11): often a task typed into the wrong terminal.
+    if let Some(repo) = scopes.iter().find_map(|s| other_repository(path, s, home)) {
+        warnings.push(format!(
+            "'{}' is in another repository ({}); grant it only if this workspace really works \
+             there, not because a task meant for that repository was typed in the wrong terminal",
+            path.display(),
+            repo.display()
+        ));
     }
 
     // A hidden directory directly under home that is not a known build cache.
@@ -1336,6 +1400,11 @@ pub fn binding_for(
     if path.is_file() || path.starts_with(workspace) {
         return (binding, replaced);
     }
+    // Another repository is the approving workspace's business alone (R-PERM.11): shared through
+    // a folder holding several checkouts, every one of them could write it.
+    if other_repository(path, workspace, home).is_some() {
+        return (binding, replaced);
+    }
     for other in existing
         .iter()
         .filter(|s| crate::config::scope_paths_equiv(&s.path, path))
@@ -1550,6 +1619,92 @@ mod answer_settles_tests {
 mod tests {
     use super::*;
 
+    mod other_repository_tests {
+        use super::*;
+
+        fn repo(dir: &Path) -> PathBuf {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            dunce::canonicalize(dir).unwrap()
+        }
+
+        /// SPEC R-PERM.11: the 2026-11-13 incident, a session in `ahma` working in `neubit4`.
+        #[test]
+        fn a_sibling_checkout_of_another_project_is_another_repository() {
+            let t = tempfile::tempdir().unwrap();
+            let ahma = repo(&t.path().join("ahma"));
+            let neubit = repo(&t.path().join("neubit4"));
+            std::fs::create_dir_all(neubit.join("rust/src")).unwrap();
+            assert_eq!(
+                other_repository(&neubit.join("rust/src"), &ahma, None),
+                Some(neubit.clone())
+            );
+            assert_eq!(other_repository(&neubit, &ahma, None), Some(neubit));
+        }
+
+        /// Every surface that shows a grant's risk (the CLI's grant, the TUI) says it too.
+        #[test]
+        fn a_grant_into_another_repository_carries_a_warning() {
+            let t = tempfile::tempdir().unwrap();
+            let ahma = repo(&t.path().join("ahma"));
+            let neubit = repo(&t.path().join("neubit4"));
+            match classify_grant_risk(&neubit, None, std::slice::from_ref(&ahma)) {
+                GrantRisk::High(why) => assert!(
+                    why.iter().any(|w| w.contains("another repository")),
+                    "{why:?}"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn the_workspaces_own_repository_is_not_another() {
+            let t = tempfile::tempdir().unwrap();
+            let ahma = repo(&t.path().join("ahma"));
+            let sub = ahma.join("crate/src");
+            std::fs::create_dir_all(&sub).unwrap();
+            // Inside the workspace, and the workspace seen from its own subdirectory.
+            assert_eq!(other_repository(&sub, &ahma, None), None);
+            assert_eq!(other_repository(&ahma, &sub, None), None);
+            // A repository nested inside the workspace (vendored, a submodule) is the
+            // workspace's business.
+            let vendored = repo(&ahma.join("vendor/lib"));
+            assert_eq!(other_repository(&vendored, &ahma, None), None);
+        }
+
+        #[test]
+        fn a_worktree_of_the_same_repository_is_not_another() {
+            let t = tempfile::tempdir().unwrap();
+            let main = repo(&t.path().join("main"));
+            let wt_admin = main.join(".git/worktrees/wt");
+            std::fs::create_dir_all(&wt_admin).unwrap();
+            let wt = t.path().join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_admin.display())).unwrap();
+            assert_eq!(other_repository(&wt, &main, None), None);
+            assert_eq!(other_repository(&main, &wt, None), None);
+        }
+
+        #[test]
+        fn a_folder_in_no_repository_is_not_another_repository() {
+            let t = tempfile::tempdir().unwrap();
+            let ahma = repo(&t.path().join("ahma"));
+            let cache = t.path().join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            assert_eq!(other_repository(&cache, &ahma, None), None);
+        }
+
+        #[test]
+        fn a_dotfiles_repository_in_home_does_not_make_home_one_repository() {
+            let t = tempfile::tempdir().unwrap();
+            let home = repo(t.path());
+            let ws = home.join("work");
+            let cache = home.join("Library/Caches/tool");
+            std::fs::create_dir_all(&ws).unwrap();
+            std::fs::create_dir_all(&cache).unwrap();
+            assert_eq!(other_repository(&cache, &ws, Some(&home)), None);
+        }
+    }
+
     fn scope_for(path: &str, workspace: &str) -> PersistentScope {
         PersistentScope {
             path: PathBuf::from(path),
@@ -1668,6 +1823,26 @@ mod tests {
             Path::new(b),
             "a path inside a workspace is never shared"
         );
+        assert!(replaced.is_empty());
+    }
+
+    /// SPEC R-PERM.11: a grant into another repository is bound to the exact workspace that
+    /// approved it, never to a folder holding several. Shared, it would let every checkout under
+    /// that folder write the other repository.
+    #[test]
+    fn a_grant_into_another_repository_is_never_shared() {
+        let t = tempfile::tempdir().unwrap();
+        let github = dunce::canonicalize(t.path()).unwrap().join("github");
+        for name in ["ahma", "alt/ahma", "neubit4"] {
+            std::fs::create_dir_all(github.join(name).join(".git")).unwrap();
+        }
+        let neubit = github.join("neubit4");
+        let existing = [scope_for(
+            neubit.to_str().unwrap(),
+            github.join("alt/ahma").to_str().unwrap(),
+        )];
+        let (binding, replaced) = binding_for(&neubit, &github.join("ahma"), &existing, None);
+        assert_eq!(binding, github.join("ahma"));
         assert!(replaced.is_empty());
     }
 

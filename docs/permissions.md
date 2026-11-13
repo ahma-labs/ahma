@@ -85,6 +85,17 @@ by its time limit decides nothing: the grant lasts for this session only. The di
 names the `ahma sandbox revoke` that undoes a kept grant, and `ahma sandbox list` marks a
 saved grant on a path where nothing exists (SPEC R-PERM.10.3). **No** runs nothing, and ahma does not
 ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).
+
+**Another repository is different** (SPEC R-PERM.11). A command that works in a git
+repository other than the session's own — `cd ../other-repo && …`, `git -C`, an absolute
+path into it — asks first, read or write, because the usual reason is a task typed into
+the wrong terminal. **No** stops that command (the next one there asks again); **Yes** lets
+the session keep working there and grants nothing. A yes to a later write there lasts this
+session only and is **never** remembered by itself: the result names the
+`ahma sandbox grant <repo> --workspace <this workspace>` you type to keep it. A repository
+you granted this workspace yourself is never asked about, and `ahma doctor` lists such
+grants in one line. A grant into another repository that an older ahma saved from a
+dialog's yes is a doctor warning, with revoke as the fix.
 When the command **succeeded** despite the refusal — an optional cache, a lock or
 history file it can do without — ahma adds one line to its output naming the grant
 that would allow it, and asks nothing: a question about something that cost nothing
@@ -117,8 +128,10 @@ A few deliberate details:
 | **24 hours** (a lease) | `~/.ahma/settings.toml`, ending on its own; `ahma sandbox renew` extends it. | `l` / `L` | A long unattended run. |
 | **always** | `~/.ahma/settings.toml`, until you revoke it. | `R` / `Y` | A cache your builds always need. |
 
-`n`, Enter and Esc deny. Only the 24-hour and always tiers touch disk, and only after
-you've seen the exact file and the exact line. A grant made or revoked in the file
+`n`, Enter and Esc deny. Only the 24-hour and always tiers touch disk. From the TUI and
+the CLI that happens only after you've seen the exact file and the exact line; Claude
+Code's own dialog is a yes/no, so a yes there is saved only when the run shows it helped,
+and never for another repository (above). A grant made or revoked in the file
 applies to a running server from its next command.
 
 ## When nothing can allow it: one run outside the sandbox
