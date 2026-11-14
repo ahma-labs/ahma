@@ -316,6 +316,16 @@ tree. The view must be correct **at startup**, not only for events that happen a
     cloud model is offered everything. `more_tools` exists only inside ahma's own agent loop —
     it is never listed to MCP clients.
   - **R24.13 — `/setup` is the guided settings view** (root SPEC R-SETUP.4). It is a full-window overlay opened by `/setup` or by `ahma setup` in a terminal. It covers the whole window, so no key of the panels underneath shows beside its own. It opens on the first proposed change, asked as a question with why, its benefit and its risk (a one-sentence introduction above it until the first answer); `Space` shows the exact change, its undo and who found it. `y` and `n` answer it and show the next, nothing is written before the last answer, one result screen then lists what was applied, failed, declined and refused, and a key leaves (`ahma setup` exits with it; typed `/setup` only closes the view). A no from ahma's own detectors is remembered per folder; `r` asks again. `d` opens the reference (Install, Settings, Allow & deny) and `p` returns to the proposals. A high-risk item needs a second `y`; there is no apply-all. `t` (or `/setup <words>`) hands the sentence to the chat model, which can only propose changes as data in an `ahma-proposal` block that is validated before it appears. `/connect` is the model wizard.
+  - **R24.14 — Only a typed `!` runs outside the sandbox.** The host shell runs exactly one
+    kind of command: one the human typed after `!` (R-HUB.9). Everything else the TUI starts
+    runs as an agent command does. A `#goal` shell step is model-written, so it **must** run
+    as `run_terminal_command` in the TUI's MCP session (R25), inside the session's sandbox,
+    with no fallback to the host shell when that session cannot be reached: the step fails
+    and the rest of the plan is cancelled. A step whose command is still running when the
+    tool replies follows the operation it started and ends when that operation ends. A card
+    that mirrors an operation something else started is shown and may be cancelled, but is
+    **never** run by the TUI, whatever its status: the step queue starts only plan steps that
+    have not started.
 
 ### R25: Tool-call session reuse (TUI chat)
 

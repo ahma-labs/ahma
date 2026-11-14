@@ -1895,6 +1895,29 @@ impl WindowLine {
     }
 }
 
+/// What runs a command window's work, which decides what may start it (SPEC
+/// R24.14). Only a step of a `#goal` plan is ever started by the step queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowRunner {
+    /// A `!` command the human typed: the host shell, outside the sandbox.
+    /// Started where it was typed, never by the queue.
+    Host,
+    /// A `#goal` shell step: `run_terminal_command` in ahma's MCP session,
+    /// inside the sandbox like every other agent command.
+    Sandboxed,
+    /// A `#goal` step answered by the model.
+    Llm,
+    /// A card mirroring an operation something else started. Shown, never run.
+    Mirror,
+}
+
+impl WindowRunner {
+    /// Whether the step queue may start a window of this kind.
+    pub fn is_step(self) -> bool {
+        matches!(self, Self::Sandboxed | Self::Llm)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiWindow {
     pub id: usize,
@@ -1910,7 +1933,7 @@ pub struct TuiWindow {
     /// Mirrors the backing operation's `last_output_at` — the card's activity
     /// panel animates fast while output is arriving, slow when quiet.
     pub last_output_at: Option<std::time::Instant>,
-    pub is_cli: bool,
+    pub runner: WindowRunner,
     pub command: String,
     pub working_dir: String,
     pub llm_model: Option<String>,
@@ -1920,6 +1943,12 @@ pub struct TuiWindow {
 }
 
 impl TuiWindow {
+    /// Whether the window shows a command's line output (anything but a model
+    /// step's streamed answer).
+    pub fn is_cli(&self) -> bool {
+        self.runner != WindowRunner::Llm
+    }
+
     /// The most recent real output line — the collapsed running row shows it as
     /// a live "what is it doing" tail. Skips the live-edge marker, separators,
     /// and the friendly start line, which carry no activity information.
@@ -4663,7 +4692,7 @@ mod tests {
             finished_at: if finished { Some(Instant::now()) } else { None },
             duration_ms: None,
             last_output_at: None,
-            is_cli: true,
+            runner: WindowRunner::Host,
             command: String::new(),
             working_dir: String::new(),
             llm_model: None,

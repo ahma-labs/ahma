@@ -539,7 +539,10 @@ impl AhmaMcpService {
                     return Ok(result);
                 }
                 let hint = crate::tool_hints::preview(&op_id, "run_terminal_command");
-                Ok(common::text_result(format!("AHMA ID: {}{}", op_id, hint)))
+                Ok(common::text_result(format!(
+                    "{}{op_id}{hint}",
+                    crate::utils::operation::STARTED_PREFIX
+                )))
             }
             Err(e) => {
                 self.progress_push.unregister(&id).await;

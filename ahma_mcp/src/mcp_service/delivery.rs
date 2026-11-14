@@ -117,11 +117,12 @@ pub fn queued_notice(id: &str, ahead: &[HolderInfo]) -> String {
         [first, rest @ ..] => format!("{} and {} more", first.describe(), rest.len()),
     };
     format!(
-        "AHMA ID: {id}\n\
+        "{}{id}\n\
          NOT started — queued behind {behind}. Commands that may write the workspace run one \
          at a time, in the order they were sent; this one runs automatically when its turn \
          comes. Do not send it again. `await` id `{id}` for its result, or `cancel` it (or \
-         the operation ahead of it)."
+         the operation ahead of it).",
+        crate::utils::operation::STARTED_PREFIX
     )
 }
 

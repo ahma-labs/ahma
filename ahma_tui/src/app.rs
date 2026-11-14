@@ -1580,7 +1580,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         finished_at: None,
         duration_ms: None,
         last_output_at: None,
-        is_cli: true,
+        runner: crate::state::WindowRunner::Host,
         command: cmd_str.clone(),
         working_dir: working_dir.clone(),
         llm_model: None,
@@ -5343,9 +5343,16 @@ fn window_from_step(
     step: &crate::llm_bridge::ParsedStep,
     state: &crate::state::AppState,
 ) -> crate::state::TuiWindow {
-    let is_cli = step.r#type.as_str() == "shell_command";
+    use crate::state::WindowRunner;
+    // A shell step is a model-written command: it runs in the sandbox like
+    // every other agent command, never in the host shell (SPEC R24.14).
+    let runner = if step.r#type.as_str() == "shell_command" {
+        WindowRunner::Sandboxed
+    } else {
+        WindowRunner::Llm
+    };
 
-    let (label, command, llm_model) = if is_cli {
+    let (label, command, llm_model) = if runner == WindowRunner::Sandboxed {
         (
             format!(
                 "Command: {} in {}",
@@ -5377,7 +5384,7 @@ fn window_from_step(
         finished_at: None,
         duration_ms: None,
         last_output_at: None,
-        is_cli,
+        runner,
         command,
         working_dir: state.workspace.clone(),
         llm_model,
@@ -5407,7 +5414,7 @@ fn handle_decomposed_event(
 
 fn handle_window_output_event(window_id: usize, line: String, state: &mut crate::state::AppState) {
     if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
-        if w.is_cli {
+        if w.is_cli() {
             w.content.push(crate::state::WindowLine::output(line));
         } else {
             append_multiline_window_output(&mut w.content, &line);
@@ -5440,32 +5447,46 @@ fn handle_window_finished_event(
     summary: String,
     state: &mut crate::state::AppState,
 ) {
-    let mut current_failed = false;
-    if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
-        w.status = if success {
-            crate::state::WindowStatus::Finished
-        } else {
-            crate::state::WindowStatus::Error
-        };
-        w.content
-            .push(crate::state::WindowLine::end(w.status, summary));
-        w.finished_at = Some(std::time::Instant::now());
-        if !success {
-            current_failed = true;
-        }
-    }
-    if current_failed {
-        cancel_pending_windows(state);
+    let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) else {
+        return;
+    };
+    w.status = if success {
+        crate::state::WindowStatus::Finished
     } else {
-        run_next_pending_window(state);
+        crate::state::WindowStatus::Error
+    };
+    w.content
+        .push(crate::state::WindowLine::end(w.status, summary));
+    w.finished_at = Some(std::time::Instant::now());
+    // Only a plan step moves the plan on; a `!` command finishing is not the
+    // end of a step.
+    if w.runner.is_step() {
+        advance_steps(success, state);
     }
 }
 
-/// Marks every still-`Pending` window as `Cancelled`, used to cascade a
-/// failure to windows that hadn't started running yet.
+/// After a `#goal` step ends: start the next one, or, when it failed, cancel
+/// the rest of the plan.
+fn advance_steps(success: bool, state: &mut crate::state::AppState) {
+    if success {
+        run_next_pending_window(state);
+    } else {
+        cancel_pending_windows(state);
+    }
+}
+
+/// A `#goal` step that has not started yet. A bound step already has its
+/// operation; a mirror's `Pending` is an agent's queued operation, which only
+/// its own server may start (SPEC R24.14).
+fn is_unstarted_step(w: &crate::state::TuiWindow) -> bool {
+    w.status == crate::state::WindowStatus::Pending && w.runner.is_step() && w.op_id.is_none()
+}
+
+/// Marks every step that has not started as `Cancelled`, used to cascade a
+/// failure to the rest of the plan.
 fn cancel_pending_windows(state: &mut crate::state::AppState) {
     for w in &mut state.windows {
-        if w.status == crate::state::WindowStatus::Pending {
+        if is_unstarted_step(w) {
             w.status = crate::state::WindowStatus::Cancelled;
             w.finished_at = Some(std::time::Instant::now());
         }
@@ -5613,6 +5634,9 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             summary,
         } => {
             handle_window_finished_event(window_id, success, summary, state);
+        }
+        BridgeEvent::WindowOperation { window_id, op_id } => {
+            bind_step_to_operation(window_id, op_id, state);
         }
         BridgeEvent::ToolCallStarted { id, name, args } => {
             // Name the chat line the same way the monitor names its rows: by what
@@ -5892,7 +5916,7 @@ fn build_new_window(
         },
         duration_ms: op.duration_ms,
         last_output_at: op.last_output_at,
-        is_cli: true,
+        runner: crate::state::WindowRunner::Mirror,
         command: op.command.clone().unwrap_or_else(|| op.display_name()),
         working_dir: op.cwd.clone().unwrap_or_else(|| state.workspace.clone()),
         llm_model: None,
@@ -5918,7 +5942,11 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             .iter_mut()
             .find(|w| w.op_id.as_deref() == Some(&op.id))
         {
-            update_existing_window(w, op, state.unicode, multi_instance);
+            // A bound step is brought up to date by `settle_bound_steps`,
+            // which also moves the plan on when it ends.
+            if w.runner != crate::state::WindowRunner::Sandboxed {
+                update_existing_window(w, op, state.unicode, multi_instance);
+            }
         } else if !state.window_suppressed_by_clear(op) {
             let w = build_new_window(op, state, multi_instance);
             to_add.push(w);
@@ -5933,6 +5961,7 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             state.windows.remove(0);
         }
     }
+    settle_bound_steps(state);
 }
 
 // ─── Source event handler ────────────────────────────────────────────────────
@@ -6558,27 +6587,29 @@ fn http_base_url(connection: &ResolvedConnection) -> String {
 }
 
 fn run_next_pending_window(state: &mut crate::state::AppState) {
-    if let Some(pos) = state
-        .windows
-        .iter()
-        .position(|w| w.status == crate::state::WindowStatus::Pending)
-    {
+    if let Some(pos) = state.windows.iter().position(is_unstarted_step) {
         let win_id = state.windows[pos].id;
         start_window_execution(win_id, state);
     }
 }
 
+/// Start a `#goal` step. Nothing else is started here: a `!` command runs
+/// where it was typed, and a mirror is never run by the TUI (SPEC R24.14).
 fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
-    use crate::llm_bridge::spawn_window_llm_task;
+    use crate::llm_bridge::{spawn_window_llm_task, spawn_window_sandboxed_task};
+    use crate::state::WindowRunner;
 
     let (base_url, model) = parse_llm_selection(state);
 
     let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) else {
         return;
     };
+    if !is_unstarted_step(w) {
+        return;
+    }
     w.status = crate::state::WindowStatus::Running;
 
-    let is_cli = w.is_cli;
+    let runner = w.runner;
     let command = w.command.clone();
     let working_dir = w.working_dir.clone();
     let bridge_tx = state.bridge_tx.clone();
@@ -6594,57 +6625,116 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
         return;
     };
 
-    if is_cli {
-        start_cli_window(win_id, command, working_dir, abort_rx, tx, state);
-    } else {
-        let mcp = if state.mcp_enabled {
-            Some(mcp_chat_config(state))
-        } else {
-            None
-        };
-        spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
+    match runner {
+        WindowRunner::Sandboxed => {
+            let mcp = mcp_chat_config(state);
+            spawn_window_sandboxed_task(win_id, command, working_dir, mcp, abort_rx, tx);
+        }
+        WindowRunner::Llm => {
+            let mcp = if state.mcp_enabled {
+                Some(mcp_chat_config(state))
+            } else {
+                None
+            };
+            spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
+        }
+        WindowRunner::Host | WindowRunner::Mirror => {}
     }
 }
 
-/// Report the re-run to the active bang reporter (if any) and hand the
-/// command off to the CLI task. Split out of `start_window_execution` so the
-/// `is_cli` branch there reads as one call.
-fn start_cli_window(
-    win_id: usize,
-    command: String,
-    working_dir: String,
-    abort_rx: tokio::sync::oneshot::Receiver<()>,
-    tx: tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>,
-    state: &mut crate::state::AppState,
-) {
-    use crate::llm_bridge::spawn_window_cli_task;
+/// A sandboxed step's reply named the operation it started: the step's
+/// window becomes that operation's card, so the operation's own updates
+/// drive it and finish the step. A card the hub already built for the same
+/// operation is folded in rather than shown twice.
+fn bind_step_to_operation(window_id: usize, op_id: String, state: &mut crate::state::AppState) {
+    use crate::state::WindowRunner;
+    let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) else {
+        return;
+    };
+    if w.status == crate::state::WindowStatus::Cancelled {
+        // Closed while the step was starting: stop what it started.
+        let instance_id = op_instance(state, &op_id);
+        cancel_op(
+            state,
+            crate::state::OpKey {
+                id: op_id,
+                instance_id,
+            },
+        );
+        return;
+    }
+    w.op_id = Some(op_id.clone());
+    state
+        .windows
+        .retain(|w| !(w.runner == WindowRunner::Mirror && w.op_id.as_deref() == Some(&op_id)));
+    settle_bound_steps(state);
+}
 
-    // A re-run is a second command, not the first one resuming, so it
-    // reports under an id of its own — window ids wrap and get reused.
-    let report = state.bang_report();
-    if let Some(r) = &report {
-        r.reporter.report(crate::tui_reporter::bang_started(
-            &r.op_id,
-            &command,
-            &working_dir,
-        ));
-        if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
-            w.op_id = Some(r.op_id.clone());
+/// The instance that ran operation `op_id`, when it is known.
+fn op_instance(state: &crate::state::AppState, op_id: &str) -> Option<String> {
+    state
+        .operations
+        .iter()
+        .find(|o| o.id == op_id)
+        .and_then(|o| o.instance_id.clone())
+}
+
+/// Bring every bound step up to date with its operation, and move the plan on
+/// when one has ended. A bound step's status is its operation's; it ends when
+/// the operation does.
+fn settle_bound_steps(state: &mut crate::state::AppState) {
+    use crate::state::{WindowRunner, WindowStatus};
+    let multi_instance = has_multiple_instances(&state.operations);
+    let mut ended = None;
+    for w in state.windows.iter_mut().filter(|w| {
+        w.runner == WindowRunner::Sandboxed
+            && matches!(w.status, WindowStatus::Running | WindowStatus::Pending)
+    }) {
+        let Some(op) = w
+            .op_id
+            .as_deref()
+            .and_then(|id| state.operations.iter().find(|o| o.id == id))
+        else {
+            continue;
+        };
+        update_existing_window(w, op, state.unicode, multi_instance);
+        if !matches!(w.status, WindowStatus::Running | WindowStatus::Pending) {
+            ended = Some(w.status == WindowStatus::Finished);
         }
     }
-    spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx, report);
+    if let Some(success) = ended {
+        advance_steps(success, state);
+    }
 }
 
 fn close_window_by_id(win_id: usize, state: &mut crate::state::AppState) {
-    if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
-        if let Ok(mut guard) = w.abort_tx.try_lock()
-            && let Some(abort_tx) = guard.take()
-        {
-            let _ = abort_tx.send(());
-        }
-        w.visible = false;
-        w.status = crate::state::WindowStatus::Cancelled;
-        w.finished_at = Some(std::time::Instant::now());
+    use crate::state::{WindowRunner, WindowStatus};
+    let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) else {
+        return;
+    };
+    if let Ok(mut guard) = w.abort_tx.try_lock()
+        && let Some(abort_tx) = guard.take()
+    {
+        let _ = abort_tx.send(());
+    }
+    let running_operation = (w.runner == WindowRunner::Sandboxed
+        && matches!(w.status, WindowStatus::Running | WindowStatus::Pending))
+    .then(|| w.op_id.clone())
+    .flatten();
+    w.visible = false;
+    w.status = WindowStatus::Cancelled;
+    w.finished_at = Some(std::time::Instant::now());
+    // A bound step's task has already returned; closing it stops the
+    // operation itself, as closing a mirror card does.
+    if let Some(op_id) = running_operation {
+        let instance_id = op_instance(state, &op_id);
+        cancel_op(
+            state,
+            crate::state::OpKey {
+                id: op_id,
+                instance_id,
+            },
+        );
     }
 }
 
@@ -7591,11 +7681,161 @@ mod tests {
             op_id.starts_with("tui_"),
             "the id must name where the work happened: {op_id}"
         );
-        assert!(w.is_cli, "and it is still an ordinary CLI window");
+        assert!(w.is_cli(), "and it is still an ordinary CLI window");
         assert_ne!(
             state.windows[0].op_id, state.windows[1].op_id,
             "two commands are two operations"
         );
+    }
+
+    /// `#goal` asks a model for steps and starts them by itself, so a shell
+    /// step is a model-written command no human typed. It runs where every
+    /// other agent command runs — in the sandbox, through ahma's MCP session —
+    /// and never in the host shell that only a typed `!` may use (SPEC
+    /// R24.14). Asserted on the effect: a step that writes outside the
+    /// workspace leaves nothing there. With no MCP server to reach, the
+    /// sandboxed step fails visibly; the host shell would have written the
+    /// file.
+    #[tokio::test]
+    async fn a_decomposed_shell_step_does_not_run_outside_the_sandbox() {
+        use crate::llm_bridge::BridgeEvent;
+        use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let escaped = outside.path().join("escaped.txt");
+
+        let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
+        state.workspace = workspace.path().display().to_string();
+        state.mcp_http_base_url = "http://127.0.0.1:9".to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.bridge_tx = Some(tx);
+
+        let step = crate::llm_bridge::ParsedStep {
+            task: "write outside the workspace".into(),
+            r#type: "shell_command".into(),
+            // `>` redirects in both bash and PowerShell.
+            command: Some(format!("echo escaped > \"{}\"", escaped.display())),
+            instructions: None,
+            subgoal: None,
+        };
+        super::handle_decomposed_event(vec![step], &mut state);
+
+        tokio::time::timeout(TestTimeouts::get(TimeoutCategory::ToolCall), async {
+            while let Some(event) = rx.recv().await {
+                let finished = matches!(event, BridgeEvent::WindowFinished { .. });
+                super::handle_bridge_event(event, &mut state);
+                if finished {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the step ends");
+
+        assert!(
+            !escaped.exists(),
+            "a model-planned step wrote outside the workspace: it ran in the host shell"
+        );
+        assert_eq!(
+            state.windows[0].status,
+            crate::state::WindowStatus::Error,
+            "with no MCP session to run it in, the step fails rather than falling back"
+        );
+    }
+
+    /// A window that mirrors an agent's operation shows it; it never runs it.
+    /// A queued operation's mirror is `Pending` and carries the agent's
+    /// command line, and the step queue starts the first `Pending` window it
+    /// finds — so without this rule a human's `!` finishing would run the
+    /// agent's queued command in the host shell (SPEC R24.14).
+    #[tokio::test]
+    async fn a_mirrored_operation_is_never_started_by_the_tui() {
+        use crate::state::{OpStatus, Operation, WindowStatus};
+        let workspace = tempfile::tempdir().unwrap();
+        let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
+        state.workspace = workspace.path().display().to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.bridge_tx = Some(tx);
+
+        let mut queued = Operation::new("op_queued", "run_terminal_command", OpStatus::Pending);
+        queued.command = Some("echo queued".to_string());
+        state.operations.push(queued);
+        super::sync_operations_to_windows(&mut state);
+        assert_eq!(state.windows.len(), 1, "the operation is shown");
+        assert_eq!(state.windows[0].status, WindowStatus::Pending);
+
+        super::run_next_pending_window(&mut state);
+
+        assert_eq!(
+            state.windows[0].status,
+            WindowStatus::Pending,
+            "the TUI started an agent's queued operation itself"
+        );
+        assert!(rx.try_recv().is_err(), "nothing was run");
+    }
+
+    /// Two shell steps, with no bridge so starting one only marks it running.
+    fn two_step_plan(state: &mut AppState) {
+        let step = |command: &str| crate::llm_bridge::ParsedStep {
+            task: command.into(),
+            r#type: "shell_command".into(),
+            command: Some(command.into()),
+            instructions: None,
+            subgoal: None,
+        };
+        super::handle_decomposed_event(vec![step("cargo build"), step("cargo test")], state);
+    }
+
+    /// A step whose command outlives the inline window follows the operation
+    /// it started: the hub's card for that operation is folded into the step,
+    /// and the operation ending is the step ending, which starts the next one.
+    #[tokio::test]
+    async fn a_bound_step_ends_with_its_operation_and_starts_the_next() {
+        use crate::state::{OpStatus, Operation, WindowStatus};
+        let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
+        two_step_plan(&mut state);
+        let (first, second) = (state.windows[0].id, state.windows[1].id);
+        assert_eq!(state.windows[0].status, WindowStatus::Running);
+        assert_eq!(state.windows[1].status, WindowStatus::Pending);
+
+        // The hub reports the operation before the tool reply names it.
+        state.operations.push(Operation::new(
+            "op_build",
+            "run_terminal_command",
+            OpStatus::Running,
+        ));
+        super::sync_operations_to_windows(&mut state);
+        assert_eq!(state.windows.len(), 3, "a card for the reported operation");
+
+        super::bind_step_to_operation(first, "op_build".into(), &mut state);
+        assert_eq!(state.windows.len(), 2, "the card is folded into the step");
+
+        state.operations[0].status = OpStatus::Succeeded;
+        super::sync_operations_to_windows(&mut state);
+        let status = |id| state.windows.iter().find(|w| w.id == id).unwrap().status;
+        assert_eq!(status(first), WindowStatus::Finished);
+        assert_eq!(status(second), WindowStatus::Running, "the plan moved on");
+    }
+
+    #[test]
+    fn a_bound_step_that_fails_cancels_the_rest_of_the_plan() {
+        use crate::state::{OpStatus, Operation, WindowStatus};
+        let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
+        two_step_plan(&mut state);
+        let (first, second) = (state.windows[0].id, state.windows[1].id);
+        state.operations.push(Operation::new(
+            "op_build",
+            "run_terminal_command",
+            OpStatus::Running,
+        ));
+        super::bind_step_to_operation(first, "op_build".into(), &mut state);
+
+        state.operations[0].status = OpStatus::Failed;
+        super::sync_operations_to_windows(&mut state);
+        let status = |id| state.windows.iter().find(|w| w.id == id).unwrap().status;
+        assert_eq!(status(first), WindowStatus::Error);
+        assert_eq!(status(second), WindowStatus::Cancelled);
     }
 
     /// Before the sandbox locks, `sandbox_status` holds the initial `"UNKNOWN"`.
@@ -7852,7 +8092,7 @@ mod tests {
             finished_at: None,
             duration_ms: None,
             last_output_at: None,
-            is_cli: true,
+            runner: crate::state::WindowRunner::Host,
             command: "echo test".to_string(),
             working_dir: state.workspace.clone(),
             llm_model: None,
@@ -10088,7 +10328,7 @@ mod tests {
             finished_at: None,
             duration_ms: None,
             last_output_at: None,
-            is_cli: true,
+            runner: crate::state::WindowRunner::Host,
             command: "pwd".to_string(),
             working_dir: state.workspace.clone(),
             llm_model: None,
