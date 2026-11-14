@@ -233,3 +233,72 @@ async fn list_instances_answers_on_the_hub_socket() {
 
     task.abort();
 }
+
+/// A subscription is an attached human, and the hub routes permission questions
+/// to the terminal on that count (SPEC R-PERM.3.6). So a source that is stopped
+/// must actually leave: an instance is told the viewer count rises with it and
+/// falls when it is aborted. A surface that holds the subscription with nobody
+/// watching would be answered to by no one (SPEC R-GUI.8).
+#[tokio::test]
+async fn aborting_the_hub_source_lowers_the_viewer_count() {
+    let (_dir, socket) = isolated_socket();
+    let hub = HubServer::bind_at(socket.clone())
+        .await
+        .expect("this test owns a freshly isolated socket");
+    let hub_task = tokio::spawn(async move { hub.serve().await });
+
+    // An instance that listens for what the hub says about its viewers.
+    let stream = ahma_common::hub::connect_to_hub().await.unwrap();
+    let (r, mut w) = tokio::io::split(stream);
+    let mut reader = BufReader::new(r);
+    send_msg(
+        &mut w,
+        &ClientMsg::Register {
+            pid: 4243,
+            mode: "stdio".to_string(),
+            scope: "/work/project".to_string(),
+            label: "watcher".to_string(),
+            client: None,
+            session_id: None,
+            client_pid: None,
+            sampling: false,
+            elicitation: false,
+            scopes: vec![],
+            read_scopes: vec![],
+            grants: vec![],
+            enforcement: None,
+            native_terminal: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    async fn viewers(
+        reader: &mut BufReader<tokio::io::ReadHalf<ahma_common::hub::HubStream>>,
+    ) -> usize {
+        loop {
+            let msg =
+                tokio::time::timeout(TestTimeouts::scale_secs(5), recv_msg::<_, HubMsg>(reader))
+                    .await
+                    .expect("the hub reports its viewers")
+                    .expect("a message");
+            if let HubMsg::Viewers { count } = msg {
+                return count;
+            }
+        }
+    }
+    // Nobody is watching yet.
+    assert_eq!(viewers(&mut reader).await, 0);
+
+    let (tx, _rx) = mpsc::channel::<SourceEvent>(64);
+    let source = spawn_hub_source(tx);
+    assert_eq!(viewers(&mut reader).await, 1, "the source is a viewer");
+
+    source.abort();
+    assert_eq!(
+        viewers(&mut reader).await,
+        0,
+        "an aborted source is not an attached human"
+    );
+    hub_task.abort();
+}

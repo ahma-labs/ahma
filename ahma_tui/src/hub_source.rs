@@ -60,10 +60,15 @@ pub use crate::mcp_source::SourceEvent;
 /// All `OperationsUpdated` events contain the merged operation list from
 /// **all** connected instances.  Each [`Operation`] has `instance_id` and
 /// `instance_label` set so the UI can display an attribution badge.
-pub fn spawn_hub_source(tx: mpsc::Sender<SourceEvent>) {
+///
+/// The subscription is an attached human (SPEC R-PERM.3.6): the hub routes
+/// permission questions to a terminal by counting subscribers. Aborting the
+/// returned handle drops the connection, and with it the count; a caller that
+/// is not being watched must do so rather than hold the subscription.
+pub fn spawn_hub_source(tx: mpsc::Sender<SourceEvent>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         hub_source_task(tx).await;
-    });
+    })
 }
 
 /// Apply one hub message to `state` and forward the resulting UI

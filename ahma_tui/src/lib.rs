@@ -23,6 +23,7 @@ pub mod llm_bridge;
 pub mod markdown;
 pub mod mcp_connections;
 pub mod mcp_source;
+pub mod session;
 pub mod session_config;
 pub mod settings_editor;
 pub mod setup_view;

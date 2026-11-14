@@ -18,355 +18,234 @@ pub async fn run(
     token_prefs: crate::TokenPrefs,
     initial_command: Option<String>,
 ) -> Result<()> {
-    use std::io;
-    use std::time::Duration;
-
-    // The teardown counterparts of these (LeaveAlternateScreen, DisableMouseCapture,
-    // DisableBracketedPaste, PopKeyboardEnhancementFlags, disable_raw_mode) are
-    // deliberately not imported here: they belong to `terminal_guard`, which owns
-    // the single restore path. Undoing the setup from two places is how the panic
-    // path came to be missed.
-    use crossterm::{
-        event::{
-            EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
-            PushKeyboardEnhancementFlags,
-        },
-        execute,
-        terminal::{EnterAlternateScreen, enable_raw_mode, supports_keyboard_enhancement},
-    };
-    use futures::StreamExt;
-    use ratatui::{Terminal, backend::CrosstermBackend};
-    use tokio::sync::mpsc;
-
-    use crate::hub_source::spawn_hub_source;
-    use crate::keymap::map_key;
-    use crate::llm_bridge::{BridgeEvent, spawn_discovery_task};
-    use crate::mcp_source::{SourceEvent, spawn_mcp_source};
-    use crate::state::AppState;
+    use crate::session::{Session, SessionOptions, run_session};
+    use crate::state::Capabilities;
     use crate::theme::Theme;
-    use crate::ui;
 
     let unicode = detect_unicode();
     let theme = Theme::with_color(unicode, !no_color());
-    let mut state = AppState::new(
-        &connection.display_url,
-        connection.transport_label(),
-        unicode,
+    let mut session = Session::start(
+        connection,
+        SessionOptions {
+            profile_override,
+            workspace_path,
+            token_prefs,
+            initial_command,
+            unicode,
+            surface: ahma_common::hub::Surface::Tui,
+            caps: Capabilities::terminal(),
+        },
     );
-    if let Some(ref path) = workspace_path {
-        // Canonicalized like `project_root` below: this string becomes the chat
-        // session's `McpChatConfig.workspace_root` and hence its `roots/list`
-        // answer, so a relative or symlinked spelling here would hand the server
-        // a different-looking scope than the one the bridge locked.
-        state.workspace = dunce::canonicalize(path)
-            .unwrap_or_else(|_| path.clone())
-            .to_string_lossy()
-            .into_owned();
-    }
-    // Project root for the task-tree filter: the explicit path argument, else
-    // the directory the TUI was started from. Canonicalized so it compares
-    // against instance sandbox scopes (which are canonicalized at lock time).
-    state.project_root = workspace_path
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .map(|p| {
-            std::fs::canonicalize(&p)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .into_owned()
-        });
-    state.mcp_http_base_url = http_base_url(connection);
-    state.token_prefs = token_prefs;
-    // Cache the effective minimize state (flag > env > settings) for the status
-    // bar and the `/minimize` switch, so neither has to re-read settings.
-    state.minimize_tokens = resolve_token_prefs(&state).0;
+    // The terminal is attached from the first frame: it is always a subscriber,
+    // never the hub (SPEC R-HUB.9). It used to bind the hub socket itself when it
+    // started first, which made the observability of every other client depend on
+    // this window staying open: quitting the TUI unlinked the socket and every
+    // attached instance lost its event stream until it reconnected. The per-user
+    // hub owns the hub; this process only watches it, and quitting sends nothing
+    // but EOF.
+    session.set_attended(true);
 
-    if let Some(profile_name) = profile_override
-        && let Ok(cwd) = std::env::current_dir()
-    {
-        if let Ok(profile) = crate::agent_config::get_profile(&cwd, &profile_name) {
-            state.active_profile = Some(profile.name.clone());
-            state.current_provider_url = Some(profile.provider_url);
-            state.llm_selection = Some(crate::state::LlmSelection::profile(
-                profile.name.clone(),
-                profile.model,
-            ));
-        } else {
-            // The user asked for a specific profile by name and did not get it;
-            // opening as if they had never passed the flag is a surprise.
-            crate::startup_notices::push(
-                crate::startup_notices::Level::Warn,
-                format!(
-                    "--profile {profile_name} could not be loaded; continuing without it. \
-                     Use /agent list to see the profiles saved for this project."
-                ),
-            );
+    let mut frontend = TerminalFrontend::enter(theme)?;
+    let result = run_session(&mut session, &mut frontend).await;
+
+    // Always restore the terminal: one restore path, shared with the guard's
+    // `Drop` and its panic hook, so a crash cannot leave the user in raw mode on
+    // the alternate screen with the panic message written somewhere they cannot
+    // see (ahma_tui/SPEC.md, Non-Functional Requirements). Explicit here rather
+    // than left to the drop at end of scope so the terminal is back to normal
+    // before anything else this function might print.
+    frontend.restore();
+    result
+}
+
+/// The terminal as a surface (SPEC R-UI): crossterm events in, ratatui frames
+/// out.
+struct TerminalFrontend {
+    terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    events: crossterm::event::EventStream,
+    theme: crate::theme::Theme,
+    guard: crate::terminal_guard::TerminalGuard,
+}
+
+impl TerminalFrontend {
+    /// Take over the terminal.
+    fn enter(theme: crate::theme::Theme) -> Result<Self> {
+        use crossterm::{
+            event::{
+                EnableBracketedPaste, EnableMouseCapture, EventStream, KeyboardEnhancementFlags,
+                PushKeyboardEnhancementFlags,
+            },
+            execute,
+            terminal::{EnterAlternateScreen, enable_raw_mode, supports_keyboard_enhancement},
+        };
+        use ratatui::{Terminal, backend::CrosstermBackend};
+
+        // The teardown counterparts of these (LeaveAlternateScreen, DisableMouseCapture,
+        // DisableBracketedPaste, PopKeyboardEnhancementFlags, disable_raw_mode) are
+        // deliberately not imported here: they belong to `terminal_guard`, which owns
+        // the single restore path. Undoing the setup from two places is how the panic
+        // path came to be missed.
+        enable_raw_mode()?;
+        // Arm the restore *immediately*, before the rest of the setup. From here on
+        // every exit path — normal, `?`, or panic — puts the terminal back; see
+        // `terminal_guard`. Armed before `execute!` rather than after, because a
+        // failure partway through the setup used to return `Err` with raw mode
+        // already on.
+        let guard = crate::terminal_guard::TerminalGuard::arm();
+        let mut stdout = std::io::stdout();
+        // Bracketed paste makes the terminal deliver a paste as a single `Event::Paste`
+        // (interior newlines included) instead of a stream of keystrokes. Without it, a
+        // pasted trailing newline arrives as `Enter` and auto-submits, and a multi-line
+        // paste fires one submission per line. See the `Event::Paste` handler below.
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
+        // Enable the Kitty keyboard protocol's escape-code disambiguation when the
+        // terminal supports it. Without it, terminals collapse Shift+Enter into a
+        // plain Enter, so it would submit instead of inserting a newline. We remember
+        // whether the push succeeded so teardown only pops when we actually enabled it.
+        let keyboard_enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
+        if keyboard_enhanced {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            // Tell the guard only once the push has actually succeeded: popping a
+            // flag that was never pushed unbalances crossterm's stack.
+            guard.set_keyboard_enhanced(true);
+        }
+        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        terminal.clear()?;
+        Ok(Self {
+            terminal,
+            events: EventStream::new(),
+            theme,
+            guard,
+        })
+    }
+
+    fn restore(&self) {
+        self.guard.restore();
+    }
+}
+
+impl crate::session::Frontend for TerminalFrontend {
+    type Input = crossterm::event::Event;
+
+    async fn next_input(&mut self) -> Option<crossterm::event::Event> {
+        use futures::StreamExt;
+        loop {
+            match self.events.next().await {
+                Some(Ok(event)) => return Some(event),
+                Some(Err(e)) => debug!("terminal event error: {e}"),
+                None => return None,
+            }
         }
     }
 
-    // Everything that happened before the first frame (bridge restarts, a self
-    // re-exec, a refused reuse, this profile failure) surfaces here rather than
-    // in a log file the user was never told about.
-    drain_startup_notices(&mut state);
-    load_granted_scopes(&mut state);
-    offer_folder_trust(&mut state);
-    maybe_show_intro_on_first_run(&mut state);
-    // `ahma setup` opens straight onto /setup. After the trust question and the
-    // intro so neither is skipped; the command is the one the user could type.
-    if let Some(command) = initial_command {
-        dispatch_nav_command(&command, &mut state);
-        // `ahma setup` is a task, not a session: when its view is done, so is
-        // the program. (`/setup` typed inside a running TUI just closes it.)
-        state.setup_exit_on_close = state.setup_view.open;
-    }
-
-    let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
-    state.mcp_source_tx = Some(spawn_mcp_source(
-        connection.clone(),
-        mcp_tx.clone(),
-        workspace_path,
-    ));
-    // The TUI is always a subscriber, never the hub (SPEC R-HUB.9). It used
-    // to bind the hub socket itself when it started first, which made the
-    // observability of every other client depend on this window staying open:
-    // quitting the TUI unlinked the socket and every attached instance lost its
-    // event stream until it reconnected. The per-user hub owns the hub; this
-    // process only watches it, and quitting sends nothing but EOF.
-    spawn_hub_source(mcp_tx.clone());
-    // ...and a second, outgoing connection, because the TUI is also a place
-    // work happens: a `!` command runs here, unsandboxed, and used to be the
-    // one kind of work the unified view could not see (SPEC R-HUB.9).
-    state.tui_reporter = Some(crate::tui_reporter::spawn_tui_reporter(
-        state.workspace.clone(),
-    ));
-
-    // Bridge channel carries both provider discovery results and LLM tokens.
-    let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);
-    spawn_discovery_task(bridge_tx.clone());
-    // Local model servers come and go (Ollama started after the TUI, LM Studio
-    // quit): look again now and then while idle, so the picker and the
-    // fallback work from what is actually running rather than a startup
-    // snapshot.
-    let mut last_discovery = std::time::Instant::now();
-    // Questions a refused terminal-hook command left for the harness dialog
-    // (SPEC R-PERM.10(e)), re-read on the tick; `None` reads on the first one.
-    let mut last_harness_ask_poll: Option<std::time::Instant> = None;
-    // Populate the external MCP tools counter at startup (avoids needing `/mcp refresh`).
-    crate::llm_bridge::spawn_external_tools_refresh(
-        state.mcp_connections.clone(),
-        bridge_tx.clone(),
-    );
-    // Store the sender so chat actions can spawn tasks later.
-    state.bridge_tx = Some(bridge_tx);
-
-    // ── Terminal setup ───────────────────────────────────────────────────────
-    enable_raw_mode()?;
-    // Arm the restore *immediately*, before the rest of the setup. From here on
-    // every exit path — normal, `?`, or panic — puts the terminal back; see
-    // `terminal_guard`. Armed before `execute!` rather than after, because a
-    // failure partway through the setup used to return `Err` with raw mode
-    // already on.
-    let terminal_guard = crate::terminal_guard::TerminalGuard::arm();
-    let mut stdout = io::stdout();
-    // Bracketed paste makes the terminal deliver a paste as a single `Event::Paste`
-    // (interior newlines included) instead of a stream of keystrokes. Without it, a
-    // pasted trailing newline arrives as `Enter` and auto-submits, and a multi-line
-    // paste fires one submission per line. See the `Event::Paste` handler below.
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
-    // Enable the Kitty keyboard protocol's escape-code disambiguation when the
-    // terminal supports it. Without it, terminals collapse Shift+Enter into a
-    // plain Enter, so it would submit instead of inserting a newline. We remember
-    // whether the push succeeded so teardown only pops when we actually enabled it.
-    let keyboard_enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
-    if keyboard_enhanced {
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
-        // Tell the guard only once the push has actually succeeded: popping a
-        // flag that was never pushed unbalances crossterm's stack.
-        terminal_guard.set_keyboard_enhanced(true);
-    }
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-    terminal.draw(|f| ui::draw(f, &state, &theme))?;
-
-    // ── Event loop ───────────────────────────────────────────────────────────
-    let mut event_stream = EventStream::new();
-
-    // Upper bound on how many queued source/bridge events one loop iteration
-    // drains before drawing. Batching turns a firehose of per-line output
-    // events (e.g. a chatty build) into one draw per pass instead of one full
-    // widget-tree rebuild per event, while the bound keeps input and tick
-    // handling responsive during a flood.
-    const MAX_EVENT_DRAIN_PER_PASS: usize = 256;
-
-    let loop_result: Result<()> = async {
-        loop {
-            tokio::select! {
-                biased;
-
-                maybe = event_stream.next() => {
-                    match maybe {
-                        Some(Ok(Event::Key(key))) => {
-                            // Any keystroke disarms the startup auto-switch to
-                            // the task view — the user has taken the wheel.
-                            state.auto_view_pending = false;
-                            if key.code == crossterm::event::KeyCode::Char('c')
-                                && key.modifiers == crossterm::event::KeyModifiers::CONTROL
-                            {
-                                // One meaning everywhere, ahead of every
-                                // overlay: cancel the turn, else quit.
-                                interrupt(&mut state);
-                            } else if (key.code == crossterm::event::KeyCode::PageUp || key.code == crossterm::event::KeyCode::PageDown)
-                                && !state.is_help_open()
-                                && state.log_files_selected().is_none()
-                            {
-                                handle_page_up_down(key.code == crossterm::event::KeyCode::PageUp, &mut state);
-                            } else if handle_overlay_key(key, &mut state) {
-                                // handled directly by an overlay/editor widget
-                            } else {
-                                let action = map_key(
-                                    key,
-                                    state.focus,
-                                    &state.modal,
-                                    state.log_filter_active,
-                                );
-                                handle_action(action, &mut state);
-                            }
-                        }
-                        Some(Ok(Event::Resize(..))) => {
-                            terminal.autoresize()?;
-                        }
-                        Some(Ok(Event::Mouse(mouse_event))) => {
-                            state.last_mouse_pos.set(Some((mouse_event.column, mouse_event.row)));
-                            match mouse_event.kind {
-                                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                                    // A click is user input: disarm the startup
-                                    // auto-switch to the task view.
-                                    state.auto_view_pending = false;
-                                    handle_mouse_click(mouse_event.column, mouse_event.row, &mut state);
-                                }
-                                crossterm::event::MouseEventKind::ScrollUp => {
-                                    handle_mouse_scroll(mouse_event.column, mouse_event.row, true, &mut state);
-                                }
-                                crossterm::event::MouseEventKind::ScrollDown => {
-                                    handle_mouse_scroll(mouse_event.column, mouse_event.row, false, &mut state);
-                                }
-                                _ => {}
-                            }
-                        }
-                        Some(Ok(Event::Paste(text))) => {
-                            // Show the pasted text in the chat input but do NOT submit it.
-                            // A trailing newline (e.g. pasting "somecommand\n") is dropped so
-                            // it does not trigger a send; the user must press Enter themselves.
-                            // Interior newlines are kept, so a multi-line paste appears as
-                            // multiple lines in one input rather than many separate requests.
-                            state.handle_paste(&text);
-                        }
-                        Some(Err(e)) => {
-                            debug!("terminal event error: {e}");
-                        }
-                        None => break,
-                        _ => {}
-                    }
-                }
-
-                Some(src_event) = mcp_rx.recv() => {
-                    handle_source_event(src_event, &mut state);
-                }
-
-                Some(bridge_event) = bridge_rx.recv() => {
-                    handle_bridge_event(bridge_event, &mut state);
-                }
-
-                _ = tokio::time::sleep(if (state.chat_scroll_current.get() - state.chat_scroll_target.get()).abs() > 0.01
-                    || (state.log_scroll_current.get() - state.log_scroll_target.get()).abs() > 0.01
-                    || (state.chat_input_height_current.get() - state.chat_input_height_target.get()).abs() > 0.01
-                    || state.accordion.as_ref().is_some_and(|a| a.is_active(crate::ui::wall_ms()))
+    fn handle_input(
+        &mut self,
+        event: crossterm::event::Event,
+        session: &mut crate::session::Session,
+    ) -> Result<()> {
+        use crossterm::event::Event;
+        let state = &mut session.state;
+        match event {
+            Event::Key(key) => {
+                // Any keystroke disarms the startup auto-switch to
+                // the task view — the user has taken the wheel.
+                state.auto_view_pending = false;
+                if key.code == crossterm::event::KeyCode::Char('c')
+                    && key.modifiers == crossterm::event::KeyModifiers::CONTROL
                 {
-                    Duration::from_millis(15)
-                } else if chat_in_progress(&state) {
-                    Duration::from_millis(100)
+                    // One meaning everywhere, ahead of every
+                    // overlay: cancel the turn, else quit.
+                    interrupt(state);
+                } else if (key.code == crossterm::event::KeyCode::PageUp
+                    || key.code == crossterm::event::KeyCode::PageDown)
+                    && !state.is_help_open()
+                    && state.log_files_selected().is_none()
+                {
+                    handle_page_up_down(key.code == crossterm::event::KeyCode::PageUp, state);
+                } else if handle_overlay_key(key, state) {
+                    // handled directly by an overlay/editor widget
                 } else {
-                    Duration::from_millis(250)
-                }) => {
-                    // Periodic redraw / animation update
-                    let now = std::time::Instant::now();
-                    if !chat_in_progress(&state)
-                        && now.duration_since(last_discovery) >= PROVIDER_REDISCOVERY_EVERY
-                    {
-                        last_discovery = now;
-                        if let Some(tx) = state.bridge_tx.clone() {
-                            spawn_discovery_task(tx);
-                        }
-                    }
-                    for w in &mut state.windows {
-                        if w.visible && w.finished_at.is_some_and(|t| now.duration_since(t) >= std::time::Duration::from_secs(300)) {
-                            w.visible = false;
-                        }
-                    }
-                    // While a turn is in flight but quiet, pulse the liveness
-                    // spinner slowly so the user can tell it is still alive (and
-                    // not silently timed out) — token arrivals drive it fast.
-                    if chat_in_progress(&state) {
-                        state.tick_waiting_spinner();
-                    }
-                    update_scroll_animations(&mut state);
+                    let action = crate::keymap::map_key(
+                        key,
+                        state.focus,
+                        &state.modal,
+                        state.log_filter_active,
+                    );
+                    handle_action(action, state);
                 }
             }
-
-            // Checked on every pass, not only on the idle tick, so a busy
-            // event stream cannot starve it; the read itself is throttled.
-            let now = std::time::Instant::now();
-            if last_harness_ask_poll
-                .is_none_or(|t| now.duration_since(t) >= crate::harness_asks::POLL_EVERY)
-            {
-                last_harness_ask_poll = Some(now);
-                sync_harness_asks(&mut state, crate::harness_asks::pending());
+            Event::Resize(..) => {
+                self.terminal.autoresize()?;
             }
-
-            // Drain the ready backlog from the event channels before drawing,
-            // so bursts of events cost one draw rather than one draw each.
-            let mut drained = 0usize;
-            while drained < MAX_EVENT_DRAIN_PER_PASS
-                && let Ok(src_event) = mcp_rx.try_recv()
-            {
-                handle_source_event(src_event, &mut state);
-                drained += 1;
+            Event::Mouse(mouse_event) => {
+                state
+                    .last_mouse_pos
+                    .set(Some((mouse_event.column, mouse_event.row)));
+                match mouse_event.kind {
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        // A click is user input: disarm the startup
+                        // auto-switch to the task view.
+                        state.auto_view_pending = false;
+                        handle_mouse_click(mouse_event.column, mouse_event.row, state);
+                    }
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        handle_mouse_scroll(mouse_event.column, mouse_event.row, true, state);
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        handle_mouse_scroll(mouse_event.column, mouse_event.row, false, state);
+                    }
+                    _ => {}
+                }
             }
-            while drained < MAX_EVENT_DRAIN_PER_PASS
-                && let Ok(bridge_event) = bridge_rx.try_recv()
-            {
-                handle_bridge_event(bridge_event, &mut state);
-                drained += 1;
+            Event::Paste(text) => {
+                // Show the pasted text in the chat input but do NOT submit it.
+                // A trailing newline (e.g. pasting "somecommand\n") is dropped so
+                // it does not trigger a send; the user must press Enter themselves.
+                // Interior newlines are kept, so a multi-line paste appears as
+                // multiple lines in one input rather than many separate requests.
+                state.handle_paste(&text);
             }
-
-            terminal.draw(|f| ui::draw(f, &state, &theme))?;
-
-            if state.should_quit {
-                break;
-            }
+            _ => {}
         }
         Ok(())
     }
-    .await;
 
-    // ── Always restore terminal ───────────────────────────────────────────────
-    // One restore path, shared with the guard's `Drop` and its panic hook, so a
-    // crash cannot leave the user in raw mode on the alternate screen with the
-    // panic message written somewhere they cannot see (ahma_tui/SPEC.md, Non-Functional Requirements).
-    // Explicit here rather than left to the drop at end of scope so the terminal
-    // is back to normal before anything else this function might print.
-    terminal_guard.restore();
+    fn tick_interval(&self, state: &crate::state::AppState) -> std::time::Duration {
+        use std::time::Duration;
+        if (state.chat_scroll_current.get() - state.chat_scroll_target.get()).abs() > 0.01
+            || (state.log_scroll_current.get() - state.log_scroll_target.get()).abs() > 0.01
+            || (state.chat_input_height_current.get() - state.chat_input_height_target.get()).abs()
+                > 0.01
+            || state
+                .accordion
+                .as_ref()
+                .is_some_and(|a| a.is_active(crate::ui::wall_ms()))
+        {
+            Duration::from_millis(15)
+        } else if chat_in_progress(state) {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(250)
+        }
+    }
 
-    loop_result
+    fn on_tick(&mut self, state: &mut crate::state::AppState) {
+        update_scroll_animations(state);
+    }
+
+    fn present(&mut self, state: &crate::state::AppState) -> Result<()> {
+        self.terminal
+            .draw(|f| crate::ui::draw(f, state, &self.theme))?;
+        Ok(())
+    }
 }
 
 // ─── Action handler ───────────────────────────────────────────────────────────
@@ -2168,7 +2047,7 @@ where
 /// behaviour but not the server's. One variable, one verdict — the replacements are
 /// `--minimize-tokens` / `--small-model-harness` (both already reflected in
 /// `state.token_prefs`) and the matching `[tools]` settings keys.
-fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u32>) {
+pub(crate) fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u32>) {
     let settings = ahma_common::config::AhmaSettings::load();
 
     ahma_mcp::warn_retired_env("AHMA_MINIMIZE_TOKENS");
@@ -2431,7 +2310,7 @@ fn open_intro(state: &mut crate::state::AppState) {
 
 /// Show the tour by itself once, on the very first run (a marker in `~/.ahma`
 /// remembers it was shown). A missing home just skips it.
-fn maybe_show_intro_on_first_run(state: &mut crate::state::AppState) {
+pub(crate) fn maybe_show_intro_on_first_run(state: &mut crate::state::AppState) {
     let Some(marker) =
         ahma_common::config::ahma_home_dir().map(|h| h.join(".ahma").join("intro-shown"))
     else {
@@ -2627,7 +2506,7 @@ fn handle_approval_key(
 /// workspace is new to ahma. Not offered for a folder that is already trusted,
 /// or for one too broad ever to trust (home, a root — see
 /// [`ahma_core::approvals::trust_allowed`]); there the per-tool questions stay.
-fn offer_folder_trust(state: &mut crate::state::AppState) {
+pub(crate) fn offer_folder_trust(state: &mut crate::state::AppState) {
     let workspace = std::path::Path::new(&state.workspace);
     if state.workspace.is_empty()
         || ahma_core::approvals::is_workspace_trusted(workspace)
@@ -2856,7 +2735,7 @@ fn show_next_scope_grant(state: &mut crate::state::AppState) {
 /// question (R-PERM.3.5), and one no longer waiting — asked in the harness
 /// dialog, covered by a grant, answered in another TUI, or its harness gone —
 /// is withdrawn wherever it is, as the hub withdraws a question (R5.3.3).
-fn sync_harness_asks(
+pub(crate) fn sync_harness_asks(
     state: &mut crate::state::AppState,
     pending: Vec<crate::harness_asks::HarnessAsk>,
 ) {
@@ -3306,7 +3185,7 @@ fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> 
 }
 
 /// Dispatch a `/command` string from the navigator.
-fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
+pub(crate) fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
     let cmd = cmd.trim();
     if !state.caps.allows_command(cmd) {
         push_assistant_message(
@@ -4948,7 +4827,7 @@ fn validate_nav_tool_run(tool: &str, state: &crate::state::AppState) -> Result<(
 /// stays with `ahma sandbox grant/revoke`, which gates every write behind the
 /// preview-and-approve exchange and the catastrophic-path denylist (SPEC
 /// R5.4.5) — machinery the TUI must not duplicate half-way.
-fn load_granted_scopes(state: &mut crate::state::AppState) {
+pub(crate) fn load_granted_scopes(state: &mut crate::state::AppState) {
     let settings = ahma_common::config::AhmaSettings::load();
     state.granted_scopes = settings
         .sandbox
@@ -4970,7 +4849,7 @@ fn load_granted_scopes(state: &mut crate::state::AppState) {
 /// pane, and the warnings additionally into the chat transcript, which is the
 /// pane that is open by default. A warning the user has to run `/log` to
 /// discover is not much better than one in a file.
-fn drain_startup_notices(state: &mut crate::state::AppState) {
+pub(crate) fn drain_startup_notices(state: &mut crate::state::AppState) {
     use crate::startup_notices::Level;
 
     for notice in crate::startup_notices::drain() {
@@ -5264,7 +5143,8 @@ fn follow_client_model_availability(state: &mut crate::state::AppState) {
 }
 
 /// How often the idle TUI looks for local model servers again.
-const PROVIDER_REDISCOVERY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const PROVIDER_REDISCOVERY_EVERY: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 fn handle_providers_discovered(
     providers: Vec<ahma_llm_monitor::LocalProvider>,
@@ -5643,7 +5523,10 @@ fn spawn_grant_advisor(
     });
 }
 
-fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate::state::AppState) {
+pub(crate) fn handle_bridge_event(
+    event: crate::llm_bridge::BridgeEvent,
+    state: &mut crate::state::AppState,
+) {
     use crate::llm_bridge::BridgeEvent;
     use crate::state::ChatEntry;
 
@@ -6100,7 +5983,10 @@ fn append_active_log_lines(active_log_lines: &mut Vec<String>, content: &str) {
     }
 }
 
-fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate::state::AppState) {
+pub(crate) fn handle_source_event(
+    event: crate::mcp_source::SourceEvent,
+    state: &mut crate::state::AppState,
+) {
     use crate::mcp_source::SourceEvent;
     match event {
         SourceEvent::HealthChanged { healthy } => state.set_server_healthy(healthy),
@@ -6625,7 +6511,7 @@ fn handle_operation_output(
 /// got ASCII glyphs *and* a fully coloured UI, since nothing here ever consulted
 /// it when choosing styles. Colour is [`no_color`]'s business; glyphs are this
 /// function's. See <https://no-color.org>.
-fn detect_unicode() -> bool {
+pub(crate) fn detect_unicode() -> bool {
     !std::env::var("TERM")
         .unwrap_or_default()
         .to_lowercase()
@@ -6639,7 +6525,7 @@ pub fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
 }
 
-fn http_base_url(connection: &ResolvedConnection) -> String {
+pub(crate) fn http_base_url(connection: &ResolvedConnection) -> String {
     match &connection.transport {
         crate::connection::ResolvedTransport::Http(url)
         | crate::connection::ResolvedTransport::Http3(url) => url.clone(),
@@ -7438,7 +7324,7 @@ fn page_log_scroll(up: bool, state: &mut crate::state::AppState) {
     }
 }
 
-fn update_scroll_animations(state: &mut crate::state::AppState) {
+pub(crate) fn update_scroll_animations(state: &mut crate::state::AppState) {
     // Clamp the animation against the live max so a resize that shrank the
     // content (recomputed in draw as chat_max_scroll) pulls a stale target/offset
     // back into range instead of stranding the view above the oldest line.
@@ -7476,7 +7362,7 @@ fn update_scroll_animations(state: &mut crate::state::AppState) {
     }
 }
 
-fn chat_in_progress(state: &crate::state::AppState) -> bool {
+pub(crate) fn chat_in_progress(state: &crate::state::AppState) -> bool {
     state.turn.is_some()
 }
 
