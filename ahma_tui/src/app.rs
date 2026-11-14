@@ -1222,7 +1222,7 @@ fn handle_approval_action(
 /// the asking agent checks ([`crate::state::ApprovalGate::workspace`]), and
 /// lives outside the sandbox in `~/.ahma/settings.toml` — see
 /// [`ahma_core::approvals`].
-fn resolve_approval_always(state: &mut crate::state::AppState) {
+pub(crate) fn resolve_approval_always(state: &mut crate::state::AppState) {
     use crate::state::{LogEntry, LogLevel};
 
     if let Some(gate) = state.approval.as_ref() {
@@ -1258,8 +1258,6 @@ fn resolve_approval_always(state: &mut crate::state::AppState) {
 /// flow raises, resolves through the same coordinator, and persists through the
 /// same preview-and-approve path.
 fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
-    use crate::state::{LogEntry, LogLevel, OpStatus};
-
     // Inside the detail overlay, act on the operation being viewed rather than
     // whatever the tree selection happens to be behind it — same rule as `c`.
     let op = match state.detail_op_key() {
@@ -1267,7 +1265,27 @@ fn reraise_grant_for_selected_op(state: &mut crate::state::AppState) {
         None => state.selected_op().cloned(),
     };
     let Some(op) = op else { return };
+    reraise_grant_for(state, op);
+}
 
+/// Ask again for the access a denied operation needed, naming the operation
+/// rather than relying on what is selected.
+pub(crate) fn reraise_grant(
+    state: &mut crate::state::AppState,
+    key: &crate::state::OpKey,
+) -> Result<(), crate::controller::Refused> {
+    let Some(op) = state.find_op(key).cloned() else {
+        return Err(crate::controller::Refused::Stale);
+    };
+    if op.denial.is_none() || op.status != crate::state::OpStatus::Denied {
+        return Err(crate::controller::Refused::Nothing);
+    }
+    reraise_grant_for(state, op);
+    Ok(())
+}
+
+fn reraise_grant_for(state: &mut crate::state::AppState, op: crate::state::Operation) {
+    use crate::state::{LogEntry, LogLevel, OpStatus};
     let Some((path, access)) = op.denial.clone().filter(|_| op.status == OpStatus::Denied) else {
         state.push_log(LogEntry {
             timestamp: chrono::Local::now(),
@@ -1304,7 +1322,7 @@ fn send_incoming(msg: ahma_common::hub::ClientMsg) {
     }
 }
 
-fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
+pub(crate) fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
     use crate::state::{LogEntry, LogLevel};
 
     let Some(gate) = state.approval.take() else {
@@ -1376,7 +1394,7 @@ fn request_cancel_selected_op(state: &mut crate::state::AppState) {
 /// cancelled on that client's instance through the hub; the TUI's own MCP
 /// session cannot see it, so the `cancel` tool there would miss. Without a
 /// known instance the TUI's own session is the only place to ask.
-fn cancel_op(state: &mut crate::state::AppState, key: crate::state::OpKey) {
+pub(crate) fn cancel_op(state: &mut crate::state::AppState, key: crate::state::OpKey) {
     use crate::state::{LogEntry, LogLevel};
     state.push_log(LogEntry {
         timestamp: chrono::Local::now(),
@@ -1523,6 +1541,14 @@ fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool
     // is no automated path to this branch — every invocation is a deliberate
     // human-in-the-loop action.
     if let Some(stripped) = text.strip_prefix('!') {
+        if !state.caps.host_commands {
+            push_assistant_message(
+                state,
+                "`!` runs a command outside the sandbox, which only a keystroke typed at a \
+                 terminal may do. Run it in `ahma tui`.",
+            );
+            return true;
+        }
         let cmd_str = stripped.trim().to_string();
         if !cmd_str.is_empty() {
             run_unsandboxed_command(cmd_str, state);
@@ -1600,14 +1626,20 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
 }
 
 fn submit_chat_input(state: &mut crate::state::AppState) {
-    use crate::state::ChatEntry;
-
     let text = state.chat_input_text().trim().to_string();
     if text.is_empty() {
         return;
     }
     state.clear_chat_input();
     state.remember_input(&text);
+    submit_text(state, text);
+}
+
+/// What a human sent from this session's input — the terminal's widget or a
+/// browser's request — whose meaning is the controller's, not the surface's:
+/// a `/` command, a `#` goal, a `!` host command, or a chat turn.
+pub(crate) fn submit_text(state: &mut crate::state::AppState, text: String) {
+    use crate::state::ChatEntry;
 
     if text.starts_with('/') {
         dispatch_nav_command(&text, state);
@@ -1810,7 +1842,7 @@ fn first_line(text: &str) -> &str {
 /// Stop the running turn, if any. The turn ends here at once rather than on
 /// the instance's reply, so Esc works even when the hub is gone; the
 /// instance's own "cancelled" error then finds no turn and is ignored.
-fn cancel_turn(state: &mut crate::state::AppState) -> bool {
+pub(crate) fn cancel_turn(state: &mut crate::state::AppState) -> bool {
     let Some(turn) = state.turn.take() else {
         return false;
     };
@@ -2702,7 +2734,7 @@ fn is_scope_grant_key_target(state: &crate::state::AppState) -> bool {
         && !state.typing_in_chat()
 }
 
-fn toggle_scope_grant_detail(state: &mut crate::state::AppState) {
+pub(crate) fn toggle_scope_grant_detail(state: &mut crate::state::AppState) {
     if let Some(gate) = state.scope_grant.as_mut() {
         gate.show_detail = !gate.show_detail;
         gate.scroll = 0;
@@ -2713,14 +2745,16 @@ fn toggle_scope_grant_detail(state: &mut crate::state::AppState) {
 }
 
 fn try_select_scope_grant_option(c: char, state: &mut crate::state::AppState) -> bool {
-    use ahma_common::scope_grant::GrantDecision;
-
     // `s` stays an alias of `y` (read-write, this session) for the
     // fingers that learned it.
     let key = if c == 's' { 'y' } else { c };
     // Only the keys this question offers: the `--tmp` question has no
     // `always` or 24-hour answer (GrantReason::offers_saved_tiers).
-    let Some(reason) = state.scope_grant.as_ref().map(|g| g.request.reason) else {
+    let Some((id, reason)) = state
+        .scope_grant
+        .as_ref()
+        .map(|g| (g.decision_id.clone(), g.request.reason))
+    else {
         return false;
     };
     let Some(option) = ahma_common::grant_prompt::options_for(reason)
@@ -2729,28 +2763,15 @@ fn try_select_scope_grant_option(c: char, state: &mut crate::state::AppState) ->
     else {
         return false;
     };
-    let Some(gate) = state.scope_grant.as_mut() else {
-        return false;
-    };
-    // Typed ahead, not read: swallow it (deny never waits).
-    if option.decision != GrantDecision::Deny && !gate.armed() {
-        return true;
-    }
-    // A grant that is saved to settings is never given without
-    // the exact line it writes on screen (SPEC R-PERM.2): the
-    // first press scrolls that line into view, and a second
-    // saves only if the last frame showed it whole (R-PERM.3.5).
-    if option.decision.tier().is_persistent()
-        && !(gate.show_detail && gate.view.get().save_line_visible)
-    {
-        reveal_scope_grant_save_line(state);
-        return true;
-    }
-    resolve_scope_grant(state, option.decision);
+    // The rules for taking an answer are the controller's, shared with every
+    // other surface (SPEC R-GUI.6). Whatever it decided, the key was consumed:
+    // typed ahead, or the first press of a saving key, is not text for
+    // anything else.
+    let _ = crate::controller::answer_scope_grant(state, &id, option.value);
     true
 }
 
-fn reveal_scope_grant_save_line(state: &mut crate::state::AppState) {
+pub(crate) fn reveal_scope_grant_save_line(state: &mut crate::state::AppState) {
     let already_shown = state.scope_grant.as_mut().is_some_and(|gate| {
         let shown = gate.show_detail && gate.reveal_save_line;
         gate.show_detail = true;
@@ -2823,8 +2844,9 @@ fn scroll_gate(
 /// this moment however long it waited, so its arming delay starts now: a key
 /// typed for the question that just left must not answer this one.
 fn show_next_scope_grant(state: &mut crate::state::AppState) {
+    let wait = state.caps.wait_for_presentation;
     state.scope_grant = state.scope_grant_queue.pop_front().map(|mut gate| {
-        gate.shown_at = std::time::Instant::now();
+        gate.restart_arming(wait);
         gate
     });
 }
@@ -2858,7 +2880,8 @@ fn sync_harness_asks(
         if known {
             continue;
         }
-        let gate = crate::state::ScopeGrantGate::from_harness_ask(ask);
+        let mut gate = crate::state::ScopeGrantGate::from_harness_ask(ask);
+        gate.restart_arming(state.caps.wait_for_presentation);
         let request = gate.request.clone();
         if state.scope_grant.is_none() {
             state.scope_grant = Some(gate);
@@ -2905,7 +2928,7 @@ fn take_settled_copies(
 /// Resolve the pending scope-grant prompt: send the decision to the hub, where
 /// the owning instance applies it to its live session (and writes it at the
 /// `always` tier, bound to that session's workspace), and log it.
-fn resolve_scope_grant(
+pub(crate) fn resolve_scope_grant(
     state: &mut crate::state::AppState,
     decision: ahma_common::scope_grant::GrantDecision,
 ) {
@@ -3040,7 +3063,6 @@ fn handle_web_approval_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
 ) -> bool {
-    use ahma_common::web_approval::WebApprovalDecision;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     if state.web_approval.is_none()
@@ -3054,43 +3076,27 @@ fn handle_web_approval_key(
     if scroll_grant_body(key, state) {
         return true;
     }
-    // A granting key typed before the question could be read answers
-    // nothing (SPEC R-PERM.3.5); it is consumed so it lands nowhere else.
-    let armed = state.web_approval.as_ref().is_some_and(|g| g.armed());
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('a' | 's' | 'o'), KeyModifiers::NONE) if !armed => true,
-        (KeyCode::Char('a'), KeyModifiers::NONE) => {
-            // Saving to settings shows the exact line first; the second
-            // press saves it (SPEC R-PERM.3.5).
-            let confirmed = state
-                .web_approval
-                .as_ref()
-                .is_some_and(|g| g.confirm_always);
-            if confirmed {
-                resolve_web_approval(state, WebApprovalDecision::AllowAlways);
-            } else if let Some(gate) = state.web_approval.as_mut() {
-                gate.confirm_always = true;
-            }
-            true
-        }
-        (KeyCode::Char('s'), KeyModifiers::NONE) => {
-            resolve_web_approval(state, WebApprovalDecision::AllowSession);
-            true
-        }
-        // SPEC R-WEB.5 defines three tiers. `AllowOnce` existed in the decision
-        // enum and had a log branch here, but no key ever produced it — one of
-        // the three specified tiers was unreachable, so "I'm not sure yet" had
-        // no answer short of allowing the whole session.
-        (KeyCode::Char('o'), KeyModifiers::NONE) => {
-            resolve_web_approval(state, WebApprovalDecision::AllowOnce);
-            true
-        }
+    // The rules for taking an answer — read first (SPEC R-PERM.3.5), `always`
+    // saved only on a second step, what this session may do — are the
+    // controller's, shared with every other surface. A key it did not take is
+    // still consumed, so it lands nowhere else.
+    let Some(id) = state.web_approval.as_ref().map(|g| g.decision_id.clone()) else {
+        return false;
+    };
+    // SPEC R-WEB.5 defines three tiers: `AllowOnce` once existed in the decision
+    // enum with no key to produce it, so "I'm not sure yet" had no answer short
+    // of allowing the whole session.
+    let answer = match (key.code, key.modifiers) {
+        (KeyCode::Char('a'), KeyModifiers::NONE) => crate::controller::WebAnswer::Always,
+        (KeyCode::Char('s'), KeyModifiers::NONE) => crate::controller::WebAnswer::Session,
+        (KeyCode::Char('o'), KeyModifiers::NONE) => crate::controller::WebAnswer::Once,
         (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
-            resolve_web_approval(state, WebApprovalDecision::Deny);
-            true
+            crate::controller::WebAnswer::Deny
         }
-        _ => false,
-    }
+        _ => return false,
+    };
+    let _ = crate::controller::answer_web_approval(state, &id, answer);
+    true
 }
 
 /// Resolve the pending web-approval prompt: send the decision to the hub (which
@@ -3099,13 +3105,14 @@ fn handle_web_approval_key(
 /// The next waiting web-egress question takes the screen, unread from this
 /// moment (SPEC R-PERM.3.5).
 fn show_next_web_approval(state: &mut crate::state::AppState) {
+    let wait = state.caps.wait_for_presentation;
     state.web_approval = state.web_approval_queue.pop_front().map(|mut gate| {
-        gate.shown_at = std::time::Instant::now();
+        gate.restart_arming(wait);
         gate
     });
 }
 
-fn resolve_web_approval(
+pub(crate) fn resolve_web_approval(
     state: &mut crate::state::AppState,
     decision: ahma_common::web_approval::WebApprovalDecision,
 ) {
@@ -3301,6 +3308,17 @@ fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> 
 /// Dispatch a `/command` string from the navigator.
 fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
     let cmd = cmd.trim();
+    if !state.caps.allows_command(cmd) {
+        push_assistant_message(
+            state,
+            format!(
+                "`{}` is not available here: it changes ahma itself, and this surface only \
+                 answers questions and watches work. Run it in `ahma tui`.",
+                cmd.split_whitespace().next().unwrap_or(cmd)
+            ),
+        );
+        return;
+    }
     if handle_window_nav_commands(cmd, state)
         || handle_basic_nav_command(cmd, state)
         || handle_mcp_nav_command(cmd, state)
@@ -6217,7 +6235,8 @@ fn enqueue_scope_grant(
     if known {
         return;
     }
-    let gate = crate::state::ScopeGrantGate::from_request(request.clone());
+    let mut gate = crate::state::ScopeGrantGate::from_request(request.clone());
+    gate.restart_arming(state.caps.wait_for_presentation);
     if state.scope_grant.is_none() {
         state.scope_grant = Some(gate);
     } else {
@@ -6254,7 +6273,8 @@ fn enqueue_web_approval(
     if known {
         return;
     }
-    let gate = crate::state::WebApprovalGate::from_request(request);
+    let mut gate = crate::state::WebApprovalGate::from_request(request);
+    gate.restart_arming(state.caps.wait_for_presentation);
     if state.web_approval.is_none() {
         state.web_approval = Some(gate);
     } else {
@@ -7949,6 +7969,103 @@ mod tests {
         let status = |id| state.windows.iter().find(|w| w.id == id).unwrap().status;
         assert_eq!(status(first), WindowStatus::Error);
         assert_eq!(status(second), WindowStatus::Cancelled);
+    }
+
+    fn restricted_state() -> AppState {
+        const RULES: &[crate::state::CommandRule] = &[
+            crate::state::CommandRule {
+                head: "/help",
+                refuse_first_arg: &[],
+            },
+            crate::state::CommandRule {
+                head: "/doctor",
+                refuse_first_arg: &["fix"],
+            },
+        ];
+        let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
+        state.surface = ahma_common::hub::Surface::Gui;
+        state.caps = crate::state::Capabilities {
+            host_commands: false,
+            persistent_answers: false,
+            wait_for_presentation: true,
+            commands: crate::state::CommandPolicy::Only(RULES),
+        };
+        state
+    }
+
+    fn last_notice(state: &AppState) -> String {
+        state
+            .chat
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                crate::state::ChatEntry::Assistant { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// `!` runs in the host shell, outside the sandbox, and only a keystroke
+    /// typed at a terminal may start it (SPEC R24.14, R-GUI.9). Text sent from
+    /// a browser reaches the same parser, so the refusal is here, not in the
+    /// page: no window opens and nothing is spawned.
+    #[tokio::test]
+    async fn bang_is_refused_without_the_capability() {
+        let mut state = restricted_state();
+        state.workspace = tempfile::tempdir().unwrap().path().display().to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        state.bridge_tx = Some(tx);
+
+        super::submit_text(&mut state, "!echo escaped".to_string());
+
+        assert!(state.windows.is_empty(), "no window was opened");
+        assert!(rx.try_recv().is_err(), "nothing ran");
+        assert!(last_notice(&state).contains("outside the sandbox"));
+
+        // The terminal still has it.
+        let mut terminal = AppState::new("http://127.0.0.1:9", "HTTP", true);
+        terminal.workspace = state.workspace.clone();
+        super::submit_text(&mut terminal, "!echo ok".to_string());
+        assert_eq!(terminal.windows.len(), 1);
+    }
+
+    /// Anything not named is refused, so a command added later is closed to a
+    /// restricted session until someone opens it.
+    #[test]
+    fn a_restricted_session_runs_only_the_commands_it_names() {
+        let mut state = restricted_state();
+        for refused in [
+            "/setup set tools.timeout_secs 9",
+            "/sync",
+            "/mcp add stdio rm -rf /",
+            "/connect",
+            "/provider add x http://y",
+            "/doctor fix 1",
+            "/agent save a",
+            "/quit",
+            "/exit",
+            "/some-skill do things",
+        ] {
+            state.chat.clear();
+            super::dispatch_nav_command(refused, &mut state);
+            assert!(
+                last_notice(&state).contains("is not available here"),
+                "{refused} must be refused, got: {}",
+                last_notice(&state)
+            );
+        }
+        assert!(!state.should_quit, "/quit must not end the session");
+        for allowed in ["/help", "/doctor", "/doctor how is my setup"] {
+            state.chat.clear();
+            super::dispatch_nav_command(allowed, &mut state);
+            assert!(
+                !last_notice(&state).contains("is not available here"),
+                "{allowed} must run"
+            );
+        }
+        // The terminal's policy is unchanged.
+        assert!(crate::state::Capabilities::terminal().allows_command("/setup set x y"));
     }
 
     /// Before the sandbox locks, `sandbox_status` holds the initial `"UNKNOWN"`.

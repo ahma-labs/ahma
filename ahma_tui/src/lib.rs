@@ -13,6 +13,7 @@ pub mod accordion;
 pub mod agent_config;
 pub mod app;
 pub mod connection;
+pub mod controller;
 pub mod harness_asks;
 pub mod hub_source;
 pub mod intro;

@@ -1512,6 +1512,10 @@ pub struct ScopeGrantGate {
     pub reveal_save_line: bool,
     /// What the last frame showed, published by the renderer.
     pub view: std::cell::Cell<GateView>,
+    /// No surface has shown this question yet, so it cannot be answered, and
+    /// its arming delay has not started (SPEC R-GUI.6). Only a session whose
+    /// surface reports presentation ever sets it.
+    pub awaiting_presentation: bool,
 }
 
 /// How long a grant question must be on screen before a key can grant it.
@@ -1553,6 +1557,23 @@ impl ScopeGrantGate {
             scroll: 0,
             reveal_save_line: false,
             view: Default::default(),
+            awaiting_presentation: false,
+        }
+    }
+
+    /// Start the arming delay again: the question just took the screen. With
+    /// `wait_for_presentation` it starts only once a surface reports it shown.
+    pub fn restart_arming(&mut self, wait_for_presentation: bool) {
+        self.shown_at = std::time::Instant::now();
+        self.awaiting_presentation = wait_for_presentation;
+    }
+
+    /// A surface reports having shown the question: its arming delay starts
+    /// now, the first time only.
+    pub fn presented(&mut self) {
+        if self.awaiting_presentation {
+            self.awaiting_presentation = false;
+            self.shown_at = std::time::Instant::now();
         }
     }
 
@@ -1566,7 +1587,7 @@ impl ScopeGrantGate {
 
     /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).
     pub fn armed(&self) -> bool {
-        self.shown_at.elapsed() >= GRANT_ARMING_DELAY
+        !self.awaiting_presentation && self.shown_at.elapsed() >= GRANT_ARMING_DELAY
     }
 }
 
@@ -1592,6 +1613,8 @@ pub struct WebApprovalGate {
     pub scroll: usize,
     /// What the last frame showed, published by the renderer.
     pub view: std::cell::Cell<GateView>,
+    /// No surface has shown this question yet (see [`ScopeGrantGate`]).
+    pub awaiting_presentation: bool,
 }
 
 impl WebApprovalGate {
@@ -1606,12 +1629,29 @@ impl WebApprovalGate {
             confirm_always: false,
             scroll: 0,
             view: Default::default(),
+            awaiting_presentation: false,
+        }
+    }
+
+    /// Start the arming delay again (see [`ScopeGrantGate::restart_arming`]).
+    pub fn restart_arming(&mut self, wait_for_presentation: bool) {
+        self.shown_at = std::time::Instant::now();
+        self.awaiting_presentation = wait_for_presentation;
+        self.confirm_always = false;
+    }
+
+    /// A surface reports having shown the question (see
+    /// [`ScopeGrantGate::presented`]).
+    pub fn presented(&mut self) {
+        if self.awaiting_presentation {
+            self.awaiting_presentation = false;
+            self.shown_at = std::time::Instant::now();
         }
     }
 
     /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).
     pub fn armed(&self) -> bool {
-        self.shown_at.elapsed() >= GRANT_ARMING_DELAY
+        !self.awaiting_presentation && self.shown_at.elapsed() >= GRANT_ARMING_DELAY
     }
 }
 
@@ -1895,6 +1935,81 @@ impl WindowLine {
     }
 }
 
+/// One slash command a restricted session may run: its head, and the first
+/// arguments that turn it into something it may not.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandRule {
+    pub head: &'static str,
+    /// A first argument that is refused (`/doctor fix`, `/log file`).
+    pub refuse_first_arg: &'static [&'static str],
+}
+
+/// Which slash commands a session may run.
+#[derive(Debug, Clone, Copy)]
+pub enum CommandPolicy {
+    /// Every command the TUI has.
+    All,
+    /// Only these. Anything not named is refused, so a command added later is
+    /// closed to a restricted session until someone opens it.
+    Only(&'static [CommandRule]),
+}
+
+/// What a session's human may make ahma do from this surface (SPEC R-GUI.9).
+///
+/// Enforced where the text is parsed — a `!` or a `/setup` typed into chat
+/// reaches the controller whatever the page offers — not by what the page
+/// shows. The terminal has everything: it is the surface that runs as the
+/// human, outside every sandbox (SPEC R-HUB.9).
+#[derive(Debug, Clone, Copy)]
+pub struct Capabilities {
+    /// `!cmd`, which runs in the host shell, outside the sandbox, and
+    /// `/mcp add stdio`, which stores a command ahma will later spawn. Only a
+    /// keystroke the human typed at a terminal is that (SPEC R24.14).
+    pub host_commands: bool,
+    /// Answers that write settings and outlive the session: `always`, a
+    /// 24-hour lease, always-allow for a tool (SPEC R-GUI.9). A session without
+    /// it can answer once, for the session, or no.
+    pub persistent_answers: bool,
+    /// Whether a question's arming delay starts only when a surface reports
+    /// having shown it (SPEC R-GUI.6), instead of when the question arrived. A
+    /// terminal draws at once, so it needs no report.
+    pub wait_for_presentation: bool,
+    pub commands: CommandPolicy,
+}
+
+impl Capabilities {
+    /// The terminal: everything.
+    pub const fn terminal() -> Self {
+        Self {
+            host_commands: true,
+            persistent_answers: true,
+            wait_for_presentation: false,
+            commands: CommandPolicy::All,
+        }
+    }
+
+    /// Whether `cmd` (a slash command as typed, with its arguments) may run.
+    pub fn allows_command(&self, cmd: &str) -> bool {
+        let CommandPolicy::Only(rules) = self.commands else {
+            return true;
+        };
+        let mut words = cmd.split_whitespace();
+        let Some(head) = words.next() else {
+            return false;
+        };
+        let first_arg = words.next();
+        rules.iter().any(|rule| {
+            rule.head == head && first_arg.is_none_or(|arg| !rule.refuse_first_arg.contains(&arg))
+        })
+    }
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self::terminal()
+    }
+}
+
 /// What runs a command window's work, which decides what may start it (SPEC
 /// R24.14). Only a step of a `#goal` plan is ever started by the step queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1975,6 +2090,8 @@ fn liveness_initial_seed() -> u64 {
 
 /// Top-level application state — owns all panel data and UI mode.
 pub struct AppState {
+    /// What this session may do (SPEC R-GUI.9). The terminal may do everything.
+    pub caps: Capabilities,
     /// The surface this session runs on: who its answers and setting changes
     /// are attributed to (SPEC R-GUI.7). `ahma tui` is the default; `ahma gui`
     /// sets its own.
@@ -2795,6 +2912,7 @@ impl AppState {
 
         Self {
             surface: ahma_common::hub::Surface::default(),
+            caps: Capabilities::terminal(),
             server_url: server_url.into(),
             mcp_http_base_url: String::new(),
             transport_label: transport_label.into(),
