@@ -333,12 +333,17 @@ pub struct ChatHistory {
     entries: VecDeque<ChatEntry>,
     /// Bumped on every mutation; cache-invalidation key for derived render data.
     generation: u64,
+    /// The id of the first entry. An entry keeps its id for as long as it
+    /// exists, however many before it have been evicted, so a surface can tell
+    /// an entry that changed from one that moved (see [`Self::id_at`]).
+    base: u64,
 }
 
 impl ChatHistory {
     pub fn push(&mut self, entry: ChatEntry) {
         if self.entries.len() >= CHAT_HISTORY_CAP {
             self.entries.pop_front();
+            self.base += 1;
         }
         self.entries.push_back(entry);
         self.generation = self.generation.wrapping_add(1);
@@ -354,14 +359,23 @@ impl ChatHistory {
     }
 
     pub fn clear(&mut self) {
+        self.base += self.entries.len() as u64;
         self.entries.clear();
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The id of the entry at `index`: stable while the entry exists, and never
+    /// reused by another.
+    pub fn id_at(&self, index: usize) -> u64 {
+        self.base + index as u64
     }
 
     /// Drop completed entries, keeping only work still in progress: assistant
     /// output that is still streaming and tool calls awaiting a result. Used by
     /// `/clear` so an ongoing turn is not yanked off the screen mid-flight.
     pub fn retain_in_flight(&mut self) {
+        // What stays is renumbered: entries between it and the front went.
+        self.base += self.entries.len() as u64;
         self.entries.retain(|entry| {
             matches!(
                 entry,
@@ -485,6 +499,7 @@ impl ChatHistory {
             _ => user_positions.get(dropped).copied().unwrap_or(0),
         };
         self.entries.drain(..cut);
+        self.base += cut as u64;
         self.generation = self.generation.wrapping_add(1);
         dropped
     }
@@ -1512,6 +1527,10 @@ pub struct ScopeGrantGate {
     pub reveal_save_line: bool,
     /// What the last frame showed, published by the renderer.
     pub view: std::cell::Cell<GateView>,
+    /// No surface has shown this question yet, so it cannot be answered, and
+    /// its arming delay has not started (SPEC R-GUI.6). Only a session whose
+    /// surface reports presentation ever sets it.
+    pub awaiting_presentation: bool,
 }
 
 /// How long a grant question must be on screen before a key can grant it.
@@ -1553,6 +1572,23 @@ impl ScopeGrantGate {
             scroll: 0,
             reveal_save_line: false,
             view: Default::default(),
+            awaiting_presentation: false,
+        }
+    }
+
+    /// Start the arming delay again: the question just took the screen. With
+    /// `wait_for_presentation` it starts only once a surface reports it shown.
+    pub fn restart_arming(&mut self, wait_for_presentation: bool) {
+        self.shown_at = std::time::Instant::now();
+        self.awaiting_presentation = wait_for_presentation;
+    }
+
+    /// A surface reports having shown the question: its arming delay starts
+    /// now, the first time only.
+    pub fn presented(&mut self) {
+        if self.awaiting_presentation {
+            self.awaiting_presentation = false;
+            self.shown_at = std::time::Instant::now();
         }
     }
 
@@ -1566,7 +1602,7 @@ impl ScopeGrantGate {
 
     /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).
     pub fn armed(&self) -> bool {
-        self.shown_at.elapsed() >= GRANT_ARMING_DELAY
+        !self.awaiting_presentation && self.shown_at.elapsed() >= GRANT_ARMING_DELAY
     }
 }
 
@@ -1592,6 +1628,8 @@ pub struct WebApprovalGate {
     pub scroll: usize,
     /// What the last frame showed, published by the renderer.
     pub view: std::cell::Cell<GateView>,
+    /// No surface has shown this question yet (see [`ScopeGrantGate`]).
+    pub awaiting_presentation: bool,
 }
 
 impl WebApprovalGate {
@@ -1606,12 +1644,29 @@ impl WebApprovalGate {
             confirm_always: false,
             scroll: 0,
             view: Default::default(),
+            awaiting_presentation: false,
+        }
+    }
+
+    /// Start the arming delay again (see [`ScopeGrantGate::restart_arming`]).
+    pub fn restart_arming(&mut self, wait_for_presentation: bool) {
+        self.shown_at = std::time::Instant::now();
+        self.awaiting_presentation = wait_for_presentation;
+        self.confirm_always = false;
+    }
+
+    /// A surface reports having shown the question (see
+    /// [`ScopeGrantGate::presented`]).
+    pub fn presented(&mut self) {
+        if self.awaiting_presentation {
+            self.awaiting_presentation = false;
+            self.shown_at = std::time::Instant::now();
         }
     }
 
     /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).
     pub fn armed(&self) -> bool {
-        self.shown_at.elapsed() >= GRANT_ARMING_DELAY
+        !self.awaiting_presentation && self.shown_at.elapsed() >= GRANT_ARMING_DELAY
     }
 }
 
@@ -1895,6 +1950,81 @@ impl WindowLine {
     }
 }
 
+/// One slash command a restricted session may run: its head, and the first
+/// arguments that turn it into something it may not.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandRule {
+    pub head: &'static str,
+    /// A first argument that is refused (`/doctor fix`, `/log file`).
+    pub refuse_first_arg: &'static [&'static str],
+}
+
+/// Which slash commands a session may run.
+#[derive(Debug, Clone, Copy)]
+pub enum CommandPolicy {
+    /// Every command the TUI has.
+    All,
+    /// Only these. Anything not named is refused, so a command added later is
+    /// closed to a restricted session until someone opens it.
+    Only(&'static [CommandRule]),
+}
+
+/// What a session's human may make ahma do from this surface (SPEC R-GUI.9).
+///
+/// Enforced where the text is parsed — a `!` or a `/setup` typed into chat
+/// reaches the controller whatever the page offers — not by what the page
+/// shows. The terminal has everything: it is the surface that runs as the
+/// human, outside every sandbox (SPEC R-HUB.9).
+#[derive(Debug, Clone, Copy)]
+pub struct Capabilities {
+    /// `!cmd`, which runs in the host shell, outside the sandbox, and
+    /// `/mcp add stdio`, which stores a command ahma will later spawn. Only a
+    /// keystroke the human typed at a terminal is that (SPEC R24.14).
+    pub host_commands: bool,
+    /// Answers that write settings and outlive the session: `always`, a
+    /// 24-hour lease, always-allow for a tool (SPEC R-GUI.9). A session without
+    /// it can answer once, for the session, or no.
+    pub persistent_answers: bool,
+    /// Whether a question's arming delay starts only when a surface reports
+    /// having shown it (SPEC R-GUI.6), instead of when the question arrived. A
+    /// terminal draws at once, so it needs no report.
+    pub wait_for_presentation: bool,
+    pub commands: CommandPolicy,
+}
+
+impl Capabilities {
+    /// The terminal: everything.
+    pub const fn terminal() -> Self {
+        Self {
+            host_commands: true,
+            persistent_answers: true,
+            wait_for_presentation: false,
+            commands: CommandPolicy::All,
+        }
+    }
+
+    /// Whether `cmd` (a slash command as typed, with its arguments) may run.
+    pub fn allows_command(&self, cmd: &str) -> bool {
+        let CommandPolicy::Only(rules) = self.commands else {
+            return true;
+        };
+        let mut words = cmd.split_whitespace();
+        let Some(head) = words.next() else {
+            return false;
+        };
+        let first_arg = words.next();
+        rules.iter().any(|rule| {
+            rule.head == head && first_arg.is_none_or(|arg| !rule.refuse_first_arg.contains(&arg))
+        })
+    }
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self::terminal()
+    }
+}
+
 /// What runs a command window's work, which decides what may start it (SPEC
 /// R24.14). Only a step of a `#goal` plan is ever started by the step queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1975,6 +2105,12 @@ fn liveness_initial_seed() -> u64 {
 
 /// Top-level application state — owns all panel data and UI mode.
 pub struct AppState {
+    /// What this session may do (SPEC R-GUI.9). The terminal may do everything.
+    pub caps: Capabilities,
+    /// The surface this session runs on: who its answers and setting changes
+    /// are attributed to (SPEC R-GUI.7). `ahma tui` is the default; `ahma gui`
+    /// sets its own.
+    pub surface: ahma_common::hub::Surface,
     pub windows: Vec<TuiWindow>,
     pub next_window_id: usize,
     /// Set by `/clear`. Operations that had already completed before this
@@ -2790,6 +2926,8 @@ impl AppState {
             .unwrap_or_default();
 
         Self {
+            surface: ahma_common::hub::Surface::default(),
+            caps: Capabilities::terminal(),
             server_url: server_url.into(),
             mcp_http_base_url: String::new(),
             transport_label: transport_label.into(),
@@ -3822,6 +3960,46 @@ enum TreeToggle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A surface reconciles by id: an entry keeps its id while it exists, an
+    /// evicted one takes its id with it, and nothing is ever given another's.
+    #[test]
+    fn a_chat_entry_keeps_its_id_while_it_exists_and_ids_are_never_reused() {
+        let mut chat = ChatHistory::default();
+        for i in 0..3 {
+            chat.push(ChatEntry::Notice {
+                text: format!("n{i}"),
+            });
+        }
+        let ids: Vec<u64> = (0..3).map(|i| chat.id_at(i)).collect();
+        assert_eq!(ids, [0, 1, 2]);
+        chat.push(ChatEntry::Notice { text: "n3".into() });
+        assert_eq!(chat.id_at(0), 0, "appending moves nothing");
+
+        // Fill past the cap: the oldest go, the rest keep their ids.
+        for i in 4..(CHAT_HISTORY_CAP as u64 + 4) {
+            chat.push(ChatEntry::Notice {
+                text: format!("n{i}"),
+            });
+        }
+        let last = chat.len() - 1;
+        assert_eq!(chat.id_at(last), CHAT_HISTORY_CAP as u64 + 3);
+        let survivor = chat.id_at(0);
+        assert!(survivor > 0, "the first entries were evicted");
+        assert_eq!(
+            chat.id_at(1),
+            survivor + 1,
+            "the ones that stayed keep consecutive ids"
+        );
+
+        // Clearing frees no id for reuse.
+        let before = chat.id_at(chat.len() - 1);
+        chat.clear();
+        chat.push(ChatEntry::Notice {
+            text: "after".into(),
+        });
+        assert!(chat.id_at(0) > before, "an id is never reused");
+    }
 
     fn turn_in(phase: TurnPhase, for_secs: u64) -> (ChatTurn, std::time::Instant) {
         let mut turn = ChatTurn::new(None);

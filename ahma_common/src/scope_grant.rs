@@ -468,6 +468,10 @@ pub struct AnsweredQuestion {
     pub request: ScopeGrantRequest,
     /// The answer, already held to what the question offered.
     pub decision: GrantDecision,
+    /// The surface that gave it, so the copies it settles are audited under
+    /// the same one (SPEC R-CFG10.5). Absent: the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
 
 /// Answers held for the hub reporter at most; with no reporter (no hub), the
@@ -737,6 +741,7 @@ impl GrantCoordinator {
         inner.answered.push_back(AnsweredQuestion {
             request: req.clone(),
             decision,
+            surface: None,
         });
         self.answered_signal.notify_one();
 

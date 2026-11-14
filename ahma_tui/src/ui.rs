@@ -6680,6 +6680,7 @@ mod tests {
                 confirm_always: false,
                 scroll: 0,
                 view: Default::default(),
+                awaiting_presentation: false,
             });
             let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
             terminal
@@ -6742,6 +6743,7 @@ mod tests {
             confirm_always: false,
             scroll: 0,
             view: Default::default(),
+            awaiting_presentation: false,
         });
         let (w, h) = (120u16, 40u16);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();

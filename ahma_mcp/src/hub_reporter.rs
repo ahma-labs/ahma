@@ -349,9 +349,9 @@ async fn recv_optional_web(
 /// Persist an approved `always` domain to `~/.ahma/settings.toml`. The session
 /// grant was already applied in-memory by [`WebApprovalCoordinator::resolve`]; this
 /// makes it survive restarts. Best-effort: a write failure is logged, not fatal.
-fn persist_resolved_web_allow(domain: &str) {
+fn persist_resolved_web_allow(domain: &str, surface: &str) {
     match settings_path() {
-        Some(file) => match persist_web_allow(&file, domain, "tui") {
+        Some(file) => match persist_web_allow(&file, domain, surface) {
             Ok(true) => info!(domain, "web approval persisted to [web].always_allow"),
             Ok(false) => info!(domain, "web approval already in [web].always_allow"),
             Err(e) => warn!("hub_reporter: failed to persist web allow for {domain}: {e:#}"),
@@ -828,6 +828,7 @@ async fn handle_incoming(
             decision,
             advice,
             advice_followed,
+            surface,
         } => {
             resolve_scope_grant(
                 decision_id,
@@ -836,6 +837,7 @@ async fn handle_incoming(
                 grant_coordinator,
                 grant_sandbox,
                 (advice, advice_followed),
+                ahma_common::hub::answer_surface(surface.as_deref()),
             )
             .await
         }
@@ -845,7 +847,17 @@ async fn handle_incoming(
         HubMsg::SubmitWebApproval {
             decision_id,
             decision,
-        } => resolve_web_approval(decision_id, decision, writer, web_coordinator).await,
+            surface,
+        } => {
+            resolve_web_approval(
+                decision_id,
+                decision,
+                writer,
+                web_coordinator,
+                ahma_common::hub::answer_surface(surface.as_deref()),
+            )
+            .await
+        }
         other => debug!("hub_reporter: ignored unexpected HubMsg: {:?}", other),
     }
     false
@@ -979,8 +991,12 @@ async fn resolve_scope_grant(
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
     sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
     advice: (Option<String>, Option<bool>),
+    surface: &'static str,
 ) {
-    debug!("hub_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
+    debug!(
+        "hub_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?} \
+         surface={surface}"
+    );
     let Some(coord) = grant_coordinator else {
         return;
     };
@@ -1000,7 +1016,7 @@ async fn resolve_scope_grant(
                 &path,
                 tier,
                 tool.as_deref(),
-                "tui",
+                surface,
                 &decision_id,
                 time_to_decision_ms,
             ) {
@@ -1025,7 +1041,7 @@ async fn resolve_scope_grant(
                 tier,
                 tool,
                 default_granted_by: "scope-grant prompt",
-                surface: "tui",
+                surface,
                 decision_id: &decision_id,
                 time_to_decision_ms,
                 risk_class: None,
@@ -1045,7 +1061,7 @@ async fn resolve_scope_grant(
                     path.display().to_string(),
                     None,
                     ahma_common::permissions::GrantTier::Session,
-                    Some("tui".to_string()),
+                    Some(surface.to_string()),
                 )
                 .with_request(&decision_id, time_to_decision_ms, None)
                 .with_advice(advice.0.clone(), advice.1),
@@ -1055,7 +1071,10 @@ async fn resolve_scope_grant(
     }
     // The answer travels with it, so the hub can settle every other waiting
     // copy of this question (SPEC R-PERM.3.8).
-    let answer = coord.take_answered(&decision_id);
+    let answer = coord.take_answered(&decision_id).map(|mut answered| {
+        answered.surface = Some(surface.to_string());
+        answered
+    });
     let _ = send_msg(
         writer,
         &ClientMsg::ScopeGrantResolved {
@@ -1110,13 +1129,17 @@ async fn resolve_web_approval(
     decision: WebApprovalDecision,
     writer: &mut tokio::io::WriteHalf<HubStream>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
+    surface: &'static str,
 ) {
-    debug!("hub_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}");
+    debug!(
+        "hub_reporter: received SubmitWebApproval id={decision_id} decision={decision:?} \
+         surface={surface}"
+    );
     let Some(coord) = web_coordinator else {
         return;
     };
     match coord.resolve(&decision_id, decision) {
-        WebResolveOutcome::Persist { domain } => persist_resolved_web_allow(&domain),
+        WebResolveOutcome::Persist { domain } => persist_resolved_web_allow(&domain, surface),
         WebResolveOutcome::AllowOnce { .. }
         | WebResolveOutcome::AllowSession { .. }
         | WebResolveOutcome::Denied { .. } => {}
@@ -2654,6 +2677,7 @@ mod tests {
                 decision: GrantDecision::Deny,
                 advice: None,
                 advice_followed: None,
+                surface: None,
             },
         )
         .await
@@ -2678,13 +2702,87 @@ mod tests {
                 decision: GrantDecision::Deny,
                 advice: None,
                 advice_followed: None,
+                surface: None,
             },
         )
         .await
         .expect("send Deny SubmitScopeGrant");
         match read_client_msg(&mut server_reader).await {
-            ClientMsg::ScopeGrantResolved { decision_id, .. } => assert_eq!(decision_id, did),
+            ClientMsg::ScopeGrantResolved {
+                decision_id,
+                answer,
+            } => {
+                assert_eq!(decision_id, did);
+                assert_eq!(
+                    answer.and_then(|a| a.surface).as_deref(),
+                    Some("tui"),
+                    "an answer with no surface came from the TUI (SPEC R-CFG10.5)"
+                );
+            }
             other => panic!("expected ScopeGrantResolved after Deny, got {other:?}"),
+        }
+
+        // ── 6b. The same answer from the GUI is attributed to the GUI, and
+        //        says so to the hub, so the copies it settles are too. ────────
+        let gui_dir = tempfile::tempdir().unwrap();
+        let req = coord
+            .begin(
+                gui_dir.path(),
+                ScopeAccess::Ro,
+                GrantReason::PreExecViolation,
+                Some("cargo".into()),
+            )
+            .expect("begin should mint an in-flight request");
+        let did = req.decision_id.clone();
+        send_msg(
+            &mut server_writer,
+            &HubMsg::SubmitScopeGrant {
+                decision_id: did.clone(),
+                decision: GrantDecision::Deny,
+                advice: None,
+                advice_followed: None,
+                surface: Some("gui".into()),
+            },
+        )
+        .await
+        .expect("send GUI Deny SubmitScopeGrant");
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::ScopeGrantResolved {
+                decision_id,
+                answer,
+            } => {
+                assert_eq!(decision_id, did);
+                assert_eq!(answer.and_then(|a| a.surface).as_deref(), Some("gui"));
+            }
+            other => panic!("expected ScopeGrantResolved after the GUI's Deny, got {other:?}"),
+        }
+        // A surface this build does not know is not trusted into the record.
+        let odd_dir = tempfile::tempdir().unwrap();
+        let req = coord
+            .begin(
+                odd_dir.path(),
+                ScopeAccess::Ro,
+                GrantReason::PreExecViolation,
+                Some("cargo".into()),
+            )
+            .expect("begin should mint an in-flight request");
+        send_msg(
+            &mut server_writer,
+            &HubMsg::SubmitScopeGrant {
+                decision_id: req.decision_id.clone(),
+                decision: GrantDecision::Deny,
+                advice: None,
+                advice_followed: None,
+                surface: Some("<script>".into()),
+            },
+        )
+        .await
+        .expect("send odd-surface SubmitScopeGrant");
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::ScopeGrantResolved { answer, .. } => {
+                assert_eq!(answer.and_then(|a| a.surface).as_deref(), Some("unknown"));
+            }
+            other => panic!("expected ScopeGrantResolved, got {other:?}"),
         }
 
         // ── 7. Emit a Progress event → hub_event_for None → continue. ─────────

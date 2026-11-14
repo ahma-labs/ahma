@@ -13,6 +13,7 @@ pub mod accordion;
 pub mod agent_config;
 pub mod app;
 pub mod connection;
+pub mod controller;
 pub mod harness_asks;
 pub mod hub_source;
 pub mod intro;
@@ -22,6 +23,7 @@ pub mod llm_bridge;
 pub mod markdown;
 pub mod mcp_connections;
 pub mod mcp_source;
+pub mod session;
 pub mod session_config;
 pub mod settings_editor;
 pub mod setup_view;
@@ -78,15 +80,29 @@ pub async fn run_tui(
     token_prefs: TokenPrefs,
     initial_command: Option<String>,
 ) -> Result<()> {
-    // Pre-flight the directory this TUI will answer `roots/list` with, so a
+    let connection = prepare_connection(connect, path.as_deref()).await?;
+    app::run(&connection, profile, path, token_prefs, initial_command).await
+}
+
+/// Find the server a surface will watch, making sure the one per-user hub exists
+/// first: what `ahma tui` and `ahma gui` both do before they show anything, so
+/// they cannot find different servers.
+///
+/// Problems that are not fatal are pushed as startup notices rather than
+/// returned: the human sees them in the first frame (SPEC R7: nothing silent).
+pub async fn prepare_connection(
+    connect: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> Result<connection::ResolvedConnection> {
+    // Pre-flight the directory this surface will answer `roots/list` with, so a
     // typo or a `$HOME` launch is named here rather than surfacing later as a
     // per-session sandbox rejection (SPEC R5.2.4, R5.2.1.1).
-    if let Err(e) = connection::preflight_scope(path.as_deref()) {
+    if let Err(e) = connection::preflight_scope(path) {
         startup_notices::push(startup_notices::Level::Warn, format!("{e:#}"));
     }
 
     if connect.is_none() {
-        // Ensure the one per-user hub exists. The TUI does **not** start a
+        // Ensure the one per-user hub exists. A surface does **not** start a
         // server of its own, and above all does not start one scoped to its
         // launch directory: that used to lock every editor session that
         // arrived afterwards to whichever folder a terminal happened to be in
@@ -110,6 +126,5 @@ pub async fn run_tui(
             }
         }
     }
-    let connection = connection::resolve_connection(connect).await?;
-    app::run(&connection, profile, path, token_prefs, initial_command).await
+    connection::resolve_connection(connect).await
 }

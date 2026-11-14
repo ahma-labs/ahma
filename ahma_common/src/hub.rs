@@ -538,6 +538,10 @@ pub enum ClientMsg {
         /// Whether the answer followed it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advice_followed: Option<bool>,
+        /// The surface the human answered on, for the audit (R-CFG10.5);
+        /// absent from the TUI and from builds that predate the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<String>,
     },
     /// An instance announcing a scope-grant decision is resolved, so the hub can
     /// dismiss the prompt on any other TUI showing the same `decision_id`.
@@ -566,6 +570,9 @@ pub enum ClientMsg {
         decision_id: String,
         decision: crate::web_approval::WebApprovalDecision,
         target_instance_id: Option<String>,
+        /// The surface the human answered on (see `SubmitScopeGrant`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<String>,
     },
     /// An instance announcing a web-approval decision is resolved, so the hub can
     /// dismiss the prompt on any other TUI showing the same `decision_id`.
@@ -626,6 +633,8 @@ pub enum HubMsg {
         advice: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advice_followed: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<String>,
     },
     /// Tell every TUI to dismiss the scope-grant modal for `decision_id` (a twin
     /// surface answered, or the instance withdrew it).
@@ -642,6 +651,8 @@ pub enum HubMsg {
     SubmitWebApproval {
         decision_id: String,
         decision: crate::web_approval::WebApprovalDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<String>,
     },
     /// Tell every TUI to dismiss the web-approval modal for `decision_id` (a twin
     /// surface answered, or the instance withdrew it).
@@ -1075,6 +1086,50 @@ pub async fn hub_token_for(socket: &Path) -> Option<String> {
         Err(_) => None,
     };
     fresh.or_else(|| PRELOADED_TOKENS.lock().get(socket).cloned())
+}
+
+/// The human-facing surface a session runs on (SPEC R-GUI.7): who an answer
+/// or a setting change is attributed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Surface {
+    /// `ahma tui`.
+    #[default]
+    Tui,
+    /// `ahma gui`.
+    Gui,
+}
+
+impl Surface {
+    /// The name an audit record carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Gui => "gui",
+        }
+    }
+
+    /// What an answer sends on the wire: nothing for the TUI, whose bytes do
+    /// not change (SPEC R24.5), its name otherwise.
+    pub fn on_wire(self) -> Option<String> {
+        match self {
+            Self::Tui => None,
+            other => Some(other.as_str().to_string()),
+        }
+    }
+}
+
+/// The audit surface an answer to a question came from (SPEC R-CFG10.5).
+///
+/// An answer with no surface came from the TUI, the only one that existed
+/// before the field. A surface this build does not know is recorded as
+/// `"unknown"`: the wire is authenticated (R-HUB.13), but an audit record is
+/// not the place to trust an arbitrary string.
+pub fn answer_surface(wire: Option<&str>) -> &'static str {
+    match wire {
+        None | Some("tui") => "tui",
+        Some("gui") => "gui",
+        Some(_) => "unknown",
+    }
 }
 
 /// The `Authorization` header value for a request to the hub at `socket`, or
@@ -2545,6 +2600,7 @@ where
             target_instance_id,
             advice,
             advice_followed,
+            surface,
         } => {
             route_decision_to_instance(
                 &hub,
@@ -2555,6 +2611,7 @@ where
                     decision,
                     advice,
                     advice_followed,
+                    surface,
                 },
             )
             .await
@@ -2564,6 +2621,7 @@ where
             decision_id,
             decision,
             target_instance_id,
+            surface,
         } => {
             route_decision_to_instance(
                 &hub,
@@ -2572,6 +2630,7 @@ where
                 HubMsg::SubmitWebApproval {
                     decision_id: decision_id.clone(),
                     decision,
+                    surface,
                 },
             )
             .await
@@ -2754,6 +2813,7 @@ async fn settle_waiting_copies(hub: &Arc<Hub>, answer: &crate::scope_grant::Answ
                 decision: answer.decision,
                 advice: None,
                 advice_followed: None,
+                surface: answer.surface.clone(),
             },
         )
         .await;
@@ -3837,6 +3897,7 @@ mod tests {
                 target_instance_id: Some("inst-1".into()),
                 advice: None,
                 advice_followed: None,
+                surface: None,
             },
             ClientMsg::ScopeGrantResolved {
                 decision_id: "dec-42".into(),
@@ -3856,6 +3917,7 @@ mod tests {
                 decision: GrantDecision::Deny,
                 advice: None,
                 advice_followed: None,
+                surface: None,
             },
             HubMsg::ScopeGrantDismiss {
                 decision_id: "dec-42".into(),
@@ -3887,6 +3949,7 @@ mod tests {
                 decision_id: "web-7".into(),
                 decision: WebApprovalDecision::AllowSession,
                 target_instance_id: Some("inst-1".into()),
+                surface: None,
             },
             ClientMsg::WebApprovalResolved {
                 decision_id: "web-7".into(),
@@ -3903,6 +3966,7 @@ mod tests {
             HubMsg::SubmitWebApproval {
                 decision_id: "web-7".into(),
                 decision: WebApprovalDecision::Deny,
+                surface: None,
             },
             HubMsg::WebApprovalDismiss {
                 decision_id: "web-7".into(),
@@ -4228,6 +4292,7 @@ mod tests {
                 answer: Some(AnsweredQuestion {
                     request: req("qa", "/w/app"),
                     decision: GrantDecision::GrantRwSession,
+                    surface: None,
                 }),
             },
         )
@@ -6108,6 +6173,7 @@ mod tests {
                 target_instance_id: Some(id),
                 advice: None,
                 advice_followed: None,
+                surface: None,
             },
         )
         .await
@@ -6370,6 +6436,7 @@ mod tests {
                 target_instance_id: None,
                 advice: None,
                 advice_followed: None,
+                surface: None,
             },
         )
         .await
@@ -6803,5 +6870,128 @@ mod relay_wire_compat {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod answer_surface_tests {
+    use super::*;
+    use crate::scope_grant::GrantDecision;
+    use crate::web_approval::WebApprovalDecision;
+    use serde_json::json;
+
+    /// A human's answer says which surface it came from, so the audit record
+    /// names it (SPEC R-CFG10.5). The field is additive and absent for the
+    /// TUI, whose bytes must not change (SPEC R24.5).
+    #[test]
+    fn an_answer_names_its_surface_without_changing_the_tuis_bytes() {
+        let from_tui = ClientMsg::SubmitScopeGrant {
+            decision_id: "d1".into(),
+            decision: GrantDecision::Deny,
+            target_instance_id: None,
+            advice: None,
+            advice_followed: None,
+            surface: None,
+        };
+        let value = serde_json::to_value(&from_tui).unwrap();
+        assert!(value.get("surface").is_none(), "{value}");
+
+        let from_gui = ClientMsg::SubmitScopeGrant {
+            decision_id: "d1".into(),
+            decision: GrantDecision::Deny,
+            target_instance_id: None,
+            advice: None,
+            advice_followed: None,
+            surface: Some("gui".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&from_gui).unwrap()["surface"],
+            json!("gui")
+        );
+
+        // An answer from a build that predates the field still reads.
+        let old: ClientMsg = serde_json::from_value(json!({
+            "type": "SubmitScopeGrant",
+            "decision_id": "d1",
+            "decision": serde_json::to_value(GrantDecision::Deny).unwrap(),
+            "target_instance_id": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            ClientMsg::SubmitScopeGrant { surface: None, .. }
+        ));
+
+        // The same for a web approval, in both directions.
+        let web = ClientMsg::SubmitWebApproval {
+            decision_id: "w1".into(),
+            decision: WebApprovalDecision::Deny,
+            target_instance_id: None,
+            surface: Some("gui".into()),
+        };
+        assert_eq!(serde_json::to_value(&web).unwrap()["surface"], json!("gui"));
+        let routed = HubMsg::SubmitWebApproval {
+            decision_id: "w1".into(),
+            decision: WebApprovalDecision::Deny,
+            surface: None,
+        };
+        assert!(
+            serde_json::to_value(&routed)
+                .unwrap()
+                .get("surface")
+                .is_none()
+        );
+    }
+
+    /// What an audit record may say. An answer from a build that sent no
+    /// surface came from the TUI, the only one that existed; anything this
+    /// build does not know is recorded as unknown rather than trusted.
+    #[test]
+    fn only_a_known_surface_is_recorded_and_none_means_the_tui() {
+        assert_eq!(answer_surface(None), "tui");
+        assert_eq!(answer_surface(Some("tui")), "tui");
+        assert_eq!(answer_surface(Some("gui")), "gui");
+        assert_eq!(answer_surface(Some("harness")), "unknown");
+        assert_eq!(answer_surface(Some("<script>")), "unknown");
+        assert_eq!(answer_surface(Some("")), "unknown");
+    }
+
+    #[test]
+    fn a_surface_names_itself_and_only_a_gui_says_so_on_the_wire() {
+        assert_eq!(Surface::Tui.as_str(), "tui");
+        assert_eq!(Surface::Gui.as_str(), "gui");
+        assert_eq!(Surface::Tui.on_wire(), None);
+        assert_eq!(Surface::Gui.on_wire().as_deref(), Some("gui"));
+        assert_eq!(answer_surface(Surface::Gui.on_wire().as_deref()), "gui");
+        assert_eq!(answer_surface(Surface::Tui.on_wire().as_deref()), "tui");
+    }
+
+    /// The hub hands the surface on to the instance that raised the question.
+    #[test]
+    fn the_hub_routes_an_answers_surface_to_the_instance() {
+        let msg = ClientMsg::SubmitWebApproval {
+            decision_id: "w1".into(),
+            decision: WebApprovalDecision::Deny,
+            target_instance_id: None,
+            surface: Some("gui".into()),
+        };
+        let ClientMsg::SubmitWebApproval {
+            decision_id,
+            decision,
+            surface,
+            ..
+        } = msg
+        else {
+            unreachable!()
+        };
+        let routed = HubMsg::SubmitWebApproval {
+            decision_id,
+            decision,
+            surface,
+        };
+        assert_eq!(
+            serde_json::to_value(&routed).unwrap()["surface"],
+            json!("gui")
+        );
     }
 }

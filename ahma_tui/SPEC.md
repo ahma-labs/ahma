@@ -327,6 +327,37 @@ tree. The view must be correct **at startup**, not only for events that happen a
     **never** run by the TUI, whatever its status: the step queue starts only plan steps that
     have not started.
 
+### R-UI: One session, one controller, any surface
+
+`ahma tui` is one surface over a session; the same session can have another (root SPEC R-GUI). What that
+takes is a seam, and these rules keep it.
+
+- **R-UI.1 — A session knows nothing of its surface.** `Session` holds the state of one human's view
+  of ahma and the connections that feed it (the hub, the MCP server, local tasks, ticks). It names no
+  terminal or browser type. A surface implements `Frontend`: it waits for its own raw input, decodes it,
+  applies it to the session, and presents the state. `run_session` is the one loop that joins them — the
+  same ordering, drain bound and tick for every surface — so surfaces differ in what they draw and read,
+  not in how a session behaves.
+- **R-UI.2 — The rules live once, in the controller.** Whether an answer is taken — that the question
+  named is the one on screen, that it was shown and read before a granting answer counts (R-PERM.3.5),
+  that a saving answer waited for the exact line it writes (R-PERM.2), that a session may give it at all
+  (root R-GUI.9) — is decided by `controller::answer_*` and nowhere else. A surface's key handler decodes
+  a key into an `Intent` and calls the controller; it does not repeat a rule. A rule that binds one surface
+  binds all of them.
+- **R-UI.3 — An intent names its target.** An `Intent` carries a decision id, an operation, a section
+  key — never a position or a selection — so it means the same thing whichever surface sent it and
+  whatever that surface had selected, and a question that has gone is `Stale`, not applied to its
+  successor. A `Report` tells the session what a surface showed; it is a fact the rules depend on, not a
+  request, and a report about another question unlocks nothing.
+- **R-UI.4 — Capabilities say what a session may do.** `Capabilities` are enforced where text is parsed
+  (`submit_text`, `dispatch_nav_command`), not by what a surface offers: a `!` or a `/setup` typed into
+  chat reaches the same parser. The terminal has every capability; a restricted session has the commands
+  it is named for and no more, so a command added later is refused until it is opened.
+- **R-UI.5 — Attendance.** A session subscribes to the hub only while a human is attached and leaves when
+  they are not (root R-PERM.3.6, R-GUI.8); `Session::set_attended` is the one place that happens.
+- **R-UI.6 — A chat entry keeps its id while it exists**, and an id is never reused, so a surface can tell
+  an entry that changed from one that moved.
+
 ### R25: Tool-call session reuse (TUI chat)
 
 Chat tool calls from `ahma tui` **must** reuse a single negotiated MCP session rather than
