@@ -26,6 +26,22 @@ impl TestServerInstance {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// The token this server published for its port (SPEC R-HUB.14), read the
+    /// way a client does, waiting briefly for a server on port 0 to write it
+    /// once its bind has picked the port.
+    pub async fn published_token(&self) -> Option<String> {
+        let deadline = std::time::Instant::now() + TestTimeouts::get(TimeoutCategory::Quick);
+        loop {
+            if let Some(token) = ahma_common::hub::serve_http_token_for(self.port).await {
+                return Some(token);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(TestTimeouts::poll_interval()).await;
+        }
+    }
+
     /// Get the port this server is listening on.
     pub fn port(&self) -> u16 {
         self.port
@@ -160,6 +176,18 @@ struct ServerSpec {
     env: Vec<(String, String)>,
 }
 
+/// Whether a test server runs the way an operator starts it, or open.
+///
+/// `ahma serve http` requires a token by default (SPEC R-HUB.14). Nearly every
+/// test here is about the protocol — handshakes, SSE, roots — and sends plain
+/// requests, so they run `Open`, an explicit choice the server discloses.
+/// `serve_http_default_token_test` is the one that runs `Default`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Authentication {
+    Open,
+    Default,
+}
+
 /// Build the argv for a test server.
 ///
 /// `sandbox_scope: None` omits `--sandbox-scope` entirely, putting the bridge in
@@ -168,6 +196,7 @@ fn build_server_spec(
     tools_dir: &Path,
     sandbox_scope: Option<&Path>,
     handshake_timeout_secs: Option<u64>,
+    authentication: Authentication,
 ) -> ServerSpec {
     let mut args = vec![
         "--sync".to_string(),
@@ -190,6 +219,9 @@ fn build_server_spec(
     if let Some(scope) = sandbox_scope {
         args.push("--sandbox-scope".to_string());
         args.push(scope.to_string_lossy().to_string());
+    }
+    if authentication == Authentication::Open {
+        args.push("--allow-unauthenticated".to_string());
     }
 
     // The server's handshake deadline must be as patient as the client's wait.
@@ -475,7 +507,7 @@ pub async fn spawn_test_server() -> Result<TestServerInstance, String> {
 pub async fn spawn_test_server_with_timeout(
     handshake_timeout_secs: Option<u64>,
 ) -> Result<TestServerInstance, String> {
-    spawn_test_server_inner(handshake_timeout_secs, true).await
+    spawn_test_server_inner(handshake_timeout_secs, true, Authentication::Open).await
 }
 
 /// Like [`spawn_test_server`] but in **strict-roots** mode: no `--sandbox-scope`
@@ -483,12 +515,19 @@ pub async fn spawn_test_server_with_timeout(
 /// answer. Required by tests that exercise the roots flow — an explicit
 /// fallback scope is locked without querying roots at all (SPEC R5.2.2).
 pub async fn spawn_test_server_strict_roots() -> Result<TestServerInstance, String> {
-    spawn_test_server_inner(None, false).await
+    spawn_test_server_inner(None, false, Authentication::Open).await
+}
+
+/// A server started the way an operator starts it: no authentication flag, so
+/// it requires the token it publishes (SPEC R-HUB.14).
+pub async fn spawn_test_server_with_default_auth() -> Result<TestServerInstance, String> {
+    spawn_test_server_inner(None, true, Authentication::Default).await
 }
 
 async fn spawn_test_server_inner(
     handshake_timeout_secs: Option<u64>,
     with_fallback_scope: bool,
+    authentication: Authentication,
 ) -> Result<TestServerInstance, String> {
     let binary = resolve_binary_path().map_err(|e| {
         eprintln!("WARNING  {e}");
@@ -499,7 +538,12 @@ async fn spawn_test_server_inner(
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create temp dir: {}", e))?;
     let sandbox_scope = temp_dir.path().to_path_buf();
     let scope_arg = with_fallback_scope.then_some(sandbox_scope.as_path());
-    let spec = build_server_spec(&tools_dir, scope_arg, handshake_timeout_secs);
+    let spec = build_server_spec(
+        &tools_dir,
+        scope_arg,
+        handshake_timeout_secs,
+        authentication,
+    );
 
     eprintln!("[TestServer] Starting test server with dynamic port");
     let (mut child, line_rx) = spawn_server_child(
@@ -569,7 +613,12 @@ pub async fn spawn_server_guard_with_config_extra_env(
         e
     })?;
     let workspace = workspace_dir();
-    let mut spec = build_server_spec(tools_dir, Some(sandbox_scope), handshake_timeout_secs);
+    let mut spec = build_server_spec(
+        tools_dir,
+        Some(sandbox_scope),
+        handshake_timeout_secs,
+        Authentication::Open,
+    );
     let mut filtered_env = Vec::new();
     for (k, v) in extra_env {
         if k == "AHMA_TASK_VAULT" {
@@ -694,7 +743,12 @@ async fn spawn_deferred_sandbox_server(
         e
     })?;
     let workspace = workspace_dir();
-    let mut spec = build_server_spec(tools_dir, fallback.scope_arg(&workspace), None);
+    let mut spec = build_server_spec(
+        tools_dir,
+        fallback.scope_arg(&workspace),
+        None,
+        Authentication::Open,
+    );
 
     // Insert --defer-sandbox before the `serve` subcommand.
     if let Some(pos) = spec.args.iter().position(|a| a == "serve") {

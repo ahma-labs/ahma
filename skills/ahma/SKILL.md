@@ -298,8 +298,8 @@ ahma network revoke <host>                     # remove host from allowlist
 ```bash
 # Start MCP server (stdio / HTTP / Unix socket)
 ahma serve stdio [--tools git,fileutils] [--sandbox] [--log-monitor]
-ahma serve http [--port 3000] [--host 0.0.0.0] [--disable-quic]
-ahma serve unix [--socket-path <path>]   # default: the per-user runtime dir
+ahma serve http [--port 3000] [--host 0.0.0.0] [--disable-quic]   # a token is required (published to a file ahma's clients read); --allow-unauthenticated opts out
+ahma serve unix [--socket-path <path>]   # default: the per-user runtime dir; same token rule
 
 # Tool execution & inspection
 ahma tool run run_terminal_command -- "echo hello"

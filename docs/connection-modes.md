@@ -174,6 +174,14 @@ ahma serve http --sandbox-scope /path/to/your/project
 ahma serve http --port 8080 --host 127.0.0.1
 ```
 
+**Authentication (on by default).** A command running inside ahma's sandbox can reach a loopback port, and a session on this server locks the scope that client's `roots/list` names, so `ahma serve http` makes a token and requires it of every route but `/health` (SPEC R-HUB.14). The token is 64 hex characters in `serve-http-<port>.token` in your runtime directory, readable only by you and outside what a sandboxed command can read; ahma's own clients (`ahma tui --connect`, the proxies) find it themselves. Another client must be given it:
+
+```bash
+curl -H "Authorization: Bearer $(cat ~/.ahma/serve-http-3000.token)" http://127.0.0.1:3000/mcp ...
+```
+
+(`~/.ahma` is the runtime directory unless `XDG_RUNTIME_DIR` is set: then `$XDG_RUNTIME_DIR/ahma`.) To choose the token yourself use `--require-token-path <file>`. To run with none, `--allow-unauthenticated`: ahma says so on every start, because any local process, including a sandboxed command, can then use the server.
+
 | Feature | STDIO Mode | HTTP Mode |
 |---------|-----------|----------|
 | Sandbox scope | Client `roots/list` (or explicit flag) | Per session via `roots/list` (or explicit flag) |
@@ -265,6 +273,8 @@ ahma serve unix --socket-path /run/ahma/mcp.sock
 # Linux abstract socket (@ prefix, no filesystem entry)
 ahma serve unix --socket-path @ahma
 ```
+
+**Authentication (on by default).** A command running inside ahma's sandbox can connect to a Unix socket, so `ahma serve unix` makes a token and requires it of every route but `/health` (SPEC R-HUB.14). It is written beside the socket (`mcp.sock` → `mcp.token`; for an abstract `@name` socket, `abstract-name.token` in the runtime directory), readable only by you, and removed when the server stops. ahma's own clients read it from there and need no configuration; a client that only dials the socket is refused with a 401 until it is given the token. `--require-token-path` chooses your own, and `--allow-unauthenticated` runs without one, disclosed on every start.
 
 ### mcp.json configuration (VS Code)
 

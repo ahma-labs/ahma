@@ -2,6 +2,7 @@
 //!
 //! Contains the different operational modes for the ahma_mcp server.
 
+mod bridge_auth;
 pub mod cli;
 pub mod http_bridge;
 pub mod hub;

@@ -64,8 +64,11 @@ honest gating.
 - **Bearer authentication** is on when a token is configured (`--require-token <token>`,
   `--require-token-path <file>`, or `[auth]` in settings). Every route except `/health`
   then needs `Authorization: Bearer <token>` (scheme case-insensitive); the comparison is
-  constant-time; `SIGHUP` re-reads the token file without a restart. Without a token there
-  is no authentication, and binding a non-loopback address warns loudly.
+  constant-time; `SIGHUP` re-reads the token file without a restart. The library on its own
+  with no token has no authentication, and binding a non-loopback address warns loudly. The
+  commands that start a server — `ahma serve http`, `ahma serve unix` and the per-user hub —
+  never run that way unless the operator says so with `--allow-unauthenticated`: they make a
+  token (root SPEC R-HUB.13, R-HUB.14).
 - **Per-IP rate limiting** (`--rate-limit-rps`, `--rate-limit-burst`) answers excess
   requests with HTTP 429 and `Retry-After`; `/health` is exempt.
 - **Listeners**: TCP (`ahma serve http`), a Unix socket (`ahma serve unix`, `AF_UNIX` on every OS), and

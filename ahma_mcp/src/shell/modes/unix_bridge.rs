@@ -70,7 +70,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
     // Derive a dummy bind_addr (unused when ListenerKind::Unix is set).
     let bind_addr = "127.0.0.1:0".parse().unwrap();
 
-    let bridge_config = BridgeConfig {
+    let mut bridge_config = BridgeConfig {
         bind_addr,
         server_command,
         server_args,
@@ -83,9 +83,11 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         // QUIC is UDP-based and incompatible with Unix sockets.
         enable_quic: false,
         disable_http1_1: false,
-        listener_kind: ListenerKind::Unix(socket_path),
-        require_token: None,
-        require_token_path: None,
+        listener_kind: ListenerKind::Unix(socket_path.clone()),
+        // Set below: a token the operator configured, none if they chose none,
+        // else one this server makes (SPEC R-HUB.14).
+        require_token: config.require_token.clone(),
+        require_token_path: config.require_token_path.clone(),
         rate_limit_rps: 0,
         rate_limit_burst: 10,
         active_sessions: None,
@@ -99,6 +101,14 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         // Session options are a hub feature (SPEC R-HUB.4).
         session_options: None,
     };
+
+    // Held for as long as the server runs: dropping it removes the token file.
+    let _auth = super::bridge_auth::apply(
+        &config,
+        super::bridge_auth::Home::Socket(socket_path.into()),
+        &mut bridge_config,
+    )
+    .await?;
 
     start_bridge(bridge_config).await?;
 
