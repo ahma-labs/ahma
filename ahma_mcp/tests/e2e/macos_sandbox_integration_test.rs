@@ -600,6 +600,133 @@ fn test_container_daemon_sockets_refuse_a_sandboxed_connect() {
     }
 }
 
+/// Kernel test for SPEC R-HUB.13.3: a sandboxed command cannot `connect(2)` to
+/// the hub's socket — in the runtime directory or wherever the hub was told to
+/// listen — and can neither read nor write what is beside it (its token, the
+/// session grants). Without the token a connect gets nothing, but the token is
+/// the second wall; this is the first. The SSH broker's directory, inside the
+/// runtime directory, and an ordinary socket in the workspace stay reachable.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_a_sandboxed_command_cannot_reach_the_hub() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, SshAgentMode, set_ssh_agent_mode};
+    use std::os::unix::net::UnixListener;
+
+    /// Files this test made in the runtime directory, removed however it ends.
+    struct Unlink(Vec<std::path::PathBuf>);
+    impl Drop for Unlink {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    set_ssh_agent_mode(SshAgentMode::Broker);
+    let pid = std::process::id();
+    let scope = TempDir::new().expect("scope dir");
+    let scope_dir = dunce::canonicalize(scope.path()).expect("canonical scope");
+    let elsewhere = TempDir::new().expect("a directory outside the runtime directory");
+    let elsewhere_dir = dunce::canonicalize(elsewhere.path()).expect("canonical dir");
+    let runtime = dunce::canonicalize(ahma_common::hub::runtime_dir().expect("a runtime dir"))
+        .expect("canonical runtime dir");
+    let agent = runtime.join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+
+    // The hub is told to listen outside the runtime directory.
+    let hub_sock = elsewhere_dir.join("hub.sock");
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("AHMA_HUB_SOCK", &hub_sock) };
+    let sockets = [
+        (runtime.join(format!("hubtest{pid}.sock")), false),
+        (hub_sock.clone(), false),
+        (agent.join(format!("hubtest{pid}.sock")), true),
+        (scope_dir.join("app.sock"), true),
+    ];
+    let mut cleanup = Unlink(vec![]);
+    let mut listeners = Vec::new();
+    for (sock, _) in &sockets {
+        cleanup.0.push(sock.clone());
+        let listener = UnixListener::bind(sock).expect("bind test socket");
+        let accepting = listener.try_clone().unwrap();
+        std::thread::spawn(move || for _ in accepting.incoming() {});
+        listeners.push(listener);
+    }
+    // What a hub keeps beside its socket.
+    let secrets = [
+        runtime.join(format!("hubtest{pid}.txt")),
+        ahma_common::hub::token_path_for(&hub_sock),
+    ];
+    for secret in &secrets {
+        std::fs::write(secret, "secret").unwrap();
+        cleanup.0.push(secret.clone());
+    }
+
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        true,  // no_temp_files
+        false, // livelog
+        false, // tmp_access
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+
+    let run = |sandboxed: bool, program: &str, args: &[&str]| -> bool {
+        let mut cmd = if sandboxed {
+            let mut c = Command::new("sandbox-exec");
+            c.args(["-p", &profile, program]);
+            c
+        } else {
+            Command::new(program)
+        };
+        cmd.args(args)
+            .current_dir(scope.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run command")
+            .status
+            .success()
+    };
+    for (sock, reachable) in &sockets {
+        let path = sock.to_string_lossy();
+        assert!(
+            run(false, "/usr/bin/nc", &["-U", &path]),
+            "{}: the control connect failed",
+            sock.display()
+        );
+        assert_eq!(
+            run(true, "/usr/bin/nc", &["-U", &path]),
+            *reachable,
+            "{}: sandboxed connect expected reachable={reachable}\n{profile}",
+            sock.display()
+        );
+    }
+    for secret in &secrets {
+        let path = secret.to_string_lossy();
+        assert!(
+            run(false, "/bin/cat", &[&path]),
+            "{}: the control read failed",
+            secret.display()
+        );
+        assert!(
+            !run(true, "/bin/cat", &[&path]),
+            "{}: a sandboxed command read what the hub keeps",
+            secret.display()
+        );
+    }
+    // Nor can it write there: a session grant written to the runtime
+    // directory would answer a question for the human.
+    let planted = runtime.join(format!("hubtest{pid}.planted"));
+    cleanup.0.push(planted.clone());
+    assert!(
+        !run(true, "/usr/bin/touch", &[&planted.to_string_lossy()]),
+        "a sandboxed command wrote into the runtime directory"
+    );
+    assert!(!planted.exists());
+}
+
 /// Kernel test for the SSH key broker's socket (SPEC R-CRED.1): a sandboxed
 /// command reaches a broker socket in ahma's agent directory — inside the
 /// runtime directory the profile otherwise denies — and lists the key the

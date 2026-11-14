@@ -114,7 +114,10 @@ tree. The view must be correct **at startup**, not only for events that happen a
   `started_epoch_ms`, `ended_epoch_ms`, `partial`, `interrupted`, `unsandboxed` on `HubEvent`;
   `client`, `session_id`, `client_pid`, `ended_epoch_ms` on `Register`/`InstanceInfo`), or a
   new message type that an older reader skips — never a renamed or removed field or message.
-  Mixed-version hub / instance / TUI combinations keep interoperating. The MCP client identity
+  Mixed-version hub / instance / TUI combinations keep interoperating, with one exception:
+  the hub's token (root SPEC R-HUB.13) is a header on the connection's upgrade request, not a
+  field of any message, so the NDJSON bytes are unchanged; a client that predates it is
+  refused and told to restart. The MCP client identity
   (`clientInfo.name`, learned at `initialize` — after hub registration) is conveyed by the
   reporter **reconnecting and re-registering** (reconnect-to-relabel), which also re-replays
   state, not by an `UpdateInstance` message.

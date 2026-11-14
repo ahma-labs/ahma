@@ -852,6 +852,9 @@ fn check_trust(settings: &AhmaSettings, workspace: &Path, out: &mut Vec<Finding>
 pub enum HubStatus {
     /// Nothing answers on its socket.
     NotRunning,
+    /// Something may be there, but this process is not allowed to connect: a
+    /// sandbox keeps its commands away from the hub (SPEC R-HUB.13.3).
+    Unreachable,
     /// It answers; `version` is its `/health` version (`semver+build_id`), if
     /// it gave a readable one.
     Running { version: Option<String> },
@@ -870,20 +873,27 @@ pub async fn probe_hub(socket: &Path) -> HubStatus {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let exchange = async {
-        let mut stream = crate::local_socket::LocalStream::connect(socket)
-            .await
-            .ok()?;
+        let mut stream = match crate::local_socket::LocalStream::connect(socket).await {
+            Ok(stream) => stream,
+            // Refused by the OS, not absent: a sandbox's rule, or a directory
+            // this process may not enter.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return HubStatus::Unreachable;
+            }
+            Err(_) => return HubStatus::NotRunning,
+        };
         let mut reply = Vec::new();
         let answered = stream
             .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
             .await
             .is_ok()
             && stream.read_to_end(&mut reply).await.is_ok();
-        Some(answered.then_some(reply).and_then(|r| health_version(&r)))
+        HubStatus::Running {
+            version: answered.then_some(reply).and_then(|r| health_version(&r)),
+        }
     };
     match tokio::time::timeout(HUB_PROBE_TIMEOUT, exchange).await {
-        Ok(Some(version)) => HubStatus::Running { version },
-        Ok(None) => HubStatus::NotRunning,
+        Ok(status) => status,
         // Connected, then said nothing in time.
         Err(_) => HubStatus::Running { version: None },
     }
@@ -951,6 +961,15 @@ fn check_hub(input: &DoctorInput, out: &mut Vec<Finding>) {
             level: Level::Info,
             title: "Hub is not running".into(),
             detail: "It starts by itself when needed.".into(),
+            fix: None,
+        },
+        HubStatus::Unreachable => Finding {
+            level: Level::Info,
+            title: "Hub is out of reach".into(),
+            detail: "This process may not connect to the hub's socket. Inside a sandbox \
+                     that is deliberate: a command cannot reach the hub (R-HUB.13). Run \
+                     the doctor from a terminal outside it to see the hub."
+                .into(),
             fix: None,
         },
     };
@@ -1770,6 +1789,40 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
         let absent = hub_finding(HubStatus::NotRunning);
         assert_eq!(absent.title, "Hub is not running");
         assert_eq!(absent.level, Level::Info);
+    }
+
+    /// A hub this process is not allowed to reach is not a hub that is not
+    /// there. Inside a sandbox the socket's directory is out of bounds (SPEC
+    /// R-HUB.13.3), and "not running — it starts by itself" would send the
+    /// reader after the wrong problem.
+    #[cfg(unix)] // Needs Unix file modes to make the socket unreachable.
+    #[tokio::test]
+    async fn a_hub_the_process_may_not_reach_is_not_reported_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let socket = run.join("hub.sock");
+        let _listener = crate::local_socket::LocalListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let reachable = std::fs::metadata(&socket).is_ok();
+        let status = probe_hub(&socket).await;
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if reachable {
+            // Running as root: modes do not stop a connect, so there is
+            // nothing to observe.
+            return;
+        }
+        assert_eq!(status, HubStatus::Unreachable);
+
+        let out_of_reach = hub_finding(HubStatus::Unreachable);
+        assert_eq!(out_of_reach.title, "Hub is out of reach");
+        assert!(
+            out_of_reach.detail.contains("sandbox")
+                && !out_of_reach.detail.contains("starts by itself"),
+            "{}",
+            out_of_reach.detail
+        );
     }
 
     /// Answer one `/health` request on `socket` with `body`.

@@ -61,6 +61,7 @@ owned by someone else or reachable by group or others. It holds:
 |---|---|
 | `hub.lock` | The mutex: whoever holds it is the hub. A kernel lock, so it is released the moment its holder dies, and nothing is left to clean up after a crash. |
 | `hub.sock` | The one socket: the MCP endpoint editors proxy to, and the event stream (instances, operations and approvals). Only the lock holder binds or removes it. `0600`. |
+| `hub.token` | The secret every client must present (see below). `0600`, new each time a hub starts, removed when it stops. |
 | `history.jsonl` | The last hour of operations, so recent work survives a restart. `0600`. |
 
 Both halves share the socket. `/mcp` and `/health` are ordinary HTTP; the
@@ -87,6 +88,36 @@ rather than mode bits. The hub opens no TCP port on any OS. Tokio cannot drive
 `AF_UNIX` sockets on Windows, so each connection is served by two threads; closing a
 connection still closes its socket at once, after the last reply and its end-of-stream
 have been sent, even when the other side never answers (SPEC R-HUB.2).
+
+## Who may connect
+
+The `0700` directory and the `0600` socket keep other users out. They do not
+keep out your own *sandboxed commands*: a command an agent runs is your user, and
+a unix-socket `connect` is not something a file permission can refuse. Left
+open, one could ask the hub for a session with `no_sandbox`, answer a waiting
+permission question itself, or stop the hub.
+
+So the hub authenticates every connection (SPEC R-HUB.13). Each request — `/mcp`,
+`/restart`, the event stream — carries `Authorization: Bearer <token>`, where the
+token is the 64-character secret the hub wrote to `hub.token` when it started.
+Only `/health` is open. Your editors, `ahma tui`, hooks and session workers read
+the token themselves; you never handle it.
+
+What keeps a command away from it:
+
+| Platform | Connecting to the socket | Reading the token |
+|---|---|---|
+| macOS | Refused by the sandbox profile, for the runtime directory and for a socket you placed elsewhere | Refused: the profile denies the runtime directory (not undoable with `allow_credential_reads`) |
+| Linux | Not refused by the kernel (Landlock cannot mediate it), so a command can connect | Unreadable: the runtime directory is in no sandbox rule, and no grant can cover it |
+| Windows | Not refused | Not protected: there is no filesystem boundary yet |
+
+On Linux, then, the token is the only barrier, and on Windows it is a barrier
+only once a filesystem boundary exists. Inside an outer sandbox that ahma defers
+to (macOS cannot nest one), the outer sandbox decides. `ahma doctor` run from
+inside a sandbox says the hub is *out of reach*, not that it is not running.
+
+An `ahma` window or `ahma tui` that was already running when you upgraded does not
+have the token and is told to restart. Nothing else changes.
 
 ## Lifetime
 

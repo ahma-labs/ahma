@@ -224,6 +224,9 @@ impl AhmaMcpService {
     fn enforce_committed_scopes(&self) -> bool {
         #[cfg(target_os = "linux")]
         if !self.adapter.sandbox().is_test_mode() {
+            // The ruleset is about to hide the hub's runtime directory from
+            // this process: keep the hub's token first (SPEC R-HUB.13.2).
+            ahma_common::hub::preload_hub_token(&ahma_common::hub::default_socket_path());
             if let Err(e) = crate::sandbox::enforce_landlock_sandbox(
                 &self.adapter.sandbox().scopes(),
                 &self.adapter.sandbox().read_scopes(),

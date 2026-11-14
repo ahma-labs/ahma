@@ -3655,7 +3655,21 @@ fn resolve_task_vault(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Optio
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Read the hub's token ahead of this process restricting itself (SPEC
+/// R-HUB.13.2): from the socket it was told to use, and from the default one
+/// when that differs.
+fn preload_hub_tokens(cfg: &AppConfig) {
+    if !cfg.unix_socket_path.is_empty() {
+        ahma_common::hub::preload_hub_token(std::path::Path::new(&cfg.unix_socket_path));
+    }
+    ahma_common::hub::preload_hub_token(&ahma_common::hub::default_socket_path());
+}
+
 pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::Sandbox>>> {
+    // Before anything here can restrict this process: once its own sandbox
+    // hides the hub's runtime directory, the token read now is the one it
+    // presents (SPEC R-HUB.13.2).
+    preload_hub_tokens(cfg);
     let policy = resolve_sandbox_policy(cfg);
 
     // Rebuilding the policy rather than mutating it keeps this compiling warning-free

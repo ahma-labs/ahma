@@ -35,6 +35,15 @@
 //! Nothing in this module starts a hub. That is one path, in `ahma_mcp`'s
 //! `hub_client`; a hooked command or a session worker only ever connects
 //! (SPEC R-HUB.8).
+//!
+//! ## Who may connect
+//!
+//! The `0700` directory and `0600` socket keep other users out. They do not
+//! keep out the user's own sandboxed commands, which can `connect(2)` to the
+//! socket, so every connection must also present the hub's token (SPEC
+//! R-HUB.13): [`HubToken`], written by the lock holder to
+//! [`token_path_for`]`(socket)`, read by clients through [`hub_token_for`]
+//! and sent as `Authorization: Bearer`. The only exemption is `/health`.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -748,11 +757,26 @@ pub fn runtime_dir() -> Option<PathBuf> {
 /// `~/.ahma`.
 #[cfg(unix)]
 fn runtime_dir_under(xdg: Option<String>) -> Option<PathBuf> {
-    let dir = xdg
-        .filter(|x| !x.is_empty())
+    ensure_runtime_dir(runtime_dir_candidate(xdg)?)
+}
+
+#[cfg(unix)]
+fn runtime_dir_candidate(xdg: Option<String>) -> Option<PathBuf> {
+    xdg.filter(|x| !x.is_empty())
         .map(|xdg| PathBuf::from(xdg).join("ahma"))
-        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
-    ensure_runtime_dir(dir)
+        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))
+}
+
+/// Where [`runtime_dir`] is, without creating it: for a rule that must name
+/// the directory — a grant that may never cover it, a profile that denies it —
+/// and must not make one as a side effect of asking.
+#[cfg(unix)]
+pub fn runtime_dir_location() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    if crate::test_isolation::spawned_under_test_harness() {
+        return Some(crate::config::ahma_home_dir()?.join(".ahma"));
+    }
+    runtime_dir_candidate(std::env::var("XDG_RUNTIME_DIR").ok())
 }
 
 /// Create `dir` (owner-only on Unix) and return it, or say why it cannot be
@@ -802,12 +826,17 @@ mod runtime_dir_creation_tests {
 /// than a mode bit.
 #[cfg(not(unix))]
 pub fn runtime_dir() -> Option<PathBuf> {
-    let dir = std::env::var("LOCALAPPDATA")
+    ensure_runtime_dir(runtime_dir_location()?)
+}
+
+/// Where [`runtime_dir`] is, without creating it (see the Unix version).
+#[cfg(not(unix))]
+pub fn runtime_dir_location() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA")
         .ok()
         .filter(|x| !x.is_empty())
         .map(|local| PathBuf::from(local).join("ahma").join("run"))
-        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))?;
-    ensure_runtime_dir(dir)
+        .or_else(|| crate::config::ahma_home_dir().map(|home| home.join(".ahma")))
 }
 
 /// Refuse a runtime directory another local user can reach (SPEC R-HUB.2).
@@ -897,6 +926,132 @@ pub fn lock_path_for(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The hub's token (SPEC R-HUB.13)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Where the hub at `socket` publishes its token (SPEC R-HUB.13.1): the same
+/// name with a `.token` extension, so `hub.sock` has `hub.token` and a socket
+/// a test or an operator places brings its own — the token follows whatever
+/// socket a client is asked to connect to.
+pub fn token_path_for(socket: &Path) -> PathBuf {
+    socket.with_extension("token")
+}
+
+/// The secret a client must present to use the hub (SPEC R-HUB.13).
+///
+/// Random for every hub, held in memory and in one `0600` file. Never
+/// printed: its `Debug` is redacted, and it is never put in an argument or an
+/// environment variable, which a sandboxed command can read from other
+/// processes.
+#[derive(Clone)]
+pub struct HubToken(String);
+
+impl HubToken {
+    /// A fresh token: two version-4 UUIDs from the operating system's random
+    /// source, as 64 hex characters (244 random bits). Built on `uuid` so no
+    /// further dependency enters the graph for it.
+    pub fn generate() -> Self {
+        Self(format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// The token as it travels in `Authorization: Bearer <token>`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `presented` is this token, compared in constant time. An empty
+    /// string is never a match.
+    pub fn matches(&self, presented: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        !presented.is_empty() && bool::from(self.0.as_bytes().ct_eq(presented.as_bytes()))
+    }
+}
+
+impl std::fmt::Debug for HubToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HubToken(<redacted>)")
+    }
+}
+
+/// Publish `token` at `path`, owner-only and atomically: written to a
+/// private temporary file and renamed over the old one, so a reader sees the
+/// previous hub's token or this one's and never a partial file.
+async fn write_token_file(path: &Path, token: &HubToken) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let written = async {
+        let mut file = options.open(&tmp).await?;
+        file.write_all(token.as_str().as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    written
+}
+
+/// The token of the hub at `socket`, read from beside it; `None` when there
+/// is no readable token file (no hub, an older hub, or a process whose own
+/// sandbox hides it).
+pub fn read_hub_token(socket: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(token_path_for(socket)).ok()?;
+    let token = raw.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Tokens read ahead of a process restricting itself, by socket path.
+static PRELOADED_TOKENS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Read the hub's token now and keep it in memory (SPEC R-HUB.13.2).
+///
+/// A session worker or a hooked command that is about to restrict itself
+/// calls this first: once its own sandbox hides the runtime directory, the
+/// copy it holds is what it presents. A read that finds nothing keeps any
+/// copy already held.
+pub fn preload_hub_token(socket: &Path) {
+    if let Some(token) = read_hub_token(socket) {
+        PRELOADED_TOKENS.lock().insert(socket.to_path_buf(), token);
+    }
+}
+
+/// The token to present to the hub at `socket`: the file beside it, read
+/// fresh so a client follows a hub that restarted, else the copy
+/// [`preload_hub_token`] kept.
+pub async fn hub_token_for(socket: &Path) -> Option<String> {
+    let fresh = match tokio::fs::read_to_string(token_path_for(socket)).await {
+        Ok(raw) => Some(raw.trim().to_string()).filter(|t| !t.is_empty()),
+        Err(_) => None,
+    };
+    fresh.or_else(|| PRELOADED_TOKENS.lock().get(socket).cloned())
+}
+
+/// The `Authorization` header value for a request to the hub at `socket`, or
+/// `None` when there is no token to present (a server that is not a hub, or
+/// one that predates R-HUB.13).
+pub async fn authorization_header_for(socket: &Path) -> Option<String> {
+    hub_token_for(socket)
+        .await
+        .map(|token| format!("Bearer {token}"))
+}
+
 /// The socket an operator-started `ahma serve unix` binds when it is not
 /// given one.
 ///
@@ -959,11 +1114,29 @@ const MAX_UPGRADE_HEAD: usize = 8 * 1024;
 
 /// The request a client sends to switch a fresh connection to the event
 /// stream.
-fn events_upgrade_request() -> String {
+fn events_upgrade_request(token: Option<&str>) -> String {
+    let authorization = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     format!(
         "GET {EVENTS_PATH} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
-         Upgrade: {EVENTS_UPGRADE}\r\n\r\n"
+         Upgrade: {EVENTS_UPGRADE}\r\n{authorization}\r\n"
     )
+}
+
+/// The token a request head presents: the value of its `Authorization:
+/// Bearer` header (the scheme is case-insensitive, RFC 7235 §2.1).
+fn bearer_from_head(head: &str) -> Option<&str> {
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("authorization") {
+            return None;
+        }
+        let (scheme, token) = value.trim().split_once(char::is_whitespace)?;
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then_some(token.trim())
+    })
 }
 
 /// Read an HTTP head — everything up to the blank line — one byte at a time.
@@ -1028,36 +1201,69 @@ fn is_switching_protocols(head: &str) -> bool {
         == Some("101")
 }
 
-/// Switch a fresh connection to the event stream: send the upgrade and wait
-/// for the hub to accept it.
-async fn upgrade_to_events<S>(stream: &mut S) -> Result<()>
+/// How the hub answered an event-stream upgrade that was not a refusal to
+/// host one.
+enum Upgrade {
+    /// `101`: the connection now carries the event stream.
+    Switched,
+    /// `401`: the hub did not accept the token presented, or none.
+    Unauthorized,
+}
+
+/// Switch a fresh connection to the event stream: send the upgrade, with the
+/// token if there is one, and wait for the hub to accept it.
+async fn upgrade_to_events<S>(stream: &mut S, token: Option<&str>) -> Result<Upgrade>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let handshake = async {
         stream
-            .write_all(events_upgrade_request().as_bytes())
+            .write_all(events_upgrade_request(token).as_bytes())
             .await?;
         read_http_head(stream).await
     };
     let head = tokio::time::timeout(UPGRADE_HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| anyhow::anyhow!("the hub did not answer the event-stream upgrade"))??;
-    if !is_switching_protocols(&head) {
-        let status = head.lines().next().unwrap_or_default().to_string();
-        bail!("this server does not host the ahma event stream ({status})");
+    if is_switching_protocols(&head) {
+        return Ok(Upgrade::Switched);
     }
-    Ok(())
+    let status = head.lines().next().unwrap_or_default().to_string();
+    if status.split_whitespace().nth(1) == Some("401") {
+        return Ok(Upgrade::Unauthorized);
+    }
+    bail!("this server does not host the ahma event stream ({status})");
+}
+
+/// What every refusal for a missing or wrong hub token says, so a client that
+/// predates SPEC R-HUB.13 learns what to do rather than only that it failed.
+pub const HUB_UNAUTHORIZED_BODY: &str = "This ahma hub requires its token (SPEC R-HUB.13). \
+    A client that predates hub authentication cannot connect: restart it \
+    (your editor's MCP server, or `ahma tui`).";
+
+fn unauthorized_reply() -> String {
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"ahma-hub\"\r\n\
+         Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        HUB_UNAUTHORIZED_BODY.len(),
+        HUB_UNAUTHORIZED_BODY
+    )
 }
 
 /// Answer an event-stream upgrade on a raw connection: the hub's side of
 /// [`connect_to_hub_at`]'s handshake, for a [`HubServer`] serving its own
 /// socket — and for a test playing the hub.
 ///
-/// Anything else is refused with a status and the connection closed. The
-/// per-user hub does not come through here: its socket is served by the MCP
-/// bridge, whose HTTP server performs the same upgrade.
-pub async fn accept_events_upgrade<S>(stream: &mut S) -> std::result::Result<(), String>
+/// With `expected`, the upgrade must present that token (SPEC R-HUB.13) or it
+/// is refused `401`; `None` accepts any upgrade, for a test playing a hub
+/// that has no token. Anything else is refused with a status and the
+/// connection closed. The per-user hub does not come through here: its socket
+/// is served by the MCP bridge, whose HTTP server performs the same upgrade
+/// behind the same token.
+pub async fn accept_events_upgrade<S>(
+    stream: &mut S,
+    expected: Option<&HubToken>,
+) -> std::result::Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1065,13 +1271,20 @@ where
         .await
         .map_err(|_| "no upgrade request arrived".to_string())?;
     let (reply, outcome) = match head {
-        Ok(head) if is_events_upgrade_request(&head) => (
-            format!(
-                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
-                 Upgrade: {EVENTS_UPGRADE}\r\n\r\n"
-            ),
-            Ok(()),
-        ),
+        Ok(head) if is_events_upgrade_request(&head) => {
+            let presented = bearer_from_head(&head).unwrap_or_default();
+            if expected.is_some_and(|token| !token.matches(presented)) {
+                (unauthorized_reply(), Err("no valid hub token".to_string()))
+            } else {
+                (
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+                         Upgrade: {EVENTS_UPGRADE}\r\n\r\n"
+                    ),
+                    Ok(()),
+                )
+            }
+        }
         Ok(_) => (
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
             Err("a request for something other than the event stream".to_string()),
@@ -1107,9 +1320,27 @@ pub async fn connect_to_hub() -> Result<HubStream> {
 /// Takes the path rather than resolving it so a test can address the hub it
 /// started, and so a diagnostic can address one that is not the default.
 pub async fn connect_to_hub_at(socket_path: &Path) -> Result<HubStream> {
+    let token = hub_token_for(socket_path).await;
     let mut stream = LocalStream::connect(socket_path).await?;
-    upgrade_to_events(&mut stream).await?;
-    Ok(stream)
+    if let Upgrade::Switched = upgrade_to_events(&mut stream, token.as_deref()).await? {
+        return Ok(stream);
+    }
+    // A hub that started between our read and our connect has a new token:
+    // read it once more and try again, on a connection of its own.
+    let fresh = read_hub_token(socket_path).filter(|t| Some(t) != token.as_ref());
+    if let Some(fresh) = fresh {
+        let mut stream = LocalStream::connect(socket_path).await?;
+        if let Upgrade::Switched = upgrade_to_events(&mut stream, Some(&fresh)).await? {
+            return Ok(stream);
+        }
+    }
+    bail!(
+        "the ahma hub refused this client's token ({}): {HUB_UNAUTHORIZED_BODY}",
+        match token {
+            Some(_) => "it did not match",
+            None => "none could be read beside the socket",
+        }
+    );
 }
 
 /// One-shot query of a hub at an explicit socket: connect, ask for the
@@ -1894,6 +2125,9 @@ pub struct HubServer {
     listener: Option<LocalListener>,
     hub: Arc<Hub>,
     socket_path: PathBuf,
+    /// What a client must present (SPEC R-HUB.13), published beside the socket
+    /// by [`HubServer::lock_at`] and removed with it.
+    token: HubToken,
     /// Held for as long as this server exists, unless it is relinquished;
     /// declared last so it is the last thing released. `None` once
     /// [`HubServer::relinquish`] has given the rendezvous up.
@@ -1907,9 +2141,17 @@ pub struct HubServer {
 #[derive(Clone)]
 pub struct HubEvents {
     hub: Arc<Hub>,
+    token: HubToken,
 }
 
 impl HubEvents {
+    /// The token every connection to this hub's socket must present (SPEC
+    /// R-HUB.13). A host that serves more than the event stream on the socket
+    /// requires it of every route but `/health`.
+    pub fn token(&self) -> &HubToken {
+        &self.token
+    }
+
     /// Operations still running in a session worker attached now, by id:
     /// what a draining hub waits for before it goes (SPEC R-HUB.5), and what
     /// an exit interrupts.
@@ -1979,11 +2221,24 @@ impl HubServer {
             return Err(HubBindError::AlreadyRunning);
         }
         crate::fs_lock::remove_stale_socket(&socket_path);
+        // Published before anything can connect, and only by the lock holder
+        // (SPEC R-HUB.13.1). A hub that cannot publish its token must not
+        // serve: its clients could not authenticate, and a socket that
+        // accepts unauthenticated connections is the thing this prevents.
+        let token = HubToken::generate();
+        let token_path = token_path_for(&socket_path);
+        write_token_file(&token_path, &token).await.map_err(|e| {
+            HubBindError::Failed(anyhow::anyhow!(
+                "ahma hub: cannot publish its token at {}: {e}",
+                token_path.display()
+            ))
+        })?;
         let (hub, _) = Hub::new();
         Ok(Self {
             listener: None,
             hub: Arc::new(hub),
             socket_path,
+            token,
             lock: Some(lock),
         })
     }
@@ -1992,6 +2247,7 @@ impl HubServer {
     pub fn events(&self) -> HubEvents {
         HubEvents {
             hub: self.hub.clone(),
+            token: self.token.clone(),
         }
     }
 
@@ -2070,7 +2326,7 @@ impl HubServer {
                 Ok(mut stream) => {
                     let events = self.events();
                     tokio::spawn(async move {
-                        match accept_events_upgrade(&mut stream).await {
+                        match accept_events_upgrade(&mut stream, Some(events.token())).await {
                             Ok(()) => events.serve(stream).await,
                             Err(why) => debug!("hub: refused a connection: {why}"),
                         }
@@ -2088,14 +2344,16 @@ impl HubServer {
 }
 
 impl Drop for HubServer {
-    /// Unlink the socket while the lock is still held (SPEC R-ISO.3): once it
-    /// is released a successor may bind the same path, and removing the file
-    /// after that would remove *its* socket.
+    /// Unlink the socket and its token while the lock is still held (SPEC
+    /// R-ISO.3, R-HUB.13.1): once it is released a successor may bind the same
+    /// path and publish its own token, and removing either file after that
+    /// would remove *its* file.
     ///
     /// A relinquished server owns neither, so it touches nothing.
     fn drop(&mut self) {
         if self.lock.is_some() {
             crate::fs_lock::remove_stale_socket(&self.socket_path);
+            let _ = std::fs::remove_file(token_path_for(&self.socket_path));
         }
     }
 }
@@ -3649,6 +3907,159 @@ mod tests {
         tokio::spawn(async move { server.serve().await });
     }
 
+    // ── R-HUB.13: the hub authenticates every connection ─────────────────────
+
+    /// Ask the hub at `sock` for the event stream by hand, with `authorization`
+    /// as the header value if any, and return the status line it answers.
+    async fn raw_upgrade_status(sock: &std::path::Path, authorization: Option<&str>) -> String {
+        let mut stream = LocalStream::connect(sock).await.expect("connect");
+        let auth = authorization
+            .map(|v| format!("Authorization: {v}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "GET {EVENTS_PATH} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+             Upgrade: {EVENTS_UPGRADE}\r\n{auth}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let head = read_http_head(&mut stream).await.expect("an answer");
+        head.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// The socket's modes keep other users out, not the user's own sandboxed
+    /// commands, which can `connect(2)` to it. Without the hub's token they
+    /// get nothing: no event stream, so no question to read and none to
+    /// answer (SPEC R-HUB.13).
+    #[tokio::test]
+    async fn an_event_stream_upgrade_without_the_token_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+
+        let status = raw_upgrade_status(&sock, None).await;
+        assert!(status.contains(" 401 "), "{status}");
+        assert!(list_instances_at(&sock).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_with_a_wrong_token_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+        let wrong = "0".repeat(64);
+        let status = raw_upgrade_status(&sock, Some(&format!("Bearer {wrong}"))).await;
+        assert!(status.contains(" 401 "), "{status}");
+        let status = raw_upgrade_status(&sock, Some("Bearer ")).await;
+        assert!(status.contains(" 401 "), "{status}");
+    }
+
+    /// A client that holds the token — it reads it beside the socket — is
+    /// served as before.
+    #[tokio::test]
+    async fn a_client_holding_the_token_is_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+
+        let token = read_hub_token(&sock).expect("the hub published its token");
+        let status = raw_upgrade_status(&sock, Some(&format!("bearer {token}"))).await;
+        assert!(
+            status.contains(" 101 "),
+            "scheme is case-insensitive: {status}"
+        );
+
+        let stream = connect_to_hub_at(&sock)
+            .await
+            .expect("connect with the token");
+        let (_r, mut w) = tokio::io::split(stream);
+        send_msg(&mut w, &test_register_msg()).await.unwrap();
+        let deadline = std::time::Instant::now() + TestTimeouts::scale_secs(5);
+        loop {
+            let seen = list_instances_at(&sock).await.map(|i| i.len()).unwrap_or(0);
+            if seen == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the instance never registered"
+            );
+            tokio::time::sleep(TestTimeouts::poll_interval()).await;
+        }
+    }
+
+    /// The token is the lock holder's: written owner-only beside the socket
+    /// before anything can connect, new for every hub, and removed while the
+    /// lock is still held (SPEC R-HUB.13.1). A second starter that loses the
+    /// lock leaves the holder's token alone.
+    #[tokio::test]
+    async fn the_token_belongs_to_the_lock_holder_and_goes_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        let token_file = token_path_for(&sock);
+        assert_eq!(token_file, tmp.path().join("hub.token"));
+
+        let first = HubServer::lock_at(sock.clone()).await.expect("free");
+        let first_token = std::fs::read_to_string(&token_file).expect("written at lock");
+        assert_eq!(first_token.trim().len(), 64, "256 bits, hex");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only");
+        }
+
+        assert!(matches!(
+            HubServer::lock_at(sock.clone()).await,
+            Err(HubBindError::AlreadyRunning)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&token_file).unwrap(),
+            first_token,
+            "a starter that lost the lock wrote nothing"
+        );
+
+        drop(first);
+        assert!(!token_file.exists(), "removed with the hub");
+
+        let second = HubServer::lock_at(sock.clone()).await.expect("free again");
+        let second_token = std::fs::read_to_string(&token_file).unwrap();
+        assert_ne!(first_token, second_token, "a new hub, a new token");
+        drop(second);
+    }
+
+    /// A process that restricts itself reads the token first and keeps it
+    /// (SPEC R-HUB.13.2): once its own sandbox hides the file, the preloaded
+    /// copy is what it presents.
+    #[cfg(unix)] // Needs Unix file modes to make the file unreadable.
+    #[tokio::test]
+    async fn the_preloaded_token_is_used_when_the_file_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hub.sock");
+        start_hub(&sock).await;
+        preload_hub_token(&sock);
+
+        let token_file = token_path_for(&sock);
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&token_file).is_ok() {
+            // Running as root: modes do not stop a read, so there is nothing
+            // to observe.
+            return;
+        }
+        assert!(read_hub_token(&sock).is_none());
+        assert!(hub_token_for(&sock).await.is_some(), "the preloaded copy");
+        assert!(list_instances_at(&sock).await.is_ok(), "and it is accepted");
+    }
+
+    #[test]
+    fn the_token_is_redacted_in_debug() {
+        let token = HubToken::generate();
+        let shown = format!("{token:?}");
+        assert!(!shown.contains(token.as_str()), "{shown}");
+        assert!(token.matches(token.as_str()));
+        assert!(!token.matches(""));
+        assert!(!token.matches(&"f".repeat(64)));
+    }
+
     fn test_register_msg() -> ClientMsg {
         ClientMsg::Register {
             pid: std::process::id(),
@@ -4419,7 +4830,9 @@ mod tests {
         let events = hub.events();
         let hosting = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
-            accept_events_upgrade(&mut stream).await.unwrap();
+            accept_events_upgrade(&mut stream, Some(events.token()))
+                .await
+                .unwrap();
             events.serve(stream).await;
         });
         assert!(list_instances_at(&sock).await.unwrap().is_empty());
@@ -4458,7 +4871,19 @@ mod tests {
 
     #[test]
     fn the_upgrade_handshake_recognises_its_own_request_and_reply() {
-        assert!(is_events_upgrade_request(&events_upgrade_request()));
+        assert!(is_events_upgrade_request(&events_upgrade_request(None)));
+        let with_token = events_upgrade_request(Some("t0k"));
+        assert!(is_events_upgrade_request(&with_token));
+        assert_eq!(bearer_from_head(&with_token), Some("t0k"));
+        assert_eq!(
+            bearer_from_head("GET / HTTP/1.1\r\nAUTHORIZATION: BEARER  x \r\n\r\n"),
+            Some("x")
+        );
+        assert_eq!(
+            bearer_from_head("GET / HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n"),
+            None
+        );
+        assert_eq!(bearer_from_head(&events_upgrade_request(None)), None);
         assert!(is_events_upgrade_request(
             "GET /events HTTP/1.1\r\nupgrade:  AHMA-HUB \r\n\r\n"
         ));
@@ -4816,7 +5241,10 @@ mod tests {
         }
         // A worker that disconnected with an operation still marked running.
         hub.record_op_event("gone", &started_ev("gone-op")).await;
-        let events = HubEvents { hub: Arc::new(hub) };
+        let events = HubEvents {
+            hub: Arc::new(hub),
+            token: HubToken::generate(),
+        };
         assert_eq!(
             events.operations_in_flight().await,
             vec!["w1-op".to_string()]

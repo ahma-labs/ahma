@@ -538,8 +538,13 @@ pub async fn trigger_uds_restart_with_mode(path: &str, mode: Option<&str>) -> bo
         Some(mode) => format!("/restart?mode={mode}"),
         None => "/restart".to_string(),
     };
+    // The hub's socket requires the hub's token (SPEC R-HUB.13).
+    let authorization = ahma_common::hub::authorization_header_for(std::path::Path::new(path))
+        .await
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "POST {target} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        "POST {target} HTTP/1.0\r\nHost: localhost\r\n{authorization}Connection: close\r\nContent-Length: 0\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).await.is_err() {
         return false;

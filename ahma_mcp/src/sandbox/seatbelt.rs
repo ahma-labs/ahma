@@ -103,6 +103,9 @@ impl Sandbox {
         // so a command reaches it only through the broker. After the network
         // rules; the broker's sockets are let back in by `broker_rules`.
         let agent_connect_denies = super::ssh_agent::seatbelt_agent_connect_denies();
+        // SPEC R-HUB.13.3: the hub trusts whoever holds its token, so a command
+        // reaches neither its socket nor the directory that holds the token.
+        let hub_denies = hub_rendezvous_denies();
         let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
 
         // SPEC R6.2.6: signals stay inside this command's own sandbox unless
@@ -130,7 +133,7 @@ impl Sandbox {
 (allow pseudo-tty)
 (allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
 (allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
-{exec_config_deny_rules}{network_rules}{socket_connect_denies}{agent_connect_denies}(allow mach-lookup)
+{exec_config_deny_rules}{network_rules}{socket_connect_denies}{agent_connect_denies}{hub_denies}(allow mach-lookup)
 (allow ipc-posix-shm*)
 {broker_rules}"#,
             working_dir = wd_str,
@@ -148,6 +151,7 @@ impl Sandbox {
             exec_config_deny_rules = exec_config_deny_rules,
             network_rules = network_rules,
             socket_connect_denies = socket_connect_denies,
+            hub_denies = hub_denies,
             agent_connect_denies = agent_connect_denies,
             broker_rules = broker_rules(),
         );
@@ -582,6 +586,62 @@ fn container_socket_connect_denies(home: &Path) -> String {
         rules.push_str(&format!(
             "(deny network-outbound (remote unix-socket (path-regex #\"{re}\")))\n"
         ));
+    }
+    rules
+}
+
+/// What keeps a command out of the hub (SPEC R-HUB.13.3). A `connect(2)` to a
+/// unix socket is a `network-outbound` operation, which `(allow network*)`
+/// permits and a file deny does not touch, so the hub's socket gets a connect
+/// deny; and the directory that holds it and its token, with the session
+/// grants and questions beside them, is denied for reading and writing. Not
+/// subject to `allow_credential_reads`: the token and the grants are
+/// authority, not a credential a user may choose to share.
+///
+/// Emitted after every allow a scope, a temp root or the network adds, and
+/// before the broker's rules, which re-open the broker's directory inside it.
+fn hub_rendezvous_denies() -> String {
+    hub_rendezvous_denies_for(
+        ahma_common::hub::runtime_dir().as_deref(),
+        &ahma_common::hub::default_socket_path(),
+    )
+}
+
+/// [`hub_rendezvous_denies`] for a given runtime directory and hub socket.
+fn hub_rendezvous_denies_for(runtime_dir: Option<&Path>, socket: &Path) -> String {
+    let mut rules = String::new();
+    // Both spellings: the kernel matches the canonical path, and a raw one
+    // covers a parent that does not resolve.
+    let spellings = |path: &Path| -> Vec<PathBuf> {
+        let mut out = vec![path.to_path_buf()];
+        let canonical = dunce::canonicalize(path).ok().or_else(|| {
+            let parent = dunce::canonicalize(path.parent()?).ok()?;
+            Some(parent.join(path.file_name()?))
+        });
+        if let Some(canonical) = canonical.filter(|c| c != path) {
+            out.push(canonical);
+        }
+        out
+    };
+    let dirs: Vec<PathBuf> = runtime_dir.map(&spellings).unwrap_or_default();
+    for dir in &dirs {
+        rules.push_str(&format!(
+            "(deny network-outbound (remote unix-socket (subpath \"{0}\")))\n\
+             (deny file-read* file-write* (subpath \"{0}\"))\n",
+            dir.display()
+        ));
+    }
+    // A socket the operator placed elsewhere brings its own token beside it.
+    if !dirs.iter().any(|dir| socket.starts_with(dir)) {
+        for sock in spellings(socket) {
+            rules.push_str(&format!(
+                "(deny network-outbound (remote unix-socket (path-literal \"{0}\")))\n\
+                 (deny file-read* file-write* (literal \"{0}\"))\n\
+                 (deny file-read* file-write* (literal \"{1}\"))\n",
+                sock.display(),
+                ahma_common::hub::token_path_for(&sock).display()
+            ));
+        }
     }
     rules
 }
@@ -1108,6 +1168,71 @@ mod tests {
             "(allow network-outbound (remote unix-socket (subpath \"{}\")))",
             dir.display()
         ))
+    }
+
+    /// SPEC R-HUB.13.3: a command cannot connect to the hub's socket, nor read
+    /// or write the directory that holds it and its token — whether the hub is
+    /// in the runtime directory or a socket was placed elsewhere. The denies
+    /// follow every allow a scope or the network could add, and the SSH
+    /// broker's directory inside the runtime directory is let back in after
+    /// them (SBPL is last-match-wins). The kernel test is
+    /// `test_a_sandboxed_command_cannot_reach_the_hub`.
+    #[test]
+    fn the_hub_rendezvous_is_denied_and_the_broker_let_back_in_after() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode, set_upstream_agent};
+        set_ssh_agent_mode(SshAgentMode::Broker);
+        let (dir, sb, _) = agent_rule_fixture();
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+
+        let runtime = ahma_common::hub::runtime_dir().expect("a runtime dir");
+        let canonical = dunce::canonicalize(&runtime).unwrap_or_else(|_| runtime.clone());
+        let network_allow = p.find("(allow network*)").expect("network allow");
+        let broker_allow = p
+            .find(&broker_connect_allow().expect("a runtime dir"))
+            .unwrap_or_else(|| panic!("broker allow missing:\n{p}"));
+        for dir in [&runtime, &canonical] {
+            for rule in [
+                format!(
+                    "(deny network-outbound (remote unix-socket (subpath \"{}\")))",
+                    dir.display()
+                ),
+                format!(
+                    "(deny file-read* file-write* (subpath \"{}\"))",
+                    dir.display()
+                ),
+            ] {
+                let at = p
+                    .find(&rule)
+                    .unwrap_or_else(|| panic!("{rule} missing:\n{p}"));
+                assert!(at > network_allow, "{rule} must follow the network allow");
+                assert!(at < broker_allow, "{rule} must precede the broker allow");
+            }
+        }
+
+        // A hub socket outside the runtime directory is denied by name, with
+        // its token file.
+        let socket = std::env::temp_dir().join("hub-elsewhere.sock");
+        let rules = super::hub_rendezvous_denies_for(Some(&runtime), &socket);
+        for rule in [
+            format!(
+                "(deny network-outbound (remote unix-socket (path-literal \"{}\")))",
+                socket.display()
+            ),
+            format!(
+                "(deny file-read* file-write* (literal \"{}\"))",
+                socket.display()
+            ),
+            format!(
+                "(deny file-read* file-write* (literal \"{}\"))",
+                ahma_common::hub::token_path_for(&socket).display()
+            ),
+        ] {
+            assert!(rules.contains(&rule), "{rule} missing:\n{rules}");
+        }
+        // One inside the runtime directory needs nothing more than the directory.
+        let inside = super::hub_rendezvous_denies_for(Some(&runtime), &runtime.join("hub.sock"));
+        assert!(!inside.contains("path-literal"), "{inside}");
+        set_upstream_agent(None).unwrap();
     }
 
     /// SPEC R-CRED.11, `"broker"`: a command cannot connect to the human's own

@@ -90,6 +90,10 @@ What keeps secrets unreadable on macOS is therefore an explicit **denylist**, no
 
 > **A denylist is a weaker guarantee than a scope, and is worth reading as one.** A scope denies everything it does not name; a denylist denies only what it *does* name, so any secret nobody thought to enumerate is readable. It is the best available answer on this platform — not an equivalent of the Linux position above.
 
+#### The hub is out of bounds
+
+A sandboxed command is your user, so it could otherwise `connect` to ahma's own hub socket and ask the hub for a session without the sandbox. The profile therefore denies connecting to the hub's socket and reading or writing the directory that holds it and its token, for the runtime directory and for a socket you placed elsewhere; the SSH key broker's `agent/` directory inside it is let back in. These rules are not subject to `allow_credential_reads`, and no grant can cover the directory. The hub also requires its token on every request but `/health`, which is the barrier on Linux, where the kernel cannot refuse the connect (SPEC R-HUB.13; [the hub](hub.md#who-may-connect)).
+
 #### Git authentication: SSH through the key broker, or HTTPS through a credential helper
 
 Private keys in `~/.ssh`, whatever they are named, are unreadable inside the sandbox, by design, and no grant can change that. ssh can still use a key without reading it: a sandboxed command's `$SSH_AUTH_SOCK` is ahma's [SSH key broker](ssh-agent-broker.md), which signs for a server once a human allows that key for it, with an unencrypted ed25519 key file itself and with a passphrase-protected, RSA, ECDSA or security key only through your own agent (load it on the host with `ssh-add <key>`, once per login). A new host key is added by connecting once from your own terminal. HTTPS works too: git's credential helper (for example `git-credential-osxkeychain`, or `gh auth setup-git`) reads the keychain, which the sandbox allows. ahma says this, in the same words, both when a command is refused a key file and when ssh reports `Permission denied (publickey)`.

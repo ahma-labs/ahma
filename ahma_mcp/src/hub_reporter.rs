@@ -2221,7 +2221,7 @@ mod tests {
             .await
             .expect("timed out waiting for the reporter to connect")
             .expect("accept failed");
-        ahma_common::hub::accept_events_upgrade(&mut stream)
+        ahma_common::hub::accept_events_upgrade(&mut stream, None)
             .await
             .expect("the reporter asks for the event stream (SPEC R-HUB.2)");
         let (read_half, write_half) = tokio::io::split(stream);

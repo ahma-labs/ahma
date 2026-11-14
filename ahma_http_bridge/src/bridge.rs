@@ -629,13 +629,20 @@ async fn bearer_auth_middleware(
         }
         _ => {
             debug!("Request rejected: missing or invalid bearer token");
+            // The hub's clients that predate its token need to be told to
+            // restart, not just that they were refused (SPEC R-HUB.13.4).
+            let body = if state.hub_events.is_some() {
+                ahma_common::hub::HUB_UNAUTHORIZED_BODY
+            } else {
+                "Unauthorized"
+            };
             (
                 StatusCode::UNAUTHORIZED,
                 [(
                     axum::http::header::WWW_AUTHENTICATE,
                     BEARER_WWW_AUTHENTICATE,
                 )],
-                "Unauthorized",
+                body,
             )
                 .into_response()
         }
@@ -786,9 +793,17 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
     }
     session_manager.start_sweeper();
     session_manager.start_liveness_prober();
+    // A bridge that serves a hub's socket requires that hub's token of every
+    // route but `/health` — `/mcp`, `/restart` and `/events` alike (SPEC
+    // R-HUB.13). It is not configurable: an operator token cannot replace it,
+    // because the hub's own clients present the hub's (R-HUB.4).
+    let require_token = match &config.hub_events {
+        Some(events) => Some(events.token().as_str().to_owned()),
+        None => config.require_token.clone(),
+    };
     Arc::new(BridgeState {
         session_manager,
-        require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
+        require_token: ArcSwapOption::new(require_token.map(Arc::new)),
         listener_kind: config.listener_kind.clone(),
         exit: config.exit.clone(),
         hub_events: config.hub_events.clone(),
@@ -1585,8 +1600,10 @@ async fn handle_hub_events(
 /// sits behind the bearer-auth and rate-limit layers (unlike `/health`), it
 /// validates `Origin` like every MCP route, and — because the default local
 /// deployment has no bearer token — the TCP peer must be a loopback address.
-/// Unix-socket listeners inject no `ConnectInfo`; filesystem permissions on
-/// the socket are the equivalent gate there.
+/// Unix-socket listeners inject no `ConnectInfo`. On the hub's socket the
+/// hub's token is the gate (SPEC R-HUB.13): the socket's modes keep other
+/// users out, not the user's own sandboxed commands. A socket that is not a
+/// hub's is protected by its modes alone.
 async fn handle_restart(
     State(state): State<Arc<BridgeState>>,
     request: axum::extract::Request,
@@ -3268,6 +3285,90 @@ for line in sys.stdin:
         .unwrap();
         assert!(response.starts_with("HTTP/1.0 200"), "{response}");
         assert!(response.contains("\"version\""), "{response}");
+        bridge.abort();
+    }
+
+    /// One raw request to the bridge at `path`; the status line of the answer.
+    /// `extra` is header lines, each ending `\r\n`.
+    async fn raw_status(path: &std::path::Path, request_line: &str, extra: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = ahma_common::local_socket::LocalStream::connect(path)
+            .await
+            .expect("connect");
+        let request = format!(
+            "{request_line} HTTP/1.0\r\nHost: localhost\r\n{extra}Content-Length: 0\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        let _ = tokio::time::timeout(
+            TestTimeouts::scale_secs(5),
+            stream.read_to_string(&mut response),
+        )
+        .await;
+        response.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// The hub's socket is reachable by the user's own sandboxed commands, so
+    /// the bridge that serves it requires the hub's token on every route but
+    /// `/health` (SPEC R-HUB.13) — `/mcp`, where a session may ask for
+    /// `no_sandbox` or roots of its choosing, and `/restart` as much as the
+    /// event stream. The requirement is not configurable: the config carries
+    /// no token here.
+    #[tokio::test]
+    async fn a_bridge_hosting_a_hub_requires_its_token_on_every_route_but_health() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("hub.sock");
+        let hub = ahma_common::hub::HubServer::lock_at(path.clone())
+            .await
+            .expect("a free rendezvous");
+        let config = BridgeConfig {
+            listener_kind: ListenerKind::Unix(path.to_string_lossy().into_owned()),
+            enable_quic: false,
+            require_token: None,
+            hub_events: Some(hub.events()),
+            ..BridgeConfig::default()
+        };
+        let bridge = tokio::spawn(start_bridge(config));
+        // Listening, and the event stream works for a client that holds the token.
+        once_listening(&path, || ahma_common::hub::list_instances_at(&path)).await;
+
+        let health = raw_status(&path, "GET /health", "").await;
+        assert!(health.contains(" 200"), "/health stays open: {health}");
+
+        for request_line in [
+            "POST /mcp",
+            "GET /mcp",
+            "DELETE /mcp",
+            "POST /restart",
+            "GET /events",
+        ] {
+            let status = raw_status(&path, request_line, "").await;
+            assert!(
+                status.contains(" 401"),
+                "{request_line} without a token: {status}"
+            );
+            let wrong = format!("Authorization: Bearer {}\r\n", "0".repeat(64));
+            let status = raw_status(&path, request_line, &wrong).await;
+            assert!(
+                status.contains(" 401"),
+                "{request_line} with a wrong token: {status}"
+            );
+        }
+        // An unknown route is refused before it is routed, not answered 404.
+        let status = raw_status(&path, "GET /nope", "").await;
+        assert!(status.contains(" 401"), "{status}");
+
+        // With the token the route is reached: it answers something other
+        // than 401. (`/restart` is not sent: it would stop the bridge.)
+        let with_token = ahma_common::hub::authorization_header_for(&path)
+            .await
+            .map(|v| format!("Authorization: {v}\r\n"))
+            .expect("the hub published its token");
+        let status = raw_status(&path, "GET /nope", &with_token).await;
+        assert!(
+            status.contains(" 404"),
+            "authenticated, then unrouted: {status}"
+        );
         bridge.abort();
     }
 
