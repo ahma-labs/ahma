@@ -378,6 +378,7 @@ async fn report(
 mod tests {
     use super::*;
     use crate::frontend::Region;
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::{Method, Request as HttpRequest};
@@ -852,11 +853,12 @@ mod tests {
 
         let mut body = r.into_body().into_data_stream();
         let mut next = async || {
-            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
-                .await
-                .expect("an event arrives")
-                .expect("the stream is open")
-                .expect("a chunk");
+            let chunk =
+                tokio::time::timeout(TestTimeouts::get(TimeoutCategory::HttpRequest), body.next())
+                    .await
+                    .expect("an event arrives")
+                    .expect("the stream is open")
+                    .expect("a chunk");
             String::from_utf8(chunk.to_vec()).unwrap()
         };
         let first = next().await;
@@ -898,7 +900,12 @@ mod tests {
             Some(WebInput::TabOpened(_))
         ));
         drop(r);
-        match tokio::time::timeout(Duration::from_secs(5), h.inputs.recv()).await {
+        match tokio::time::timeout(
+            TestTimeouts::get(TimeoutCategory::HttpRequest),
+            h.inputs.recv(),
+        )
+        .await
+        {
             Ok(Some(WebInput::TabClosed(_))) => {}
             other => panic!("the frontend is told the tab went: {}", other.is_ok()),
         }

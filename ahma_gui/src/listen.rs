@@ -58,6 +58,7 @@ pub async fn serve(listeners: Vec<TcpListener>, app: Router, shutdown: watch::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn raw(addr: SocketAddr, request: &str) -> String {
@@ -65,7 +66,7 @@ mod tests {
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut out = String::new();
         let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            TestTimeouts::get(TimeoutCategory::HttpRequest),
             stream.read_to_string(&mut out),
         )
         .await;
@@ -138,7 +139,7 @@ mod tests {
         }
 
         stop_tx.send(true).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        tokio::time::timeout(TestTimeouts::get(TimeoutCategory::Cleanup), server)
             .await
             .expect("the server stops when told to")
             .unwrap();

@@ -47,10 +47,10 @@ impl Terminal {
 
     /// Write `text` to the terminal.
     pub fn say(&self, text: &str) {
-        if let Ok(mut out) = self.out.lock() {
-            let _ = out.write_all(text.as_bytes());
-            let _ = out.flush();
-        }
+        // A writer that panicked mid-line leaves a usable file: keep writing.
+        let mut out = self.out.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
     }
 
     /// Call `on_enter` each time the human presses Enter here, on a thread of its
