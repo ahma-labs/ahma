@@ -655,15 +655,27 @@ fn broker_rules() -> String {
     let Some(dir) = ahma_common::hub::runtime_dir().map(|d| d.join("agent")) else {
         return String::new();
     };
-    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
-    // A connect is a network operation, and the agent denies (R-CRED.11) come
-    // before this: the broker's sockets are let back in after them, so no
-    // upstream path can shadow the broker.
-    format!(
-        "(allow file-read* file-write-data (subpath \"{}\"))\n{}",
-        dir.display(),
-        super::ssh_agent::seatbelt_broker_connect_allow(&dir)
-    )
+    // Both spellings: the denies before this (the human's agent, R-CRED.11; the
+    // hub's directory, R-HUB.13.3) are emitted under both, and it is not safe
+    // to assume the kernel compares only the canonical one.
+    let canonical = dunce::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    let mut spellings = vec![canonical.clone()];
+    if dir != canonical {
+        spellings.push(dir);
+    }
+    // A connect is a network operation, and the denies come before this: the
+    // broker's sockets are let back in after them, so no upstream path can
+    // shadow the broker.
+    spellings
+        .iter()
+        .map(|dir| {
+            format!(
+                "(allow file-read* file-write-data (subpath \"{}\"))\n{}",
+                dir.display(),
+                super::ssh_agent::seatbelt_broker_connect_allow(dir)
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1168,6 +1180,74 @@ mod tests {
             "(allow network-outbound (remote unix-socket (subpath \"{}\")))",
             dir.display()
         ))
+    }
+
+    /// The hub denies cover both spellings of the runtime directory, so the SSH
+    /// broker's directory inside it must be let back in under both, after
+    /// them. A raw-spelling deny with only a canonical allow after it refused a
+    /// hooked command its own broker on macOS, where a temp directory is
+    /// `/var/...` and the canonical path `/private/var/...`. Built here with a
+    /// symlinked home, so the two spellings differ on any machine.
+    #[test]
+    fn the_brokers_directory_is_let_back_in_under_both_spellings_after_the_hub_denies() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode, set_upstream_agent};
+        set_ssh_agent_mode(SshAgentMode::Broker);
+        let root = tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", &link) };
+
+        let raw = ahma_common::hub::runtime_dir().expect("a runtime dir");
+        assert!(
+            raw.starts_with(&link),
+            "the raw spelling goes through the link"
+        );
+        let agent_raw = raw.join("agent");
+        std::fs::create_dir_all(&agent_raw).unwrap();
+        let agent_canonical = dunce::canonicalize(&agent_raw).unwrap();
+        assert_ne!(agent_raw, agent_canonical, "the spellings must differ");
+
+        let sb = Sandbox::new(
+            vec![root.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let p = sb.generate_seatbelt_profile_test(root.path());
+        let last_deny = [&raw, &dunce::canonicalize(&raw).unwrap()]
+            .iter()
+            .map(|dir| {
+                p.rfind(&format!(
+                    "(deny file-read* file-write* (subpath \"{}\"))",
+                    dir.display()
+                ))
+                .unwrap_or_else(|| panic!("deny for {} missing:\n{p}", dir.display()))
+            })
+            .max()
+            .unwrap();
+        for spelling in [&agent_raw, &agent_canonical] {
+            for rule in [
+                format!(
+                    "(allow network-outbound (remote unix-socket (subpath \"{}\")))",
+                    spelling.display()
+                ),
+                format!(
+                    "(allow file-read* file-write-data (subpath \"{}\"))",
+                    spelling.display()
+                ),
+            ] {
+                let at = p
+                    .rfind(&rule)
+                    .unwrap_or_else(|| panic!("{rule} missing:\n{p}"));
+                assert!(at > last_deny, "{rule} must follow the hub denies:\n{p}");
+            }
+        }
+        set_upstream_agent(None).unwrap();
     }
 
     /// SPEC R-HUB.13.3: a command cannot connect to the hub's socket, nor read
