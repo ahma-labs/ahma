@@ -63,6 +63,9 @@ pub struct Session {
     /// Questions a refused terminal-hook command left for the harness dialog
     /// (SPEC R-PERM.10(e)) are re-read on the tick; `None` reads on the first.
     last_harness_ask_poll: Option<Instant>,
+    /// Where those questions are read: this machine's records for a connected
+    /// session, nothing for a detached one.
+    harness_asks: fn() -> Vec<crate::harness_asks::HarnessAsk>,
 }
 
 impl Drop for Session {
@@ -211,11 +214,14 @@ impl Session {
             hub_source: None,
             last_discovery: Instant::now(),
             last_harness_ask_poll: None,
+            harness_asks: crate::harness_asks::pending,
         }
     }
 
     /// A session over `state` with no connections: what a test drives, feeding
-    /// it events by hand.
+    /// it events by hand. It reads nothing from this machine, the questions
+    /// terminal hooks left included: give it those with
+    /// [`Self::with_harness_asks`].
     pub fn detached(state: AppState) -> Self {
         let (mcp_tx, mcp_rx) = mpsc::channel(256);
         let (_bridge_tx, bridge_rx) = mpsc::channel(512);
@@ -227,7 +233,17 @@ impl Session {
             hub_source: None,
             last_discovery: Instant::now(),
             last_harness_ask_poll: None,
+            harness_asks: Vec::new,
         }
+    }
+
+    /// Read the questions terminal hooks left from `source` instead.
+    pub fn with_harness_asks(
+        mut self,
+        source: fn() -> Vec<crate::harness_asks::HarnessAsk>,
+    ) -> Self {
+        self.harness_asks = source;
+        self
     }
 
     /// Say whether a human is attached. The hub routes a permission question to
@@ -314,7 +330,7 @@ impl Session {
             .is_none_or(|t| now.duration_since(t) >= crate::harness_asks::POLL_EVERY)
         {
             self.last_harness_ask_poll = Some(now);
-            crate::app::sync_harness_asks(&mut self.state, crate::harness_asks::pending());
+            crate::app::sync_harness_asks(&mut self.state, (self.harness_asks)());
         }
         let mut drained = 0usize;
         while drained < MAX_EVENT_DRAIN_PER_PASS
@@ -557,6 +573,41 @@ mod tests {
             "answered by the second press"
         );
         assert_eq!(front.handled, ["intent", "report", "intent"]);
+    }
+
+    /// A session takes the questions refused terminal-hook commands left only
+    /// from its own source: a detached one reads nothing from this machine, so
+    /// a record another process left cannot take the screen in a test (it did,
+    /// on a Windows runner, after the question under test was answered); a
+    /// session given a source shows what that source holds.
+    #[tokio::test]
+    async fn a_session_takes_harness_questions_only_from_its_source() {
+        fn one() -> Vec<crate::harness_asks::HarnessAsk> {
+            vec![crate::harness_asks::HarnessAsk {
+                workspace: std::env::temp_dir().join("ws"),
+                question: ahma_common::harness_asks::Question {
+                    dir: std::env::temp_dir().join("elsewhere"),
+                    access: ahma_common::config::ScopeAccess::Ro,
+                    covers: vec![],
+                    programs: vec![],
+                },
+                harness_pid: std::process::id(),
+            }]
+        }
+        let mut quiet = detached();
+        run_session(&mut quiet, &mut Scripted::new([Step::Idle]))
+            .await
+            .unwrap();
+        assert!(quiet.state.scope_grant.is_none(), "read nothing");
+
+        let mut fed = detached().with_harness_asks(one);
+        run_session(&mut fed, &mut Scripted::new([Step::Idle]))
+            .await
+            .unwrap();
+        assert!(
+            fed.state.scope_grant.is_some(),
+            "showed what its source held"
+        );
     }
 
     /// Quiet is time: a tick reaches the surface, so what only it animates
