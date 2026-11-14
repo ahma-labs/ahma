@@ -138,7 +138,8 @@ instructions describe the session's mode (R1.5.4).
 |---|---|---|
 | The session scope (workspace) | the agent | Everything here is untrusted input to ahma (invariant 4) |
 | `~/.ahma` (settings, ledger, logs outside the tree) | the user, ahma outside the sandbox | Never inside any sandbox scope (R5.4.8), so the agent cannot read or extend its own grants |
-| Paths a trusted program executes (git hooks, editor/harness auto-run config, hub sockets) | — | Deny-write, or allow with loud disclosure (R-HANDOFF) |
+| Paths a trusted program executes (git hooks, editor/harness auto-run config) | — | Deny-write, or allow with loud disclosure (R-HANDOFF) |
+| The hub socket (R-HUB.2) | — | Its file is deny-write, but a `connect(2)` to it is not mediated and the hub authenticates no message, so a sandboxed command can act as a hub client (open: §11) |
 | The network | — | Outbound unrestricted unless `--restrict-network` (R-WEB.16); listening never restricted, disclosed (R-LISTEN); `fetch_webpage` is governed by `[web]` (R-WEB) |
 
 ## Quick Status
@@ -1666,7 +1667,9 @@ lifetime.
   `~/.ahma`; `%LOCALAPPDATA%\ahma\run` on Windows), created `0700` and verified to be owned by
   the caller with no group or other bits before use. It holds `hub.lock` and `hub.sock`, the
   socket `0600`. There is no machine-global socket. The directory is checked, not merely the
-  socket, because a `0600` socket inside a lax directory is still squattable.
+  socket, because a `0600` socket inside a lax directory is still squattable. These modes keep
+  other users out; they do not keep out the user's own sandboxed commands, and the hub
+  authenticates no message (open: §11).
   - **The lock is the mutex, on every OS.** `hub.lock` beside the socket (generally
     `<socket>.lock`) is a kernel advisory lock, released when its holder dies. The hub takes it
     before anything else; a loser connects to the winner. Only the holder touches the socket
@@ -2163,4 +2166,5 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **`ahma permissions grant`** (R-PERM.2.1): granting goes through each kind's own command (`ahma sandbox grant`, `ahma web allow`, `ahma network allow`); the unified `grant` verb covers `ssh-sign` only.
 - **A hook question asked in a live MCP session** (R-PERM.6.1 rung 1): a hook denial is asked in Claude Code's dialog (R-PERM.10) or the TUI, never through a live MCP session for the same workspace.
 - **Container daemon sockets on Linux** (R-HANDOFF.6): Landlock at the ABI ahma uses does not mediate `connect(2)` to a pathname unix socket, and ahma has no other rule there, so a command whose user may reach a daemon socket (the `docker` group for `/var/run/docker.sock`, rootless Docker or podman under `$XDG_RUNTIME_DIR`) can use it. Masking the sockets in the opt-in mount-namespace tier (R6.1.7) is the likely route.
+- **The hub trusts every connection** (R-HUB.2, R-PERM.3): the hub acts on the first message of any connection to `hub.sock` without authenticating it — `Subscribe` (which also raises the viewer count that routes questions to rung 2, R-PERM.3.6), `SubmitScopeGrant`, `SubmitWebApproval`, `SubmitApproval`, `ReRaiseScopeGrant`, `SubmitPrompt`, `Shutdown` (`ahma_common::hub::handle_connection`). The `0700` directory and `0600` socket keep other users out, not the user's own sandboxed commands: no sandbox rule denies a `connect(2)` to the socket (on macOS `(allow network*)` permits it and only container and SSH-agent sockets are denied; Landlock does not mediate a pathname-socket connect), so a command inside the sandbox can subscribe, read a pending question's `decision_id`, and answer it. The likely fix is a Seatbelt connect deny on the hub socket plus an approver token in a `0600` file in the runtime directory, required for every message that answers, subscribes or steers; Windows stays unprotected until the filesystem boundary exists.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.
