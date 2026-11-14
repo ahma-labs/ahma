@@ -590,6 +590,28 @@ fn container_socket_connect_denies(home: &Path) -> String {
     rules
 }
 
+/// `path` as the kernel will compare it: canonicalized as far as it exists,
+/// with the rest of it appended. A directory that is not made yet — the SSH
+/// broker's, created when its lease starts — still has a canonical spelling,
+/// and a rule that names only the raw one would not match what the kernel
+/// resolves (a macOS temp directory is `/var/...`, canonically `/private/var/...`).
+fn canonical_spelling(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(canonical) = dunce::canonicalize(existing) {
+            return tail.iter().rev().fold(canonical, |p, name| p.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// What keeps a command out of the hub (SPEC R-HUB.13.3). A `connect(2)` to a
 /// unix socket is a `network-outbound` operation, which `(allow network*)`
 /// permits and a file deny does not touch, so the hub's socket gets a connect
@@ -614,11 +636,8 @@ fn hub_rendezvous_denies_for(runtime_dir: Option<&Path>, socket: &Path) -> Strin
     // covers a parent that does not resolve.
     let spellings = |path: &Path| -> Vec<PathBuf> {
         let mut out = vec![path.to_path_buf()];
-        let canonical = dunce::canonicalize(path).ok().or_else(|| {
-            let parent = dunce::canonicalize(path.parent()?).ok()?;
-            Some(parent.join(path.file_name()?))
-        });
-        if let Some(canonical) = canonical.filter(|c| c != path) {
+        let canonical = canonical_spelling(path);
+        if canonical != path {
             out.push(canonical);
         }
         out
@@ -658,7 +677,7 @@ fn broker_rules() -> String {
     // Both spellings: the denies before this (the human's agent, R-CRED.11; the
     // hub's directory, R-HUB.13.3) are emitted under both, and it is not safe
     // to assume the kernel compares only the canonical one.
-    let canonical = dunce::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    let canonical = canonical_spelling(&dir);
     let mut spellings = vec![canonical.clone()];
     if dir != canonical {
         spellings.push(dir);
@@ -1205,9 +1224,12 @@ mod tests {
             raw.starts_with(&link),
             "the raw spelling goes through the link"
         );
+        // The broker's directory does not exist yet when the profile is made:
+        // the lease creates it afterwards, so its canonical spelling cannot
+        // come from canonicalizing it.
         let agent_raw = raw.join("agent");
-        std::fs::create_dir_all(&agent_raw).unwrap();
-        let agent_canonical = dunce::canonicalize(&agent_raw).unwrap();
+        assert!(!agent_raw.exists());
+        let agent_canonical = dunce::canonicalize(&raw).unwrap().join("agent");
         assert_ne!(agent_raw, agent_canonical, "the spellings must differ");
 
         let sb = Sandbox::new(
