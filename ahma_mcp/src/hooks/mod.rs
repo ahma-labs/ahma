@@ -1627,6 +1627,30 @@ fn write_exec_output(output: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Register this hooked command with the hub, unless this process deferred to
+/// an outer sandbox (SPEC R7.6, R-HUB.8, R-HUB.13): then whether it could reach
+/// the hub, or read its token, is that sandbox's decision, and it skips
+/// registration.
+fn register_hook_with_hub(
+    deferred_to_outer_sandbox: bool,
+    operation_monitor: std::sync::Arc<crate::operation_monitor::OperationMonitor>,
+    cwd: &str,
+    session_id: Option<String>,
+) -> Option<crate::hub_reporter::ReporterHandle> {
+    if deferred_to_outer_sandbox {
+        return None;
+    }
+    crate::hub_reporter::set_initial_identity(session_id, None);
+    Some(crate::hub_reporter::spawn_reporter(
+        operation_monitor,
+        "hook",
+        cwd.to_string(),
+        "hook",
+        None,
+        None,
+    ))
+}
+
 /// How long a hooked command waits for its report to reach the hub.
 const HOOK_REPORT_FLUSH: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -1855,6 +1879,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // an outer sandbox and the command runs bare within it. Say so on every such
     // command — on stderr, which the harness shows to the model and the user —
     // because "ahma is not the control here" must never be silent.
+    let deferred_to_outer_sandbox = sandbox.deferred_to_outer_sandbox().is_some();
     if let Some(host) = sandbox.deferred_to_outer_sandbox() {
         eprintln!(
             "{}",
@@ -1891,14 +1916,11 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // exactly as it would have. This never spawns a hub — a hook is a
     // latency-sensitive path, and starting one here would put a process launch
     // in front of the user's command.
-    crate::hub_reporter::set_initial_identity(payload.session_id.clone(), None);
-    let reporter = crate::hub_reporter::spawn_reporter(
+    let reporter = register_hook_with_hub(
+        deferred_to_outer_sandbox,
         operation_monitor.clone(),
-        "hook",
-        payload.cwd.clone(),
-        "hook",
-        None,
-        None,
+        &payload.cwd,
+        payload.session_id.clone(),
     );
 
     // The hooked command joins the same workspace write queue as every MCP
@@ -2009,7 +2031,9 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // hub before this process exits. Bounded and short (SPEC R-HUB.8): a
     // user's command must never wait on observability, so a hub that is
     // absent or slow costs this much and no more.
-    flush_hook_report(reporter).await;
+    if let Some(reporter) = reporter {
+        flush_hook_report(reporter).await;
+    }
 
     // A grant approved for this run is remembered only if the run shows it
     // helped (SPEC R-PERM.10.3).
@@ -4004,6 +4028,32 @@ fn powershell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// SPEC R7.6: a hook that deferred to an outer sandbox skips hub
+    /// registration. Whether it could reach the hub, or read its token, is
+    /// that sandbox's decision, not ahma's; a hook that connected anyway would
+    /// put an instance of unknown confinement in front of the TUI's grant
+    /// questions. A hook ahma sandboxes itself reports as before.
+    #[tokio::test]
+    async fn a_hook_under_deferral_does_not_register_with_the_hub() {
+        let monitor = std::sync::Arc::new(crate::operation_monitor::OperationMonitor::new(
+            crate::operation_monitor::MonitorConfig::with_timeout(std::time::Duration::from_secs(
+                5,
+            )),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process (SPEC R-ISO.1).
+        unsafe { std::env::set_var("AHMA_HUB_SOCK", dir.path().join("none.sock")) };
+        let cwd = dir.path().display().to_string();
+        assert!(
+            super::register_hook_with_hub(true, monitor.clone(), &cwd, None).is_none(),
+            "a deferred hook must not register"
+        );
+        assert!(
+            super::register_hook_with_hub(false, monitor, &cwd, None).is_some(),
+            "a hook ahma sandboxes itself still reports (R-HUB.8)"
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 
