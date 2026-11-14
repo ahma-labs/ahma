@@ -1,0 +1,34 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license = "AGPL-3.0"
+name = "ahma_gui"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Browser interface for ahma: a loopback server and a first-party page over the same session as the terminal."
+
+[lib]
+name = "ahma_gui"
+path = "src/lib.rs"
+
+[dependencies]
+ahma_common = { path = "../ahma_common" }
+ahma_tui = { path = "../ahma_tui" }
+anyhow.workspace = true
+axum = { version = "0.8", features = ["tokio"] }
+chrono = { workspace = true }
+futures.workspace = true
+pulldown-cmark = "0.13"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+webbrowser = "1.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }

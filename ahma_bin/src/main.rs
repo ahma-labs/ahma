@@ -195,6 +195,24 @@ async fn run() -> Result<()> {
             )
             .await
         }
+        Subcommands::Gui(gui_args) => {
+            tracing::info!("Starting the browser interface");
+            ahma_gui::run_gui(ahma_gui::GuiOptions {
+                connect: gui_args.connect.clone(),
+                profile: gui_args.profile.clone(),
+                path: gui_args.path.clone(),
+                token_prefs: tui_token_prefs(
+                    cli.minimize_tokens,
+                    cli.no_minimize_tokens,
+                    cli.small_model_harness,
+                    cli.no_small_model_harness,
+                    cli.context_length,
+                ),
+                port: gui_args.port,
+                open_browser: !gui_args.no_open,
+            })
+            .await
+        }
         // `ahma setup` in a terminal, with no item flag: the guided view
         // (SPEC R-SETUP.4). `--cli`, `--auto`, an item flag, `--plan`, or a
         // pipe (the install scripts' `< /dev/tty` is a terminal; CI is not)

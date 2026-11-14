@@ -142,7 +142,7 @@ while IFS= read -r manifest; do
     echo "Missing crate root in $crate_dir (expected src/lib.rs or src/main.rs)"
     missing=1
   fi
-done < <(find . -name Cargo.toml -not -path "./target/*")
+done < <(find . -name Cargo.toml -not -path "./target/*" -not -path "*/node_modules/*")
 
 if [[ "$missing" -ne 0 ]]; then
   echo ""
@@ -170,7 +170,7 @@ while IFS= read -r manifest; do
     echo "FAIL $manifest defines its own 'rust-version'; remove it and inherit from [workspace.package]."
     EDITION_OVERRIDE_FAIL=1
   fi
-done < <(find . -name Cargo.toml -not -path "./target/*")
+done < <(find . -name Cargo.toml -not -path "./target/*" -not -path "*/node_modules/*")
 if [[ "$EDITION_OVERRIDE_FAIL" -ne 0 ]]; then
   echo ""
   echo "  Each member crate must use:"
@@ -254,6 +254,9 @@ echo "OK No Result-shaped use of a parking_lot guard"
 echo "=== Guardrail: lint recurring test patterns ===" 
 ./scripts/lint_test_paths.sh
 
+echo "=== Guardrail: the ahma gui page (forbidden APIs, first-party imports) ==="
+bash ./scripts/check-gui-web.sh
+
 echo "=== Guardrail: workspace license boundaries ==="
 bash ./scripts/check-license-boundaries.sh
 
@@ -301,8 +304,8 @@ while IFS= read -r test_root; do
     LAYOUT_VIOLATIONS+="$test_root"$'\n'
   fi
 done < <({
-  find . -mindepth 3 -maxdepth 3 -type f -path '*/tests/*.rs' -not -path './target/*'
-  find . -mindepth 4 -maxdepth 4 -type f -path '*/tests/*/main.rs' -not -path './target/*'
+  find . -mindepth 3 -maxdepth 3 -type f -path '*/tests/*.rs' -not -path './target/*' -not -path '*/node_modules/*'
+  find . -mindepth 4 -maxdepth 4 -type f -path '*/tests/*/main.rs' -not -path './target/*' -not -path '*/node_modules/*'
 } | sort)
 if [[ -n "$LAYOUT_VIOLATIONS" ]]; then
   echo ""

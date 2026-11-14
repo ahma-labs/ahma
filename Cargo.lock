@@ -35,6 +35,7 @@ version = "0.22.17"
 dependencies = [
  "ahma_common",
  "ahma_core",
+ "ahma_gui",
  "ahma_mcp",
  "ahma_simplify",
  "ahma_tui",
@@ -116,6 +117,28 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ahma_gui"
+version = "0.22.17"
+dependencies = [
+ "ahma_common",
+ "ahma_tui",
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "webbrowser",
 ]
 
 [[package]]

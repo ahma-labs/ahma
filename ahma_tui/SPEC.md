@@ -53,7 +53,7 @@ Criteria specified in §3 or in the root SPEC are cited by id, not restated.
   placeholders in a command's label (`[question]`, `<url>`) are never matched: they describe
   arguments, and `/q` once highlighted `/doctor [question]` above `/quit`. The highlight
   returns to the top whenever the query changes.
-- **Approval gates (root R-WEB.6, R-WEB.6.3, R-PERM.7.1, R-PERM.3.8, R-PERM.10(e))**: the TUI
+- **Approval gates (root R-WEB.6, R-WEB.6.3, R-PERM.7.1, R-PERM.3.8, R-PERM.3.10, R-PERM.10(e))**: the TUI
   renders and resolves chat tool approval (`y`/`n`), sandbox scope grants and web egress; all
   three deny on Enter/Esc. A denied operation is selectable and `a` re-raises its grant
   question. The grant queue also holds the questions refused terminal-hook commands left for

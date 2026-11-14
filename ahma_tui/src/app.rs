@@ -2376,7 +2376,7 @@ fn handle_intro_key(key: crossterm::event::KeyEvent, state: &mut crate::state::A
 /// order matches `ui::draw`, so the overlay a key reaches is the one on screen.
 /// The trust and doctor questions are drawn over grant questions; grant
 /// questions are drawn over help, settings and every other modal (SPEC
-/// R-PERM.3.8), so Esc denies a grant instead of closing help beneath it.
+/// R-PERM.3.10), so Esc denies a grant instead of closing help beneath it.
 fn handle_overlay_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     handle_trust_key(key, state)
         || handle_doctor_confirm_key(key, state)
@@ -2602,7 +2602,7 @@ fn handle_scope_grant_key(
     }
 
     // Scroll keys move the question's body; the answers stay put (SPEC
-    // R-PERM.3.8).
+    // R-PERM.3.10).
     if scroll_grant_body(key, state) {
         return true;
     }
@@ -2686,7 +2686,7 @@ pub(crate) fn reveal_scope_grant_save_line(state: &mut crate::state::AppState) {
 }
 
 /// Scroll the open grant question's body if `key` is a scroll key (SPEC
-/// R-PERM.3.8): the scope question first, as its answer keys are, then the web
+/// R-PERM.3.10): the scope question first, as its answer keys are, then the web
 /// one. `false` for any other key.
 fn scroll_grant_body(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     if let Some(gate) = state.scope_grant.as_mut() {
@@ -7172,7 +7172,7 @@ fn scroll_log(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) 
 
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
     // A grant question is drawn over everything, so the wheel scrolls its body
-    // wherever the pointer is (SPEC R-PERM.3.8). Scrolling answers nothing.
+    // wherever the pointer is (SPEC R-PERM.3.10). Scrolling answers nothing.
     let line = crossterm::event::KeyEvent::new(
         if up {
             crossterm::event::KeyCode::Up
@@ -8920,7 +8920,7 @@ mod tests {
     }
 
     /// The second press of a saving key saves only once a frame has shown
-    /// the settings line whole (SPEC R-PERM.3.5, R-PERM.3.8): not before
+    /// the settings line whole (SPEC R-PERM.3.5, R-PERM.3.10): not before
     /// anything is drawn, and not on a terminal too short to show it.
     #[test]
     fn a_saving_answer_waits_until_its_settings_line_was_drawn() {
@@ -9010,7 +9010,7 @@ mod tests {
     }
 
     /// A grant question is drawn over help and settings, so it takes the keys
-    /// first (SPEC R-PERM.3.8): Esc denies it rather than closing what lies
+    /// first (SPEC R-PERM.3.10): Esc denies it rather than closing what lies
     /// underneath, and the overlay below is still there afterwards.
     #[test]
     fn a_grant_question_over_help_or_settings_takes_the_keys() {
@@ -9034,7 +9034,7 @@ mod tests {
     }
 
     /// The mouse wheel scrolls an open grant question's body, wherever the
-    /// pointer is: the question is drawn over everything (SPEC R-PERM.3.8).
+    /// pointer is: the question is drawn over everything (SPEC R-PERM.3.10).
     #[test]
     fn the_mouse_wheel_scrolls_the_grant_body() {
         use crate::state::AppState;

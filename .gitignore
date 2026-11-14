@@ -70,3 +70,6 @@ ahma-release-new.pem
 
 # Local example logs for debugging
 example-logs/
+
+# Dev-time front-end tooling (ahma_gui/web): installed with `npm ci`, never committed.
+node_modules/
