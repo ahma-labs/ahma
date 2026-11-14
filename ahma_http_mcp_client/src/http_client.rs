@@ -225,6 +225,16 @@ impl LocalSocketSender {
         if let Some(target) = request.uri().path_and_query().cloned() {
             *request.uri_mut() = target.into();
         }
+        // The hub's socket requires the hub's token (SPEC R-HUB.13); read
+        // beside the socket, so a socket that is not a hub's sends nothing.
+        if !request.headers().contains_key(http::header::AUTHORIZATION)
+            && let Some(token) = ahma_common::hub::hub_token_for(&self.path).await
+            && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
+        {
+            request
+                .headers_mut()
+                .insert(http::header::AUTHORIZATION, value);
+        }
 
         let stream =
             LocalStream::connect(&self.path)

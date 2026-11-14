@@ -11,8 +11,13 @@
 //! **with the session**: the frontend encodes them into the MCP URL's query,
 //! and the hub turns them back into arguments for that session's worker
 //! alone. Forwarding per session is strictly narrower than the inheritance it
-//! replaces — anything that can reach the socket already runs as this user and
-//! could simply run `ahma --no-sandbox` itself.
+//! replaces.
+//!
+//! It is safe to forward `--no-sandbox` and `--sandbox-scope` only because the
+//! socket authenticates its clients (SPEC R-HUB.13). The argument that anything
+//! able to reach it "could simply run `ahma --no-sandbox` itself" does not hold
+//! for a command inside ahma's own sandbox: whatever it runs inherits that
+//! sandbox, while a worker the hub spawns does not.
 //!
 //! The allowlist is exhaustive on purpose: an unknown name is refused rather
 //! than ignored, so a typo in a client config is a loud error instead of a flag

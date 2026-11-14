@@ -1577,7 +1577,8 @@ impl AhmaMcpService {
                     )));
                 }
                 Ok(handlers::common::text_result(format!(
-                    "AHMA ID: {id}{still_running}{hint}"
+                    "{}{id}{still_running}{hint}",
+                    crate::utils::operation::STARTED_PREFIX
                 )))
             }
             Err(e) => {

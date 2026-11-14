@@ -187,11 +187,12 @@ onto it and exits when you are done. See [setup.md](setup.md).
 | Prefix | What it does |
 |---|---|
 | `/` | Command navigator (from an empty input) |
-| `#` | Ask the LLM to decompose a goal into steps |
+| `#` | Ask the LLM to decompose a goal into steps, then run them in order. Shell steps run inside the sandbox, like any agent command |
 | `!` | **Run a command completely outside the sandbox**, at your full user privilege |
 
 `!` is the deliberate escape hatch, and it is deliberately narrow: it fires only
-from a keystroke you type, never from an LLM turn or a tool call. Every use is
+from a keystroke you type, never from an LLM turn, a `#` plan step or a tool
+call. Every use is
 disclosed twice — a warning in the log pane naming the command, and an
 `UNSANDBOXED` label on the output window. It exists because the alternative is
 worse: a user who cannot run one unconfined command from inside ahma runs it in

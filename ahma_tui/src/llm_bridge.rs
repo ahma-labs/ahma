@@ -63,6 +63,12 @@ pub enum BridgeEvent {
         success: bool,
         summary: String,
     },
+    /// A sandboxed `#goal` step started an operation that is still running
+    /// (or queued): the window follows that operation from here on.
+    WindowOperation {
+        window_id: usize,
+        op_id: String,
+    },
     ExternalToolsRefreshed {
         manager: crate::mcp_connections::McpConnectionManager,
     },
@@ -182,6 +188,63 @@ async fn retry_tool_call_after_403(
     }
 }
 
+/// Call one ahma tool in the TUI's MCP session — the session its own
+/// `roots/list` answer scoped, reused across calls (SPEC R25) — and return the
+/// reply text and whether it is an error. Shared by `/run`, cancel, and the
+/// sandboxed `#goal` steps, so every tool the TUI runs runs the same way.
+async fn call_tool_in_session(
+    tool: &str,
+    arguments: serde_json::Value,
+    mcp: &McpChatConfig,
+    tx: &Sender<BridgeEvent>,
+) -> (String, bool) {
+    if is_local_default_server(&mcp.base_url) {
+        // The chat's tool calls run in an ordinary MCP session on the
+        // per-user hub, scoped by this TUI's own `roots/list` answer —
+        // not by a server started for this directory (SPEC R-HUB.9).
+        let socket = ahma_common::hub::default_socket_path()
+            .to_string_lossy()
+            .into_owned();
+        let res = ahma_mcp::shell::modes::hub_client::ensure_hub(&socket, None).await;
+        if let Err(e) = res {
+            return (format!("Error reaching the ahma hub: {e}"), true);
+        }
+    }
+
+    // Shared, process-wide client (keyed by base URL): building a fresh
+    // reqwest client per tool call re-does TLS/pool setup and loses
+    // keep-alive connection reuse.
+    let (request_base_url, client) = match ahma_core::agent::cached_http_client(&mcp.base_url) {
+        Ok(pair) => pair,
+        Err(e) => return (format!("Error: {e}"), true),
+    };
+    let url = format!("{}/mcp", request_base_url);
+
+    let session_id = match ahma_core::agent::get_or_create_session(&client, &url, mcp).await {
+        Ok(sid) => sid,
+        Err(err) => return (format!("Error: {err}"), true),
+    };
+    // Feed the (possibly freshly negotiated) session id back to the app so
+    // the *next* tool call's McpChatConfig carries it and reuses this
+    // session instead of handshaking a brand-new one (SPEC R25).
+    let _ = tx
+        .send(BridgeEvent::SessionEstablished {
+            session_id: session_id.clone(),
+        })
+        .await;
+
+    let tool_result =
+        ahma_core::agent::call_mcp_tool_http(&client, &url, &session_id, tool, arguments.clone())
+            .await;
+    match tool_result {
+        Ok((result, failed)) => (result, failed),
+        Err(ref err) if err.contains("HTTP 403") => {
+            retry_tool_call_after_403(&client, &url, mcp, tool, arguments, tx).await
+        }
+        Err(err) => (format!("Error: {err}"), true),
+    }
+}
+
 pub fn spawn_tool_call_task(
     tool: String,
     arguments: serde_json::Value,
@@ -198,84 +261,70 @@ pub fn spawn_tool_call_task(
                 args: args_str,
             })
             .await;
-
-        if is_local_default_server(&mcp.base_url) {
-            // The chat's tool calls run in an ordinary MCP session on the
-            // per-user hub, scoped by this TUI's own `roots/list` answer —
-            // not by a server started for this directory (SPEC R-HUB.9).
-            let socket = ahma_common::hub::default_socket_path()
-                .to_string_lossy()
-                .into_owned();
-            let res = ahma_mcp::shell::modes::hub_client::ensure_hub(&socket, None).await;
-            if let Err(e) = res {
-                let _ = tx
-                    .send(BridgeEvent::ToolCallFinished {
-                        id: id.clone(),
-                        result: format!("Error reaching the ahma hub: {e}"),
-                        failed: true,
-                    })
-                    .await;
-                return;
-            }
-        }
-
-        // Shared, process-wide client (keyed by base URL): building a fresh
-        // reqwest client per tool call re-does TLS/pool setup and loses
-        // keep-alive connection reuse.
-        let (request_base_url, client) = match ahma_core::agent::cached_http_client(&mcp.base_url) {
-            Ok(pair) => pair,
-            Err(e) => {
-                let _ = tx
-                    .send(BridgeEvent::ToolCallFinished {
-                        id: id.clone(),
-                        result: format!("Error: {e}"),
-                        failed: true,
-                    })
-                    .await;
-                return;
-            }
-        };
-        let url = format!("{}/mcp", request_base_url);
-
-        let session_id = match ahma_core::agent::get_or_create_session(&client, &url, &mcp).await {
-            Ok(sid) => sid,
-            Err(err) => {
-                let _ = tx
-                    .send(BridgeEvent::ToolCallFinished {
-                        id: id.clone(),
-                        result: format!("Error: {err}"),
-                        failed: true,
-                    })
-                    .await;
-                return;
-            }
-        };
-        // Feed the (possibly freshly negotiated) session id back to the app so
-        // the *next* tool call's McpChatConfig carries it and reuses this
-        // session instead of handshaking a brand-new one (SPEC R25).
-        let _ = tx
-            .send(BridgeEvent::SessionEstablished {
-                session_id: session_id.clone(),
-            })
-            .await;
-
-        let tool_result = ahma_core::agent::call_mcp_tool_http(
-            &client,
-            &url,
-            &session_id,
-            &tool,
-            arguments.clone(),
-        )
-        .await;
-        let (result, failed) = match tool_result {
-            Ok((result, failed)) => (result, failed),
-            Err(ref err) if err.contains("HTTP 403") => {
-                retry_tool_call_after_403(&client, &url, &mcp, &tool, arguments, &tx).await
-            }
-            Err(err) => (format!("Error: {err}"), true),
-        };
+        let (result, failed) = call_tool_in_session(&tool, arguments, &mcp, &tx).await;
         let _ = tx
             .send(BridgeEvent::ToolCallFinished { id, result, failed })
+            .await;
+    });
+}
+
+/// Run a `#goal` shell step the way every agent command runs: as
+/// `run_terminal_command` in ahma's MCP session, inside the sandbox (SPEC
+/// R24.14). The step is a model-written command no human typed, so there is
+/// no host-shell fallback: when the session cannot be reached the step fails.
+///
+/// A reply that is the result finishes the window here. A reply that names a
+/// started (still running, or queued) operation binds the window to it, and
+/// the operation's own updates finish it.
+pub fn spawn_window_sandboxed_task(
+    window_id: usize,
+    command: String,
+    working_dir: String,
+    mcp: McpChatConfig,
+    mut abort_rx: tokio::sync::oneshot::Receiver<()>,
+    tx: Sender<BridgeEvent>,
+) {
+    tokio::spawn(async move {
+        let arguments = serde_json::json!({
+            "command": command,
+            "working_directory": working_dir,
+        });
+        let (reply, failed) =
+            call_tool_in_session("run_terminal_command", arguments, &mcp, &tx).await;
+        let started = (!failed)
+            .then(|| ahma_mcp::utils::operation::started_operation_id(&reply))
+            .flatten()
+            .map(str::to_string);
+
+        if let Some(op_id) = started {
+            // Bound even when the window was closed meanwhile: binding a
+            // closed window cancels what it started.
+            let _ = tx
+                .send(BridgeEvent::WindowOperation { window_id, op_id })
+                .await;
+            return;
+        }
+        if abort_rx.try_recv().is_ok() {
+            return; // Closed while it ran; the window already says so.
+        }
+        for line in reply.lines() {
+            let _ = tx
+                .send(BridgeEvent::WindowOutput {
+                    window_id,
+                    line: line.to_string(),
+                })
+                .await;
+        }
+        // A command that exited non-zero is an ordinary reply, not a tool
+        // error; its identity line says how it ended.
+        let success = !failed && ahma_common::op_identity::verdict_of(&reply) != Some(false);
+        let summary = if success { "Completed" } else { "Failed" };
+        let _ = tx
+            .send(BridgeEvent::WindowFinished {
+                window_id,
+                success,
+                summary: summary.to_string(),
+            })
             .await;
     });
 }
@@ -287,9 +336,6 @@ pub struct ParsedStep {
     pub command: Option<String>,
     pub instructions: Option<String>,
     pub subgoal: Option<String>,
-    pub sandbox_scopes: Option<Vec<String>>,
-    pub allowed_tools: Option<Vec<String>>,
-    pub allowed_domains: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -330,14 +376,10 @@ pub fn build_planning_prompt(
 System Instructions:
 1. Break the task down into distinct, logical, self-contained sub-tasks.
 2. Each step must be one of the following types:
-   - "shell_command": Running a sandboxed terminal command.
+   - "shell_command": Running a terminal command. It runs inside the workspace sandbox, like every other agent command.
    - "llm_call": A subtask that requires reasoning or parsing text.
    - "planning": A subtask that requires further planning/decomposition.
-3. Security Scoping Down Rules:
-   - If a step operates on a subdirectory (e.g. "src"), you may narrow down filesystem access by setting `sandbox_scopes` (e.g. `["src"]`).
-   - You may restrict the allowed command prefixes in `allowed_tools` (e.g. `["cargo build", "cargo clippy"]` or `["git diff"]`).
-   - You may restrict outbound network access by setting `allowed_domains` (e.g. `["crates.io", "api.github.com"]`).
-4. Output format: You must output ONLY a valid JSON object matching the schema below. No other markdown formatting except optional json code blocks.
+3. Output format: You must output ONLY a valid JSON object matching the schema below. No other markdown formatting except optional json code blocks.
 
 Expected JSON Schema:
 ```json
@@ -346,10 +388,7 @@ Expected JSON Schema:
     {{
       "task": "description of this step",
       "type": "shell_command",
-      "command": "cargo check --workspace",
-      "sandbox_scopes": ["optional_subdir"],
-      "allowed_tools": ["cargo"],
-      "allowed_domains": []
+      "command": "cargo check --workspace"
     }},
     {{
       "task": "evaluate errors",

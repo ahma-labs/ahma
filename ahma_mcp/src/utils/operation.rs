@@ -83,9 +83,41 @@ pub fn generate_id_with_details(counter_val: u64, tool_name: &str, command: &str
     }
 }
 
+/// How a tool reply begins when it started an operation and returned before
+/// the operation finished (still running, or queued behind another writer).
+/// A reply that *is* the result begins with the identity line instead (SPEC
+/// R2.6.2). One definition for the server that writes it and the clients that
+/// read it.
+pub const STARTED_PREFIX: &str = "AHMA ID: ";
+
+/// The operation a "started, not finished" reply names, or `None` when the
+/// reply is the result itself. Anchored at the start: output that merely
+/// contains the words is a result, not a started operation.
+pub fn started_operation_id(reply: &str) -> Option<&str> {
+    reply
+        .strip_prefix(STARTED_PREFIX)?
+        .split_whitespace()
+        .next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_started_reply_names_its_operation_and_a_result_names_none() {
+        let still_running = format!("{STARTED_PREFIX}op_abcd_3_cargo\n\nStill running.");
+        assert_eq!(
+            started_operation_id(&still_running),
+            Some("op_abcd_3_cargo")
+        );
+        let queued = format!("{STARTED_PREFIX}op_abcd_4\nNOT started — queued behind x.");
+        assert_eq!(started_operation_id(&queued), Some("op_abcd_4"));
+        // A finished command whose own output prints the marker is a result.
+        let result = format!("echo · exited 0\n{STARTED_PREFIX}op_fake");
+        assert_eq!(started_operation_id(&result), None);
+        assert_eq!(started_operation_id(STARTED_PREFIX), None);
+    }
 
     #[test]
     fn test_clean_details() {

@@ -209,7 +209,8 @@ impl OpIdentity<'_> {
         }
     }
 
-    /// Render the identity line.
+    /// Render the identity line. Its first character is [`Self::glyph`], which
+    /// [`verdict_of`] reads back.
     ///
     /// `show_origin` is set by the caller when more than one origin is present in
     /// the visible set — a badge on every row when everything came from the same
@@ -286,10 +287,60 @@ fn human_duration_ms(ms: u64) -> String {
     human_duration_secs(ms / 1000)
 }
 
+/// Whether a finished operation succeeded, read from the glyph that leads its
+/// identity line (the first line of an inline tool result, SPEC R2.6.2):
+/// `Some(true)` for ✓, `Some(false)` for ✗, `None` for a running operation or
+/// text that is not an identity line. The reading half of
+/// [`OpIdentity::glyph`], kept beside it so the two cannot drift.
+pub fn verdict_of(text: &str) -> Option<bool> {
+    let first = text.lines().next()?;
+    if first.starts_with("✓ ") {
+        Some(true)
+    } else if first.starts_with("✗ ") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_rendered_line_states_its_verdict_and_other_text_states_none() {
+        let finished = |exit_code, status: &str| OpIdentity {
+            title: "cargo build",
+            cwd: Some("/w/proj"),
+            origin: None,
+            outcome: OpOutcome::Finished {
+                exit_code,
+                status: status.to_string(),
+                duration_ms: 1200,
+            },
+        };
+        let line = |id: OpIdentity| format!("{}\nbody", id.render(false));
+        assert_eq!(
+            verdict_of(&line(finished(Some(0), "Completed"))),
+            Some(true)
+        );
+        assert_eq!(verdict_of(&line(finished(Some(2), "Failed"))), Some(false));
+        assert_eq!(verdict_of(&line(finished(None, "Cancelled"))), Some(false));
+        let denied = OpIdentity {
+            outcome: OpOutcome::Denied {
+                reason: "outside sandbox scope".into(),
+            },
+            ..finished(None, "Failed")
+        };
+        assert_eq!(verdict_of(&line(denied)), Some(false));
+        let running = OpIdentity {
+            outcome: OpOutcome::Running { elapsed_secs: 3 },
+            ..finished(None, "Running")
+        };
+        assert_eq!(verdict_of(&running.render(false)), None);
+        assert_eq!(verdict_of("plain output ✓ later"), None);
+    }
 
     #[test]
     fn a_terminal_command_is_titled_by_its_command() {

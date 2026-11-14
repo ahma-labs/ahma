@@ -138,7 +138,8 @@ instructions describe the session's mode (R1.5.4).
 |---|---|---|
 | The session scope (workspace) | the agent | Everything here is untrusted input to ahma (invariant 4) |
 | `~/.ahma` (settings, ledger, logs outside the tree) | the user, ahma outside the sandbox | Never inside any sandbox scope (R5.4.8), so the agent cannot read or extend its own grants |
-| Paths a trusted program executes (git hooks, editor/harness auto-run config, hub sockets) | — | Deny-write, or allow with loud disclosure (R-HANDOFF) |
+| Paths a trusted program executes (git hooks, editor/harness auto-run config) | — | Deny-write, or allow with loud disclosure (R-HANDOFF) |
+| The hub socket (R-HUB.2) | — | Its file is deny-write, but a `connect(2)` to it is not mediated and the hub authenticates no message, so a sandboxed command can act as a hub client (open: §11) |
 | The network | — | Outbound unrestricted unless `--restrict-network` (R-WEB.16); listening never restricted, disclosed (R-LISTEN); `fetch_webpage` is governed by `[web]` (R-WEB) |
 
 ## Quick Status
@@ -1666,7 +1667,8 @@ lifetime.
   `~/.ahma`; `%LOCALAPPDATA%\ahma\run` on Windows), created `0700` and verified to be owned by
   the caller with no group or other bits before use. It holds `hub.lock` and `hub.sock`, the
   socket `0600`. There is no machine-global socket. The directory is checked, not merely the
-  socket, because a `0600` socket inside a lax directory is still squattable.
+  socket, because a `0600` socket inside a lax directory is still squattable. These modes keep
+  other users out; they do not keep out the user's own sandboxed commands, which R-HUB.13 does.
   - **The lock is the mutex, on every OS.** `hub.lock` beside the socket (generally
     `<socket>.lock`) is a kernel advisory lock, released when its holder dies. The hub takes it
     before anything else; a loser connects to the winner. Only the holder touches the socket
@@ -1744,7 +1746,10 @@ lifetime.
   MCP URL's query and applied to that session's worker alone, never to the hub or to other
   sessions. The option list is an allowlist and an unknown name is refused, not ignored.
   Settings that govern the hub as a whole — bearer tokens, rate limits, handshake and idle
-  timeouts — are deliberately not settable per session.
+  timeouts — are deliberately not settable per session. Forwarding `--no-sandbox` and
+  `--sandbox-scope` is safe only because the socket authenticates its clients (R-HUB.13): a
+  command inside ahma's own sandbox that could open a session on it could ask for an unconfined
+  worker.
   - **R-HUB.4.1 — The worker sees the real client.** The frontend **must** hand the worker the
     client's own `clientInfo` and capabilities, whichever handshake the client used. When it
     answers a 2026-07-28 `server/discover` probe and builds the `initialize` itself, it reads
@@ -1864,6 +1869,44 @@ lifetime.
     hub is its run's private one (R7.6, R-ISO.1).
   - When the runtime directory cannot be entered, the hub starts in the temp directory instead
     of failing with a bare ENOENT.
+
+- **R-HUB.13 — The hub authenticates every connection.** The `0700` directory and `0600`
+  socket keep other users out. They do not keep out the user's own sandboxed commands, which
+  can `connect(2)` to the socket, and through it could open an MCP session with `no_sandbox`
+  or roots of their choosing (R-HUB.4), answer a waiting question, hijack another session's
+  instance, or stop the hub. So every request on `hub.sock` — `/mcp`, `/restart`, the
+  `/events` upgrade, anything — **must** carry `Authorization: Bearer <token>`, compared in
+  constant time, and is refused `401` otherwise. `/health` is the one exemption: it names the
+  build and whether the hub is draining, and a diagnostic must be able to ask it. The check is
+  on the connection, not on each message, so a new message cannot forget it, and a bridge that
+  serves a hub's socket takes the hub's token whatever its own configuration says.
+  - **R-HUB.13.1 — Lifecycle.** The lock holder writes 64 hex characters from the operating
+    system's random source to `<socket>.token` (`hub.token` beside `hub.sock`), `0600`, by
+    rename, after it takes the lock and before anything can connect; a hub that cannot publish
+    its token does not serve. A new token is written every time a hub takes the lock, and the
+    file is removed while the lock is still held (R-ISO.3). A loser of the lock leaves the
+    holder's token alone.
+  - **R-HUB.13.2 — Holders.** A client reads the token from beside the socket it connects to,
+    fresh on each connection, so it follows a hub that restarted, and once more on a `401`. A
+    process that will restrict itself — a session worker, a hooked command — reads it
+    **before** it does and keeps it in memory. The token is **never** put in an argument, an
+    environment variable or a log: a sandboxed command can read other processes' arguments, and
+    on macOS their environment.
+  - **R-HUB.13.3 — The sandbox keeps commands away from it.** On macOS every profile denies
+    `network-outbound` to unix sockets under the runtime directory, and to the hub socket
+    wherever it is, and denies `file-read*` and `file-write*` on that directory and the
+    token beside an elsewhere socket. These rules are not subject to `allow_credential_reads`,
+    and the SSH key broker's directory inside the runtime directory is let back in after them
+    (R-CRED.1). On every OS no grant may equal, lie inside or contain the runtime directory
+    (R5.4.5). On Linux there is no kernel rule against the connect: Landlock at ahma's ABI does
+    not mediate a pathname-socket connect, so there the token is the boundary, and the
+    runtime directory's being in no ruleset is what keeps a command from reading it. Windows
+    has no filesystem boundary to protect it (§11).
+  - **R-HUB.13.4 — Older clients are refused, and told why.** A client that predates this
+    requirement presents no token. It is refused with a message that says to restart it, which
+    is an explicit exception to R-HUB.5's mixed-version proxying and to the compatibility
+    promise of R24.5; it affects only frontends and TUIs already running across an upgrade.
+    A newer client reads no token from an older hub and sends none, and works as before.
 
 ### R-ISO: Test/Live Endpoint Isolation
 
@@ -2163,4 +2206,7 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **`ahma permissions grant`** (R-PERM.2.1): granting goes through each kind's own command (`ahma sandbox grant`, `ahma web allow`, `ahma network allow`); the unified `grant` verb covers `ssh-sign` only.
 - **A hook question asked in a live MCP session** (R-PERM.6.1 rung 1): a hook denial is asked in Claude Code's dialog (R-PERM.10) or the TUI, never through a live MCP session for the same workspace.
 - **Container daemon sockets on Linux** (R-HANDOFF.6): Landlock at the ABI ahma uses does not mediate `connect(2)` to a pathname unix socket, and ahma has no other rule there, so a command whose user may reach a daemon socket (the `docker` group for `/var/run/docker.sock`, rootless Docker or podman under `$XDG_RUNTIME_DIR`) can use it. Masking the sockets in the opt-in mount-namespace tier (R6.1.7) is the likely route.
+- **The hub's token protects least where there is no filesystem boundary** (R-HUB.13): on Windows a command can read `hub.token` and connect; on Linux a command can reach the socket and the token is the only barrier (the runtime directory is in no Landlock ruleset and the token is never in an argument or environment variable; that a command cannot read a holder's memory or `/proc/<pid>/environ` rests on Landlock's ptrace scoping, which has no ahma test yet); under macOS deferral to an outer sandbox (R7.6) that sandbox, not ahma's, decides whether a command can connect or read the token. A hub socket the operator places in a directory a sandbox can read puts its token there too.
+- **Operator-started `ahma serve unix` and `ahma serve http` take no token by default** (R-HTTP, R-HUB.13): a loopback `serve http` port and a `serve unix` socket outside the runtime directory are reachable from inside the sandbox and open the same session options the hub's `/mcp` does, so they are the same escape. Open; the hub's own socket is fixed.
+- **Hooks register with the hub under deferral** (R7.6): the spec says a hook in that state skips registration, but `ahma hooks run-shell` starts its reporter regardless. Whether it can reach the hub is then the outer sandbox's decision.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

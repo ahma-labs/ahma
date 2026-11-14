@@ -1107,6 +1107,24 @@ fn check_grant_refusal(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> 
         ));
     }
 
+    // 4b. The hub's runtime directory — its socket and token, the session
+    //     grants and the questions waiting there — is authority, not a
+    //     credential under $HOME, so the home-rooted list above misses it
+    //     where it sits elsewhere (`$XDG_RUNTIME_DIR`). Neither it, nor
+    //     anything inside it, nor anything that contains it (SPEC R-HUB.13.3).
+    if let Some(runtime) = crate::hub::runtime_dir_location() {
+        let runtime = dunce::canonicalize(&runtime).unwrap_or(runtime);
+        if path.starts_with(&runtime) || runtime.starts_with(path) {
+            return Some(format!(
+                "'{}' is, or contains, ahma's runtime directory {}, which holds the hub's \
+                 token and the answers to waiting questions and must never be exposed to a \
+                 sandboxed tool",
+                path.display(),
+                runtime.display()
+            ));
+        }
+    }
+
     // 5. OS system directories.
     if is_system_dir(path) {
         return Some(format!(
@@ -2818,6 +2836,40 @@ mod denylist_by_prefix_tests {
             classify_grant_risk(path, Some(home), &[]),
             GrantRisk::Refused(_)
         )
+    }
+
+    /// SPEC R-HUB.13.3: the directory that holds the hub's socket and token,
+    /// the session grants and the questions is authority, wherever it is — a
+    /// grant covering it would hand a sandboxed command the means to answer
+    /// for the human. Refused when it is the directory, inside it, or an
+    /// ancestor that contains it (`$XDG_RUNTIME_DIR` on Linux sits outside
+    /// `$HOME`, so the home-rooted list does not reach it).
+    #[test]
+    fn the_runtime_directory_is_never_granted() {
+        let runtime = crate::hub::runtime_dir_location().expect("a runtime directory");
+        let unrelated = tempfile::tempdir().unwrap();
+        for covered in [
+            runtime.clone(),
+            runtime.join("session-grants"),
+            runtime.join("hub.token"),
+            runtime.parent().expect("a parent").to_path_buf(),
+        ] {
+            assert!(
+                matches!(
+                    classify_grant_risk(&covered, None, &[]),
+                    GrantRisk::Refused(_)
+                ),
+                "{} is, or covers, the runtime directory and must be refused",
+                covered.display()
+            );
+        }
+        assert!(
+            !matches!(
+                classify_grant_risk(unrelated.path(), None, &[]),
+                GrantRisk::Refused(_)
+            ),
+            "an unrelated directory is still an ordinary grant"
+        );
     }
 
     /// SPEC R-PERM.4.3, field case: `/bin/ps` was offered as an ordinary

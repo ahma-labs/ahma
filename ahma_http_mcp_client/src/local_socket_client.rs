@@ -201,6 +201,17 @@ fn auth_error(
 }
 
 impl LocalSocketHttpClient {
+    /// The bearer token to send: the one the caller configured, else the hub's
+    /// (SPEC R-HUB.13), read beside the socket on every request so a client
+    /// follows a hub that restarted. A socket that is not a hub's has no token
+    /// file, and nothing is sent.
+    async fn token_to_present(&self, configured: Option<String>) -> Option<String> {
+        match configured {
+            Some(token) => Some(token),
+            None => ahma_common::hub::hub_token_for(&self.socket_path).await,
+        }
+    }
+
     fn base_request_builder(
         &self,
         method: Method,
@@ -376,6 +387,7 @@ impl StreamableHttpClient for LocalSocketHttpClient {
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let json_body = serde_json::to_string(&message).map_err(LocalSocketError::Json)?;
         let session_was_attached = session_id.is_some();
+        let auth_token = self.token_to_present(auth_token).await;
         let builder = self
             .base_request_builder(
                 Method::POST,
@@ -418,6 +430,7 @@ impl StreamableHttpClient for LocalSocketHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
+        let auth_token = self.token_to_present(auth_token).await;
         let builder = self.base_request_builder(
             Method::DELETE,
             uri.as_ref(),
@@ -452,6 +465,7 @@ impl StreamableHttpClient for LocalSocketHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, sse_stream::Error>>, StreamableHttpError<Self::Error>>
     {
+        let auth_token = self.token_to_present(auth_token).await;
         let mut builder = self
             .base_request_builder(
                 Method::GET,

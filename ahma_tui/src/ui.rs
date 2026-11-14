@@ -5529,7 +5529,7 @@ mod tests {
             finished_at: None,
             duration_ms: None,
             last_output_at: None,
-            is_cli: true,
+            runner: crate::state::WindowRunner::Host,
             command: String::new(),
             working_dir: String::new(),
             llm_model: None,
