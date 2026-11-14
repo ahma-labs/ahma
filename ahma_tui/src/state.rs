@@ -333,12 +333,17 @@ pub struct ChatHistory {
     entries: VecDeque<ChatEntry>,
     /// Bumped on every mutation; cache-invalidation key for derived render data.
     generation: u64,
+    /// The id of the first entry. An entry keeps its id for as long as it
+    /// exists, however many before it have been evicted, so a surface can tell
+    /// an entry that changed from one that moved (see [`Self::id_at`]).
+    base: u64,
 }
 
 impl ChatHistory {
     pub fn push(&mut self, entry: ChatEntry) {
         if self.entries.len() >= CHAT_HISTORY_CAP {
             self.entries.pop_front();
+            self.base += 1;
         }
         self.entries.push_back(entry);
         self.generation = self.generation.wrapping_add(1);
@@ -354,14 +359,23 @@ impl ChatHistory {
     }
 
     pub fn clear(&mut self) {
+        self.base += self.entries.len() as u64;
         self.entries.clear();
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The id of the entry at `index`: stable while the entry exists, and never
+    /// reused by another.
+    pub fn id_at(&self, index: usize) -> u64 {
+        self.base + index as u64
     }
 
     /// Drop completed entries, keeping only work still in progress: assistant
     /// output that is still streaming and tool calls awaiting a result. Used by
     /// `/clear` so an ongoing turn is not yanked off the screen mid-flight.
     pub fn retain_in_flight(&mut self) {
+        // What stays is renumbered: entries between it and the front went.
+        self.base += self.entries.len() as u64;
         self.entries.retain(|entry| {
             matches!(
                 entry,
@@ -485,6 +499,7 @@ impl ChatHistory {
             _ => user_positions.get(dropped).copied().unwrap_or(0),
         };
         self.entries.drain(..cut);
+        self.base += cut as u64;
         self.generation = self.generation.wrapping_add(1);
         dropped
     }
@@ -3945,6 +3960,46 @@ enum TreeToggle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A surface reconciles by id: an entry keeps its id while it exists, an
+    /// evicted one takes its id with it, and nothing is ever given another's.
+    #[test]
+    fn a_chat_entry_keeps_its_id_while_it_exists_and_ids_are_never_reused() {
+        let mut chat = ChatHistory::default();
+        for i in 0..3 {
+            chat.push(ChatEntry::Notice {
+                text: format!("n{i}"),
+            });
+        }
+        let ids: Vec<u64> = (0..3).map(|i| chat.id_at(i)).collect();
+        assert_eq!(ids, [0, 1, 2]);
+        chat.push(ChatEntry::Notice { text: "n3".into() });
+        assert_eq!(chat.id_at(0), 0, "appending moves nothing");
+
+        // Fill past the cap: the oldest go, the rest keep their ids.
+        for i in 4..(CHAT_HISTORY_CAP as u64 + 4) {
+            chat.push(ChatEntry::Notice {
+                text: format!("n{i}"),
+            });
+        }
+        let last = chat.len() - 1;
+        assert_eq!(chat.id_at(last), CHAT_HISTORY_CAP as u64 + 3);
+        let survivor = chat.id_at(0);
+        assert!(survivor > 0, "the first entries were evicted");
+        assert_eq!(
+            chat.id_at(1),
+            survivor + 1,
+            "the ones that stayed keep consecutive ids"
+        );
+
+        // Clearing frees no id for reuse.
+        let before = chat.id_at(chat.len() - 1);
+        chat.clear();
+        chat.push(ChatEntry::Notice {
+            text: "after".into(),
+        });
+        assert!(chat.id_at(0) > before, "an id is never reused");
+    }
 
     fn turn_in(phase: TurnPhase, for_secs: u64) -> (ChatTurn, std::time::Instant) {
         let mut turn = ChatTurn::new(None);

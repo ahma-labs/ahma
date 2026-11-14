@@ -75,6 +75,21 @@ pub enum Intent {
     ReRaiseGrant {
         op: OpKey,
     },
+    /// Open the section `key`, or with `None` close the one that is open: one
+    /// is open at a time.
+    OpenSection {
+        key: Option<String>,
+    },
+    /// Send the next chat turns to the window `key`.
+    ChatWith {
+        key: String,
+    },
+    /// Show or hide the tail of an operation's output inline.
+    ToggleOpOutput {
+        op: OpKey,
+    },
+    /// This project, or every project.
+    ToggleProjectFilter,
 }
 
 /// What a surface tells the session about what it showed. These are not
@@ -150,6 +165,35 @@ pub fn apply(state: &mut AppState, intent: Intent) -> Result<(), Refused> {
             Ok(())
         }
         Intent::ReRaiseGrant { op } => crate::app::reraise_grant(state, &op),
+        Intent::OpenSection { key } => {
+            let now = crate::ui::wall_ms();
+            match key {
+                Some(key) if state.open_section.as_deref() != Some(key.as_str()) => {
+                    state.open_section(&key, now)
+                }
+                Some(_) | None => {
+                    if let Some(open) = state.open_section.clone() {
+                        state.toggle_section(&open, now);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Intent::ChatWith { key } => crate::app::chat_with(state, &key),
+        Intent::ToggleOpOutput { op } => {
+            if state.find_op(&op).is_none() {
+                return Err(Refused::Stale);
+            }
+            state.expanded_op = match state.expanded_op.as_deref() {
+                Some(open) if open == op.id => None,
+                _ => Some(op.id),
+            };
+            Ok(())
+        }
+        Intent::ToggleProjectFilter => {
+            state.show_all_projects = !state.show_all_projects;
+            Ok(())
+        }
     }
 }
 
@@ -595,6 +639,86 @@ mod tests {
             answer(&mut state, "q", &saving),
             Err(Refused::SaveLineNotShown)
         );
+    }
+
+    fn op(id: &str) -> crate::state::Operation {
+        crate::state::Operation::new(id, "run_terminal_command", crate::state::OpStatus::Running)
+    }
+
+    /// Showing output is a toggle on an operation that exists; one that is gone
+    /// is stale, not a no-op that looks like it worked.
+    #[test]
+    fn an_operations_output_is_shown_and_hidden_by_name() {
+        let mut state = state(Capabilities::terminal());
+        state.operations.push(op("a"));
+        let key = |id: &str| OpKey {
+            id: id.into(),
+            instance_id: None,
+        };
+        assert_eq!(
+            apply(&mut state, Intent::ToggleOpOutput { op: key("a") }),
+            Ok(())
+        );
+        assert_eq!(state.expanded_op.as_deref(), Some("a"));
+        assert_eq!(
+            apply(&mut state, Intent::ToggleOpOutput { op: key("a") }),
+            Ok(())
+        );
+        assert_eq!(state.expanded_op, None);
+        assert_eq!(
+            apply(&mut state, Intent::ToggleOpOutput { op: key("gone") }),
+            Err(Refused::Stale)
+        );
+    }
+
+    #[test]
+    fn one_section_is_open_at_a_time_and_none_closes_it() {
+        let mut state = state(Capabilities::terminal());
+        let open = |state: &mut AppState, key: Option<&str>| {
+            apply(
+                state,
+                Intent::OpenSection {
+                    key: key.map(str::to_string),
+                },
+            )
+            .unwrap()
+        };
+        open(&mut state, Some("s1"));
+        assert_eq!(state.open_section.as_deref(), Some("s1"));
+        open(&mut state, Some("s2"));
+        assert_eq!(state.open_section.as_deref(), Some("s2"), "one at a time");
+        open(&mut state, Some("s2"));
+        assert_eq!(state.open_section, None, "the open one again closes it");
+        open(&mut state, Some("s1"));
+        open(&mut state, None);
+        assert_eq!(state.open_section, None);
+        open(&mut state, None);
+        assert_eq!(state.open_section, None, "closing nothing is fine");
+    }
+
+    #[test]
+    fn the_project_filter_toggles() {
+        let mut state = state(Capabilities::terminal());
+        assert!(!state.show_all_projects);
+        apply(&mut state, Intent::ToggleProjectFilter).unwrap();
+        assert!(state.show_all_projects);
+        apply(&mut state, Intent::ToggleProjectFilter).unwrap();
+        assert!(!state.show_all_projects);
+    }
+
+    /// A surface that cannot show the terminal's model-setup wizard is not sent
+    /// into it: with no model, chatting says what to do, and nothing opens.
+    #[test]
+    fn chatting_with_a_window_without_a_model_points_at_the_terminal() {
+        let mut gui = state(gui_caps());
+        assert!(gui.llm_selection.is_none());
+        assert_eq!(
+            apply(&mut gui, Intent::ChatWith { key: "w".into() }),
+            Err(Refused::NotAllowed)
+        );
+        assert!(!gui.modal.is_open(), "no wizard opened");
+        assert!(gui.chat.entries().iter().any(|e| matches!(e,
+            crate::state::ChatEntry::Assistant { content, .. } if content.contains("ahma tui"))));
     }
 
     fn web_gate(state: &mut AppState, id: &str) {

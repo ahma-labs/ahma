@@ -237,8 +237,8 @@ impl crate::session::Frontend for TerminalFrontend {
         }
     }
 
-    fn on_tick(&mut self, state: &mut crate::state::AppState) {
-        update_scroll_animations(state);
+    fn on_tick(&mut self, session: &mut crate::session::Session) {
+        update_scroll_animations(&mut session.state);
     }
 
     fn present(&mut self, state: &crate::state::AppState) -> Result<()> {
@@ -634,6 +634,25 @@ fn selected_instance_header_key(state: &crate::state::AppState) -> Option<String
         RowKind::Instance { group_id, .. } => Some(group_id.clone()),
         _ => None,
     })
+}
+
+/// Send chat turns to the window `key`, for a surface that is not the terminal
+/// (SPEC R-UI): the terminal's [`activate_window_chat`] without the model-setup
+/// wizard, which only the terminal can show. With no model configured it says
+/// where to configure one.
+pub(crate) fn chat_with(
+    state: &mut crate::state::AppState,
+    key: &str,
+) -> Result<(), crate::controller::Refused> {
+    if state.llm_selection.is_none() && !state.caps.persistent_answers {
+        push_assistant_message(
+            state,
+            "No model is configured. Connect one in `ahma tui` (/connect), then chat here.",
+        );
+        return Err(crate::controller::Refused::NotAllowed);
+    }
+    activate_window_chat(key, state);
+    Ok(())
 }
 
 fn activate_window_chat(key: &str, state: &mut crate::state::AppState) {
@@ -7362,7 +7381,7 @@ pub(crate) fn update_scroll_animations(state: &mut crate::state::AppState) {
     }
 }
 
-pub(crate) fn chat_in_progress(state: &crate::state::AppState) -> bool {
+pub fn chat_in_progress(state: &crate::state::AppState) -> bool {
     state.turn.is_some()
 }
 

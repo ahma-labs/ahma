@@ -361,7 +361,7 @@ pub trait Frontend {
     }
 
     /// Called after every tick, for what only this surface has to keep moving.
-    fn on_tick(&mut self, _state: &mut AppState) {}
+    fn on_tick(&mut self, _session: &mut Session) {}
 
     /// Show the state. Called once before the loop and once after every pass.
     fn present(&mut self, state: &AppState) -> Result<()>;
@@ -391,7 +391,7 @@ pub async fn run_session<F: Frontend>(session: &mut Session, frontend: &mut F) -
                 let ticked = matches!(input, SessionInput::Tick);
                 session.handle(input);
                 if ticked {
-                    frontend.on_tick(&mut session.state);
+                    frontend.on_tick(session);
                 }
             }
         }
@@ -465,7 +465,7 @@ mod tests {
             Duration::from_millis(5)
         }
 
-        fn on_tick(&mut self, _state: &mut AppState) {
+        fn on_tick(&mut self, _session: &mut Session) {
             self.ticks += 1;
         }
 
