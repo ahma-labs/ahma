@@ -187,9 +187,45 @@ impl HttpClient {
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, SendError> {
         match self {
-            Self::Tcp(_) => Ok(request.send().await?),
+            Self::Tcp(client) => {
+                let mut request = request.build()?;
+                attach_serve_http_token(&mut request).await;
+                Ok(client.execute(request).await?)
+            }
             Self::LocalSocket(sender) => sender.send(request.build()?).await,
         }
+    }
+}
+
+/// The port of a request to this machine over plain `http://`, or `None` for
+/// anything else: a token published for a local `ahma serve http` is for that
+/// server, and is never sent to another host.
+fn loopback_http_port(url: &reqwest::Url) -> Option<u16> {
+    if url.scheme() != "http" {
+        return None;
+    }
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        .then(|| url.port_or_known_default())
+        .flatten()
+}
+
+/// Present the token an operator-started `ahma serve http` published for its
+/// port (SPEC R-HUB.14), unless the request already carries credentials. A
+/// server that published none — one run with `--allow-unauthenticated`, or one
+/// that is not ahma — leaves the request as it was.
+async fn attach_serve_http_token(request: &mut reqwest::Request) {
+    if request.headers().contains_key(http::header::AUTHORIZATION) {
+        return;
+    }
+    let Some(port) = loopback_http_port(request.url()) else {
+        return;
+    };
+    if let Some(token) = ahma_common::hub::serve_http_token_for(port).await
+        && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
+    {
+        request
+            .headers_mut()
+            .insert(http::header::AUTHORIZATION, value);
     }
 }
 
@@ -265,6 +301,64 @@ mod tests {
     use super::*;
     use crate::test_support::serve_on_local_socket;
     use ahma_common::local_socket::LocalListener;
+
+    /// A request to a local `ahma serve http` carries the token that server
+    /// published for its port (SPEC R-HUB.14) — and only that server's: not a
+    /// request to another host, nor to another port, nor over TLS, nor one that
+    /// already has credentials.
+    #[tokio::test]
+    async fn a_request_to_a_local_serve_http_carries_its_published_token() {
+        let token = ahma_common::hub::HubToken::generate();
+        let path = ahma_common::hub::serve_http_token_path(48311).expect("a runtime dir");
+        ahma_common::hub::publish_token(&path, &token)
+            .await
+            .unwrap();
+
+        let authorization = |url: &str, existing: Option<&str>| {
+            let url = reqwest::Url::parse(url).unwrap();
+            let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+            if let Some(existing) = existing {
+                request
+                    .headers_mut()
+                    .insert(http::header::AUTHORIZATION, existing.parse().unwrap());
+            }
+            async move {
+                attach_serve_http_token(&mut request).await;
+                request
+                    .headers()
+                    .get(http::header::AUTHORIZATION)
+                    .map(|v| v.to_str().unwrap().to_string())
+            }
+        };
+        let expected = format!("Bearer {}", token.as_str());
+        for local in [
+            "http://127.0.0.1:48311/mcp",
+            "http://localhost:48311/mcp",
+            "http://[::1]:48311/mcp",
+        ] {
+            assert_eq!(
+                authorization(local, None).await.as_deref(),
+                Some(expected.as_str()),
+                "{local}"
+            );
+        }
+        for elsewhere in [
+            "http://example.com:48311/mcp",
+            "http://10.0.0.5:48311/mcp",
+            "https://127.0.0.1:48311/mcp",
+            "http://127.0.0.1:48312/mcp",
+        ] {
+            assert_eq!(authorization(elsewhere, None).await, None, "{elsewhere}");
+        }
+        assert_eq!(
+            authorization("http://127.0.0.1:48311/mcp", Some("Bearer theirs"))
+                .await
+                .as_deref(),
+            Some("Bearer theirs"),
+            "credentials the caller chose are kept"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     fn echo_app() -> axum::Router {
         axum::Router::new().route(

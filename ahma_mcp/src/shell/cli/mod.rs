@@ -247,6 +247,8 @@ pub struct AppConfig {
     pub require_token: Option<String>,
     /// Path to a file containing the required token (AHMA_REQUIRE_TOKEN_PATH).
     pub require_token_path: Option<PathBuf>,
+    /// Run `serve unix` / `serve http` with no token (`--allow-unauthenticated`).
+    pub allow_unauthenticated: bool,
     /// Rate limit requests per second (AHMA_RATE_LIMIT_RPS).
     pub rate_limit_rps: u64,
     /// Rate limit burst allowance (AHMA_RATE_LIMIT_BURST).
@@ -334,6 +336,7 @@ impl Default for AppConfig {
             task_vault: None,
             require_token: None,
             require_token_path: None,
+            allow_unauthenticated: false,
             rate_limit_rps: 0,
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
@@ -1393,6 +1396,10 @@ pub struct Cli {
     /// Path to a file containing the required bearer token for HTTP access.
     #[arg(long = "require-token-path", value_name = "PATH", global = true)]
     pub require_token_path: Option<PathBuf>,
+
+    /// Run `serve unix` or `serve http` with no bearer token. By default those servers make a token and publish it to a file ahma's own clients read, because a command running inside ahma's sandbox can reach a local socket or loopback port and open a session that chooses its own sandbox scope. Use this only for a server that is protected some other way; it is disclosed on every start.
+    #[arg(long = "allow-unauthenticated", global = true)]
+    pub allow_unauthenticated: bool,
 
     /// Maximum requests per second for HTTP rate limiting.
     #[arg(long = "rate-limit-rps", value_name = "RPS", global = true)]
@@ -3590,6 +3597,7 @@ pub fn build_app_config_with_settings(
         task_vault: resolve_task_vault(cli, &s),
         require_token: auth.require_token,
         require_token_path: auth.require_token_path,
+        allow_unauthenticated: cli.allow_unauthenticated,
         rate_limit_rps: auth.rate_limit_rps,
         rate_limit_burst: auth.rate_limit_burst,
         instance_label: auth.instance_label,

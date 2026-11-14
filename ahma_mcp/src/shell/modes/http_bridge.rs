@@ -67,7 +67,7 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         ),
     }
 
-    let bridge_config = BridgeConfig {
+    let mut bridge_config = BridgeConfig {
         bind_addr,
         server_command,
         server_args,
@@ -96,6 +96,16 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         // Session options are a hub feature (SPEC R-HUB.4).
         session_options: None,
     };
+
+    // A token the operator configured, none if they chose none, else one this
+    // server makes and publishes for ahma's own clients (SPEC R-HUB.14). Held
+    // for as long as the server runs: dropping it removes the token file.
+    let _auth = super::bridge_auth::apply(
+        &config,
+        super::bridge_auth::Home::Port(config.http_port),
+        &mut bridge_config,
+    )
+    .await?;
 
     start_bridge(bridge_config).await?;
 

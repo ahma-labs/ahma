@@ -30,6 +30,7 @@ mod request_handler_coverage_test;
 mod restart_test;
 mod sampling_routing_test;
 mod sandbox_roots_handshake_test;
+mod serve_http_default_token_test;
 mod session_delete_test;
 mod sighup_token_reload_test;
 mod sse_endpoint_test;

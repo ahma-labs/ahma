@@ -567,7 +567,24 @@ pub async fn trigger_tcp_restart_with_mode(url: &str, mode: Option<&str>) -> boo
         Some(mode) => format!("{}/restart?mode={mode}", url.trim_end_matches('/')),
         None => format!("{}/restart", url.trim_end_matches('/')),
     };
-    if let Ok(resp) = PROBE_CLIENT.post(&restart_url).send().await {
+    // A local `ahma serve http` requires the token it published (SPEC R-HUB.14).
+    let Ok(mut request) = PROBE_CLIENT.post(&restart_url).build() else {
+        return false;
+    };
+    if let Some(port) = request.url().port_or_known_default().filter(|_| {
+        request.url().scheme() == "http"
+            && matches!(
+                request.url().host_str(),
+                Some("localhost" | "127.0.0.1" | "[::1]")
+            )
+    }) && let Some(token) = ahma_common::hub::serve_http_token_for(port).await
+        && let Ok(value) = format!("Bearer {token}").parse()
+    {
+        request
+            .headers_mut()
+            .insert(reqwest::header::AUTHORIZATION, value);
+    }
+    if let Ok(resp) = PROBE_CLIENT.execute(request).await {
         return resp.status().is_success();
     }
     false
@@ -1090,6 +1107,7 @@ mod tests {
             task_vault: None,
             require_token: None,
             require_token_path: None,
+            allow_unauthenticated: false,
             rate_limit_rps: 0,
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),

@@ -5450,6 +5450,17 @@ fn handle_window_finished_event(
     let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) else {
         return;
     };
+    // A sandboxed step is finished by its operation (`settle_bound_steps`),
+    // and the tool's reply can arrive after that: the same end, which must not
+    // move the plan on a second time.
+    if w.runner == crate::state::WindowRunner::Sandboxed
+        && !matches!(
+            w.status,
+            crate::state::WindowStatus::Running | crate::state::WindowStatus::Pending
+        )
+    {
+        return;
+    }
     w.status = if success {
         crate::state::WindowStatus::Finished
     } else {
@@ -5473,6 +5484,39 @@ fn advance_steps(success: bool, state: &mut crate::state::AppState) {
     } else {
         cancel_pending_windows(state);
     }
+}
+
+/// Bind `op` to the sandboxed step that started it, if one is running and
+/// not yet bound: the same command, where it ran, and started by this
+/// session's own agent tool client. The hub reports an operation before the
+/// tool's reply names it, and one that ends inside the inline window is never
+/// named, so without this the step and the operation would be two cards.
+fn claim_for_running_step(
+    op: &crate::state::Operation,
+    windows: &mut [crate::state::TuiWindow],
+) -> bool {
+    use crate::state::{WindowRunner, WindowStatus};
+    let ours = matches!(
+        op.origin.as_deref(),
+        Some(ahma_core::agent::AGENT_TOOL_CLIENT) | Some("ahma-tui")
+    );
+    let (Some(command), Some(cwd)) = (op.command.as_deref(), op.cwd.as_deref()) else {
+        return false;
+    };
+    if !ours {
+        return false;
+    }
+    let Some(step) = windows.iter_mut().find(|w| {
+        w.runner == WindowRunner::Sandboxed
+            && w.status == WindowStatus::Running
+            && w.op_id.is_none()
+            && w.command.trim() == command.trim()
+            && w.working_dir == cwd
+    }) else {
+        return false;
+    };
+    step.op_id = Some(op.id.clone());
+    true
 }
 
 /// A `#goal` step that has not started yet. A bound step already has its
@@ -5947,6 +5991,8 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             if w.runner != crate::state::WindowRunner::Sandboxed {
                 update_existing_window(w, op, state.unicode, multi_instance);
             }
+        } else if claim_for_running_step(op, &mut state.windows) {
+            // The step's own card follows this operation from now on.
         } else if !state.window_suppressed_by_clear(op) {
             let w = build_new_window(op, state, multi_instance);
             to_add.push(w);
@@ -7816,6 +7862,70 @@ mod tests {
         let status = |id| state.windows.iter().find(|w| w.id == id).unwrap().status;
         assert_eq!(status(first), WindowStatus::Finished);
         assert_eq!(status(second), WindowStatus::Running, "the plan moved on");
+    }
+
+    /// The operation a running step started is that step's card, not a second
+    /// one beside it: the hub reports it before the tool's reply names it, and
+    /// a command that finishes inside the inline window is never named at all.
+    /// Matched on what the wire carries — the command, where it ran and that
+    /// this session's own agent tool client started it — so another session's
+    /// identical command is not taken for the step's.
+    #[tokio::test]
+    async fn a_running_step_claims_the_operation_it_started() {
+        use crate::state::{OpStatus, Operation, WindowStatus};
+        let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
+        two_step_plan(&mut state);
+        let (first, second) = (state.windows[0].id, state.windows[1].id);
+        let cwd = state.windows[0].working_dir.clone();
+
+        let op = |id: &str, origin: &str, command: &str| {
+            let mut o = Operation::new(id, "run_terminal_command", OpStatus::Running);
+            o.command = Some(command.to_string());
+            o.cwd = Some(cwd.clone());
+            o.origin = Some(origin.to_string());
+            o
+        };
+        // Another session running the same command is another operation.
+        state
+            .operations
+            .push(op("op_other", "claude-code", "cargo build"));
+        super::sync_operations_to_windows(&mut state);
+        assert_eq!(
+            state.windows.len(),
+            3,
+            "a stranger's operation keeps its card"
+        );
+        assert!(state.windows[0].op_id.is_none());
+
+        state.operations.push(op(
+            "op_mine",
+            ahma_core::agent::AGENT_TOOL_CLIENT,
+            "cargo build",
+        ));
+        super::sync_operations_to_windows(&mut state);
+        assert_eq!(
+            state.windows.len(),
+            3,
+            "the step's own operation adds no card"
+        );
+        assert_eq!(state.windows[0].op_id.as_deref(), Some("op_mine"));
+
+        // It ends, and the plan moves on once.
+        for o in &mut state.operations {
+            if o.id == "op_mine" {
+                o.status = OpStatus::Succeeded;
+            }
+        }
+        super::sync_operations_to_windows(&mut state);
+        let status =
+            |state: &AppState, id| state.windows.iter().find(|w| w.id == id).unwrap().status;
+        assert_eq!(status(&state, first), WindowStatus::Finished);
+        assert_eq!(status(&state, second), WindowStatus::Running);
+
+        // The tool's reply arrives after the operation ended: it is the same
+        // end, and must not move the plan on a second time.
+        super::handle_window_finished_event(first, true, "Completed".into(), &mut state);
+        assert_eq!(status(&state, second), WindowStatus::Running);
     }
 
     #[test]

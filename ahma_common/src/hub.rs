@@ -934,7 +934,25 @@ pub fn lock_path_for(socket: &Path) -> PathBuf {
 /// name with a `.token` extension, so `hub.sock` has `hub.token` and a socket
 /// a test or an operator places brings its own — the token follows whatever
 /// socket a client is asked to connect to.
+///
+/// A Linux abstract socket (`@name`, or `\0name` once resolved) has no
+/// directory, so its token is `abstract-<name>.token` in the runtime directory.
 pub fn token_path_for(socket: &Path) -> PathBuf {
+    let text = socket.to_string_lossy();
+    if let Some(name) = text.strip_prefix('@').or_else(|| text.strip_prefix('\0')) {
+        let name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dir = runtime_dir_location().unwrap_or_else(std::env::temp_dir);
+        return dir.join(format!("abstract-{name}.token"));
+    }
     socket.with_extension("token")
 }
 
@@ -980,8 +998,9 @@ impl std::fmt::Debug for HubToken {
 
 /// Publish `token` at `path`, owner-only and atomically: written to a
 /// private temporary file and renamed over the old one, so a reader sees the
-/// previous hub's token or this one's and never a partial file.
-async fn write_token_file(path: &Path, token: &HubToken) -> std::io::Result<()> {
+/// previous server's token or this one's and never a partial file. What the hub
+/// and an operator-started `serve unix|http` (SPEC R-HUB.14) both use.
+pub async fn publish_token(path: &Path, token: &HubToken) -> std::io::Result<()> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1004,6 +1023,21 @@ async fn write_token_file(path: &Path, token: &HubToken) -> std::io::Result<()> 
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     written
+}
+
+/// Where an operator-started `ahma serve http` on `port` publishes its token
+/// (SPEC R-HUB.14): in the runtime directory, named for the port, where a client
+/// of a loopback `http://` URL looks. `None` when there is no runtime directory.
+pub fn serve_http_token_path(port: u16) -> Option<PathBuf> {
+    runtime_dir().map(|dir| dir.join(format!("serve-http-{port}.token")))
+}
+
+/// The token of the `ahma serve http` on loopback `port`, if one is published
+/// and this process may read it.
+pub async fn serve_http_token_for(port: u16) -> Option<String> {
+    let path = serve_http_token_path(port)?;
+    let raw = tokio::fs::read_to_string(path).await.ok()?;
+    Some(raw.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// The token of the hub at `socket`, read from beside it; `None` when there
@@ -2227,7 +2261,7 @@ impl HubServer {
         // accepts unauthenticated connections is the thing this prevents.
         let token = HubToken::generate();
         let token_path = token_path_for(&socket_path);
-        write_token_file(&token_path, &token).await.map_err(|e| {
+        publish_token(&token_path, &token).await.map_err(|e| {
             HubBindError::Failed(anyhow::anyhow!(
                 "ahma hub: cannot publish its token at {}: {e}",
                 token_path.display()
@@ -4048,6 +4082,31 @@ mod tests {
         assert!(read_hub_token(&sock).is_none());
         assert!(hub_token_for(&sock).await.is_some(), "the preloaded copy");
         assert!(list_instances_at(&sock).await.is_ok(), "and it is accepted");
+    }
+
+    /// A Linux abstract socket (`@name`, or `\0name` once resolved) has no
+    /// directory to put a token beside; its token goes in the runtime
+    /// directory, never in whatever the working directory happens to be.
+    #[test]
+    fn an_abstract_socket_keeps_its_token_in_the_runtime_directory() {
+        let runtime = runtime_dir_location().expect("a runtime dir");
+        for socket in ["@ahma", "\0ahma"] {
+            assert_eq!(
+                token_path_for(Path::new(socket)),
+                runtime.join("abstract-ahma.token"),
+                "{socket:?}"
+            );
+        }
+        // Names are not paths: every separator becomes `_`, so what is left is
+        // one file name, whatever the name asks for.
+        let odd = token_path_for(Path::new("@../x/y"));
+        assert_eq!(odd, runtime.join("abstract-.._x_y.token"));
+        assert_eq!(odd.parent(), Some(runtime.as_path()));
+        // An ordinary socket is unchanged.
+        assert_eq!(
+            token_path_for(Path::new("/run/ahma/mcp.sock")),
+            Path::new("/run/ahma/mcp.token")
+        );
     }
 
     #[test]

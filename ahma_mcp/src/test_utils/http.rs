@@ -59,6 +59,11 @@ pub async fn spawn_http_bridge_with_args(
     cmd.arg("--log-to-stderr");
     cmd.arg("--handshake-timeout")
         .arg(TestTimeouts::scale_secs(120).as_secs().to_string());
+    // `ahma serve http` requires a token by default (SPEC R-HUB.14). The tests
+    // that use this helper are about the protocol and send plain requests, so
+    // they run open, an explicit choice the server discloses;
+    // `serve_http_default_token_test` (ahma_http_bridge) runs the default.
+    cmd.arg("--allow-unauthenticated");
     cmd.args(extra_args);
     cmd.args(["serve", "http", "--port", &port.to_string()]);
 

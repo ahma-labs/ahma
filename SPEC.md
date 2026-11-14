@@ -1908,6 +1908,30 @@ lifetime.
     promise of R24.5; it affects only frontends and TUIs already running across an upgrade.
     A newer client reads no token from an older hub and sends none, and works as before.
 
+- **R-HUB.14 — Operator-started endpoints authenticate too.** `ahma serve unix` and
+  `ahma serve http` are reachable by the user's own sandboxed commands exactly as the hub is — a
+  unix socket no sandbox rule mediates on Linux, a loopback port the sandbox's network
+  allowance covers — and a session on either locks the scope its client's `roots/list` names,
+  so a command that can open one chooses where it may write. Unless the operator gave a token
+  (`--require-token`, `--require-token-path`, `[auth]`) or chose none, such a server **must**
+  make one and require it of every route but `/health`:
+  - **R-HUB.14.1 — Where it is published.** 64 hex characters from the operating system's
+    random source, owner-only, by rename, before the server accepts a connection (a server on
+    port 0, once its bind has picked the port); removed when the server stops. `serve unix`
+    publishes it beside its socket (`mcp.sock` → `mcp.token`), where ahma's own clients of that
+    socket already look; `serve http` publishes `serve-http-<port>.token` in the runtime
+    directory (R-HUB.2), which R-HUB.13.3 keeps out of a sandboxed command's reach. It is never
+    printed, logged or put in an argument or an environment variable.
+  - **R-HUB.14.2 — ahma's own clients need no configuration.** A request ahma makes to a
+    loopback `http://` URL, or over a unix socket, presents the token published for that port or
+    socket unless the caller already chose credentials. A token is never sent to another host,
+    another port or over TLS.
+  - **R-HUB.14.3 — Choosing none is allowed, and loud.** `--allow-unauthenticated` runs the
+    server with no token, publishes nothing, and says on every start, in the log and on
+    standard error, that any local process, including a sandboxed command, can use it (R7).
+  - Third-party clients of such a server must be given the token: the default breaks a client
+    that configured a URL and no credentials.
+
 ### R-ISO: Test/Live Endpoint Isolation
 
 The hub socket, the default `serve unix` socket and the history file are per-user singletons;
@@ -2207,6 +2231,4 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **A hook question asked in a live MCP session** (R-PERM.6.1 rung 1): a hook denial is asked in Claude Code's dialog (R-PERM.10) or the TUI, never through a live MCP session for the same workspace.
 - **Container daemon sockets on Linux** (R-HANDOFF.6): Landlock at the ABI ahma uses does not mediate `connect(2)` to a pathname unix socket, and ahma has no other rule there, so a command whose user may reach a daemon socket (the `docker` group for `/var/run/docker.sock`, rootless Docker or podman under `$XDG_RUNTIME_DIR`) can use it. Masking the sockets in the opt-in mount-namespace tier (R6.1.7) is the likely route.
 - **The hub's token protects least where there is no filesystem boundary** (R-HUB.13): on Windows a command can read `hub.token` and connect; on Linux a command can reach the socket and the token is the only barrier (the runtime directory is in no Landlock ruleset and the token is never in an argument or environment variable; that a command cannot read a holder's memory or `/proc/<pid>/environ` rests on Landlock's ptrace scoping, which has no ahma test yet); under macOS deferral to an outer sandbox (R7.6) that sandbox, not ahma's, decides whether a command can connect or read the token. A hub socket the operator places in a directory a sandbox can read puts its token there too.
-- **Operator-started `ahma serve unix` and `ahma serve http` take no token by default** (R-HTTP, R-HUB.13): a loopback `serve http` port and a `serve unix` socket outside the runtime directory are reachable from inside the sandbox and open the same session options the hub's `/mcp` does, so they are the same escape. Open; the hub's own socket is fixed.
-- **Hooks register with the hub under deferral** (R7.6): the spec says a hook in that state skips registration, but `ahma hooks run-shell` starts its reporter regardless. Whether it can reach the hub is then the outer sandbox's decision.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.
