@@ -59,6 +59,48 @@ mod ahma_mcp_tests {
         );
     }
 
+    /// SPEC R-GUI.1, R-DOC.7: `ahma gui --help` says it listens on this machine only
+    /// and offers a port and no address, and the command is in the top-level help.
+    #[test]
+    fn test_ahma_gui_help_names_loopback_and_offers_no_address() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+
+        let output = test_command(&binary)
+            .args(["gui", "--help"])
+            .output()
+            .expect("Failed to execute ahma gui --help");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            output.status.success(),
+            "ahma gui --help should succeed. Output: {combined}"
+        );
+        assert!(
+            combined.contains("--port") && combined.contains("--no-open"),
+            "{combined}"
+        );
+        assert!(combined.contains("127.0.0.1"), "{combined}");
+        assert!(
+            !combined.contains("--bind")
+                && !combined.contains("--host")
+                && !combined.contains("--listen"),
+            "there is no option to listen elsewhere: {combined}"
+        );
+
+        let top = test_command(&binary)
+            .arg("--help")
+            .output()
+            .expect("Failed to execute ahma --help");
+        assert!(
+            String::from_utf8_lossy(&top.stdout).contains("gui"),
+            "the top-level help lists the gui command"
+        );
+    }
+
     /// `ahma settings explain` says what a key is, who may set it and the one
     /// command that changes it, and offers the near names for a typo
     /// (SPEC R-CFG11).

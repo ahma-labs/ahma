@@ -503,7 +503,7 @@ ahma web list
 ```
 
 Every grant and revoke is appended to `~/.ahma/permissions-audit.jsonl`, with the
-surface that answered (`cli`, `tui`, `harness`). Filesystem grants are written through
+surface that answered (`cli`, `tui`, `gui`, `harness`). Filesystem grants are written through
 one function — the CLI, the TUI modal and an elicitation answer all share it — and that
 function applies the denylist above and writes the audit record, so no surface can skip
 either.

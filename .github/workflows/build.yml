@@ -607,6 +607,53 @@ jobs:
 
   #######################################
 
+  # The `ahma gui` page (SPEC R-GUI.10). `cargo build` never runs Node: the compiled files in
+  # ahma_gui/web/dist are committed and embedded, so this job is what proves they are the
+  # compile of the committed source, and that the page's own tests pass. `--ignore-scripts`
+  # because the one dependency, `typescript`, needs no install script and nothing else may run one.
+  job-web:
+    name: GUI page (tsc, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ github.token }}
+          persist-credentials: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Forbidden APIs, first-party imports, one lockfile package
+        run: bash ./scripts/check-gui-web.sh
+
+      - name: Install (typescript only, no scripts)
+        working-directory: ahma_gui/web
+        run: npm ci --ignore-scripts
+
+      - name: Compile
+        working-directory: ahma_gui/web
+        run: npm run build
+
+      - name: Committed build equals a fresh compile
+        run: |
+          if ! git diff --exit-code -- ahma_gui/web/dist; then
+            echo '::error::ahma_gui/web/dist differs from a fresh compile; run `npm run build` in ahma_gui/web and commit it'
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- ahma_gui/web/dist)" ]; then
+            echo '::error::the compile produced files that are not committed in ahma_gui/web/dist'
+            git status --porcelain -- ahma_gui/web/dist
+            exit 1
+          fi
+
+      - name: Page tests
+        working-directory: ahma_gui/web
+        run: npm test
+
+  #######################################
+
   # Single aggregate gate. This is the ONE required status check on main (rename-stable —
   # individual matrix legs can be renamed without touching branch protection). The merge
   # queue runs this on `merge_group` before merging; a push to main runs it as the release
@@ -619,6 +666,7 @@ jobs:
       - job-cargo-nextest
       - job-android-nextest
       - job-security
+      - job-web
       - job-coverage
     runs-on: ubuntu-latest
     steps:
@@ -627,11 +675,13 @@ jobs:
           echo "nextest=${{ needs.job-cargo-nextest.result }}"
           echo "android=${{ needs.job-android-nextest.result }}"
           echo "security=${{ needs.job-security.result }}"
+          echo "web=${{ needs.job-web.result }}"
           echo "coverage=${{ needs.job-coverage.result }}"
           fail=0
           [ "${{ needs.job-cargo-nextest.result }}" = "success" ] || { echo '::error::test matrix did not pass'; fail=1; }
           [ "${{ needs.job-android-nextest.result }}" = "success" ] || { echo '::error::android tests did not pass'; fail=1; }
           [ "${{ needs.job-security.result }}" = "success" ] || { echo '::error::security (cargo deny) did not pass'; fail=1; }
+          [ "${{ needs.job-web.result }}" = "success" ] || { echo '::error::GUI page (tsc, tests) did not pass'; fail=1; }
           # job-coverage only runs on main-branch pushes (its own `if:`), so it is
           # legitimately "skipped" on production pushes / workflow_dispatch. Gate on
           # an actual failure, not on a skip — on the release path (main push) it

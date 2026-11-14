@@ -4304,7 +4304,7 @@ fn build_scope_grant_answers(
 
 // ─── Grant question popup ─────────────────────────────────────────────────────
 
-/// One grant question, laid out by [`draw_gate_popup`] (SPEC R-PERM.3.8).
+/// One grant question, laid out by [`draw_gate_popup`] (SPEC R-PERM.3.10).
 struct GatePopup {
     title: String,
     /// Preferred width; a narrower terminal gets its whole width.
@@ -4326,7 +4326,7 @@ struct GatePopup {
 }
 
 /// Draw a grant question: its answers and deny hint pinned at the bottom and
-/// always drawn whole, its body scrolling above them (SPEC R-PERM.3.8).
+/// always drawn whole, its body scrolling above them (SPEC R-PERM.3.10).
 ///
 /// The popup grows with its content up to the terminal less a one-row margin
 /// (none on a short terminal), instead of a fixed height that clipped the
@@ -4591,7 +4591,7 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
     let tool = gate.tool.as_deref().unwrap_or("A tool");
     // R-WEB.6.1: the URL is attacker-influenced text rendered inside a security
     // prompt. Cap it so a crafted long URL cannot bury the question in wrapped
-    // noise; the answers are pinned below the body regardless (R-PERM.3.8).
+    // noise; the answers are pinned below the body regardless (R-PERM.3.10).
     let url = truncate(&gate.url, 256);
 
     let mut lines = vec![
@@ -6832,7 +6832,7 @@ mod tests {
         (rows, view)
     }
 
-    /// SPEC R-PERM.3.8: whatever the terminal size and however long the
+    /// SPEC R-PERM.3.10: whatever the terminal size and however long the
     /// question, every answer and the deny hint are on screen, each answer
     /// whole on one row. Before this, a 120×40 terminal showed `[n]`, `[o]`
     /// and half of `[w]`, and cut the deny hint and the `[?]` that leads to

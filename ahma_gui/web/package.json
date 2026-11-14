@@ -1,0 +1,15 @@
+{
+  "name": "ahma-gui-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The browser page for `ahma gui`: a thin renderer over the server's view. No runtime dependencies.",
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit",
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -1035,6 +1035,12 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
                  If you are running a custom binary, implement TUI dispatch using ahma_tui::run_tui."
             )
         }
+        Subcommands::Gui(_) => {
+            anyhow::bail!(
+                "gui is provided by the ahma_bin crate (includes ahma_gui). \
+                 If you are running a custom binary, implement it using ahma_gui::run_gui."
+            )
+        }
         Subcommands::Tls(_) => {
             anyhow::bail!(
                 "tls commands are provided by the ahma_bin crate (includes ahma_common::local_tls). \
@@ -1481,6 +1487,8 @@ pub enum Subcommands {
     Tool(ToolArgs),
     /// Start the TUI control plane (terminal dashboard for active tasks).
     Tui(TuiArgs),
+    /// Start the browser interface: the same session as the TUI, in a page served only to this machine.
+    Gui(GuiArgs),
     /// Local TLS certificate management: init, rotate, and check status.
     Tls(TlsArgs),
     /// Bundle management: audit MTDF tool bundles for supply-chain risks, and record or check a SHA-256 content manifest.
@@ -2532,6 +2540,39 @@ pub struct InfoArgs {
 }
 
 // ── tui ───────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma gui`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  # Find the per-user hub, listen on a free local port, open a browser
+  ahma gui
+
+  # Print the address and the pairing code only
+  ahma gui --no-open
+
+  # A fixed port, for an SSH port-forward
+  ahma gui --port 8765 --no-open")]
+pub struct GuiArgs {
+    /// URL of the ahma server to monitor; when omitted, `ahma gui` finds the per-user hub exactly as `ahma tui` does. Supported forms: http://host:port, https://host:port and unix:///path/to.sock.
+    #[arg(long = "connect")]
+    pub connect: Option<String>,
+
+    /// Launch directly with a specific agent profile.
+    #[arg(long = "profile")]
+    pub profile: Option<String>,
+
+    /// Port to listen on, on this machine only (127.0.0.1 and ::1). The default, 0, lets the system pick a free one and prints the address. There is no option to listen on any other address: to reach it from another machine, forward the port over SSH.
+    #[arg(long = "port", default_value_t = 0)]
+    pub port: u16,
+
+    /// Do not open a browser. The address is printed either way, with a pairing code you type into the page: the page proves it was opened by whoever is at this terminal, which a command running in ahma's sandbox cannot do.
+    #[arg(long = "no-open")]
+    pub no_open: bool,
+
+    /// Optional path to set as the sandbox scope (defaults to the current directory).
+    #[arg(index = 1, value_name = "PATH")]
+    pub path: Option<PathBuf>,
+}
 
 /// Arguments for `ahma tui`.
 #[derive(Parser, Debug)]
@@ -5908,6 +5949,53 @@ mod tests {
     fn test_vault_subcommand_no_longer_parses() {
         let err = Cli::try_parse_from(["ahma", "vault", "list"]);
         assert!(err.is_err(), "`ahma vault` must be an unknown subcommand");
+    }
+
+    /// `ahma gui` listens on this machine only and has no option to do otherwise
+    /// (SPEC R-GUI.1): the flags are a port and whether to open a browser, and a
+    /// host is not among them.
+    #[test]
+    fn test_gui_subcommand_parses_a_port_and_has_no_host() {
+        let cli = Cli::try_parse_from(["ahma", "gui", "--port", "8765", "--no-open", "/proj"])
+            .expect("gui parses");
+        let Subcommands::Gui(args) = cli.command else {
+            panic!("a gui subcommand")
+        };
+        assert_eq!(args.port, 8765);
+        assert!(args.no_open);
+        assert_eq!(args.path, Some(PathBuf::from("/proj")));
+        let defaults = Cli::try_parse_from(["ahma", "gui"]).unwrap();
+        let Subcommands::Gui(d) = defaults.command else {
+            panic!()
+        };
+        assert_eq!(
+            (d.port, d.no_open),
+            (0, false),
+            "a free port, and open the browser"
+        );
+        for host_flag in ["--host", "--bind", "--listen", "--address"] {
+            assert!(
+                Cli::try_parse_from(["ahma", "gui", host_flag, "0.0.0.0"]).is_err(),
+                "{host_flag} must not exist: the listener is loopback only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_subcommand_gui_bails() {
+        let err = dispatch_subcommand(
+            Subcommands::Gui(GuiArgs {
+                connect: None,
+                profile: None,
+                port: 0,
+                no_open: true,
+                path: None,
+            }),
+            make_cfg(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("gui is provided"));
     }
 
     #[tokio::test]

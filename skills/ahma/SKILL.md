@@ -14,7 +14,7 @@ description: >
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
   "maintainability", "cognitive complexity", "cyclomatic complexity", "simplicity score",
   "code quality metrics", "hotspot", "ahma simplify", "ahma help", "ahma ?",
-  "ahma update", "ahma tui", "/ahma tui", "network_grant", "ahma network", "network grant".
+  "ahma update", "ahma tui", "/ahma tui", "ahma gui", "/ahma gui", "network_grant", "ahma network", "network grant".
 user-invocable: true
 ---
 
@@ -341,11 +341,11 @@ ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 | `/ahma simplify top N` | — | Auto-fix top N complexity issues concurrently |
 | `/ahma simplify N` | — | Get fix instructions for issue #N only (manual mode) |
 | `/ahma tui` | — | Start the terminal user interface (TUI) control plane |
+| `/ahma gui` | — | Start the browser GUI *(experimental)*: loopback only, a pairing code typed from this terminal; [docs/gui.md](https://github.com/ahma-labs/ahma/blob/main/docs/gui.md) |
 | `/ahma update` | — | Update ahma to the latest version |
 | `/ahma uninstall` | — | Remove integrations installed by `ahma setup` (MCP entries, hooks, skills, binary) |
 
-`/ahma help` / `/ahma ?` just reprints this table plus the key config flags (`--tools`,
-`--sandbox`, `--log-monitor`).
+`/ahma help` / `/ahma ?` just reprints this table plus the key config flags (`--tools`, `--sandbox`, `--log-monitor`).
 
 ---
 

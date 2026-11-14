@@ -1520,7 +1520,7 @@ pub struct ScopeGrantGate {
     /// its reason says.
     pub harness: Option<crate::harness_asks::HarnessAsk>,
     /// Body rows scrolled past. Only the body scrolls; the answers under it
-    /// are pinned (SPEC R-PERM.3.8).
+    /// are pinned (SPEC R-PERM.3.10).
     pub scroll: usize,
     /// Keep the "If you choose always" section in view instead of `scroll`:
     /// set by the first press of a saving key, cleared by a scroll key or `?`.
@@ -1537,7 +1537,7 @@ pub struct ScopeGrantGate {
 /// Deny keys work at once.
 pub const GRANT_ARMING_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
-/// What the last frame of a grant question's popup showed (SPEC R-PERM.3.8).
+/// What the last frame of a grant question's popup showed (SPEC R-PERM.3.10).
 ///
 /// The renderer writes it and the key handler reads it, as `detail_max_scroll`
 /// does for the detail overlays; it lives in the gate so it dies with the
@@ -1624,7 +1624,7 @@ pub struct WebApprovalGate {
     /// `a` was pressed once: the exact settings line is on screen and a
     /// second `a` saves it (SPEC R-PERM.3.5).
     pub confirm_always: bool,
-    /// Body rows scrolled past; the answers are pinned (SPEC R-PERM.3.8).
+    /// Body rows scrolled past; the answers are pinned (SPEC R-PERM.3.10).
     pub scroll: usize,
     /// What the last frame showed, published by the renderer.
     pub view: std::cell::Cell<GateView>,

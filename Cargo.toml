@@ -25,6 +25,7 @@ default-members = [
     "ahma_harness_tools",
     # AGPL-3.0 crates (end-user product surface)
     "ahma_tui",
+    "ahma_gui",
     "ahma_bin",
 ]
 
@@ -47,6 +48,7 @@ members = [
     "ahma_harness_tools",
     # AGPL-3.0 crates (end-user product surface)
     "ahma_tui",
+    "ahma_gui",
     "ahma_bin",
     # dev-only workspace automation (not published, not in default-members)
     "xtask",

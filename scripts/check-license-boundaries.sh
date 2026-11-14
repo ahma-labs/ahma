@@ -29,6 +29,7 @@ PERMISSIVE_CRATES=(
 AGPL_CRATES=(
   ahma_bin
   ahma_tui
+  ahma_gui
 )
 
 agpl_pattern="^($(IFS='|'; echo "${AGPL_CRATES[*]}")) v"

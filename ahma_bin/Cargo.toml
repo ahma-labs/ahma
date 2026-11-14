@@ -84,6 +84,7 @@ ahma_mcp = { path = "../ahma_mcp" }
 ahma_core = { path = "../ahma_core" }
 ahma_simplify = { path = "../ahma_simplify", optional = true }
 ahma_tui = { path = "../ahma_tui" }
+ahma_gui = { path = "../ahma_gui" }
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
