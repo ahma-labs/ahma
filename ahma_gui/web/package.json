@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -p .",
     "check": "tsc -p . --noEmit",
-    "test": "node --test test/"
+    "test": "node --test \"test/*.test.ts\""
   },
   "devDependencies": {
     "typescript": "5.9.3"

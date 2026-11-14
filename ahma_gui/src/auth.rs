@@ -370,8 +370,12 @@ mod tests {
         assert_eq!(auth.authenticate(&token_b), Some(b));
         let secret_a = token_a.split_once('.').unwrap().1;
         assert_eq!(auth.authenticate(&format!("{}.{}", b.0, secret_a)), None);
-        for bad in ["", ".", "x.y", "99.abcdef", &format!("{}.", a.0), secret_a] {
-            assert_eq!(auth.authenticate(bad), None, "{bad:?}");
+        // The failing case is named by its position: a secret is never printed.
+        for (case, bad) in ["", ".", "x.y", "99.abcdef", &format!("{}.", a.0), secret_a]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(auth.authenticate(bad), None, "bad token case {case}");
         }
         auth.remove(a);
         assert_eq!(auth.authenticate(&token_a), None);

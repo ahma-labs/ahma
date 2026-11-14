@@ -623,7 +623,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Forbidden APIs, first-party imports, one lockfile package
         run: bash ./scripts/check-gui-web.sh
