@@ -687,6 +687,80 @@ async fn red_team_livelog_symlink_read_allowed() {
 // RED TEAM TEST 9: Spawn-Time Landlock (worker-thread regression)
 // =============================================================================
 
+/// SPEC R-HUB.13.3: on Linux the hub's token is the boundary, because Landlock
+/// at ahma's ABI cannot refuse a `connect(2)` to the hub's socket. So what a
+/// command in ahma's sandbox must not be able to do is *read* what holds the
+/// token: the runtime directory is in no ruleset, and the process that holds a
+/// copy in memory (a worker, a hook) cannot be read through `/proc` — Landlock
+/// refuses a restricted process `ptrace_may_access` to one outside its domain.
+/// Each is checked against an unrestricted control, so a refusal means the
+/// sandbox, not a typo in the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(target_os = "linux")]
+async fn red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder() {
+    init_test_logging();
+    skip_if_landlock_unavailable!();
+
+    let scope_dir = create_non_tmp_scope_dir();
+    // The token as the hub keeps it: beside its socket, in the runtime directory.
+    let runtime = ahma_common::hub::runtime_dir().expect("a runtime directory");
+    let token = ahma_common::hub::HubToken::generate();
+    let token_file = runtime.join("redteam-hub.token");
+    ahma_common::hub::publish_token(&token_file, &token)
+        .await
+        .unwrap();
+    // A secret a process holds in memory, as a worker holds the token it
+    // preloaded: here in this process's environment, which `/proc` exposes.
+    const MARKER: &str = "AHMA_REDTEAM_HOLDER_SECRET=hunter2-held-in-memory";
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("AHMA_REDTEAM_HOLDER_SECRET", "hunter2-held-in-memory") };
+    let environ = format!("/proc/{}/environ", std::process::id());
+
+    // Controls: this unrestricted process reads both.
+    assert_eq!(
+        std::fs::read_to_string(&token_file).unwrap().trim(),
+        token.as_str()
+    );
+    assert!(
+        std::fs::read(&environ)
+            .unwrap()
+            .windows(MARKER.len())
+            .any(|w| w == MARKER.as_bytes()),
+        "the control read of {environ} must see the marker"
+    );
+
+    let sandbox = Sandbox::new(
+        vec![scope_dir.path().to_path_buf()],
+        SandboxMode::Strict,
+        true, // no_temp_files: avoid the blanket /tmp read+write rule
+        false,
+        false,
+    )
+    .unwrap();
+    let scope = scope_dir.path().to_path_buf();
+    for (what, path) in [
+        ("the hub's token file", token_file.display().to_string()),
+        ("the holder's /proc environment", environ),
+    ] {
+        let out = sandbox
+            .create_shell_command("bash", &format!("cat {path}"), &scope)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains(token.as_str()) && !stdout.contains("hunter2-held-in-memory"),
+            "SECURITY: a sandboxed command read {what}: {stdout}"
+        );
+        assert!(
+            !out.status.success(),
+            "SECURITY: reading {what} must fail under Landlock, got exit 0"
+        );
+    }
+    let _ = std::fs::remove_file(token_file);
+}
+
 /// Children built via `Sandbox::create_command` must be kernel-restricted even
 /// when spawned from a tokio worker thread.
 ///
