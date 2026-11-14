@@ -710,11 +710,18 @@ async fn red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder()
         .await
         .unwrap();
     // A secret a process holds in memory, as a worker holds the token it
-    // preloaded: here in this process's environment, which `/proc` exposes.
+    // preloaded: a separate process outside the sandbox, started with it in its
+    // environment. (`/proc/<pid>/environ` shows the environment as of `exec`, so
+    // a `set_var` in this process would never appear there.)
     const MARKER: &str = "AHMA_REDTEAM_HOLDER_SECRET=hunter2-held-in-memory";
-    // SAFETY: nextest runs each test in its own process.
-    unsafe { std::env::set_var("AHMA_REDTEAM_HOLDER_SECRET", "hunter2-held-in-memory") };
-    let environ = format!("/proc/{}/environ", std::process::id());
+    let mut holder = tokio::process::Command::new("sleep")
+        .arg("600")
+        .env("AHMA_REDTEAM_HOLDER_SECRET", "hunter2-held-in-memory")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the holder process");
+    let environ = format!("/proc/{}/environ", holder.id().expect("holder pid"));
 
     // Controls: this unrestricted process reads both.
     assert_eq!(
@@ -759,6 +766,7 @@ async fn red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder()
         );
     }
     let _ = std::fs::remove_file(token_file);
+    ahma_mcp::shell_pool::kill_process_tree(&mut holder).await;
 }
 
 /// Children built via `Sandbox::create_command` must be kernel-restricted even
