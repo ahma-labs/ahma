@@ -1507,6 +1507,7 @@ mod tests {
                 decision: ahma_common::scope_grant::GrantDecision::Deny,
                 advice: None,
                 advice_followed: None,
+                surface: None,
             },
         );
         assert!(matches!(a, Applied::None));
@@ -1819,6 +1820,7 @@ mod tests {
             HubMsg::SubmitWebApproval {
                 decision_id: "w1".to_string(),
                 decision: ahma_common::web_approval::WebApprovalDecision::Deny,
+                surface: None,
             },
         );
         assert!(matches!(a, Applied::None));

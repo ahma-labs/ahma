@@ -1975,6 +1975,10 @@ fn liveness_initial_seed() -> u64 {
 
 /// Top-level application state — owns all panel data and UI mode.
 pub struct AppState {
+    /// The surface this session runs on: who its answers and setting changes
+    /// are attributed to (SPEC R-GUI.7). `ahma tui` is the default; `ahma gui`
+    /// sets its own.
+    pub surface: ahma_common::hub::Surface,
     pub windows: Vec<TuiWindow>,
     pub next_window_id: usize,
     /// Set by `/clear`. Operations that had already completed before this
@@ -2790,6 +2794,7 @@ impl AppState {
             .unwrap_or_default();
 
         Self {
+            surface: ahma_common::hub::Surface::default(),
             server_url: server_url.into(),
             mcp_http_base_url: String::new(),
             transport_label: transport_label.into(),

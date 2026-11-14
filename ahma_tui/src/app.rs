@@ -2951,6 +2951,7 @@ fn resolve_scope_grant(
             target_instance_id: None,
             advice: None,
             advice_followed: None,
+            surface: state.surface.on_wire(),
         });
     }
     send_incoming(ahma_common::hub::ClientMsg::SubmitScopeGrant {
@@ -2959,6 +2960,7 @@ fn resolve_scope_grant(
         target_instance_id: None,
         advice: advice_line,
         advice_followed,
+        surface: state.surface.on_wire(),
     });
 
     let (level, message) = match decision {
@@ -3119,6 +3121,7 @@ fn resolve_web_approval(
         decision_id: gate.decision_id,
         decision,
         target_instance_id: None,
+        surface: state.surface.on_wire(),
     });
 
     let (level, message) = match decision {
