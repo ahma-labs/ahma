@@ -151,124 +151,179 @@ pub fn command_words(command: &str) -> Vec<String> {
 /// comments are dropped, since they run nothing. Still a heuristic, not a
 /// shell: it only has to tell what runs from what is merely written down.
 fn shell_segments(command: &str) -> Vec<Vec<String>> {
-    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
-    let mut word = String::new();
-    let mut in_word = false;
-    // Heredocs announced on the current line: (closing word, strip tabs).
-    let mut heredocs: Vec<(String, bool)> = Vec::new();
-    let chars: Vec<char> = command.chars().collect();
-    let mut i = 0;
-    let end_word = |segments: &mut Vec<Vec<String>>, word: &mut String, in_word: &mut bool| {
-        if *in_word {
-            segments
-                .last_mut()
-                .expect("one segment")
-                .push(std::mem::take(word));
-            *in_word = false;
-        }
-    };
-    while i < chars.len() {
-        let c = chars[i];
+    let mut s = ShellSplitter::new(command);
+    while let Some(c) = s.peek(0) {
         match c {
-            '\'' => {
-                in_word = true;
-                i += 1;
-                while i < chars.len() && chars[i] != '\'' {
-                    word.push(chars[i]);
-                    i += 1;
-                }
-            }
-            '"' => {
-                in_word = true;
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        i += 1;
-                    }
-                    word.push(chars[i]);
-                    i += 1;
-                }
-            }
-            '\\' if i + 1 < chars.len() => {
-                in_word = true;
-                i += 1;
-                if chars[i] != '\n' {
-                    word.push(chars[i]);
-                }
-            }
-            '#' if !in_word => {
-                while i + 1 < chars.len() && chars[i + 1] != '\n' {
-                    i += 1;
-                }
-            }
-            '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
-                end_word(&mut segments, &mut word, &mut in_word);
-                i += 2;
-                let strip_tabs = chars.get(i) == Some(&'-');
-                if strip_tabs {
-                    i += 1;
-                }
-                while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
-                    i += 1;
-                }
-                let mut delimiter = String::new();
-                while let Some(&d) = chars.get(i) {
-                    if d.is_whitespace() || matches!(d, ';' | '&' | '|' | '(' | ')' | '<' | '>') {
-                        break;
-                    }
-                    if !matches!(d, '\'' | '"' | '\\') {
-                        delimiter.push(d);
-                    }
-                    i += 1;
-                }
-                if !delimiter.is_empty() {
-                    heredocs.push((delimiter, strip_tabs));
-                }
-                continue;
+            '\'' => s.single_quoted(),
+            '"' => s.double_quoted(),
+            '\\' if s.peek(1).is_some() => s.escaped(),
+            '#' if !s.in_word => s.comment(),
+            '<' if s.peek(1) == Some('<') && s.peek(2) != Some('<') => {
+                s.heredoc_operator();
+                continue; // already past the operator and its delimiter
             }
             '\n' => {
-                end_word(&mut segments, &mut word, &mut in_word);
-                segments.push(Vec::new());
-                // Skip the bodies of the heredocs this line announced.
-                for (delimiter, strip_tabs) in std::mem::take(&mut heredocs) {
-                    loop {
-                        let start = i + 1;
-                        if start >= chars.len() {
-                            i = chars.len();
-                            break;
-                        }
-                        let end = chars[start..]
-                            .iter()
-                            .position(|c| *c == '\n')
-                            .map_or(chars.len(), |p| start + p);
-                        let line: String = chars[start..end].iter().collect();
-                        i = end;
-                        let line = if strip_tabs {
-                            line.trim_start_matches('\t')
-                        } else {
-                            line.as_str()
-                        };
-                        if line == delimiter {
-                            break;
-                        }
-                    }
-                }
+                s.end_command();
+                s.skip_heredoc_bodies();
             }
-            '&' | '|' | ';' | '(' | ')' => {
-                end_word(&mut segments, &mut word, &mut in_word);
-                segments.push(Vec::new());
-            }
-            c if c.is_whitespace() => end_word(&mut segments, &mut word, &mut in_word),
+            '&' | '|' | ';' | '(' | ')' => s.end_command(),
+            c if c.is_whitespace() => s.end_word(),
             c => {
-                in_word = true;
-                word.push(c);
+                s.in_word = true;
+                s.word.push(c);
             }
         }
-        i += 1;
+        s.i += 1;
     }
-    end_word(&mut segments, &mut word, &mut in_word);
-    segments.retain(|s| !s.is_empty());
-    segments
+    s.finish()
+}
+
+/// The state [`shell_segments`] walks along a command line.
+struct ShellSplitter {
+    chars: Vec<char>,
+    /// The next character to read.
+    i: usize,
+    segments: Vec<Vec<String>>,
+    word: String,
+    in_word: bool,
+    /// Heredocs announced on the current line: (closing word, strip tabs).
+    heredocs: Vec<(String, bool)>,
+}
+
+impl ShellSplitter {
+    fn new(command: &str) -> Self {
+        Self {
+            chars: command.chars().collect(),
+            i: 0,
+            segments: vec![Vec::new()],
+            word: String::new(),
+            in_word: false,
+            heredocs: Vec::new(),
+        }
+    }
+
+    fn peek(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.i + offset).copied()
+    }
+
+    fn end_word(&mut self) {
+        if self.in_word {
+            let word = std::mem::take(&mut self.word);
+            self.segments.last_mut().expect("one segment").push(word);
+            self.in_word = false;
+        }
+    }
+
+    /// `&`, `|`, `;`, parentheses and newlines: the next word starts a new command.
+    fn end_command(&mut self) {
+        self.end_word();
+        self.segments.push(Vec::new());
+    }
+
+    fn finish(mut self) -> Vec<Vec<String>> {
+        self.end_word();
+        self.segments.retain(|s| !s.is_empty());
+        self.segments
+    }
+
+    /// At an opening quote: copy up to the closing one, which the caller steps past.
+    fn single_quoted(&mut self) {
+        self.in_word = true;
+        self.i += 1;
+        while let Some(c) = self.peek(0).filter(|c| *c != '\'') {
+            self.word.push(c);
+            self.i += 1;
+        }
+    }
+
+    /// Like [`Self::single_quoted`], but a backslash takes the next character literally.
+    fn double_quoted(&mut self) {
+        self.in_word = true;
+        self.i += 1;
+        while let Some(c) = self.peek(0).filter(|c| *c != '"') {
+            if c == '\\' && self.peek(1).is_some() {
+                self.i += 1;
+            }
+            self.word.push(self.chars[self.i]);
+            self.i += 1;
+        }
+    }
+
+    /// At a backslash with a character after it: that character is literal, and a
+    /// backslash-newline is a line continuation that adds nothing.
+    fn escaped(&mut self) {
+        self.in_word = true;
+        self.i += 1;
+        if self.chars[self.i] != '\n' {
+            self.word.push(self.chars[self.i]);
+        }
+    }
+
+    /// At a `#` that starts a word: stop on the last character before the newline.
+    fn comment(&mut self) {
+        while self.peek(1).is_some_and(|c| c != '\n') {
+            self.i += 1;
+        }
+    }
+
+    /// At `<<` (not `<<<`): read the closing word and remember it. Leaves `i` on the
+    /// character after the delimiter.
+    fn heredoc_operator(&mut self) {
+        self.end_word();
+        self.i += 2;
+        let strip_tabs = self.peek(0) == Some('-');
+        if strip_tabs {
+            self.i += 1;
+        }
+        while self.peek(0).is_some_and(|c| c == ' ' || c == '\t') {
+            self.i += 1;
+        }
+        let mut delimiter = String::new();
+        while let Some(d) = self.peek(0) {
+            if d.is_whitespace() || matches!(d, ';' | '&' | '|' | '(' | ')' | '<' | '>') {
+                break;
+            }
+            if !matches!(d, '\'' | '"' | '\\') {
+                delimiter.push(d);
+            }
+            self.i += 1;
+        }
+        if !delimiter.is_empty() {
+            self.heredocs.push((delimiter, strip_tabs));
+        }
+    }
+
+    /// At a newline: skip the bodies of the heredocs the line just ended announced.
+    fn skip_heredoc_bodies(&mut self) {
+        for (delimiter, strip_tabs) in std::mem::take(&mut self.heredocs) {
+            self.skip_heredoc_body(&delimiter, strip_tabs);
+        }
+    }
+
+    /// Leaves `i` on the newline that ends the closing line, or past the end.
+    fn skip_heredoc_body(&mut self, delimiter: &str, strip_tabs: bool) {
+        loop {
+            let start = self.i + 1;
+            if start >= self.chars.len() {
+                self.i = self.chars.len();
+                return;
+            }
+            let end = self.chars[start..]
+                .iter()
+                .position(|c| *c == '\n')
+                .map_or(self.chars.len(), |p| start + p);
+            let line: String = self.chars[start..end].iter().collect();
+            self.i = end;
+            let line = if strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line.as_str()
+            };
+            if line == delimiter {
+                return;
+            }
+        }
+    }
 }
 
 /// The folders a shell line names, resolved against `cwd`: every `cd` target (later segments

@@ -98,6 +98,30 @@ async fn alerts_for(monitor: &OperationMonitor, op_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Run the pipeline against the default LLM completion service, the one every
+/// test here exercises; only the operation, config and cancellation vary.
+async fn run_pipeline(
+    op_id: &str,
+    config: &LivelogConfig,
+    runtime: &ahma_mcp::config::LivelogRuntime,
+    sandbox: &Arc<Sandbox>,
+    working_dir: &std::path::Path,
+    token: CancellationToken,
+    monitor: &Arc<OperationMonitor>,
+) {
+    run_livelog_pipeline(
+        op_id,
+        config,
+        runtime,
+        sandbox,
+        working_dir,
+        token,
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+}
+
 fn make_sandbox(temp_dir: &std::path::Path) -> Arc<Sandbox> {
     Arc::new(
         Sandbox::new(
@@ -139,15 +163,14 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-clean").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-clean",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -186,15 +209,14 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-issue").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-issue",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -240,15 +262,14 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-cooldown").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-cooldown",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -292,15 +313,14 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
     });
 
     let start = std::time::Instant::now();
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-cancel",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
     let elapsed = start.elapsed();
@@ -343,15 +363,14 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
     register_op(&monitor, "test-op-500").await;
 
     // Pipeline should complete without panic/hang despite LLM 500.
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-500",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -386,15 +405,14 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-bad-json").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-bad-json",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -431,15 +449,14 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-zero-cd").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-zero-cd",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -473,15 +490,14 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
     register_op(&monitor, "test-op-not-found").await;
 
     // Should complete without panicking.
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-not-found",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -521,15 +537,14 @@ async fn test_livelog_prefilter_excludes_all_lines_no_llm_call() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-prefilter-none").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-prefilter-none",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         CancellationToken::new(),
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -567,15 +582,14 @@ async fn test_livelog_prefilter_passes_matching_line() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-prefilter-pass").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-prefilter-pass",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         CancellationToken::new(),
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -613,15 +627,14 @@ async fn test_livelog_invalid_prefilter_falls_back_to_pass_all() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-prefilter-bad").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-prefilter-bad",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         CancellationToken::new(),
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -653,15 +666,14 @@ async fn test_livelog_pipeline_llm_resolve_error_exits_early() {
 
     let runtime = default_runtime(&config);
 
-    run_livelog_pipeline(
+    run_pipeline(
         "op-resolve-err",
         &config,
         &runtime,
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -710,15 +722,14 @@ async fn test_livelog_pipeline_clear_command_executes_before_source() {
     runtime.clear = true;
     runtime.env = vec![("AHMA_LIVELOG_CLEAR_TEST".to_string(), "1".to_string())];
 
-    run_livelog_pipeline(
+    run_pipeline(
         "op-clear-cmd",
         &config,
         &runtime,
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -758,15 +769,14 @@ async fn test_livelog_pipeline_clear_command_skipped_when_runtime_clear_false() 
     let monitor = make_monitor();
     register_op(&monitor, "op-no-clear").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "op-no-clear",
         &config,
         &runtime,
         &sandbox,
         temp_dir.path(),
         token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -807,15 +817,14 @@ async fn test_structured_output_issue_false_no_alert() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-struct-clean").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-struct-clean",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         CancellationToken::new(),
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -853,15 +862,14 @@ async fn test_structured_output_issue_true_formats_alert() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-struct-issue").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-struct-issue",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         CancellationToken::new(),
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
@@ -919,15 +927,14 @@ async fn test_structured_output_non_json_falls_back_to_plain_text_alert() {
     let monitor = make_monitor();
     register_op(&monitor, "test-op-struct-prose").await;
 
-    run_livelog_pipeline(
+    run_pipeline(
         "test-op-struct-prose",
         &config,
         &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         CancellationToken::new(),
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        &monitor,
     )
     .await;
 
