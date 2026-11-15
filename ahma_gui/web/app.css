@@ -126,6 +126,12 @@ button { cursor: pointer; }
   min-height: 34px; padding: 0 14px;
   background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius);
   color: var(--text); font-weight: 500;
+  /* A button is never narrower than its label (in a flex row it would
+     otherwise shrink to one letter per line, because body's
+     overflow-wrap: anywhere lowers its min-content width). break-word only
+     breaks a label that would overflow its container, and max-width keeps a
+     long label inside a narrow one. */
+  flex-shrink: 0; max-width: 100%; overflow-wrap: break-word; text-align: center;
 }
 .btn:hover:not(:disabled) { background: var(--surface-2); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -260,6 +266,7 @@ textarea.input { resize: vertical; min-height: 64px; max-height: 240px; field-si
 .chat-bar { display: flex; justify-content: space-between; align-items: center; min-height: 32px; padding: 4px 0; }
 .chat-status { font-size: 12px; }
 .composer { display: flex; gap: 8px; align-items: flex-end; }
+.composer > .input { flex: 1 1 auto; min-width: 0; width: auto; }
 
 .md > :first-child { margin-top: 0; }
 .md-p { margin: 0 0 8px; }
