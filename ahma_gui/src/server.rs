@@ -74,6 +74,9 @@ pub enum Pairing {
     /// when it also went on the clipboard. Nobody can press Enter and no new
     /// code can be shown, so a lock or an expiry ends the server.
     Background { copied: bool },
+    /// None: the one client is `ahma desktop`'s own window, whose token was
+    /// minted before it opened.
+    Linked,
 }
 
 /// The whole router.
@@ -241,6 +244,11 @@ async fn pair(State(ctx): State<Arc<AppCtx>>, body: Bytes) -> Response {
             StatusCode::GONE,
             "expired",
             "That code has expired. Type the new one shown in your terminal.",
+        ),
+        Err(PairError::Closed) => error(
+            StatusCode::FORBIDDEN,
+            "closed",
+            "This server belongs to an ahma desktop window and takes no pairing codes.",
         ),
         Err(PairError::Reused) => {
             stop("a spent pairing code was used again");
@@ -564,6 +572,7 @@ mod tests {
     const BURN: crate::auth::PairingPolicy = crate::auth::PairingPolicy {
         code_ttl: crate::auth::CODE_TTL,
         burn_on_reuse: true,
+        pairing_closed: false,
     };
 
     /// The code was on the clipboard: when the human's paste finds it already
@@ -613,6 +622,7 @@ mod tests {
             crate::auth::PairingPolicy {
                 code_ttl: std::time::Duration::ZERO,
                 burn_on_reuse: true,
+                pairing_closed: false,
             },
         );
         let code = h.code.lock().unwrap().replace('-', "");
@@ -620,6 +630,26 @@ mod tests {
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(body["error"]["code"], "expired");
         assert!(*h.stop.borrow());
+    }
+
+    /// `ahma desktop`'s server takes no codes at all: a process that finds
+    /// its port gets a refusal, never a token.
+    #[tokio::test]
+    async fn a_linked_server_refuses_every_pairing() {
+        let h = harness_for(
+            16,
+            Pairing::Linked,
+            crate::auth::PairingPolicy {
+                pairing_closed: true,
+                ..crate::auth::PairingPolicy::default()
+            },
+        );
+        let code = h.code.lock().unwrap().replace('-', "");
+        let (status, body) = try_pair(&h, &code).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "closed");
+        let (tab, token) = h.ctx.auth.mint_tab();
+        assert_eq!(h.ctx.auth.authenticate(&token), Some(tab));
     }
 
     /// At a terminal the same lock waits for Enter, and the server stays.

@@ -27,8 +27,8 @@ pub use list_tools::{
 };
 
 pub use cli::{
-    Cli, HubArgs, LegacyEgress, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs,
-    SettingsArgs, SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs, WebArgs,
+    Cli, DesktopArgs, HubArgs, LegacyEgress, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs,
+    LlmTestArgs, SettingsArgs, SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs, WebArgs,
 };
 pub use cli::{
     build_app_config, build_app_config_with_settings, dispatch_subcommand, load_settings,

@@ -34,11 +34,16 @@ fn main() -> Result<()> {
     if args.nth(1).as_deref() == Some(ahma_mcp::askpass::SUBCOMMAND) {
         std::process::exit(ahma_mcp::askpass::run(args.next()));
     }
+    // The real main thread waits for work only it can do — `ahma desktop`'s
+    // window (SPEC R-DESK.3) — until the runtime says it is done.
+    let (main_tx, main_rx) = std::sync::mpsc::channel();
+    ahma_gui::main_thread::install(main_tx.clone());
     let worker = std::thread::Builder::new()
         // Keep the name: log lines and panic messages say `main`.
         .name("main".to_string())
         .stack_size(MAIN_STACK_BYTES)
-        .spawn(|| {
+        .spawn(move || {
+            let _done = ahma_gui::main_thread::DoneOnDrop(main_tx);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -46,6 +51,7 @@ fn main() -> Result<()> {
                 .block_on(async_main())
         })
         .context("Failed to start ahma's main thread")?;
+    ahma_gui::main_thread::serve(main_rx);
     let outcome = worker.join();
     // A hook entry point that fails must refuse the call, not exit non-zero:
     // a harness reads that as "no decision" and runs the call unsandboxed.
@@ -196,6 +202,24 @@ async fn run() -> Result<()> {
             .await
         }
         Subcommands::Gui { .. } => anyhow::bail!("{}", ahma_mcp::shell::renamed_gui_message()),
+        Subcommands::Desktop(desktop_args) => {
+            tracing::info!("Starting ahma desktop");
+            ahma_gui::run_desktop(ahma_gui::DesktopOptions {
+                connect: desktop_args.connect.clone(),
+                profile: desktop_args.profile.clone(),
+                path: desktop_args.path.clone(),
+                token_prefs: tui_token_prefs(
+                    cli.minimize_tokens,
+                    cli.no_minimize_tokens,
+                    cli.small_model_harness,
+                    cli.no_small_model_harness,
+                    cli.context_length,
+                ),
+                foreground: desktop_args.foreground,
+                ready_pipe: desktop_args.ready_pipe,
+            })
+            .await
+        }
         Subcommands::Web(web_args) => {
             if let Some(legacy) = &web_args.legacy {
                 anyhow::bail!("{}", legacy.redirect());

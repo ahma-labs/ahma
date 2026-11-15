@@ -1042,6 +1042,12 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             )
         }
         Subcommands::Gui { .. } => anyhow::bail!("{}", renamed_gui_message()),
+        Subcommands::Desktop(_) => {
+            anyhow::bail!(
+                "desktop is provided by the ahma_bin crate (includes ahma_gui). \
+                 If you are running a custom binary, implement it using ahma_gui::run_desktop."
+            )
+        }
         Subcommands::Tls(_) => {
             anyhow::bail!(
                 "tls commands are provided by the ahma_bin crate (includes ahma_common::local_tls). \
@@ -1490,6 +1496,8 @@ pub enum Subcommands {
     Tui(TuiArgs),
     /// Open ahma in your web browser: the same session as the TUI, in a page served only to this machine. Returns to the prompt at once; the server stops by itself a minute after its last tab closes.
     Web(WebArgs),
+    /// Open ahma in a window of its own, on the system's web engine (macOS and Windows; elsewhere it opens `ahma web`). Returns to the prompt; closing the window stops it.
+    Desktop(DesktopArgs),
     /// Renamed: `ahma web` opens ahma in the browser, `ahma desktop` in a window of its own.
     #[command(hide = true)]
     Gui {
@@ -2609,6 +2617,36 @@ pub struct WebArgs {
     /// The egress-policy commands that lived here until 0.22.19, kept only to say where they went.
     #[command(subcommand)]
     pub legacy: Option<LegacyEgress>,
+}
+
+/// Arguments for `ahma desktop`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  # Open ahma for this directory in a window of its own, and return to the prompt
+  ahma desktop
+
+  # Stay attached to this terminal until the window closes
+  ahma desktop --foreground")]
+pub struct DesktopArgs {
+    /// URL of the ahma server to monitor; when omitted, `ahma desktop` finds the per-user hub exactly as `ahma tui` does. Supported forms: http://host:port, https://host:port and unix:///path/to.sock.
+    #[arg(long = "connect")]
+    pub connect: Option<String>,
+
+    /// Launch directly with a specific agent profile.
+    #[arg(long = "profile")]
+    pub profile: Option<String>,
+
+    /// Stay attached to this terminal until the window closes, instead of returning to the prompt.
+    #[arg(long = "foreground")]
+    pub foreground: bool,
+
+    /// Internal: run as the background window a plain `ahma desktop` started, reporting on standard output once.
+    #[arg(long = "ready-pipe", hide = true)]
+    pub ready_pipe: bool,
+
+    /// Optional path to set as the sandbox scope (defaults to the current directory).
+    #[arg(index = 1, value_name = "PATH")]
+    pub path: Option<PathBuf>,
 }
 
 /// `ahma web allow|deny|list|revoke|check`, which moved to `ahma egress`.
@@ -6136,6 +6174,21 @@ mod tests {
             text.contains("ahma web") && text.contains("ahma desktop"),
             "{text}"
         );
+    }
+
+    /// `ahma desktop` takes a path, a connection and a profile, and the same
+    /// return-to-the-prompt choice as `ahma web`; no port, since only its own
+    /// window talks to its server.
+    #[test]
+    fn test_desktop_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["ahma", "desktop", "--foreground", "/proj"]).expect("parses");
+        let Subcommands::Desktop(args) = cli.command else {
+            panic!("a desktop subcommand")
+        };
+        assert!(args.foreground && !args.ready_pipe);
+        assert_eq!(args.path, Some(PathBuf::from("/proj")));
+        assert!(Cli::try_parse_from(["ahma", "desktop", "--port", "1"]).is_err());
     }
 
     #[tokio::test]

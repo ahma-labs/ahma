@@ -51,6 +51,9 @@ pub struct PairingPolicy {
     /// from then on: set where the code was somewhere another program could
     /// read it.
     pub burn_on_reuse: bool,
+    /// No code is accepted at all: the one client's token was minted with
+    /// [`Auth::mint_tab`] (`ahma desktop`).
+    pub pairing_closed: bool,
 }
 
 impl Default for PairingPolicy {
@@ -58,6 +61,7 @@ impl Default for PairingPolicy {
         Self {
             code_ttl: CODE_TTL,
             burn_on_reuse: false,
+            pairing_closed: false,
         }
     }
 }
@@ -77,6 +81,8 @@ pub enum PairError {
     /// A spent code was used again where reuse burns: every tab is revoked
     /// and pairing is closed for good.
     Reused,
+    /// This server takes no codes (`ahma desktop`).
+    Closed,
 }
 
 /// A paired tab.
@@ -219,6 +225,9 @@ impl Auth {
     /// Try a typed code. On success the code is spent, a new one is announced
     /// for the next tab, and the token is `<tab>.<secret>`.
     pub fn pair(&self, typed: &str) -> Result<(TabId, String), PairError> {
+        if self.policy.pairing_closed {
+            return Err(PairError::Closed);
+        }
         let mut inner = self.inner.lock();
         self.sweep(&mut inner);
         if inner.burned {
@@ -266,6 +275,20 @@ impl Auth {
             // The code is not spent: nothing was paired.
             return Err(PairError::TooManyTabs);
         }
+        let (tab, token) = Self::new_tab(&mut inner);
+        // Single use.
+        let spent = std::mem::take(&mut inner.code);
+        inner.spent.push(spent);
+        if inner.spent.len() > SPENT_REMEMBERED {
+            inner.spent.remove(0);
+        }
+        inner.misses_total = 0;
+        self.renew(&mut inner);
+        Ok((tab, token))
+    }
+
+    /// A tab and its `<tab>.<secret>` token.
+    fn new_tab(inner: &mut Inner) -> (TabId, String) {
         let id = inner.next_tab;
         inner.next_tab += 1;
         let secret = format!(
@@ -280,15 +303,13 @@ impl Auth {
                 closed_at: None,
             },
         );
-        // Single use.
-        let spent = std::mem::take(&mut inner.code);
-        inner.spent.push(spent);
-        if inner.spent.len() > SPENT_REMEMBERED {
-            inner.spent.remove(0);
-        }
-        inner.misses_total = 0;
-        self.renew(&mut inner);
-        Ok((TabId(id), format!("{id}.{secret}")))
+        (TabId(id), format!("{id}.{secret}"))
+    }
+
+    /// A tab for a client this process trusts already (`ahma desktop`'s own
+    /// window), without a code.
+    pub fn mint_tab(&self) -> (TabId, String) {
+        Self::new_tab(&mut self.inner.lock())
     }
 
     /// Which tab a bearer token belongs to, compared in constant time.
@@ -570,6 +591,26 @@ mod tests {
         let (tab, token) = auth.pair(&code).unwrap();
         assert_eq!(auth.pair(&code), Err(PairError::WrongCode));
         assert_eq!(auth.authenticate(&token), Some(tab));
+    }
+
+    /// `ahma desktop`: the window is the only client, its token is minted
+    /// before it opens, and no code is ever shown or accepted.
+    #[test]
+    fn a_closed_pairing_mints_one_token_and_takes_no_code() {
+        let (auth, seen) = auth();
+        let auth = auth.with_policy(PairingPolicy {
+            pairing_closed: true,
+            ..PairingPolicy::default()
+        });
+        let (tab, token) = auth.mint_tab();
+        assert_eq!(auth.authenticate(&token), Some(tab));
+        let code = auth.current_code();
+        assert_eq!(
+            auth.pair(&code),
+            Err(PairError::Closed),
+            "not even the right code"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing new announced");
     }
 
     #[test]

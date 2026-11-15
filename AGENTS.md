@@ -236,6 +236,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Task vaults | [docs/task-vault.md](docs/task-vault.md) | `ahma_vault/SPEC.md` |
 | TUI | [docs/tui.md](docs/tui.md) | R24, R25 (`ahma_tui/SPEC.md`) |
 | Browser surface (`ahma web`, experimental) | [docs/web.md](docs/web.md) | R-GUI, `ahma_gui/SPEC.md` |
+| Desktop window (`ahma desktop`, experimental) | [docs/desktop.md](docs/desktop.md) | R-DESK, `ahma_gui/SPEC.md` |
 | Per-user hub | [docs/hub.md](docs/hub.md) | R-HUB |
 | Network egress (`--restrict-network`) | [docs/network-egress.md](docs/network-egress.md) | R-WEB.16, R-PERM.5.3 |
 | Execution audit log | [docs/execution-audit-log.md](docs/execution-audit-log.md) | R-HANDOFF.10 |

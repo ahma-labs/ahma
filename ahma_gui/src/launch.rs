@@ -28,7 +28,13 @@ const READY_WAIT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ready {
     pub url: String,
+    /// The first pairing code; empty for `ahma desktop`, which pairs nothing.
+    #[serde(default)]
     pub code: String,
+    /// `ahma desktop` only: why no window could open, so the launcher can
+    /// fall back to `ahma web`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
 }
 
 /// The background server's arguments: the launcher's own, so every flag the
@@ -166,6 +172,7 @@ mod tests {
         let ready = Ready {
             url: "http://127.0.0.1:5000/".into(),
             code: "ABCD-1234".into(),
+            unavailable: None,
         };
         let line = ready_line(&ready);
         assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
@@ -181,6 +188,7 @@ mod tests {
         let ready = Ready {
             url: "http://127.0.0.1:5000/".into(),
             code: "ABCD-1234".into(),
+            unavailable: None,
         };
         let copied = summary(&ready, Some("pbcopy"), Ok(()));
         assert!(copied.contains("http://127.0.0.1:5000/") && copied.contains("ABCD-1234"));

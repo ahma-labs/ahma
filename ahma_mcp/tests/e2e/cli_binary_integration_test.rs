@@ -108,6 +108,10 @@ mod ahma_mcp_tests {
             top.contains("  web "),
             "the top-level help lists web: {top}"
         );
+        assert!(
+            top.contains("  desktop "),
+            "the top-level help lists desktop: {top}"
+        );
         assert!(!top.contains("  gui "), "gui is hidden: {top}");
 
         let gui = test_command(&binary)

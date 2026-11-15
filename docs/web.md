@@ -132,6 +132,7 @@ and commit the result in `ahma_gui/web/dist/`; CI fails if it differs from a fre
 
 ## See also
 
+- [docs/desktop.md](desktop.md): the same page in a window of its own, with no pairing.
 - [docs/tui.md](tui.md): the terminal UI, which has more commands and the saved answers.
 - [docs/permissions.md](permissions.md): how a question is routed and answered.
 - [docs/hub.md](hub.md): the per-user hub both surfaces attach to.
