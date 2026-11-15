@@ -6,9 +6,9 @@
 
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleChecksumArgs, BundleChecksumVerifyArgs,
-    BundleCommand, InfoArgs, LogsArgs, LogsCommand, NetworkArgs, NetworkCommand, PermissionsArgs,
-    PermissionsCommand, PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs,
-    SettingsCommand, SettingsOriginCtx, WebArgs, WebCommand,
+    BundleCommand, EgressArgs, EgressCommand, InfoArgs, LogsArgs, LogsCommand, NetworkArgs,
+    NetworkCommand, PermissionsArgs, PermissionsCommand, PromptsArgs, PromptsCommand, SandboxArgs,
+    SandboxCommand, SettingsArgs, SettingsCommand, SettingsOriginCtx,
 };
 use crate::shell::{list_tools, resolution};
 // The settings row model and its provenance resolution live in `ahma_common`:
@@ -1068,7 +1068,7 @@ fn grant_permission(
     if kind != GrantKind::SshSign {
         anyhow::bail!(
             "`ahma permissions grant` grants `ssh-sign`; use `ahma sandbox grant` for a \
-             directory, `ahma network allow` for a host and `ahma web allow` for a domain."
+             directory, `ahma network allow` for a host and `ahma egress allow` for a domain."
         );
     }
     let Some((key, destination)) = subject.split_once(" for ") else {
@@ -1714,11 +1714,11 @@ fn revoke_permission(
 // Web-egress policy (SPEC R-WEB.10)
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub(crate) fn run_web_command(args: WebArgs) -> Result<()> {
+pub(crate) fn run_egress_command(args: EgressArgs) -> Result<()> {
     use ahma_common::config::settings_path;
     let file = settings_path()
         .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
-    web_command_at(&file, args.command)
+    egress_command_at(&file, args.command)
 }
 
 /// Which list a pattern lives in.
@@ -1727,9 +1727,9 @@ enum WebList {
     Deny,
 }
 
-/// Core of `ahma web`, operating on an explicit settings file so it is unit
+/// Core of `ahma egress`, operating on an explicit settings file so it is unit
 /// testable without touching the real home directory.
-fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
+fn egress_command_at(file: &std::path::Path, command: EgressCommand) -> Result<()> {
     use ahma_common::config::AhmaSettings;
     use ahma_common::web_policy::{WebPolicy, url_coordinates};
 
@@ -1739,9 +1739,9 @@ fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
     };
 
     match command {
-        WebCommand::Allow { pattern } => web_add(file, &load()?, pattern, WebList::Allow),
-        WebCommand::Deny { pattern } => web_add(file, &load()?, pattern, WebList::Deny),
-        WebCommand::Revoke { pattern } => {
+        EgressCommand::Allow { pattern } => web_add(file, &load()?, pattern, WebList::Allow),
+        EgressCommand::Deny { pattern } => web_add(file, &load()?, pattern, WebList::Deny),
+        EgressCommand::Revoke { pattern } => {
             let mut settings = load()?;
             let before = settings.web.always_allow.len() + settings.web.never_allow.len();
             settings.web.always_allow.retain(|p| p != &pattern);
@@ -1750,7 +1750,7 @@ fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
                 before - (settings.web.always_allow.len() + settings.web.never_allow.len());
             if removed == 0 {
                 println!("No `{pattern}` entry found in always_allow or never_allow.");
-                println!("Run `ahma web list` to see current entries.");
+                println!("Run `ahma egress list` to see current entries.");
                 return Ok(());
             }
             settings
@@ -1767,7 +1767,7 @@ fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
             println!("Updated: {}", file.display());
             Ok(())
         }
-        WebCommand::List => {
+        EgressCommand::List => {
             let settings = load()?;
             let (_, errors) = WebPolicy::from_settings(&settings.web);
             println!("# Web-egress policy");
@@ -1791,10 +1791,12 @@ fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
                 println!("⚠ invalid pattern ignored: {e}");
             }
             println!();
-            println!("Manage with: ahma web allow|deny|revoke <PATTERN>, or ahma web check <URL>.");
+            println!(
+                "Manage with: ahma egress allow|deny|revoke <PATTERN>, or ahma egress check <URL>."
+            );
             Ok(())
         }
-        WebCommand::Check { url } => {
+        EgressCommand::Check { url } => {
             let settings = load()?;
             let (policy, _) = WebPolicy::from_settings(&settings.web);
             let domain =
@@ -3115,16 +3117,16 @@ mod tests {
             },
         )
         .unwrap();
-        web_command_at(
+        egress_command_at(
             &file,
-            WebCommand::Allow {
+            EgressCommand::Allow {
                 pattern: "api.github.com".into(),
             },
         )
         .unwrap();
-        web_command_at(
+        egress_command_at(
             &file,
-            WebCommand::Revoke {
+            EgressCommand::Revoke {
                 pattern: "api.github.com".into(),
             },
         )
@@ -3146,16 +3148,16 @@ mod tests {
         let load = || AhmaSettings::load_from(&file);
 
         // allow → always_allow; deny → never_allow.
-        web_command_at(
+        egress_command_at(
             &file,
-            WebCommand::Allow {
+            EgressCommand::Allow {
                 pattern: "api.github.com".into(),
             },
         )
         .unwrap();
-        web_command_at(
+        egress_command_at(
             &file,
-            WebCommand::Deny {
+            EgressCommand::Deny {
                 pattern: "bad.example".into(),
             },
         )
@@ -3166,18 +3168,18 @@ mod tests {
 
         // Invalid patterns are rejected and write nothing.
         assert!(
-            web_command_at(
+            egress_command_at(
                 &file,
-                WebCommand::Allow {
+                EgressCommand::Allow {
                     pattern: "*.com".into()
                 }
             )
             .is_err()
         );
         assert!(
-            web_command_at(
+            egress_command_at(
                 &file,
-                WebCommand::Deny {
+                EgressCommand::Deny {
                     pattern: "127.0.0.1".into()
                 }
             )
@@ -3185,9 +3187,9 @@ mod tests {
         );
 
         // Duplicate allow is a no-op (no error, no duplicate entry).
-        web_command_at(
+        egress_command_at(
             &file,
-            WebCommand::Allow {
+            EgressCommand::Allow {
                 pattern: "api.github.com".into(),
             },
         )
@@ -3203,19 +3205,19 @@ mod tests {
         );
 
         // list + check must not error.
-        web_command_at(&file, WebCommand::List).unwrap();
-        web_command_at(
+        egress_command_at(&file, EgressCommand::List).unwrap();
+        egress_command_at(
             &file,
-            WebCommand::Check {
+            EgressCommand::Check {
                 url: "https://api.github.com/x".into(),
             },
         )
         .unwrap();
 
         // revoke removes only the named entry.
-        web_command_at(
+        egress_command_at(
             &file,
-            WebCommand::Revoke {
+            EgressCommand::Revoke {
                 pattern: "api.github.com".into(),
             },
         )

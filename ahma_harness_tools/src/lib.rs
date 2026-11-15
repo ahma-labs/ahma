@@ -1371,7 +1371,7 @@ mod tests {
         let err = res.expect_err("cross-domain redirect must be blocked");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("different domain") && msg.contains("ahma web allow 127.0.0.1"),
+            msg.contains("different domain") && msg.contains("ahma egress allow 127.0.0.1"),
             "error should explain the cross-domain block, got: {msg}"
         );
         assert!(

@@ -62,7 +62,7 @@ pub enum RedirectStep {
 /// - Same host (case-insensitive, any scheme/port — so `http` → `https` too):
 ///   always [`RedirectStep::Follow`] (R-WEB.8.3).
 /// - `policy`: follow iff `verdict` is `Allow`; otherwise refuse with the
-///   `ahma web allow <host>` hint. Never asks.
+///   `ahma egress allow <host>` hint. Never asks.
 /// - `block`: refuse every other host, whatever the policy says.
 /// - `prompt`: `Allow` follows and `Deny` refuses without asking; an unknown
 ///   host (`Prompt`, strict `deny` mode) yields [`RedirectStep::Ask`], i.e. the
@@ -85,7 +85,7 @@ pub fn decide_redirect(
         RedirectStep::Refuse(format!(
             "egress blocked: '{origin_host}' redirected to '{host}' ({target_url}), a different \
              domain than the approved request, and {why} (R-WEB.8). To allow it, run \
-             `ahma web allow {host}` and retry."
+             `ahma egress allow {host}` and retry."
         ))
     };
     match (mode, verdict) {
@@ -143,7 +143,7 @@ impl RedirectDomainGuard {
     /// A guard applying `mode`, with `verdict` giving the live policy decision
     /// for a redirect target URL. Without an approver (see
     /// [`Self::with_approver`]) a hop that `prompt` mode would ask about is
-    /// refused with the `ahma web allow` hint, as `policy` mode refuses it.
+    /// refused with the `ahma egress allow` hint, as `policy` mode refuses it.
     pub fn new(mode: RedirectPolicy, verdict: RedirectVerdictFn) -> Self {
         Self {
             mode,
@@ -192,7 +192,7 @@ impl RedirectDomainGuard {
             None => Err(format!(
                 "egress blocked: a redirect went to '{domain}' ({url}), which is not approved, \
                  and no approval prompt is available (R-WEB.8). To allow it, run \
-                 `ahma web allow {domain}` and retry."
+                 `ahma egress allow {domain}` and retry."
             )),
         }
     }
@@ -533,14 +533,18 @@ mod tests {
         );
         assert_refused(
             other_host(RedirectPolicy::Policy, deny()),
-            &["cdn.example", "never_allow", "ahma web allow cdn.example"],
+            &[
+                "cdn.example",
+                "never_allow",
+                "ahma egress allow cdn.example",
+            ],
         );
         assert_refused(
             other_host(RedirectPolicy::Policy, unknown()),
             &[
                 "cdn.example",
                 "different domain",
-                "ahma web allow cdn.example",
+                "ahma egress allow cdn.example",
             ],
         );
     }
@@ -617,6 +621,6 @@ mod tests {
             .ask("cdn.example", "https://cdn.example/f")
             .await
             .unwrap_err();
-        assert!(err.contains("ahma web allow cdn.example"), "{err}");
+        assert!(err.contains("ahma egress allow cdn.example"), "{err}");
     }
 }

@@ -225,7 +225,7 @@ impl AhmaMcpService {
     /// effect for the rest of the session (or is persisted for `always`). When no
     /// client can be prompted — a headless/CLI peer, a client without the
     /// elicitation capability, a timeout, or a user cancel — the domain is left
-    /// askable and the request falls back to the actionable `ahma web allow` deny,
+    /// askable and the request falls back to the actionable `ahma egress allow` deny,
     /// so egress is never widened without an explicit human "yes".
     async fn approve_web_egress(
         &self,
@@ -359,7 +359,7 @@ impl AhmaMcpService {
             tracing::info!(domain = %req.domain, "raised web-approval prompt in the ahma TUI");
             return FetchAction::Deny(format!(
                 "web egress to '{d}' needs approval — a prompt was raised in the ahma TUI. \
-                 Approve it there (or run `ahma web allow {d}`), then retry.",
+                 Approve it there (or run `ahma egress allow {d}`), then retry.",
                 d = req.domain
             ));
         }
@@ -920,6 +920,6 @@ fn waiting_for_web_answer(domain: &str) -> String {
         "web egress waiting: a question about '{domain}' is already in front of the human, and \
          their answer applies to this whole session. This request was not asked again; retry \
          the fetch after they answer. If nobody can answer it, a human can allow the domain \
-         with:\n  ahma web allow {domain}"
+         with:\n  ahma egress allow {domain}"
     )
 }

@@ -1222,7 +1222,7 @@ fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
                 area: "web",
                 subject: p.clone(),
                 detail: format!("{label} for ahma's own fetch tools"),
-                undo: Undo::Command(format!("ahma web revoke {p}")),
+                undo: Undo::Command(format!("ahma egress revoke {p}")),
             });
         }
     }
@@ -1777,7 +1777,7 @@ mod tests {
             validate(&f.env, &add)
                 .unwrap_err()
                 .0
-                .contains("ahma web allow")
+                .contains("ahma egress allow")
         );
     }
 

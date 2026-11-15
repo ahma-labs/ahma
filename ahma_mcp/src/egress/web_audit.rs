@@ -27,7 +27,7 @@ pub fn action_for(decision: &WebDecision) -> FetchAction {
         WebDecision::Deny { reason } => FetchAction::Deny(format!("web egress blocked: {reason}")),
         WebDecision::Prompt { domain } => FetchAction::Deny(format!(
             "web egress blocked: '{domain}' is not approved and the web policy is `deny`. \
-             A human can allow it with:\n  ahma web allow {domain}\n\
+             A human can allow it with:\n  ahma egress allow {domain}\n\
              (or add it to [web].always_allow in ~/.ahma/settings.toml)."
         )),
     }
@@ -117,7 +117,7 @@ mod tests {
             domain: "unknown.example".into(),
         }) {
             FetchAction::Deny(msg) => {
-                assert!(msg.contains("ahma web allow unknown.example"), "{msg}");
+                assert!(msg.contains("ahma egress allow unknown.example"), "{msg}");
             }
             other => panic!("expected Deny, got {other:?}"),
         }

@@ -1104,9 +1104,9 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in sandbox-scope management mode");
             commands::run_sandbox_command(args)
         }
-        Subcommands::Web(args) => {
+        Subcommands::Egress(args) => {
             tracing::info!("Running in web-egress policy management mode");
-            commands::run_web_command(args)
+            commands::run_egress_command(args)
         }
         Subcommands::Network(args) => {
             tracing::info!("Running in network-egress policy management mode");
@@ -1533,8 +1533,8 @@ pub enum Subcommands {
     /// Manage the web-egress allow/deny policy for ahma's own HTTP tools
     /// (`fetch_webpage`). Domains are recorded in `[web]` in
     /// `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool
-    /// cannot edit them. See `ahma web --help`.
-    Web(WebArgs),
+    /// cannot edit them. See `ahma egress --help`.
+    Egress(EgressArgs),
     /// Manage the subprocess network-egress allow policy (`--restrict-network`). Governs outbound network connections made by sandboxed subprocesses. Allowed hosts and patterns are stored in `[network].allow` in `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool cannot edit them. See `ahma network --help`.
     Network(NetworkArgs),
     /// Manage where ahma writes its operational logs (see `ahma logs --help`).
@@ -1546,7 +1546,7 @@ pub enum Subcommands {
     /// They all live in one ledger, `~/.ahma/settings.toml`: the single directory
     /// the sandbox never includes, so a sandboxed command can neither read what
     /// it has been trusted with nor grant itself more. `ahma sandbox` and
-    /// `ahma web` remain as kind-scoped shortcuts into the same ledger.
+    /// `ahma egress` remain as kind-scoped shortcuts into the same ledger.
     Permissions(PermissionsArgs),
     /// Check ahma's own health and say what would fix what it finds: settings that do not parse, granted folders that no longer exist, a hub running a different build, the warnings repeating in the logs, and whether this folder is trusted. Read-only unless you pass --fix, and even then every fix is shown and asked about first. The same checks run as /doctor in `ahma tui`.
     Doctor(DoctorArgs),
@@ -1598,7 +1598,7 @@ pub enum PermissionsCommand {
         #[arg(long = "expiring", value_name = "DURATION")]
         expiring: Option<String>,
     },
-    /// Grant a permission by kind and subject. Today: `ssh-sign`, which lets the SSH key broker sign with one key for one destination in one workspace (SPEC R-CRED.3); other kinds have their own commands (`ahma sandbox grant`, `ahma network allow`, `ahma web allow`). Previews the exact settings line and requires `--yes` to write. Example: `ahma permissions grant ssh-sign "SHA256:abc… for host:SHA256:def…" --yes`, as a refusal names it.
+    /// Grant a permission by kind and subject. Today: `ssh-sign`, which lets the SSH key broker sign with one key for one destination in one workspace (SPEC R-CRED.3); other kinds have their own commands (`ahma sandbox grant`, `ahma network allow`, `ahma egress allow`). Previews the exact settings line and requires `--yes` to write. Example: `ahma permissions grant ssh-sign "SHA256:abc… for host:SHA256:def…" --yes`, as a refusal names it.
     Grant {
         /// Kind of permission: `ssh-sign`.
         #[arg(value_name = "KIND")]
@@ -2118,14 +2118,14 @@ pub enum SandboxCommand {
 
 // ── web egress policy ────────────────────────────────────────────────────────
 
-/// Arguments for `ahma web`.
+/// Arguments for `ahma egress`.
 #[derive(clap::Args, Debug, Clone)]
-pub struct WebArgs {
+pub struct EgressArgs {
     #[command(subcommand)]
-    pub command: WebCommand,
+    pub command: EgressCommand,
 }
 
-/// Subcommands for `ahma web` — manage the web-egress policy (SPEC R-WEB.10).
+/// Subcommands for `ahma egress` — manage the web-egress policy (SPEC R-WEB.10).
 ///
 /// Governs outbound HTTP made by ahma's own tools (`fetch_webpage`). Domains are
 /// stored in `[web].always_allow` / `[web].never_allow` in `~/.ahma/settings.toml`,
@@ -2134,7 +2134,7 @@ pub struct WebArgs {
 /// (`*.github.com`), scheme/port qualifiers (`https://api.github.com`,
 /// `api.github.com:8080`). Note: `github.com` matches `github.com` only.
 #[derive(Subcommand, Debug, Clone)]
-pub enum WebCommand {
+pub enum EgressCommand {
     /// Always permit a domain pattern (add to `always_allow`).
     Allow {
         /// Domain pattern to permit.
@@ -5949,6 +5949,28 @@ mod tests {
     fn test_vault_subcommand_no_longer_parses() {
         let err = Cli::try_parse_from(["ahma", "vault", "list"]);
         assert!(err.is_err(), "`ahma vault` must be an unknown subcommand");
+    }
+
+    /// The web-egress policy is `ahma egress`: `ahma egress` is the browser surface
+    /// (SPEC R-WEB.10, R-GUI).
+    #[test]
+    fn test_egress_subcommand_manages_the_web_egress_policy() {
+        let cli = Cli::try_parse_from(["ahma", "egress", "allow", "api.github.com"])
+            .expect("egress parses");
+        match cli.command {
+            Subcommands::Egress(EgressArgs {
+                command: EgressCommand::Allow { pattern },
+            }) => assert_eq!(pattern, "api.github.com"),
+            other => panic!("expected egress allow, got {other:?}"),
+        }
+        for sub in ["deny", "revoke"] {
+            assert!(
+                Cli::try_parse_from(["ahma", "egress", sub, "x.example"]).is_ok(),
+                "egress {sub} parses"
+            );
+        }
+        assert!(Cli::try_parse_from(["ahma", "egress", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["ahma", "egress", "check", "https://x.example/"]).is_ok());
     }
 
     /// `ahma gui` listens on this machine only and has no option to do otherwise
