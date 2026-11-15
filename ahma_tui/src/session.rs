@@ -59,6 +59,9 @@ pub struct Session {
     /// The hub subscription, while someone is attached (see
     /// [`Self::set_attended`]).
     hub_source: Option<tokio::task::JoinHandle<()>>,
+    /// The MCP source task; [`Self::close`] waits for it to end the hub MCP
+    /// session.
+    mcp_source: Option<tokio::task::JoinHandle<()>>,
     last_discovery: Instant,
     /// Questions a refused terminal-hook command left for the harness dialog
     /// (SPEC R-PERM.10(e)) are re-read on the tick; `None` reads on the first.
@@ -87,7 +90,7 @@ impl Session {
     /// first frame; a browser session only while a tab is open.
     pub fn start(connection: &ResolvedConnection, options: SessionOptions) -> Self {
         use crate::llm_bridge::spawn_discovery_task;
-        use crate::mcp_source::spawn_mcp_source;
+        use crate::mcp_source::spawn_mcp_source_with_handle;
 
         let SessionOptions {
             profile_override,
@@ -177,11 +180,9 @@ impl Session {
         }
 
         let (mcp_tx, mcp_rx) = mpsc::channel::<SourceEvent>(256);
-        state.mcp_source_tx = Some(spawn_mcp_source(
-            connection.clone(),
-            mcp_tx.clone(),
-            workspace_path,
-        ));
+        let (mcp_source_tx, mcp_source) =
+            spawn_mcp_source_with_handle(connection.clone(), mcp_tx.clone(), workspace_path);
+        state.mcp_source_tx = Some(mcp_source_tx);
         // A session is a subscriber, never the hub (SPEC R-HUB.9): the per-user
         // hub owns the hub, and a session that goes away sends nothing but EOF.
         //
@@ -212,9 +213,22 @@ impl Session {
             mcp_rx,
             bridge_rx,
             hub_source: None,
+            mcp_source: Some(mcp_source),
             last_discovery: Instant::now(),
             last_harness_ask_poll: None,
             harness_asks: crate::harness_asks::pending,
+        }
+    }
+
+    /// End the session cleanly: close the MCP source's command channel and
+    /// wait, at most `within`, for it to end the hub MCP session, so the
+    /// hub stops that session's worker now instead of when it idles out.
+    pub async fn close(mut self, within: std::time::Duration) {
+        self.state.mcp_source_tx = None;
+        if let Some(task) = self.mcp_source.take()
+            && tokio::time::timeout(within, task).await.is_err()
+        {
+            tracing::debug!("session: the MCP source did not finish within {within:?}");
         }
     }
 
@@ -231,6 +245,7 @@ impl Session {
             mcp_rx,
             bridge_rx,
             hub_source: None,
+            mcp_source: None,
             last_discovery: Instant::now(),
             last_harness_ask_poll: None,
             harness_asks: Vec::new,
@@ -424,6 +439,35 @@ pub async fn run_session<F: Frontend>(session: &mut Session, frontend: &mut F) -
 mod tests {
     use super::*;
     use crate::controller::{Intent, Report};
+
+    /// Closing a session lets its MCP source finish: the source ends the hub
+    /// MCP session (DELETE) when its command channel closes, and on a
+    /// current-thread runtime that is about to be dropped, a task that is not
+    /// awaited is cancelled before it can, leaving the hub's worker for that
+    /// session running until the session idles out.
+    #[tokio::test]
+    async fn closing_a_session_waits_for_its_mcp_source_to_finish() {
+        let mut session = Session::detached(AppState::new("http://localhost:3000", "HTTP", true));
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::mcp_source::McpSourceCommand>(1);
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+        session.state.mcp_source_tx = Some(cmd_tx);
+        session.mcp_source = Some(tokio::spawn(async move {
+            // What the real source does: run until its channel closes, then
+            // clean up before returning.
+            while cmd_rx.recv().await.is_some() {}
+            tokio::task::yield_now().await;
+            let _ = done_tx.send(());
+        }));
+        session
+            .close(ahma_common::timeouts::TestTimeouts::get(
+                ahma_common::timeouts::TimeoutCategory::Quick,
+            ))
+            .await;
+        assert!(
+            done_rx.try_recv().is_ok(),
+            "the source finished its clean-up before close returned"
+        );
+    }
 
     /// What a scripted surface does next.
     enum Step {

@@ -26,6 +26,12 @@ use server::AppCtx;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// How long stopping waits for the server, then the session, before giving up
+/// on a clean exit.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a closing session waits to end its hub MCP session.
+const SESSION_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// What `ahma gui` is started with.
 pub struct GuiOptions {
     pub connect: Option<String>,
@@ -68,10 +74,12 @@ pub async fn run_gui(options: GuiOptions) -> Result<()> {
     }
 
     let (frontend, handles) = WebFrontend::new();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let ctx = Arc::new(AppCtx {
         auth: auth.clone(),
         inputs: handles.inputs.clone(),
         published: handles.published.clone(),
+        stop: stop_rx.clone(),
     });
     let app = server::router(ctx);
 
@@ -103,14 +111,18 @@ pub async fn run_gui(options: GuiOptions) -> Result<()> {
                         },
                     );
                     let mut frontend = frontend;
-                    ahma_tui::session::run_session(&mut session, &mut frontend).await
+                    let result = ahma_tui::session::run_session(&mut session, &mut frontend).await;
+                    // End the hub MCP session before this runtime goes, which
+                    // would cancel the task that does it (and leave the hub's
+                    // worker for it running until it idles out).
+                    session.close(SESSION_CLOSE_GRACE).await;
+                    result
                 })
             })();
             let _ = finished_tx.send(result);
         })
         .context("cannot start the session thread")?;
 
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let server = tokio::spawn(listen::serve(listeners, app, stop_rx));
 
     if options.open_browser
@@ -125,12 +137,24 @@ pub async fn run_gui(options: GuiOptions) -> Result<()> {
         _ = tokio::signal::ctrl_c() => None,
         finished = finished_rx => Some(finished.unwrap_or(Ok(()))),
     };
+    // A second Ctrl-C while shutting down means now.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(130);
+        }
+    });
 
-    // Stop serving, which drops the senders the session's frontend listens on,
-    // which ends its loop, which drops its hub subscription.
+    // Stop serving: every open event stream says `bye` and ends, the server
+    // drops the senders the session's frontend listens on, which ends its loop,
+    // which closes its hub MCP session and drops its hub subscription.
     let _ = stop_tx.send(true);
     drop(handles);
-    let _ = server.await;
-    let _ = tokio::task::spawn_blocking(move || session_thread.join()).await;
+    if tokio::time::timeout(SHUTDOWN_GRACE, server).await.is_err() {
+        tracing::warn!("gui: the server did not stop within {SHUTDOWN_GRACE:?}");
+    }
+    let joined = tokio::task::spawn_blocking(move || session_thread.join());
+    if tokio::time::timeout(SHUTDOWN_GRACE, joined).await.is_err() {
+        tracing::warn!("gui: the session did not end within {SHUTDOWN_GRACE:?}");
+    }
     session_result.unwrap_or(Ok(()))
 }

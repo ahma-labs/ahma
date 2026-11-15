@@ -507,11 +507,22 @@ pub enum ClientMsg {
         provider: Option<String>,
         model: Option<String>,
         target_instance_id: Option<String>,
+        /// The sender's own MCP session (`Mcp-Session-Id`). Without an explicit
+        /// target, the hub routes to the instance serving this session — the
+        /// worker scoped to the directory the surface was launched in — before
+        /// falling back to the single-candidate rule (SPEC R-HUB.6).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_session_id: Option<String>,
     },
     /// Stop the agent turn running on an instance (Esc / Ctrl-C in the TUI).
     /// The instance answers with one `AgentError` naming the cancellation, so
     /// every subscriber ends the turn the same way it ends a failed one.
-    CancelPrompt { target_instance_id: Option<String> },
+    CancelPrompt {
+        target_instance_id: Option<String>,
+        /// As for [`ClientMsg::SubmitPrompt`]: the sender's own MCP session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_session_id: Option<String>,
+    },
     /// Cancel an operation on the instance that owns it. Operation ids are
     /// unique only per instance, and a TUI's own MCP session cannot see
     /// another client's operations, so the cancel must travel to the owner.
@@ -2567,10 +2578,12 @@ where
             provider,
             model,
             target_instance_id,
+            origin_session_id,
         } => {
             route_submit_prompt(
                 &hub,
                 target_instance_id,
+                origin_session_id,
                 messages,
                 system_prompt,
                 provider,
@@ -2579,8 +2592,21 @@ where
             .await
         }
 
-        ClientMsg::CancelPrompt { target_instance_id } => {
-            route_to_instance(&hub, target_instance_id, HubMsg::CancelPrompt).await
+        ClientMsg::CancelPrompt {
+            target_instance_id,
+            origin_session_id,
+        } => {
+            if let Some(tid) = resolve_target_from(
+                &hub,
+                target_instance_id.as_deref(),
+                origin_session_id.as_deref(),
+            )
+            .await
+            .into_instance()
+                && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
+            {
+                let _ = tx.send(HubMsg::CancelPrompt).await;
+            }
         }
 
         ClientMsg::CancelOperation {
@@ -2657,6 +2683,13 @@ where
     hub.connection_count.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// How long the hub waits for the worker of a prompt's origin session to
+/// register before giving up on it. A surface's first prompt can arrive while
+/// its worker is still starting (spawn, `initialize`, `roots/list`); the worker
+/// registers within a second or two, so this is generous on purpose.
+const ORIGIN_REGISTRATION_WAIT: Duration = Duration::from_secs(10);
+const ORIGIN_REGISTRATION_POLL: Duration = Duration::from_millis(50);
+
 /// Route a `SubmitPrompt` to the chosen instance. Every failure path must
 /// broadcast an `AgentError` so the TUI stops its elapsed counter and shows
 /// feedback — silently dropping the prompt leaves the user staring at a
@@ -2664,15 +2697,21 @@ where
 async fn route_submit_prompt(
     hub: &Arc<Hub>,
     target_instance_id: Option<String>,
+    origin_session_id: Option<String>,
     messages: Vec<HubChatMessage>,
     system_prompt: Option<String>,
     provider: Option<String>,
     model: Option<String>,
 ) {
-    let target_id = resolve_target(hub, target_instance_id.as_deref()).await;
+    let resolution = resolve_prompt_target(
+        hub,
+        target_instance_id.as_deref(),
+        origin_session_id.as_deref(),
+    )
+    .await;
 
-    let delivered = match target_id {
-        Some(tid) => match hub.instance_txs.lock().await.get(&tid).cloned() {
+    let delivered = match &resolution {
+        Resolution::Instance(tid) => match hub.instance_txs.lock().await.get(tid).cloned() {
             Some(tx) => tx
                 .send(HubMsg::RunPrompt {
                     messages,
@@ -2684,19 +2723,70 @@ async fn route_submit_prompt(
                 .is_ok(),
             None => false,
         },
-        None => false,
+        Resolution::Gone | Resolution::NoCandidate | Resolution::Ambiguous(_) => false,
     };
 
     if !delivered {
-        warn!("hub: SubmitPrompt could not be routed — no instance available to run it");
+        warn!("hub: SubmitPrompt could not be routed ({resolution:?})");
         let _ = hub.broadcast.send(HubMsg::Relay(HubRelay::AgentError {
-            error: "No ahma instance is available to run the prompt. \
-                    Make sure an ahma server is connected (it normally \
-                    auto-starts); try reopening the TUI."
-                .to_string(),
+            error: unroutable_prompt_message(&resolution),
             transient: false,
         }));
     }
+}
+
+/// What the user reads when a prompt could not be routed. Each case names the
+/// actual problem: "no instance is available" said while two were running sent
+/// people looking for a server that was already there.
+fn unroutable_prompt_message(resolution: &Resolution) -> String {
+    match resolution {
+        Resolution::Ambiguous(n) => format!(
+            "{n} ahma instances are attached and this prompt did not say which one \
+             should run it. Choose one with \"Chat with this window\" in Work."
+        ),
+        Resolution::Gone => "The ahma instance this chat was talking to has disconnected. \
+                             Choose another with \"Chat with this window\" in Work."
+            .to_string(),
+        Resolution::NoCandidate | Resolution::Instance(_) => {
+            "No ahma instance is available to run the prompt: this chat's own ahma \
+             session has not connected to the hub. Close this window and launch it \
+             again; if that keeps happening, run `ahma doctor`."
+                .to_string()
+        }
+    }
+}
+
+/// Resolve a prompt's (or a cancel's) target, preferring the sender's own MCP
+/// session over the single-candidate rule, and waiting a bounded time for that
+/// session's worker to register.
+async fn resolve_prompt_target(
+    hub: &Hub,
+    target: Option<&str>,
+    origin_session_id: Option<&str>,
+) -> Resolution {
+    let Some(origin) = origin_session_id.filter(|_| target.is_none()) else {
+        return resolve_target_from(hub, target, None).await;
+    };
+    let deadline = tokio::time::Instant::now() + ORIGIN_REGISTRATION_WAIT;
+    loop {
+        if let Some(id) = session_instance(hub, origin).await {
+            return Resolution::Instance(id);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return resolve_target_from(hub, None, None).await;
+        }
+        tokio::time::sleep(ORIGIN_REGISTRATION_POLL).await;
+    }
+}
+
+/// The live instance serving MCP session `session_id`, if one is registered.
+async fn session_instance(hub: &Hub, session_id: &str) -> Option<String> {
+    hub.instances
+        .lock()
+        .await
+        .values()
+        .find(|i| i.session_id.as_deref() == Some(session_id))
+        .map(|i| i.id.clone())
 }
 
 /// Route a `SubmitApproval` to the chosen instance, clearing the pending
@@ -2742,6 +2832,28 @@ async fn route_to_instance(hub: &Arc<Hub>, target_instance_id: Option<String>, m
     }
 }
 
+/// The outcome of choosing an instance for a request (SPEC R-HUB.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resolution {
+    /// Route to this instance.
+    Instance(String),
+    /// The request named an instance that is no longer live.
+    Gone,
+    /// Nothing to route to.
+    NoCandidate,
+    /// This many candidates, and nothing to choose between them by.
+    Ambiguous(usize),
+}
+
+impl Resolution {
+    fn into_instance(self) -> Option<String> {
+        match self {
+            Resolution::Instance(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
 /// Resolve which instance a TUI request targets (SPEC R-HUB.6).
 ///
 /// An explicit id must name a **live** instance; one that has gone resolves to
@@ -2754,25 +2866,46 @@ async fn route_to_instance(hub: &Arc<Hub>, target_instance_id: Option<String>, m
 /// Hook and TUI instances are not candidates for an untargeted request: a hook
 /// has no agent loop to run a prompt, and the TUI is the thing asking.
 async fn resolve_target(hub: &Hub, target: Option<&str>) -> Option<String> {
+    resolve_target_from(hub, target, None).await.into_instance()
+}
+
+/// [`resolve_target`], with the sender's own MCP session as the choice between
+/// an explicit target and the single-candidate rule: a surface chats through
+/// its own session, whose worker is scoped to the directory it was launched
+/// in, so that worker is the one the user means.
+async fn resolve_target_from(
+    hub: &Hub,
+    target: Option<&str>,
+    origin_session_id: Option<&str>,
+) -> Resolution {
     let instances = hub.instances.lock().await;
-    match target {
-        Some(tid) => instances.contains_key(tid).then(|| tid.to_string()),
-        None => {
-            let mut candidates: Vec<&InstanceInfo> = instances
-                .values()
-                .filter(|i| i.mode != "hook" && i.mode != "tui")
-                .collect();
-            match candidates.len() {
-                1 => Some(candidates.remove(0).id.clone()),
-                0 => None,
-                n => {
-                    warn!(
-                        "hub: refusing to guess among {n} attached instances for an \
-                         untargeted request; the sender must name one"
-                    );
-                    None
-                }
-            }
+    if let Some(tid) = target {
+        return if instances.contains_key(tid) {
+            Resolution::Instance(tid.to_string())
+        } else {
+            Resolution::Gone
+        };
+    }
+    if let Some(sid) = origin_session_id
+        && let Some(own) = instances
+            .values()
+            .find(|i| i.session_id.as_deref() == Some(sid))
+    {
+        return Resolution::Instance(own.id.clone());
+    }
+    let mut candidates: Vec<&InstanceInfo> = instances
+        .values()
+        .filter(|i| i.mode != "hook" && i.mode != "tui")
+        .collect();
+    match candidates.len() {
+        1 => Resolution::Instance(candidates.remove(0).id.clone()),
+        0 => Resolution::NoCandidate,
+        n => {
+            warn!(
+                "hub: refusing to guess among {n} attached instances for an \
+                 untargeted request; the sender must name one"
+            );
+            Resolution::Ambiguous(n)
         }
     }
 }
@@ -3558,6 +3691,7 @@ mod tests {
                 provider: None,
                 model: None,
                 target_instance_id: None,
+                origin_session_id: None,
             },
         )
         .await
@@ -3579,6 +3713,216 @@ mod tests {
                 );
             }
             other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    /// Register an instance serving MCP session `session_id` and return the
+    /// read side of its connection, on which routed messages arrive.
+    async fn register_session_instance(
+        sock: &std::path::Path,
+        session_id: &str,
+    ) -> (
+        BufReader<tokio::io::ReadHalf<HubStream>>,
+        tokio::io::WriteHalf<HubStream>,
+    ) {
+        let stream = connect_to_hub_at(sock).await.unwrap();
+        let (r, mut w) = tokio::io::split(stream);
+        let ClientMsg::Register {
+            pid,
+            mode,
+            scope,
+            label,
+            client,
+            client_pid,
+            sampling,
+            elicitation,
+            scopes,
+            read_scopes,
+            grants,
+            enforcement,
+            native_terminal,
+            ..
+        } = test_register_msg()
+        else {
+            unreachable!()
+        };
+        send_msg(
+            &mut w,
+            &ClientMsg::Register {
+                pid,
+                mode,
+                scope,
+                label,
+                client,
+                session_id: Some(session_id.to_string()),
+                client_pid,
+                sampling,
+                elicitation,
+                scopes,
+                read_scopes,
+                grants,
+                enforcement,
+                native_terminal,
+            },
+        )
+        .await
+        .unwrap();
+        (BufReader::new(r), w)
+    }
+
+    /// Poll the hub until `n` instances are registered.
+    async fn wait_for_instance_count(sock: &std::path::Path, n: usize) {
+        let deadline = std::time::Instant::now() + TestTimeouts::scale_secs(5);
+        loop {
+            let seen = list_instances_at(sock).await.map(|i| i.len()).unwrap_or(0);
+            if seen == n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {n} instances, saw {seen}"
+            );
+            tokio::time::sleep(TestTimeouts::poll_interval()).await;
+        }
+    }
+
+    fn prompt_from(origin_session_id: Option<&str>) -> ClientMsg {
+        ClientMsg::SubmitPrompt {
+            messages: vec![HubChatMessage {
+                role: "user".into(),
+                content: "who are you?".into(),
+            }],
+            system_prompt: None,
+            provider: None,
+            model: None,
+            target_instance_id: None,
+            origin_session_id: origin_session_id.map(str::to_string),
+        }
+    }
+
+    /// A surface (TUI, browser) chats through its own MCP session, whose
+    /// worker is scoped to the directory the surface was launched in. With an
+    /// editor session attached as well there are two candidates, and the old
+    /// single-candidate rule refused to route at all — "No ahma instance is
+    /// available" — although the surface's own worker was right there
+    /// (SPEC R-HUB.6).
+    #[tokio::test]
+    async fn submit_prompt_routes_to_the_origin_sessions_instance_among_several() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("origin.sock");
+        start_hub(&sock).await;
+
+        let (mut editor, _ew) = register_session_instance(&sock, "sess-editor").await;
+        let (mut own, _ow) = register_session_instance(&sock, "sess-surface").await;
+        wait_for_instance_count(&sock, 2).await;
+
+        let mut surface = connect_to_hub_at(&sock).await.unwrap();
+        send_msg(&mut surface, &prompt_from(Some("sess-surface")))
+            .await
+            .unwrap();
+
+        match tokio::time::timeout(TestTimeouts::scale_secs(2), recv_instance_msg(&mut own)).await {
+            Ok(HubMsg::RunPrompt { messages, .. }) => {
+                assert_eq!(messages[0].content, "who are you?");
+            }
+            other => panic!("the surface's own worker should run the prompt, got {other:?}"),
+        }
+        // The editor's worker must not have been handed someone else's turn.
+        let leaked = tokio::time::timeout(
+            TestTimeouts::poll_interval(),
+            recv_instance_msg(&mut editor),
+        )
+        .await;
+        assert!(leaked.is_err(), "editor got {leaked:?}");
+    }
+
+    /// The surface sends its first prompt as soon as the user presses Enter,
+    /// which can be before its worker has finished registering. The hub waits
+    /// for that worker rather than failing the turn.
+    #[tokio::test]
+    async fn submit_prompt_waits_for_the_origin_sessions_instance_to_register() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("late.sock");
+        start_hub(&sock).await;
+        let (_editor, _ew) = register_session_instance(&sock, "sess-editor").await;
+        wait_for_instance_count(&sock, 1).await;
+
+        let mut surface = connect_to_hub_at(&sock).await.unwrap();
+        send_msg(&mut surface, &prompt_from(Some("sess-late")))
+            .await
+            .unwrap();
+        let (mut own, _ow) = register_session_instance(&sock, "sess-late").await;
+
+        match tokio::time::timeout(TestTimeouts::scale_secs(5), recv_instance_msg(&mut own)).await {
+            Ok(HubMsg::RunPrompt { .. }) => {}
+            other => panic!("the late worker should run the prompt, got {other:?}"),
+        }
+    }
+
+    /// With several candidates and nothing to choose by, the refusal says so:
+    /// "no instance is available" was false, and sent the user looking for a
+    /// server that was already running.
+    #[tokio::test]
+    async fn an_ambiguous_untargeted_prompt_says_which_choice_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ambiguous.sock");
+        start_hub(&sock).await;
+        let (_a, _aw) = register_session_instance(&sock, "sess-a").await;
+        let (_b, _bw) = register_session_instance(&sock, "sess-b").await;
+        wait_for_instance_count(&sock, 2).await;
+
+        let mut sub = connect_to_hub_at(&sock).await.unwrap();
+        send_msg(&mut sub, &ClientMsg::Subscribe).await.unwrap();
+        let mut sub_reader = BufReader::new(sub);
+
+        let mut surface = connect_to_hub_at(&sock).await.unwrap();
+        send_msg(&mut surface, &prompt_from(None)).await.unwrap();
+
+        let deadline = std::time::Instant::now() + TestTimeouts::scale_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let msg = tokio::time::timeout(remaining, recv_msg::<_, HubMsg>(&mut sub_reader))
+                .await
+                .expect("an AgentError should be broadcast")
+                .expect("subscriber connection open");
+            if let HubMsg::Relay(HubRelay::AgentError { error, .. }) = msg {
+                assert!(
+                    error.contains("2 ahma instances"),
+                    "the refusal should name the ambiguity: {error}"
+                );
+                assert!(
+                    !error.contains("reopening the TUI"),
+                    "stale advice: {error}"
+                );
+                break;
+            }
+        }
+    }
+
+    /// Esc cancels the turn on the worker running it, chosen the same way the
+    /// prompt was.
+    #[tokio::test]
+    async fn cancel_prompt_routes_to_the_origin_sessions_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("cancel.sock");
+        start_hub(&sock).await;
+        let (_editor, _ew) = register_session_instance(&sock, "sess-editor").await;
+        let (mut own, _ow) = register_session_instance(&sock, "sess-surface").await;
+        wait_for_instance_count(&sock, 2).await;
+
+        let mut surface = connect_to_hub_at(&sock).await.unwrap();
+        send_msg(
+            &mut surface,
+            &ClientMsg::CancelPrompt {
+                target_instance_id: None,
+                origin_session_id: Some("sess-surface".into()),
+            },
+        )
+        .await
+        .unwrap();
+        match tokio::time::timeout(TestTimeouts::scale_secs(2), recv_instance_msg(&mut own)).await {
+            Ok(HubMsg::CancelPrompt) => {}
+            other => panic!("expected CancelPrompt on the surface's worker, got {other:?}"),
         }
     }
 
@@ -6359,6 +6703,7 @@ mod tests {
                 provider: Some("p".into()),
                 model: Some("m".into()),
                 target_instance_id: None,
+                origin_session_id: None,
             },
         )
         .await
@@ -6384,6 +6729,7 @@ mod tests {
             &mut tui_cancel,
             &ClientMsg::CancelPrompt {
                 target_instance_id: None,
+                origin_session_id: None,
             },
         )
         .await

@@ -1826,6 +1826,12 @@ lifetime.
   - A decision (tool approval, scope grant, web approval) is routed back to the instance that
     **raised** it. An untargeted request is routed only when exactly one non-hook, non-tui
     session is attached; otherwise the hub refuses rather than guessing.
+  - A chat prompt (and its cancel) carries the surface's own MCP session id
+    (`origin_session_id`). Without an explicit target it goes to the instance serving that
+    session — the surface's own worker, scoped to the directory the surface was launched in —
+    before the single-candidate rule applies. A prompt that arrives before that worker has
+    registered waits for it, for a bounded time, rather than failing. A refusal names its
+    cause: no instance, several to choose between, or a chosen one that has gone.
 
 - **R-HUB.7 — Retention, with bounds.** In memory: ≤ 500 operations per instance (oldest
   *finished* evicted first, running never), ≤ `MAX_TAIL_LINES` output lines per operation,
