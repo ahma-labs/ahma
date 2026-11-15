@@ -7941,7 +7941,7 @@ mod tests {
             },
         ];
         let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
-        state.surface = ahma_common::hub::Surface::Gui;
+        state.surface = ahma_common::hub::Surface::Web;
         state.caps = crate::state::Capabilities {
             host_commands: false,
             persistent_answers: false,

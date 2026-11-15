@@ -607,7 +607,7 @@ jobs:
 
   #######################################
 
-  # The `ahma gui` page (SPEC R-GUI.10). `cargo build` never runs Node: the compiled files in
+  # The `ahma web` page (SPEC R-GUI.10). `cargo build` never runs Node: the compiled files in
   # ahma_gui/web/dist are committed and embedded, so this job is what proves they are the
   # compile of the committed source, and that the page's own tests pass. `--ignore-scripts`
   # because the one dependency, `typescript`, needs no install script and nothing else may run one.

@@ -1,4 +1,4 @@
-//! How a browser tab proves it belongs to the human who started `ahma gui`
+//! How a browser tab proves it belongs to the human who started `ahma web`
 //! (SPEC R-GUI.2).
 //!
 //! The one thing a sandboxed command cannot do is read the controlling terminal,
@@ -9,7 +9,14 @@
 //!
 //! The code is 40 bits and the server counts guesses, so it is not the whole
 //! defence but the part that matters: five misses retire it and mint another,
-//! fifteen lock pairing until the human presses Enter at the terminal.
+//! fifteen lock pairing until the human presses Enter at the terminal (or, for
+//! a server running in the background, stop it). A code also expires
+//! ([`CODE_TTL`]).
+//!
+//! `ahma web` also copies the first code to the clipboard, which other
+//! programs can read. There, [`PairingPolicy::burn_on_reuse`] turns a second
+//! use of a spent code — the human pasting a code someone else already used —
+//! into a revocation of every tab, and the server stops (SPEC R-GUI.2).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +37,30 @@ pub const RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(
 /// Tabs that may be paired at once. Each holds a connection open, and a browser
 /// allows about six per origin.
 pub const MAX_TABS: usize = 4;
+/// How long a code is good for once shown.
+pub const CODE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Spent codes remembered to recognise a second use.
+const SPENT_REMEMBERED: usize = 8;
+
+/// The rules that differ with where the code was put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingPolicy {
+    /// How long a code is good for.
+    pub code_ttl: std::time::Duration,
+    /// A spent code used again revokes every tab and refuses all pairing
+    /// from then on: set where the code was somewhere another program could
+    /// read it.
+    pub burn_on_reuse: bool,
+}
+
+impl Default for PairingPolicy {
+    fn default() -> Self {
+        Self {
+            code_ttl: CODE_TTL,
+            burn_on_reuse: false,
+        }
+    }
+}
 
 /// Where a freshly minted code goes: the controlling terminal.
 pub type Announce = Arc<dyn Fn(&str) + Send + Sync>;
@@ -41,6 +72,11 @@ pub enum PairError {
     /// Too many misses: the human unlocks it at the terminal.
     Locked,
     TooManyTabs,
+    /// The code was shown too long ago; a new one has been minted.
+    Expired,
+    /// A spent code was used again where reuse burns: every tab is revoked
+    /// and pairing is closed for good.
+    Reused,
 }
 
 /// A paired tab.
@@ -55,6 +91,11 @@ struct Tab {
 
 struct Inner {
     code: String,
+    code_minted: std::time::Instant,
+    /// Codes already used, newest last.
+    spent: Vec<String>,
+    /// Set by a reuse that burns: nothing pairs again.
+    burned: bool,
     misses_on_code: u32,
     misses_total: u32,
     next_tab: u64,
@@ -66,6 +107,7 @@ pub struct Auth {
     inner: poison_safe::Mutex<Inner>,
     announce: Announce,
     grace: std::time::Duration,
+    policy: PairingPolicy,
 }
 
 /// A std mutex with the poisoning dealt with in one place.
@@ -138,6 +180,9 @@ impl Auth {
         Self {
             inner: poison_safe::Mutex::new(Inner {
                 code,
+                code_minted: std::time::Instant::now(),
+                spent: Vec::new(),
+                burned: false,
                 misses_on_code: 0,
                 misses_total: 0,
                 next_tab: 1,
@@ -145,7 +190,22 @@ impl Auth {
             }),
             announce,
             grace: RECONNECT_GRACE,
+            policy: PairingPolicy::default(),
         }
+    }
+
+    /// The same, under `policy`.
+    pub fn with_policy(mut self, policy: PairingPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Replace the code with a fresh one and announce it.
+    fn renew(&self, inner: &mut Inner) {
+        inner.code = mint_code();
+        inner.code_minted = std::time::Instant::now();
+        inner.misses_on_code = 0;
+        (self.announce)(&display_code(&inner.code));
     }
 
     /// Forget tabs whose stream has been closed longer than the grace.
@@ -161,12 +221,33 @@ impl Auth {
     pub fn pair(&self, typed: &str) -> Result<(TabId, String), PairError> {
         let mut inner = self.inner.lock();
         self.sweep(&mut inner);
+        if inner.burned {
+            return Err(PairError::Reused);
+        }
         if inner.misses_total >= MISSES_BEFORE_LOCK {
             return Err(PairError::Locked);
         }
         let typed = normalize(typed);
         let right =
             typed.len() == CODE_LEN && bool::from(typed.as_bytes().ct_eq(inner.code.as_bytes()));
+        if self.policy.burn_on_reuse
+            && !right
+            && inner
+                .spent
+                .iter()
+                .any(|spent| bool::from(spent.as_bytes().ct_eq(typed.as_bytes())))
+        {
+            tracing::warn!(
+                "gui: a spent pairing code was used again; revoking every tab and closing pairing"
+            );
+            inner.burned = true;
+            inner.tabs.clear();
+            return Err(PairError::Reused);
+        }
+        if inner.code_minted.elapsed() >= self.policy.code_ttl {
+            self.renew(&mut inner);
+            return Err(PairError::Expired);
+        }
         if !right {
             inner.misses_on_code += 1;
             inner.misses_total += 1;
@@ -177,9 +258,7 @@ impl Auth {
                 return Err(PairError::Locked);
             }
             if inner.misses_on_code >= MISSES_PER_CODE {
-                inner.code = mint_code();
-                inner.misses_on_code = 0;
-                (self.announce)(&display_code(&inner.code));
+                self.renew(&mut inner);
             }
             return Err(PairError::WrongCode);
         }
@@ -202,10 +281,13 @@ impl Auth {
             },
         );
         // Single use.
-        inner.code = mint_code();
-        inner.misses_on_code = 0;
+        let spent = std::mem::take(&mut inner.code);
+        inner.spent.push(spent);
+        if inner.spent.len() > SPENT_REMEMBERED {
+            inner.spent.remove(0);
+        }
         inner.misses_total = 0;
-        (self.announce)(&display_code(&inner.code));
+        self.renew(&mut inner);
         Ok((TabId(id), format!("{id}.{secret}")))
     }
 
@@ -244,17 +326,23 @@ impl Auth {
     /// code again, a new one if the last was retired.
     pub fn unlock(&self) {
         let mut inner = self.inner.lock();
-        if inner.misses_total > 0 {
+        if inner.misses_total > 0 || inner.code_minted.elapsed() >= self.policy.code_ttl {
             inner.misses_total = 0;
-            inner.misses_on_code = 0;
-            inner.code = mint_code();
+            self.renew(&mut inner);
+        } else {
+            (self.announce)(&display_code(&inner.code));
         }
-        (self.announce)(&display_code(&inner.code));
     }
 
     /// Tabs paired right now.
     pub fn tabs(&self) -> usize {
         self.inner.lock().tabs.len()
+    }
+
+    #[cfg(test)]
+    fn with_code_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.policy.code_ttl = ttl;
+        self
     }
 
     #[cfg(test)]
@@ -430,6 +518,58 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(auth.authenticate(&token), None, "after the grace");
         assert_eq!(auth.tabs(), 0, "and it no longer counts against the cap");
+    }
+
+    /// A code is good for a short while only: a copy left in a clipboard
+    /// history, a scrollback or a screenshot is worth nothing after it.
+    #[test]
+    fn a_code_expires_and_a_new_one_is_announced() {
+        let (auth, seen) = auth();
+        let auth = auth.with_code_ttl(std::time::Duration::from_millis(40));
+        let code = auth.current_code();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(auth.pair(&code), Err(PairError::Expired));
+        assert_ne!(auth.current_code(), code, "a new code was minted");
+        assert_eq!(seen.lock().unwrap().len(), 2, "and announced");
+        assert!(auth.pair(&auth.current_code()).is_ok(), "the new one works");
+    }
+
+    /// Where the code was put somewhere another program could read it (the
+    /// clipboard), a second use of a spent code means someone else got there
+    /// first: every tab is revoked, and the caller stops the server.
+    #[test]
+    fn a_spent_code_used_again_revokes_every_tab_when_reuse_burns() {
+        let (auth, _) = auth();
+        let auth = auth.with_policy(PairingPolicy {
+            burn_on_reuse: true,
+            ..PairingPolicy::default()
+        });
+        let code = auth.current_code();
+        let (tab, token) = auth.pair(&code).expect("the first use pairs");
+        assert_eq!(auth.authenticate(&token), Some(tab));
+        assert_eq!(auth.pair(&code), Err(PairError::Reused));
+        assert_eq!(
+            auth.authenticate(&token),
+            None,
+            "the first pairing is revoked"
+        );
+        assert_eq!(auth.tabs(), 0);
+        assert_eq!(
+            auth.pair(&auth.current_code()),
+            Err(PairError::Reused),
+            "and nothing pairs again: the server is stopping"
+        );
+    }
+
+    /// Without that policy (the code was only ever on the terminal) a spent
+    /// code is simply wrong.
+    #[test]
+    fn a_spent_code_is_just_wrong_by_default() {
+        let (auth, _) = auth();
+        let code = auth.current_code();
+        let (tab, token) = auth.pair(&code).unwrap();
+        assert_eq!(auth.pair(&code), Err(PairError::WrongCode));
+        assert_eq!(auth.authenticate(&token), Some(tab));
     }
 
     #[test]

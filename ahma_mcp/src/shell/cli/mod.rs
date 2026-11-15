@@ -1035,12 +1035,13 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
                  If you are running a custom binary, implement TUI dispatch using ahma_tui::run_tui."
             )
         }
-        Subcommands::Gui(_) => {
+        Subcommands::Web(_) => {
             anyhow::bail!(
-                "gui is provided by the ahma_bin crate (includes ahma_gui). \
-                 If you are running a custom binary, implement it using ahma_gui::run_gui."
+                "web is provided by the ahma_bin crate (includes ahma_gui). \
+                 If you are running a custom binary, implement it using ahma_gui::run_web."
             )
         }
+        Subcommands::Gui { .. } => anyhow::bail!("{}", renamed_gui_message()),
         Subcommands::Tls(_) => {
             anyhow::bail!(
                 "tls commands are provided by the ahma_bin crate (includes ahma_common::local_tls). \
@@ -1487,8 +1488,14 @@ pub enum Subcommands {
     Tool(ToolArgs),
     /// Start the TUI control plane (terminal dashboard for active tasks).
     Tui(TuiArgs),
-    /// Start the browser interface: the same session as the TUI, in a page served only to this machine.
-    Gui(GuiArgs),
+    /// Open ahma in your web browser: the same session as the TUI, in a page served only to this machine. Returns to the prompt at once; the server stops by itself a minute after its last tab closes.
+    Web(WebArgs),
+    /// Renamed: `ahma web` opens ahma in the browser, `ahma desktop` in a window of its own.
+    #[command(hide = true)]
+    Gui {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        rest: Vec<String>,
+    },
     /// Local TLS certificate management: init, rotate, and check status.
     Tls(TlsArgs),
     /// Bundle management: audit MTDF tool bundles for supply-chain risks, and record or check a SHA-256 content manifest.
@@ -2541,19 +2548,29 @@ pub struct InfoArgs {
 
 // ── tui ───────────────────────────────────────────────────────────────────────
 
-/// Arguments for `ahma gui`.
+/// What `ahma gui` says now that it is two commands.
+pub fn renamed_gui_message() -> &'static str {
+    "`ahma gui` is now two commands: `ahma web` opens ahma in your web browser, \
+     and `ahma desktop` opens it in a window of its own."
+}
+
+/// Arguments for `ahma web`.
 #[derive(Parser, Debug)]
-#[command(after_help = "EXAMPLES:
-  # Find the per-user hub, listen on a free local port, open a browser
-  ahma gui
+#[command(
+    args_conflicts_with_subcommands = true,
+    after_help = "EXAMPLES:
+  # Open ahma for this directory in your browser; the pairing code is copied
+  # to the clipboard, so paste it into the page
+  ahma web
 
   # Print the address and the pairing code only
-  ahma gui --no-open
+  ahma web --no-open --no-copy
 
-  # A fixed port, for an SSH port-forward
-  ahma gui --port 8765 --no-open")]
-pub struct GuiArgs {
-    /// URL of the ahma server to monitor; when omitted, `ahma gui` finds the per-user hub exactly as `ahma tui` does. Supported forms: http://host:port, https://host:port and unix:///path/to.sock.
+  # A fixed port, kept attached to this terminal, for an SSH port-forward
+  ahma web --port 8765 --no-open --foreground"
+)]
+pub struct WebArgs {
+    /// URL of the ahma server to monitor; when omitted, `ahma web` finds the per-user hub exactly as `ahma tui` does. Supported forms: http://host:port, https://host:port and unix:///path/to.sock.
     #[arg(long = "connect")]
     pub connect: Option<String>,
 
@@ -2565,13 +2582,85 @@ pub struct GuiArgs {
     #[arg(long = "port", default_value_t = 0)]
     pub port: u16,
 
-    /// Do not open a browser. The address is printed either way, with a pairing code you type into the page: the page proves it was opened by whoever is at this terminal, which a command running in ahma's sandbox cannot do.
+    /// Do not open a browser. The address and a single-use pairing code are printed either way; the code proves the page was opened by whoever started ahma web.
     #[arg(long = "no-open")]
     pub no_open: bool,
+
+    /// Do not copy the pairing code to the clipboard; type it from the terminal instead. Use this where the clipboard is shared (a remote desktop) or when anything else on this machine might be watching it.
+    #[arg(long = "no-copy")]
+    pub no_copy: bool,
+
+    /// Stay attached to this terminal instead of returning to the prompt: the server stops on Ctrl-C, a code for another tab is shown here, and Enter unlocks pairing after too many wrong codes.
+    #[arg(long = "foreground")]
+    pub foreground: bool,
+
+    /// Seconds with no browser tab connected before the server stops by itself, counted from start until a tab pairs; 0 never stops. A server nobody uses is a door left open, so the default is a minute.
+    #[arg(long = "idle-timeout", default_value_t = 60, value_name = "SECONDS")]
+    pub idle_timeout: u64,
+
+    /// Internal: run as the background server a plain `ahma web` started, reporting its address and code on standard output once.
+    #[arg(long = "ready-pipe", hide = true)]
+    pub ready_pipe: bool,
 
     /// Optional path to set as the sandbox scope (defaults to the current directory).
     #[arg(index = 1, value_name = "PATH")]
     pub path: Option<PathBuf>,
+
+    /// The egress-policy commands that lived here until 0.22.19, kept only to say where they went.
+    #[command(subcommand)]
+    pub legacy: Option<LegacyEgress>,
+}
+
+/// `ahma web allow|deny|list|revoke|check`, which moved to `ahma egress`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum LegacyEgress {
+    #[command(hide = true)]
+    Allow {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    #[command(hide = true)]
+    Deny {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    #[command(hide = true)]
+    List {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    #[command(hide = true)]
+    Revoke {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    #[command(hide = true)]
+    Check {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+}
+
+impl LegacyEgress {
+    /// Where the command is now.
+    pub fn redirect(&self) -> String {
+        let (sub, rest) = match self {
+            Self::Allow { rest } => ("allow", rest),
+            Self::Deny { rest } => ("deny", rest),
+            Self::List { rest } => ("list", rest),
+            Self::Revoke { rest } => ("revoke", rest),
+            Self::Check { rest } => ("check", rest),
+        };
+        let args = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", rest.join(" "))
+        };
+        format!(
+            "The web-egress policy moved to `ahma egress`: run `ahma egress {sub}{args}`. \
+             `ahma web` now opens ahma in your browser."
+        )
+    }
 }
 
 /// Arguments for `ahma tui`.
@@ -5973,51 +6062,89 @@ mod tests {
         assert!(Cli::try_parse_from(["ahma", "egress", "check", "https://x.example/"]).is_ok());
     }
 
-    /// `ahma gui` listens on this machine only and has no option to do otherwise
-    /// (SPEC R-GUI.1): the flags are a port and whether to open a browser, and a
-    /// host is not among them.
+    /// `ahma web` listens on this machine only and has no option to do otherwise
+    /// (SPEC R-GUI.1): the flags are a port, whether to open a browser, whether
+    /// to stay attached, how long to wait for a tab, and whether to copy the
+    /// code; a host is not among them.
     #[test]
-    fn test_gui_subcommand_parses_a_port_and_has_no_host() {
-        let cli = Cli::try_parse_from(["ahma", "gui", "--port", "8765", "--no-open", "/proj"])
-            .expect("gui parses");
-        let Subcommands::Gui(args) = cli.command else {
-            panic!("a gui subcommand")
+    fn test_web_subcommand_parses_a_port_and_has_no_host() {
+        let cli = Cli::try_parse_from([
+            "ahma",
+            "web",
+            "--port",
+            "8765",
+            "--no-open",
+            "--foreground",
+            "--idle-timeout",
+            "5",
+            "--no-copy",
+            "/proj",
+        ])
+        .expect("web parses");
+        let Subcommands::Web(args) = cli.command else {
+            panic!("a web subcommand")
         };
         assert_eq!(args.port, 8765);
-        assert!(args.no_open);
+        assert!(args.no_open && args.foreground && args.no_copy);
+        assert_eq!(args.idle_timeout, 5);
         assert_eq!(args.path, Some(PathBuf::from("/proj")));
-        let defaults = Cli::try_parse_from(["ahma", "gui"]).unwrap();
-        let Subcommands::Gui(d) = defaults.command else {
+        assert!(args.legacy.is_none());
+        let defaults = Cli::try_parse_from(["ahma", "web"]).unwrap();
+        let Subcommands::Web(d) = defaults.command else {
             panic!()
         };
         assert_eq!(
-            (d.port, d.no_open),
-            (0, false),
-            "a free port, and open the browser"
+            (d.port, d.no_open, d.foreground, d.no_copy, d.idle_timeout),
+            (0, false, false, false, 60),
+            "a free port, open the browser, return to the prompt, copy the code, \
+             stop a minute after the last tab"
         );
         for host_flag in ["--host", "--bind", "--listen", "--address"] {
             assert!(
-                Cli::try_parse_from(["ahma", "gui", host_flag, "0.0.0.0"]).is_err(),
+                Cli::try_parse_from(["ahma", "web", host_flag, "0.0.0.0"]).is_err(),
                 "{host_flag} must not exist: the listener is loopback only"
             );
         }
     }
 
+    /// `ahma web allow …` was the egress policy until 0.22.19: it still parses,
+    /// so the refusal can say where the command went instead of a bare clap
+    /// error.
+    #[test]
+    fn test_web_keeps_the_old_egress_spellings_to_redirect_them() {
+        let cli = Cli::try_parse_from(["ahma", "web", "allow", "api.github.com"]).unwrap();
+        let Subcommands::Web(args) = cli.command else {
+            panic!("a web subcommand")
+        };
+        assert!(matches!(args.legacy, Some(LegacyEgress::Allow { .. })));
+        assert!(
+            args.legacy
+                .unwrap()
+                .redirect()
+                .contains("ahma egress allow")
+        );
+    }
+
+    /// `ahma gui` is now `ahma web` (the browser) or `ahma desktop` (a
+    /// window): it still parses, to say so.
+    #[test]
+    fn test_gui_is_renamed() {
+        let cli = Cli::try_parse_from(["ahma", "gui", "--no-open", "/proj"]).unwrap();
+        assert!(matches!(cli.command, Subcommands::Gui { .. }));
+        let text = renamed_gui_message();
+        assert!(
+            text.contains("ahma web") && text.contains("ahma desktop"),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
-    async fn test_dispatch_subcommand_gui_bails() {
-        let err = dispatch_subcommand(
-            Subcommands::Gui(GuiArgs {
-                connect: None,
-                profile: None,
-                port: 0,
-                no_open: true,
-                path: None,
-            }),
-            make_cfg(),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("gui is provided"));
+    async fn test_dispatch_subcommand_web_bails() {
+        let cli = Cli::try_parse_from(["ahma", "web", "--no-open"]).unwrap();
+        let err = dispatch_subcommand(cli.command, make_cfg())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("web is provided"));
     }
 
     #[tokio::test]

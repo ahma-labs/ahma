@@ -2741,7 +2741,7 @@ mod tests {
                 decision: GrantDecision::Deny,
                 advice: None,
                 advice_followed: None,
-                surface: Some("gui".into()),
+                surface: Some("web".into()),
             },
         )
         .await
@@ -2752,7 +2752,7 @@ mod tests {
                 answer,
             } => {
                 assert_eq!(decision_id, did);
-                assert_eq!(answer.and_then(|a| a.surface).as_deref(), Some("gui"));
+                assert_eq!(answer.and_then(|a| a.surface).as_deref(), Some("web"));
             }
             other => panic!("expected ScopeGrantResolved after the GUI's Deny, got {other:?}"),
         }

@@ -3,7 +3,7 @@
 * **Status**: Approved (Experimental feature)
 * **License**: AGPL-3.0
 * **Depends on**: `ahma_tui` (the controller, session and `Frontend` trait), `ahma_core`, `ahma_mcp`, `ahma_common`
-* **Used by**: `ahma_bin` (`ahma gui`)
+* **Used by**: `ahma_bin` (`ahma web`)
 
 A SPEC states what the crate does now and why. Open work in the whole product is listed once,
 in the root SPEC's Known gaps (§11).
@@ -15,7 +15,7 @@ browser tab so that I can watch and answer from a window I already have open, wi
 that window any more authority than the terminal has.*
 
 The terminal UI is the one place a human watches agent work and answers approval questions.
-`ahma gui` is a second surface on the same session and the same rules: it is a `Frontend`
+`ahma web` is a second surface on the same session and the same rules: it is a `Frontend`
 (`ahma_tui::session`) over a loopback web server and a page. The rules that decide whether an
 answer is taken live once in `ahma_tui::controller` (root R-UI); this crate decides only who
 may talk to the server and how a session's state is drawn.
@@ -26,8 +26,10 @@ Criteria in the root SPEC are cited by id, not restated.
 
 - **Loopback only (R-GUI.1)**: the sockets are `127.0.0.1` and `[::1]` on one port; a
   non-loopback peer is refused.
-- **Pairing (R-GUI.2)**: the code is written to the controlling terminal only; a tab holds a
-  per-tab token in memory; at most four tabs.
+- **Pairing (R-GUI.2)**: the code is written to the controlling terminal and, unless
+  `--no-copy`, the clipboard (`clipboard.rs`, the system's own tools); it expires after two
+  minutes; in clipboard mode a spent code used again revokes every tab and stops the server
+  (`auth::PairingPolicy`); a tab holds a per-tab token in memory; at most four tabs.
 - **Same-origin guard (R-GUI.3)**: Host by name, exact Origin, `Sec-Fetch-Site`, method
   allow-list, all before the token is read.
 - **Fixed policy on every response (R-GUI.4)**: CSP with Trusted Types, `nosniff`,
@@ -40,11 +42,16 @@ Criteria in the root SPEC are cited by id, not restated.
   **no host commands (R-GUI.9)**.
 - **First-party page, committed build (R-GUI.10)**.
 - **Disclosure on every start (R-GUI.11)**.
-- `ahma gui [PATH] [--port N] [--no-open]` starts the server, prints the address and the
-  pairing code on the terminal, opens the browser unless told not to, and stops on Ctrl-C:
-  every open event stream is sent `bye` and ends (graceful shutdown would otherwise wait on
-  an open tab forever), the session closes its hub MCP session so the hub stops that
-  session's worker at once, and the whole stop is bounded. A second Ctrl-C exits at once.
+- **Returns to the prompt, stops when unused (R-GUI.12)**: `launch.rs` starts the background
+  server and reads its one ready line; `idle.rs` stops a server with no open stream.
+- `ahma web [PATH] [--port N] [--no-open] [--no-copy] [--idle-timeout S]` launches a
+  background server (`--foreground --ready-pipe`), prints the address and code, copies the
+  code, opens the browser and returns. `--foreground` keeps today's attached server: codes on
+  the terminal, Enter unlocks. Either stops on Ctrl-C (attached), SIGTERM, a lock or expiry
+  in the background, a burned code, or the idle timeout: every open event stream is sent
+  `bye` and ends (graceful shutdown would otherwise wait on an open tab forever), the session
+  closes its hub MCP session so the hub stops that session's worker at once, the clipboard is
+  cleared of an unused code, and the whole stop is bounded. A second Ctrl-C exits at once.
 
 ## 3. Requirements Owned Here
 

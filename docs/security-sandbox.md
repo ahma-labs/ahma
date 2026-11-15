@@ -272,6 +272,17 @@ Launching an app through LaunchServices (`open App.app`, `open -a`, `open <URL>`
 
 The hub and the workers it spawns start in ahma's runtime directory, never in the checkout the hub happened to be launched from: a worker's scope comes from its own client's `roots/list`, and its tools directory and operation logs follow that scope. Before this, every worker inherited the first checkout's directory, logged into it, and loaded that checkout's `.ahma/` as the trusted tool set of every other project (SPEC R-HUB.12).
 
+## Clipboard: denied
+
+A sandboxed command on macOS cannot read or write the clipboard: the Seatbelt profile allows Mach
+lookups in general but denies the pasteboard server (`com.apple.pasteboard.1` and its legacy
+name), so `pbcopy`, `pbpaste` and `osascript -e 'the clipboard'` fail inside it. `ahma web` puts
+its pairing code on the clipboard for you to paste, and a command an agent runs that could read
+it could pair a browser tab and answer its own permission questions (SPEC R6.2.15). There is no
+setting to turn this off. Landlock on Linux cannot keep a command from the X11 or Wayland
+clipboard, and Windows has no filesystem boundary yet, so there `ahma web --no-copy` is the way
+to keep the code off the clipboard ([docs/web.md](web.md)).
+
 ## Network egress
 
 The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the domains in `[network] allow` — deny-all when that list is empty — and refuses private, loopback and cloud-metadata addresses. The README's *What the sandbox does not cover* section states what that restriction is and is not on each platform. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).

@@ -254,7 +254,7 @@ echo "OK No Result-shaped use of a parking_lot guard"
 echo "=== Guardrail: lint recurring test patterns ===" 
 ./scripts/lint_test_paths.sh
 
-echo "=== Guardrail: the ahma gui page (forbidden APIs, first-party imports) ==="
+echo "=== Guardrail: the ahma web page (forbidden APIs, first-party imports) ==="
 bash ./scripts/check-gui-web.sh
 
 echo "=== Guardrail: workspace license boundaries ==="

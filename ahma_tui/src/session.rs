@@ -6,7 +6,7 @@
 //! terminals or browsers. A [`Frontend`] is the surface: it waits for the
 //! human's input, decodes it into the controller's [`crate::controller::Intent`]
 //! and [`crate::controller::Report`], and presents the state. [`run_session`] is
-//! the loop that joins the two, so `ahma tui` and `ahma gui` differ in what
+//! the loop that joins the two, so `ahma tui` and `ahma web` differ in what
 //! they draw and read, not in how a session behaves.
 
 use crate::connection::ResolvedConnection;

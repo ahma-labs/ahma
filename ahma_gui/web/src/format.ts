@@ -17,3 +17,11 @@ export function formatDuration(ms: number): string {
   if (m < 60) return `${m}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
 }
+
+/**
+ * Whether `typed` reads as a whole pairing code: eight letters or digits once
+ * case, spaces and the dash are ignored, as the server reads it.
+ */
+export function looksLikeFullCode(typed: string): boolean {
+  return /^[0-9A-Z]{8}$/.test(typed.replace(/[\s-]/g, "").toUpperCase());
+}

@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "The browser page for `ahma gui`: a thin renderer over the server's view. No runtime dependencies.",
+  "description": "The browser page for `ahma web`: a thin renderer over the server's view. No runtime dependencies.",
   "scripts": {
     "build": "tsc -p .",
     "check": "tsc -p . --noEmit",

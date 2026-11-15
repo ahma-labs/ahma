@@ -59,16 +59,18 @@ mod ahma_mcp_tests {
         );
     }
 
-    /// SPEC R-GUI.1, R-DOC.7: `ahma gui --help` says it listens on this machine only
-    /// and offers a port and no address, and the command is in the top-level help.
+    /// SPEC R-GUI.1, R-GUI.12, R-DOC.7: `ahma web --help` says it listens on
+    /// this machine only, offers a port and no address, and names how it
+    /// returns and when it stops; the command is in the top-level help and
+    /// `gui` no longer is.
     #[test]
-    fn test_ahma_gui_help_names_loopback_and_offers_no_address() {
+    fn test_ahma_web_help_names_loopback_and_offers_no_address() {
         let binary = build_binary_cached("ahma_bin", "ahma");
 
         let output = test_command(&binary)
-            .args(["gui", "--help"])
+            .args(["web", "--help"])
             .output()
-            .expect("Failed to execute ahma gui --help");
+            .expect("Failed to execute ahma web --help");
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -77,27 +79,45 @@ mod ahma_mcp_tests {
 
         assert!(
             output.status.success(),
-            "ahma gui --help should succeed. Output: {combined}"
+            "ahma web --help should succeed. Output: {combined}"
         );
-        assert!(
-            combined.contains("--port") && combined.contains("--no-open"),
-            "{combined}"
-        );
+        for flag in [
+            "--port",
+            "--no-open",
+            "--no-copy",
+            "--foreground",
+            "--idle-timeout",
+        ] {
+            assert!(combined.contains(flag), "{flag} missing: {combined}");
+        }
         assert!(combined.contains("127.0.0.1"), "{combined}");
         assert!(
             !combined.contains("--bind")
                 && !combined.contains("--host")
-                && !combined.contains("--listen"),
-            "there is no option to listen elsewhere: {combined}"
+                && !combined.contains("--listen")
+                && !combined.contains("--ready-pipe"),
+            "no option to listen elsewhere, and the internal flag is hidden: {combined}"
         );
 
         let top = test_command(&binary)
             .arg("--help")
             .output()
             .expect("Failed to execute ahma --help");
+        let top = String::from_utf8_lossy(&top.stdout);
         assert!(
-            String::from_utf8_lossy(&top.stdout).contains("gui"),
-            "the top-level help lists the gui command"
+            top.contains("  web "),
+            "the top-level help lists web: {top}"
+        );
+        assert!(!top.contains("  gui "), "gui is hidden: {top}");
+
+        let gui = test_command(&binary)
+            .arg("gui")
+            .output()
+            .expect("Failed to execute ahma gui");
+        let said = String::from_utf8_lossy(&gui.stderr);
+        assert!(
+            !gui.status.success() && said.contains("ahma web") && said.contains("ahma desktop"),
+            "ahma gui says what it became: {said}"
         );
     }
 

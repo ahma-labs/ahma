@@ -14,7 +14,7 @@ description: >
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
   "maintainability", "cognitive complexity", "cyclomatic complexity", "simplicity score",
   "code quality metrics", "hotspot", "ahma simplify", "ahma help", "ahma ?",
-  "ahma update", "ahma tui", "/ahma tui", "ahma gui", "/ahma gui", "network_grant", "ahma network", "network grant".
+  "ahma update", "ahma tui", "/ahma tui", "ahma web", "/ahma web", "network_grant", "ahma network", "network grant".
 user-invocable: true
 ---
 
@@ -341,7 +341,7 @@ ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 | `/ahma simplify top N` | — | Auto-fix top N complexity issues concurrently |
 | `/ahma simplify N` | — | Get fix instructions for issue #N only (manual mode) |
 | `/ahma tui` | — | Start the terminal user interface (TUI) control plane |
-| `/ahma gui` | — | Start the browser GUI *(experimental)*: loopback only, a pairing code typed from this terminal; [docs/gui.md](https://github.com/ahma-labs/ahma/blob/main/docs/gui.md) |
+| `/ahma web` | — | Open ahma in the browser *(experimental)*: loopback only, returns to the prompt, the pairing code is copied to the clipboard (or typed with `--no-copy`), stops a minute after the last tab; [docs/web.md](https://github.com/ahma-labs/ahma/blob/main/docs/web.md) |
 | `/ahma update` | — | Update ahma to the latest version |
 | `/ahma uninstall` | — | Remove integrations installed by `ahma setup` (MCP entries, hooks, skills, binary) |
 

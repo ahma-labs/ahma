@@ -27,11 +27,12 @@ pub use list_tools::{
 };
 
 pub use cli::{
-    Cli, GuiArgs, HubArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs,
-    SettingsArgs, SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs,
+    Cli, HubArgs, LegacyEgress, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs,
+    SettingsArgs, SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs, WebArgs,
 };
 pub use cli::{
     build_app_config, build_app_config_with_settings, dispatch_subcommand, load_settings,
+    renamed_gui_message,
 };
 
 pub use resolution::{

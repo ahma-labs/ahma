@@ -54,7 +54,26 @@ pub struct AppCtx {
     pub published: watch::Receiver<Arc<Published>>,
     /// Becomes `true` when the server is stopping: every open event stream then
     /// says `bye` and ends, so graceful shutdown is not left waiting on a tab.
-    pub stop: watch::Receiver<bool>,
+    /// A handler sets it too, when pairing has to end the server.
+    pub stop: Arc<watch::Sender<bool>>,
+    /// Open event streams, for the idle stop (SPEC R-GUI.12).
+    pub idle: Arc<crate::idle::Idle>,
+    /// Where the code was shown, which decides what a lock or a reuse means.
+    pub pairing: Pairing,
+    /// Run after each successful pairing (clears the clipboard of the code).
+    pub on_paired: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Where the pairing code was shown (SPEC R-GUI.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pairing {
+    /// On the controlling terminal, which stays attached (`--foreground`):
+    /// Enter unlocks, and a new code appears there.
+    Terminal,
+    /// Once, by a launcher that has since returned to the prompt; `copied`
+    /// when it also went on the clipboard. Nobody can press Enter and no new
+    /// code can be shown, so a lock or an expiry ends the server.
+    Background { copied: bool },
 }
 
 /// The whole router.
@@ -165,27 +184,75 @@ async fn pair(State(ctx): State<Arc<AppCtx>>, body: Bytes) -> Response {
             "Send {\"code\": \"...\"}.",
         );
     };
-    match ctx.auth.pair(&request.code) {
-        Ok((_tab, token)) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "token": token }).to_string(),
-        )
-            .into_response(),
+    let result = ctx.auth.pair(&request.code);
+    let background = matches!(ctx.pairing, Pairing::Background { .. });
+    let stop = |why: &str| {
+        tracing::warn!("web: stopping: {why}");
+        ctx.stop.send_replace(true);
+    };
+    match result {
+        Ok((_tab, token)) => {
+            if let Some(hook) = &ctx.on_paired {
+                hook();
+            }
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "token": token }).to_string(),
+            )
+                .into_response()
+        }
         Err(PairError::WrongCode) => error(
             StatusCode::UNAUTHORIZED,
             "wrong_code",
-            "That is not the code shown in your terminal.",
+            match ctx.pairing {
+                Pairing::Background { copied: true } => {
+                    "That is not the pairing code ahma web copied to your clipboard and printed in your terminal."
+                }
+                _ => "That is not the code shown in your terminal.",
+            },
         ),
+        Err(PairError::Locked) if background => {
+            stop("too many wrong pairing codes");
+            error(
+                StatusCode::LOCKED,
+                "locked",
+                "Too many wrong codes, so ahma web has stopped. To pair, run `ahma web` again.",
+            )
+        }
         Err(PairError::Locked) => error(
             StatusCode::LOCKED,
             "locked",
-            "Too many wrong codes. Press Enter in the terminal that started ahma gui to try again.",
+            "Too many wrong codes. Press Enter in the terminal that started ahma web to try again.",
         ),
         Err(PairError::TooManyTabs) => error(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_clients",
             "Too many tabs are open. Close one and try again.",
         ),
+        Err(PairError::Expired) if background => {
+            stop("the pairing code expired");
+            error(
+                StatusCode::GONE,
+                "expired",
+                "That code has expired, so ahma web has stopped. To pair, run `ahma web` again.",
+            )
+        }
+        Err(PairError::Expired) => error(
+            StatusCode::GONE,
+            "expired",
+            "That code has expired. Type the new one shown in your terminal.",
+        ),
+        Err(PairError::Reused) => {
+            stop("a spent pairing code was used again");
+            error(
+                StatusCode::CONFLICT,
+                "reused",
+                "That code was already used. If you did not pair another tab with it, something \
+                 else on this machine read it from the clipboard. ahma web has stopped and \
+                 disconnected every tab. Run `ahma web` again; add --no-copy to type the code \
+                 instead of pasting it.",
+            )
+        }
     }
 }
 
@@ -229,6 +296,7 @@ struct StreamGuard {
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         self.ctx.auth.stream_closed(self.tab);
+        self.ctx.idle.closed(std::time::Instant::now());
         let inputs = self.ctx.inputs.clone();
         let tab = self.tab;
         // `try_send` first: a full queue is rare, and a dropped stream must not
@@ -262,16 +330,17 @@ async fn events(State(ctx): State<Arc<AppCtx>>, Extension(tab): Extension<TabId>
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "busy",
-            "ahma gui is shutting down.",
+            "ahma web is shutting down.",
         );
     }
     ctx.auth.stream_opened(tab);
+    ctx.idle.opened();
     let guard = StreamGuard {
         tab,
         ctx: ctx.clone(),
     };
     let rx = ctx.published.clone();
-    let stop = ctx.stop.clone();
+    let stop = ctx.stop.subscribe();
     Sse::new(event_stream(rx, stop, guard))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
@@ -424,8 +493,9 @@ mod tests {
         ctx: Arc<AppCtx>,
         inputs: mpsc::Receiver<WebInput>,
         published: watch::Sender<Arc<Published>>,
-        stop: watch::Sender<bool>,
+        stop: Arc<watch::Sender<bool>>,
         code: Arc<std::sync::Mutex<String>>,
+        paired_hook: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     fn harness() -> Harness {
@@ -433,26 +503,159 @@ mod tests {
     }
 
     fn harness_with(capacity: usize) -> Harness {
+        harness_for(
+            capacity,
+            Pairing::Terminal,
+            crate::auth::PairingPolicy::default(),
+        )
+    }
+
+    fn harness_for(
+        capacity: usize,
+        pairing: Pairing,
+        policy: crate::auth::PairingPolicy,
+    ) -> Harness {
         let code = Arc::new(std::sync::Mutex::new(String::new()));
         let sink = code.clone();
-        let auth = Arc::new(Auth::new(Arc::new(move |c: &str| {
-            *sink.lock().unwrap() = c.to_string();
-        })));
+        let auth = Arc::new(
+            Auth::new(Arc::new(move |c: &str| {
+                *sink.lock().unwrap() = c.to_string();
+            }))
+            .with_policy(policy),
+        );
         let (inputs_tx, inputs_rx) = mpsc::channel(capacity);
         let (published_tx, published_rx) = watch::channel(Arc::new(Published::default()));
-        let (stop_tx, stop_rx) = watch::channel(false);
+        let stop = Arc::new(watch::channel(false).0);
+        let paired_hook = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = paired_hook.clone();
         Harness {
             ctx: Arc::new(AppCtx {
                 auth,
                 inputs: inputs_tx,
                 published: published_rx,
-                stop: stop_rx,
+                stop: stop.clone(),
+                idle: Arc::new(crate::idle::Idle::new(std::time::Instant::now())),
+                pairing,
+                on_paired: Some(Arc::new(move || {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
             }),
             inputs: inputs_rx,
             published: published_tx,
-            stop: stop_tx,
+            stop,
             code,
+            paired_hook,
         }
+    }
+
+    async fn try_pair(h: &Harness, code: &str) -> (StatusCode, serde_json::Value) {
+        let r = send(
+            &h.ctx,
+            request(Method::POST, "/api/pair", HOST),
+            &format!(r#"{{"code":"{code}"}}"#),
+        )
+        .await;
+        let status = r.status();
+        let body = serde_json::from_slice(&collect(r.into_body()).await).unwrap_or_default();
+        (status, body)
+    }
+
+    const CLIPBOARD: Pairing = Pairing::Background { copied: true };
+    const BURN: crate::auth::PairingPolicy = crate::auth::PairingPolicy {
+        code_ttl: crate::auth::CODE_TTL,
+        burn_on_reuse: true,
+    };
+
+    /// The code was on the clipboard: when the human's paste finds it already
+    /// used, someone else read it. The answer says so and the server stops.
+    #[tokio::test]
+    async fn a_reused_clipboard_code_stops_the_server_and_says_why() {
+        let h = harness_for(16, CLIPBOARD, BURN);
+        let code = h.code.lock().unwrap().replace('-', "");
+        let (first, _) = try_pair(&h, &code).await;
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(
+            h.paired_hook.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a pairing runs the hook that clears the clipboard"
+        );
+        let (status, body) = try_pair(&h, &code).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "reused");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("ahma web") && message.contains("--no-copy"),
+            "{message}"
+        );
+        assert!(*h.stop.borrow(), "the server was told to stop");
+    }
+
+    /// In the background nobody can press Enter, and no new code can be shown:
+    /// a lock or an expiry ends the server, and the page says to run it again.
+    #[tokio::test]
+    async fn a_lock_in_the_background_stops_the_server() {
+        let h = harness_for(16, CLIPBOARD, BURN);
+        let mut last = (StatusCode::OK, serde_json::Value::Null);
+        for _ in 0..crate::auth::MISSES_BEFORE_LOCK {
+            last = try_pair(&h, "WRONGCODE").await;
+        }
+        assert_eq!(last.0, StatusCode::LOCKED);
+        let message = last.1["error"]["message"].as_str().unwrap();
+        assert!(message.contains("run `ahma web` again"), "{message}");
+        assert!(*h.stop.borrow());
+    }
+
+    #[tokio::test]
+    async fn an_expired_code_in_the_background_stops_the_server() {
+        let h = harness_for(
+            16,
+            CLIPBOARD,
+            crate::auth::PairingPolicy {
+                code_ttl: std::time::Duration::ZERO,
+                burn_on_reuse: true,
+            },
+        );
+        let code = h.code.lock().unwrap().replace('-', "");
+        let (status, body) = try_pair(&h, &code).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"]["code"], "expired");
+        assert!(*h.stop.borrow());
+    }
+
+    /// At a terminal the same lock waits for Enter, and the server stays.
+    #[tokio::test]
+    async fn a_lock_at_the_terminal_keeps_the_server() {
+        let h = harness();
+        for _ in 0..crate::auth::MISSES_BEFORE_LOCK {
+            try_pair(&h, "WRONGCODE").await;
+        }
+        assert!(!*h.stop.borrow());
+    }
+
+    /// An open stream is a tab watching; the idle clock counts only when none
+    /// is open.
+    #[tokio::test]
+    async fn an_open_stream_holds_off_the_idle_stop() {
+        let mut h = harness();
+        let token = paired(&h).await;
+        h.published.send_replace(published(1, &[("log", "{}", 1)]));
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let r = send(&h.ctx, authed(Method::GET, "/api/events", &token), "").await;
+        assert!(matches!(
+            h.inputs.recv().await,
+            Some(WebInput::TabOpened(_))
+        ));
+        assert!(
+            !h.ctx.idle.due(later, std::time::Duration::from_secs(60)),
+            "a tab is watching"
+        );
+        drop(r);
+        let _ = tokio::time::timeout(
+            TestTimeouts::get(TimeoutCategory::HttpRequest),
+            h.inputs.recv(),
+        )
+        .await;
+        assert!(h.ctx.idle.due(later, std::time::Duration::from_secs(60)));
     }
 
     fn request(method: Method, path: &str, host: &str) -> axum::http::request::Builder {

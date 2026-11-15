@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatDuration, shortenPath } from "../src/format.ts";
+import { formatDuration, looksLikeFullCode, shortenPath } from "../src/format.ts";
 import { backoffDelay } from "../src/stream.ts";
 
 test("paths are shortened to their last segments", () => {
@@ -27,4 +27,15 @@ test("reconnect backoff grows and is capped at about five seconds", () => {
     assert.ok(backoffDelay(n, 0) >= 200);
   }
   assert.equal(mid(30), 5000);
+});
+
+// A pasted code is submitted at once; a half-typed one is not. The reading
+// mirrors the server's (auth.rs `normalize`): case, spaces and the dash do not
+// matter.
+test("a whole pairing code is recognised the way the server reads it", () => {
+  assert.equal(looksLikeFullCode("ABCD-1234"), true);
+  assert.equal(looksLikeFullCode(" abcd 1234\n"), true);
+  assert.equal(looksLikeFullCode("ABCD-123"), false);
+  assert.equal(looksLikeFullCode("ABCD-12345"), false);
+  assert.equal(looksLikeFullCode("ABCD-12!4"), false);
 });
