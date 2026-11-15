@@ -203,13 +203,30 @@ pub(super) fn next_repo_ask(
 
 /// The dialog text before a command that works in another repository (SPEC R-PERM.11): a few
 /// plain sentences (R-PERM.10.2) that name the mismatch while the human can still act on it.
+///
+/// Both repositories are named by path, not folder name: two clones of one remote are different
+/// repositories here and are often both called `neubit4`. The last sentence names the one command
+/// that ends the asking for reads, so the human is not left with a prompt and no way out.
 pub(super) fn repo_ask_reason(repo: &Path, workspace: &Path) -> String {
+    let home = ahma_common::config::ahma_home_dir();
+    let repo_name = display_path(repo, home.as_deref());
     format!(
-        "This session works in {ws}. This command works in {repo}, a different repository. If \
-         you typed this task in the wrong terminal, choose No and give it to a session in \
-         {repo}. Yes lets this session keep working there; writing there still asks first.",
-        ws = short_name(workspace),
-        repo = short_name(repo),
+        "This session works in {ws}. This command works in {repo_name}, a different repository. \
+         If you typed this task in the wrong terminal, choose No and give it to a session in \
+         {repo_name}. Yes lets this session keep working there; writing there still asks first. \
+         To stop asking about reads there, run `{grant}`.",
+        ws = display_path(workspace, home.as_deref()),
+        grant = repo_grant_command(repo, workspace),
+    )
+}
+
+/// The command a human types to let `workspace` read `repo` without being asked again (SPEC
+/// R-PERM.11). Full paths, not `~`, so it pastes from any directory.
+pub(super) fn repo_grant_command(repo: &Path, workspace: &Path) -> String {
+    format!(
+        "ahma sandbox grant {} --read-only --workspace {}",
+        super::quote_arg_if_needed(&repo.display().to_string()),
+        super::quote_arg_if_needed(&workspace.display().to_string()),
     )
 }
 
@@ -502,9 +519,11 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
         {
             return Some(line_only(format!(
                 "ahma: noted — this session works in {} as well as {}. Nothing was granted: a \
-                 write there still asks first, and is never remembered by a yes alone.",
+                 write there still asks first, and is never remembered by a yes alone. To stop \
+                 asking about reads there, a human runs `{}`.",
                 asked.repo.display(),
-                workspace.display()
+                workspace.display(),
+                repo_grant_command(&asked.repo, &workspace),
             )));
         }
         return Some(line_only(
@@ -1010,12 +1029,23 @@ mod tests {
         assert!(reason.contains("neubit4"), "{reason}");
         assert!(reason.contains("different repository"), "{reason}");
         assert!(reason.contains("wrong terminal"), "{reason}");
+        // The dialog names the one command that ends the asking for reads (R-PERM.11).
+        let remedy = repo_grant_command(&other, &ws);
+        assert!(remedy.starts_with("ahma sandbox grant "), "{remedy}");
+        assert!(remedy.contains(" --read-only --workspace "), "{remedy}");
+        assert!(reason.contains(&remedy), "{reason}");
 
         // A no stops that command; the next one there asks again.
         let second = format!("git -C {} status", other.display());
         let (_, token) = token_of(decide(&second));
         let approval = apply_approval(&token, &ws, &second).expect("a line");
         assert!(approval.line.contains("neubit4"), "{}", approval.line);
+        assert!(
+            approval.line.contains("Nothing was granted"),
+            "{}",
+            approval.line
+        );
+        assert!(approval.line.contains(&remedy), "{}", approval.line);
         assert!(approval.trial.is_none(), "a yes here grants nothing");
         assert!(
             matches!(decide(&first), HooksDecision::AllowRewrite { .. }),
@@ -1044,6 +1074,46 @@ mod tests {
         assert!(
             matches!(token_of(decide(&cmd)), (_, _)),
             "ungranted, it asks"
+        );
+    }
+
+    /// SPEC R-PERM.11 (field case 2026-11-15): two clones of one remote
+    /// (`~/github/neubit4` and `/Volumes/T7/github/neubit4`) are different repositories, and the
+    /// dialog said "neubit4 … a different repository neubit4". The reason tells them apart by
+    /// path, and a path with a space is quoted so the remedy pastes as one command.
+    #[test]
+    fn the_repository_dialog_tells_same_named_checkouts_apart() {
+        // Expectations come from the paths themselves: `display_path` joins what is under home
+        // with the platform's separator, so a literal `~/github/neubit4` is wrong on Windows.
+        let home = ahma_common::config::ahma_home_dir();
+        let ws = home
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/h"))
+            .join("github")
+            .join("neubit4");
+        let other = PathBuf::from("/Volumes/T7/github/neubit4");
+        let reason = repo_ask_reason(&other, &ws);
+        let ws_shown = display_path(&ws, home.as_deref());
+        let other_shown = display_path(&other, home.as_deref());
+        assert_ne!(ws_shown, other_shown, "the two checkouts read differently");
+        assert!(
+            ws_shown.ends_with("neubit4") && other_shown.ends_with("neubit4"),
+            "same folder name on purpose: {ws_shown} / {other_shown}"
+        );
+        assert!(
+            reason.contains(&format!("This session works in {ws_shown}. ")),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!("This command works in {other_shown}, ")),
+            "{reason}"
+        );
+
+        let spaced = PathBuf::from("/Volumes/My Drive/neubit4");
+        let command = repo_grant_command(&spaced, &ws);
+        assert!(
+            command.contains("'/Volumes/My Drive/neubit4' --read-only --workspace "),
+            "{command}"
         );
     }
 
