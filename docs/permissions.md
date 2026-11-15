@@ -174,7 +174,7 @@ same names.
 | Kind | What it allows | Granted by | Lives in |
 |---|---|---|---|
 | `fs-scope` | a directory outside the workspace, read-only or read-write | a prompt, `ahma sandbox grant` | `[sandbox].persistent_scopes` |
-| `web-domain` | a domain ahma's own HTTP tools may fetch | a prompt, `ahma web allow` | `[web]` |
+| `web-domain` | a domain ahma's own HTTP tools may fetch | a prompt, `ahma egress allow` | `[web]` |
 | `net-host` | a host sandboxed commands may reach under `--restrict-network` | a prompt, `ahma network allow` | `[network].allow` |
 | `tool` | a tool the agent may run in a workspace without asking again | a tool-approval prompt | `[permissions].tool_approvals` |
 | `log-target` | a file outside the workspace that a `.ahma/logs/*.log` symlink points at, readable (never writable) by live-log monitoring | a human's `always` answer to the question `logs_approve` raises, or `a` on the log in `ahma tui` | `[log_targets].approvals` |
@@ -273,7 +273,7 @@ decided on its own (SPEC R-WEB.8). `[web] on_redirect_to_new_domain` says how:
 
 | Value | A redirect to another host is… |
 |---|---|
-| `"policy"` (default) | followed if the `[web]` policy — `always_allow`, `never_allow`, this session's answers, `default_policy` — allows the new host; otherwise the fetch fails with the `ahma web allow <host>` command to approve it. Never prompts. |
+| `"policy"` (default) | followed if the `[web]` policy — `always_allow`, `never_allow`, this session's answers, `default_policy` — allows the new host; otherwise the fetch fails with the `ahma egress allow <host>` command to approve it. Never prompts. |
 | `"block"` | never followed, even to a host the policy allows. The fetch fails with an error naming the target and this setting; fetch the target URL directly if you want it. |
 | `"prompt"` | treated exactly like a new request to that host: allowed or refused by the policy as usual, and, if the policy would ask (strict mode, a host you have not answered for), you get the same once / session / always question, deduplicated the same way. The redirect is followed only if you say yes. |
 
@@ -287,7 +287,7 @@ the private-address block (loopback, RFC-1918, cloud metadata) before it connect
 on_redirect_to_new_domain = "prompt"   # or "policy" (default), "block"
 ```
 
-`ahma web list` shows the value in effect. An unrecognised value is a parse error:
+`ahma egress list` shows the value in effect. An unrecognised value is a parse error:
 `[web]` is security-tier, so ahma refuses to start rather than guess.
 
 > **Upgrading:** before this setting was enforced, every redirect behaved as
@@ -503,8 +503,8 @@ ahma network allow crates.io                   # subprocess egress hosts
 ahma network list
 ahma network revoke crates.io
 
-ahma web allow api.github.com                  # outbound domains (HTTP fetch tools)
-ahma web list
+ahma egress allow api.github.com                  # outbound domains (HTTP fetch tools)
+ahma egress list
 ```
 
 Every grant and revoke is appended to `~/.ahma/permissions-audit.jsonl`, with the

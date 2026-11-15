@@ -815,7 +815,7 @@ async fn approve_web_egress_dedup_denies_second_concurrent_request() {
             // SPEC R-PERM.3.8: told the question is waiting, with the CLI way
             // out kept for when nobody answers it.
             assert!(msg.contains("already in front of the human"), "{msg}");
-            assert!(msg.contains("ahma web allow dedup.example"), "{msg}");
+            assert!(msg.contains("ahma egress allow dedup.example"), "{msg}");
         }
         other => panic!("expected Deny for an in-flight duplicate, got {other:?}"),
     }
@@ -834,7 +834,7 @@ async fn approve_web_egress_no_peer_no_tui_cancels_and_denies() {
         .await;
     match action {
         FetchAction::Deny(msg) => {
-            assert!(msg.contains("ahma web allow nosurface.example"), "{msg}");
+            assert!(msg.contains("ahma egress allow nosurface.example"), "{msg}");
         }
         other => panic!("expected Deny, got {other:?}"),
     }
@@ -857,7 +857,7 @@ async fn approve_web_egress_tui_hub_send_success_denies_with_hint() {
         FetchAction::Deny(msg) => {
             assert!(msg.contains("ahma TUI"), "{msg}");
             assert!(msg.contains("tui.example"), "{msg}");
-            assert!(msg.contains("ahma web allow tui.example"), "{msg}");
+            assert!(msg.contains("ahma egress allow tui.example"), "{msg}");
         }
         other => panic!("expected Deny with TUI hint, got {other:?}"),
     }
@@ -887,7 +887,7 @@ async fn approve_web_egress_with_no_tui_watching_asks_nobody_and_leaves_nothing_
         {
             FetchAction::Deny(msg) => {
                 assert!(!msg.contains("ahma TUI"), "no TUI was asked: {msg}");
-                assert!(msg.contains("ahma web allow nobody.example"), "{msg}");
+                assert!(msg.contains("ahma egress allow nobody.example"), "{msg}");
             }
             other => panic!("expected Deny, got {other:?}"),
         }
@@ -918,7 +918,7 @@ async fn approve_web_egress_tui_hub_send_failure_falls_back_to_cancel_and_deny()
                 !msg.contains("ahma TUI"),
                 "expected the fail-safe hint (no live TUI), got: {msg}"
             );
-            assert!(msg.contains("ahma web allow tuidown.example"), "{msg}");
+            assert!(msg.contains("ahma egress allow tuidown.example"), "{msg}");
         }
         other => panic!("expected Deny, got {other:?}"),
     }
@@ -1115,7 +1115,10 @@ async fn approve_web_egress_elicit_deny_answer_denies() {
         .await;
     match action {
         FetchAction::Deny(msg) => {
-            assert!(msg.contains("ahma web allow denyanswer.example"), "{msg}");
+            assert!(
+                msg.contains("ahma egress allow denyanswer.example"),
+                "{msg}"
+            );
         }
         other => panic!("expected Deny, got {other:?}"),
     }
@@ -1136,7 +1139,7 @@ async fn approve_web_egress_elicit_explicit_decline_denies() {
         .await;
     match action {
         FetchAction::Deny(msg) => {
-            assert!(msg.contains("ahma web allow decline.example"), "{msg}");
+            assert!(msg.contains("ahma egress allow decline.example"), "{msg}");
         }
         other => panic!("expected Deny, got {other:?}"),
     }
@@ -1159,7 +1162,7 @@ async fn approve_web_egress_elicit_cancel_denies_without_remembering() {
         .await;
     match action {
         FetchAction::Deny(msg) => {
-            assert!(msg.contains("ahma web allow cancel.example"), "{msg}");
+            assert!(msg.contains("ahma egress allow cancel.example"), "{msg}");
         }
         other => panic!("expected Deny, got {other:?}"),
     }
@@ -1228,7 +1231,8 @@ async fn fetch_webpage_prompt_mode_denies_without_peer() {
         result.expect_err("unknown domain in strict deny mode with no prompt surface must deny");
     assert!(err.message.contains("is not approved"), "{}", err.message);
     assert!(
-        err.message.contains("ahma web allow unknown.example.test"),
+        err.message
+            .contains("ahma egress allow unknown.example.test"),
         "{}",
         err.message
     );
@@ -1427,7 +1431,7 @@ async fn fetch_webpage_redirect_prompt_mode_refuses_a_declined_hop() {
         .await
         .expect_err("a declined redirect must not be followed");
     assert!(err.contains("on_redirect_to_new_domain"), "{err}");
-    assert!(err.contains("ahma web allow cdn.example"), "{err}");
+    assert!(err.contains("ahma egress allow cdn.example"), "{err}");
 }
 
 #[tokio::test]
@@ -1447,7 +1451,9 @@ async fn fetch_webpage_redirect_policy_mode_has_no_approver() {
 
     let guard = fetcher.take();
     match guard.decide("start.example", &target("https://cdn.example/f")) {
-        RedirectStep::Refuse(msg) => assert!(msg.contains("ahma web allow cdn.example"), "{msg}"),
+        RedirectStep::Refuse(msg) => {
+            assert!(msg.contains("ahma egress allow cdn.example"), "{msg}")
+        }
         other => panic!("policy mode must refuse an unapproved host, got {other:?}"),
     }
     assert!(
@@ -1466,7 +1472,7 @@ fn a_second_fetch_is_told_the_question_is_waiting() {
     assert!(text.contains("already in front of the human"), "{text}");
     assert!(text.contains("applies to this whole session"), "{text}");
     assert!(
-        text.contains("ahma web allow example.com"),
+        text.contains("ahma egress allow example.com"),
         "the way out stays: {text}"
     );
 }

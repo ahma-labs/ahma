@@ -952,7 +952,7 @@ Status: terminal hooks in Claude Code. Open (§11): offering it at the MCP clien
   - A `once` grant is **never** stored; for a filesystem scope it is applied live for the next command the session starts that may write, and retired when the one after it starts (`Sandbox::add_once_grant`, `Sandbox::spend_once_grants`): a read-only command (the R2.7.4 read lane) cannot use a write grant, so it never spends one. It passes the live gate (R-PERM.4.3) like every tier, and settles nothing beyond its command: a later need for the same path is asked again. A `session` grant lives **only** in memory and dies with the instance.
   - Only the persistent tiers (`always`, and `lease`, which ends on its own, R-PERM.2.3) are written to disk, and only after the preview-and-approve exchange R5.4.5 mandates, for every kind: the user is shown the **absolute file path** and the **exact line(s)** to be written, and nothing is written without explicit approval.
   - The R5.4.5 hard denylist gates **every** write path into the ledger because it runs inside the one persist function those surfaces share; the MCP tool has no write path of its own.
-- **R-PERM.2.1**: **One CLI, one audit trail**: `ahma permissions list | grant | revoke` **must** manage every kind through the same preview-and-confirm path, showing provenance (`granted_by`, `surface`) for each record. Kind-scoped aliases (`ahma sandbox grant|list|revoke`, `ahma web allow|list|revoke`, `ahma network allow|list|revoke`) **must** keep working, because ahma emits them as remediation. Every persist and revoke **must** append one record to an append-only audit log in `~/.ahma/`.
+- **R-PERM.2.1**: **One CLI, one audit trail**: `ahma permissions list | grant | revoke` **must** manage every kind through the same preview-and-confirm path, showing provenance (`granted_by`, `surface`) for each record. Kind-scoped aliases (`ahma sandbox grant|list|revoke`, `ahma egress allow|list|revoke`, `ahma network allow|list|revoke`) **must** keep working, because ahma emits them as remediation. Every persist and revoke **must** append one record to an append-only audit log in `~/.ahma/`.
 - **R-PERM.2.2**: **Recording a decision must never destroy it** (R-WEB.9.3, generalized to every kind): an **audit-log write failure is non-fatal** and **must not** fail the grant it records (it is logged, not propagated), and a **legacy-migration failure (R-PERM.1) must never block startup** (the worst case is re-approving a tool once). Neither relaxation runs the other way: a failure to **persist a grant** is fatal to that grant and **must** be reported.
 - **R-PERM.2.3**: **A grant can be a lease, and a lease never cuts off work in flight**: a saved filesystem grant may carry `expires_at` (Unix seconds; `ahma sandbox grant --for <dur>`), for something a task needs outside the project for a while rather than forever.
   - Every grant prompt offers it between `session` and `always` — "read-only / read-write for 24 hours (saved; ends on its own)", `l`/`L` in the TUI, `read-only-24h`/`read-write-24h` in the elicitation form — and the advisor may recommend it.
@@ -1186,7 +1186,7 @@ Parallel to the filesystem persistent-scope grants (R5.4.4–R5.4.7):
 - **R-WEB.5.1**: Session grants are cleared when the server exits and are **never** serialized.
 - **R-WEB.5.2**: A persistent grant is written **only** to `~/.ahma/settings.toml`, which is kernel-unwritable from inside the sandbox (R5.4.5), so an agent cannot grant itself permanent web access.
 - **R-WEB.5.3**: After a persistent grant is written, the server **must** confirm it as R-WEB.12.2 specifies (file path, line, content).
-- **R-WEB.5.4**: A session deny suppresses re-prompting for that domain for the rest of the session. There is no interactive "deny always"; permanent blocks use `never_allow` or `ahma web deny <pattern>`.
+- **R-WEB.5.4**: A session deny suppresses re-prompting for that domain for the rest of the session. There is no interactive "deny always"; permanent blocks use `never_allow` or `ahma egress deny <pattern>`.
 - **R-WEB.5.5**: An `always_allow` entry added at runtime takes effect immediately in the current session (the policy is hot-reloaded from the updated settings), as human-approved filesystem grants do (R5.4.6, R-PERM.2). Only a human action can write `settings.toml`.
 
 ### R-WEB.6: TUI approval modal
@@ -1211,7 +1211,7 @@ When a request is blocked under `default_policy = "deny"` and a TUI is attached:
 - **R-WEB.6.4**: For `http://` URLs the `[p]` line **must** carry a caution marker: `[p] Persist (⚠ cleartext HTTP): api.github.com`.
 - **R-WEB.6.5**: After `[p]`, the modal shows the file and line added before dismissing.
 - **R-WEB.6.6**: The modal is drawn last in the render pass, over all other content.
-- **R-WEB.6.7**: With no approval surface attached, `elicitation/create` is used (R5.3.1). With neither surface, the request is **denied** and the error gives the exact `ahma web allow <pattern>` command to pre-approve the domain.
+- **R-WEB.6.7**: With no approval surface attached, `elicitation/create` is used (R5.3.1). With neither surface, the request is **denied** and the error gives the exact `ahma egress allow <pattern>` command to pre-approve the domain.
 
 ### R-WEB.7: Dedup / debounce coordinator
 
@@ -1225,7 +1225,7 @@ When a request is blocked under `default_policy = "deny"` and a TUI is attached:
 ### R-WEB.8: Redirect chain validation
 
 - **R-WEB.8.1**: A 3xx redirect to a **different** host **must** be checked against the policy independently; redirects do not inherit the source's approval.
-- **R-WEB.8.2**: `[web] on_redirect_to_new_domain` decides a redirect to another host. `"policy"` (the default): followed only if the live policy (R-WEB.2, with session grants and denies) allows that host, otherwise the request fails with an error naming `ahma web allow <host>`; never prompts. `"block"`: never followed, even to an allowed host; the error names the target and the setting. `"prompt"`: treated exactly like a fresh request to that host, so an allowed host is followed, a denied one refused, and an unknown one goes through the approval flow (R-WEB.5–R-WEB.7) and is followed only if approved. Redirects on the guarded path are followed by hand, one hop at a time, so every hop is decided and re-checked (R-WEB.3, R-WEB.8.4). An unknown value aborts startup (R-CFG6.1).
+- **R-WEB.8.2**: `[web] on_redirect_to_new_domain` decides a redirect to another host. `"policy"` (the default): followed only if the live policy (R-WEB.2, with session grants and denies) allows that host, otherwise the request fails with an error naming `ahma egress allow <host>`; never prompts. `"block"`: never followed, even to an allowed host; the error names the target and the setting. `"prompt"`: treated exactly like a fresh request to that host, so an allowed host is followed, a denied one refused, and an unknown one goes through the approval flow (R-WEB.5–R-WEB.7) and is followed only if approved. Redirects on the guarded path are followed by hand, one hop at a time, so every hop is decided and re-checked (R-WEB.3, R-WEB.8.4). An unknown value aborts startup (R-CFG6.1).
 - **R-WEB.8.3**: Same-host redirects (including HTTP→HTTPS for the same host) are always followed.
 - **R-WEB.8.4**: The redirect target's resolved IP is always checked against R-WEB.3.
 
@@ -1246,13 +1246,13 @@ Parallel to `ahma sandbox grant|list|revoke`:
 
 | Command | Effect |
 |---------|--------|
-| `ahma web allow <pattern>` | Add to `[web] always_allow`; show file path + line added |
-| `ahma web deny <pattern>` | Add to `[web] never_allow`; show file path + line added |
-| `ahma web list` | Show `default_policy`, `block_private_ranges`, all entries with provenance |
-| `ahma web revoke <pattern>` | Remove from `always_allow` or `never_allow`; show file path + line removed |
-| `ahma web check <url>` | Dry-run: report what decision the policy would make for this URL |
+| `ahma egress allow <pattern>` | Add to `[web] always_allow`; show file path + line added |
+| `ahma egress deny <pattern>` | Add to `[web] never_allow`; show file path + line added |
+| `ahma egress list` | Show `default_policy`, `block_private_ranges`, all entries with provenance |
+| `ahma egress revoke <pattern>` | Remove from `always_allow` or `never_allow`; show file path + line removed |
+| `ahma egress check <url>` | Dry-run: report what decision the policy would make for this URL |
 
-- **R-WEB.10.1**: `ahma web allow` / `deny` **must** reject invalid patterns (bare `*`, TLD-level wildcards, private IPs) and warn on `http://` patterns.
+- **R-WEB.10.1**: `ahma egress allow` / `deny` **must** reject invalid patterns (bare `*`, TLD-level wildcards, private IPs) and warn on `http://` patterns.
 - **R-WEB.10.2**: Every mutation command **must** print the settings file path and the exact line changed or added.
 
 ### R-WEB.11: TOML configuration schema
@@ -2253,7 +2253,7 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **SSH key broker, remaining** (R-CRED.3, R-CRED.7): asking at the MCP client (elicitation) or the TUI while a command waits — today an MCP command is refused with the line and the human grants with `ahma permissions grant ssh-sign`; forwarding the client's `SSH_AUTH_SOCK` as a session option; denying a direct connect to the human's agent socket on Linux, where Landlock does not mediate a unix-socket connect (R-CRED.11) — masking it in the opt-in mount-namespace tier (R6.1.7) is the likely route, as for container sockets.
 - **Kernel denial records off macOS** (R-DENY.1): Linux and Windows still judge refusals from text; Landlock's audit records need privileges an ordinary user rarely has.
 - **One run outside the sandbox from MCP and the TUI** (R-ESCAPE): offered in Claude Code's dialog for hooked commands only.
-- **`ahma permissions grant`** (R-PERM.2.1): granting goes through each kind's own command (`ahma sandbox grant`, `ahma web allow`, `ahma network allow`); the unified `grant` verb covers `ssh-sign` only.
+- **`ahma permissions grant`** (R-PERM.2.1): granting goes through each kind's own command (`ahma sandbox grant`, `ahma egress allow`, `ahma network allow`); the unified `grant` verb covers `ssh-sign` only.
 - **A hook question asked in a live MCP session** (R-PERM.6.1 rung 1): a hook denial is asked in Claude Code's dialog (R-PERM.10) or the TUI, never through a live MCP session for the same workspace.
 - **Container daemon sockets on Linux** (R-HANDOFF.6): Landlock at the ABI ahma uses does not mediate `connect(2)` to a pathname unix socket, and ahma has no other rule there, so a command whose user may reach a daemon socket (the `docker` group for `/var/run/docker.sock`, rootless Docker or podman under `$XDG_RUNTIME_DIR`) can use it. Masking the sockets in the opt-in mount-namespace tier (R6.1.7) is the likely route.
 - **The hub's token protects least where there is no filesystem boundary** (R-HUB.13): on Windows a command can read `hub.token` and connect; on Linux a command can reach the socket and the token is the only barrier (the runtime directory is in no Landlock ruleset and the token is never in an argument or environment variable; that a command cannot read a holder's memory or `/proc/<pid>/environ` rests on Landlock's ptrace scoping, which has no ahma test yet); under macOS deferral to an outer sandbox (R7.6) that sandbox, not ahma's, decides whether a command can connect or read the token. A hub socket the operator places in a directory a sandbox can read puts its token there too.

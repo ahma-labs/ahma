@@ -1933,7 +1933,7 @@ pub enum WebDefaultPolicy {
 pub enum RedirectPolicy {
     /// Default. Follow the redirect iff the live `[web]` policy (with this
     /// session's grants and denies) allows the new host; otherwise fail with the
-    /// `ahma web allow <host>` hint. Never prompts. This is what ahma did before
+    /// `ahma egress allow <host>` hint. Never prompts. This is what ahma did before
     /// the key was enforced, whatever the file said.
     #[default]
     Policy,
@@ -1959,7 +1959,7 @@ impl RedirectPolicy {
     }
 
     /// One line saying what this mode does with a redirect to another host,
-    /// for `ahma web list`.
+    /// for `ahma egress list`.
     pub fn describe(self) -> &'static str {
         match self {
             RedirectPolicy::Policy => {
@@ -3727,8 +3727,8 @@ pub fn ledger_key_command(table: &str, key: &str) -> Option<&'static str> {
             "`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved"
         }
         ("network", "allow") => "`ahma network allow <host>` / `ahma network revoke <host>`",
-        ("web", "always_allow") => "`ahma web allow <domain>` / `ahma web revoke <domain>`",
-        ("web", "never_allow") => "`ahma web deny <domain>` / `ahma web revoke <domain>`",
+        ("web", "always_allow") => "`ahma egress allow <domain>` / `ahma egress revoke <domain>`",
+        ("web", "never_allow") => "`ahma egress deny <domain>` / `ahma egress revoke <domain>`",
         _ => return None,
     })
 }
@@ -4365,8 +4365,8 @@ mod tests {
             ("permissions.tool_approvals", "ahma permissions"),
             ("log_targets.approvals", "ahma permissions"),
             ("network.allow", "ahma network allow"),
-            ("web.always_allow", "ahma web allow"),
-            ("web.never_allow", "ahma web deny"),
+            ("web.always_allow", "ahma egress allow"),
+            ("web.never_allow", "ahma egress deny"),
         ] {
             let msg = AhmaSettings::set_in_file(&path, key, Some("[]"))
                 .unwrap_err()
@@ -4518,8 +4518,8 @@ mod tests {
         for (table, key, command) in [
             ("sandbox", "persistent_scopes", "ahma sandbox grant"),
             ("network", "allow", "ahma network allow"),
-            ("web", "always_allow", "ahma web allow"),
-            ("web", "never_allow", "ahma web deny"),
+            ("web", "always_allow", "ahma egress allow"),
+            ("web", "never_allow", "ahma egress deny"),
             ("permissions", "tool_approvals", "ahma permissions"),
         ] {
             let how = how_to_change(table, key);

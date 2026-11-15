@@ -51,7 +51,7 @@ only text built into ahma, so an agent can run it inside the sandbox
   `web.always_allow` / `never_allow`, `permissions.tool_approvals`,
   `sandbox.ssh_sign` and `log_targets.approvals` are refused by `settings set`
   and name their own command (`ahma sandbox grant`, `ahma network allow`,
-  `ahma web allow|deny`, `ahma permissions revoke`). Those check a path against
+  `ahma egress allow|deny`, `ahma permissions revoke`). Those check a path against
   the hard denylist, or a host against the host patterns, and write the audit
   record; `settings set` does neither.
 - **Every change is recorded.** `settings set|unset` and the TUI settings panel

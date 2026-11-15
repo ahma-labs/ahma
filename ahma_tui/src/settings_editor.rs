@@ -722,13 +722,13 @@ impl SettingsEditor {
             row(
                 "web.always_allow",
                 "Web: always allowed",
-                "Remove one: ahma web revoke <domain>",
+                "Remove one: ahma egress revoke <domain>",
                 SettingValue::StringList(web.always_allow.clone()),
             ),
             row(
                 "web.never_allow",
                 "Web: never allowed",
-                "Remove one: ahma web revoke <domain>",
+                "Remove one: ahma egress revoke <domain>",
                 SettingValue::StringList(web.never_allow.clone()),
             ),
         ]

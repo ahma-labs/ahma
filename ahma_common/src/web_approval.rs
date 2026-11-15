@@ -22,7 +22,7 @@
 //!    restarts, but write nothing to disk.
 //!  - [`WebApprovalDecision::AllowAlways`] — the caller additionally persists the
 //!    domain to `[web].always_allow` in `~/.ahma/settings.toml` (via the same
-//!    `ahma web allow` path), so it survives restarts.
+//!    `ahma egress allow` path), so it survives restarts.
 //!
 //! A [`WebApprovalDecision::Deny`] adds the domain to the session deny set, which
 //! both blocks it and suppresses re-asking for the rest of the session.
