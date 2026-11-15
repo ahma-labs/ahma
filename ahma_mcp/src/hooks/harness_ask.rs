@@ -1083,17 +1083,29 @@ mod tests {
     /// path, and a path with a space is quoted so the remedy pastes as one command.
     #[test]
     fn the_repository_dialog_tells_same_named_checkouts_apart() {
-        let home = ahma_common::config::ahma_home_dir().unwrap_or_else(|| PathBuf::from("/h"));
-        let ws = home.join("github").join("neubit4");
+        // Expectations come from the paths themselves: `display_path` joins what is under home
+        // with the platform's separator, so a literal `~/github/neubit4` is wrong on Windows.
+        let home = ahma_common::config::ahma_home_dir();
+        let ws = home
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/h"))
+            .join("github")
+            .join("neubit4");
         let other = PathBuf::from("/Volumes/T7/github/neubit4");
         let reason = repo_ask_reason(&other, &ws);
-        assert!(reason.contains("~/github/neubit4"), "{reason}");
-        assert!(reason.contains("/Volumes/T7/github/neubit4"), "{reason}");
+        let ws_shown = display_path(&ws, home.as_deref());
+        let other_shown = display_path(&other, home.as_deref());
+        assert_ne!(ws_shown, other_shown, "the two checkouts read differently");
         assert!(
-            reason
-                .matches("This session works in ~/github/neubit4")
-                .count()
-                == 1,
+            ws_shown.ends_with("neubit4") && other_shown.ends_with("neubit4"),
+            "same folder name on purpose: {ws_shown} / {other_shown}"
+        );
+        assert!(
+            reason.contains(&format!("This session works in {ws_shown}. ")),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!("This command works in {other_shown}, ")),
             "{reason}"
         );
 
