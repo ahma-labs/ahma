@@ -46,13 +46,34 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
     prepare_output_directory(&args.output)?;
 
     let is_workspace = is_cargo_workspace(&args.directory);
-    let extensions = resolve_extensions(&args.extensions);
     let auto_count = args.auto;
     let lenses = if auto_count.is_some() {
         parse_lenses(&["all".to_string()])?
     } else {
         parse_lenses(&args.lens)?
     };
+
+    let lens_report = analyze(&args, &directory, is_workspace, &lenses)?;
+    let project_name = get_project_name(&directory);
+
+    if let Some(count) = auto_count {
+        return emit_auto_report(&args, &lens_report, count, &directory, &project_name);
+    }
+    if lens_report.is_empty() {
+        eprintln!("No findings: nothing matched the selected lenses.");
+        return Ok(());
+    }
+    emit_report(&args, &lens_report, is_workspace, &directory, &project_name)
+}
+
+/// Scan the tree once and run every selected lens over it.
+fn analyze(
+    args: &SimplifyArgs,
+    directory: &Path,
+    is_workspace: bool,
+    lenses: &[Lens],
+) -> Result<MultiLensReport> {
+    let extensions = resolve_extensions(&args.extensions);
 
     // Build the external analyzer registry unless the user requested rca-only.
     let registry = build_registry(args.no_external);
@@ -63,13 +84,13 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
     };
 
     let changed = if args.diff {
-        Some(analysis::changed_files::changed_files(&directory)?)
+        Some(analysis::changed_files::changed_files(directory)?)
     } else {
         None
     };
 
     let scan = perform_analysis(
-        &directory,
+        directory,
         &args.output,
         is_workspace,
         &ScanOptions {
@@ -81,12 +102,12 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         registry_ref,
     )?;
 
-    let mut files_simplicity = if lenses.contains(&Lens::Complexity) {
+    let mut complexity_files = if lenses.contains(&Lens::Complexity) {
         load_metrics(&args.output, true, &scan.external)?
     } else {
         Vec::new()
     };
-    sort_files_by_simplicity(&mut files_simplicity);
+    sort_files_by_simplicity(&mut complexity_files);
 
     let duplicates = if lenses.contains(&Lens::Reuse) {
         reuse::find_duplicates(&scan.sources, &ReuseConfig::default())
@@ -116,113 +137,113 @@ pub fn run(mut args: SimplifyArgs) -> Result<()> {
         Vec::new()
     };
 
-    let lens_report = MultiLensReport {
-        complexity_files: files_simplicity,
+    Ok(MultiLensReport {
+        complexity_files,
         duplicates,
         dead_symbols,
         altitude_chains,
         ..Default::default()
-    };
-    let project_name = get_project_name(&directory);
+    })
+}
 
-    if let Some(count) = auto_count {
-        let fixes = crate::auto::prioritize_fixes(&lens_report, count, &directory);
-        let auto_md = crate::auto::create_auto_report_md(
-            &lens_report,
-            &fixes,
-            count,
-            &directory,
-            &project_name,
-        );
+/// Reports go to files when `--output-path`, `--html` or `--open` is set, else to stdout.
+fn writes_to_file(args: &SimplifyArgs) -> bool {
+    args.output_path.is_some() || args.html || args.open
+}
 
-        let write_to_file = args.output_path.is_some() || args.html || args.open;
-        if write_to_file {
-            let report_output_dir = determine_report_output_dir(&args.output_path)?;
-            fs::create_dir_all(&report_output_dir)
-                .context("Failed to create report output directory")?;
-            fs::write(report_output_dir.join("CODE_SIMPLICITY.md"), &auto_md)
-                .context("Failed to write auto report markdown")?;
+fn open_or_warn(args: &SimplifyArgs, report_output_dir: &Path) {
+    if args.open
+        && let Err(e) = open_report(report_output_dir, args.html)
+    {
+        eprintln!("Warning: Failed to open report: {}", e);
+    }
+}
 
-            if args.html {
-                let html_title = format!("Auto Simplification Plan - {}", project_name);
-                let html_content = report::render_markdown_to_html(&auto_md, &html_title);
-                fs::write(report_output_dir.join("CODE_SIMPLICITY.html"), html_content)
-                    .context("Failed to write auto report HTML")?;
-            }
+/// `--auto N`: the prioritized multi-lens plan.
+fn emit_auto_report(
+    args: &SimplifyArgs,
+    lens_report: &MultiLensReport,
+    count: usize,
+    directory: &Path,
+    project_name: &str,
+) -> Result<()> {
+    let fixes = crate::auto::prioritize_fixes(lens_report, count, directory);
+    let auto_md =
+        crate::auto::create_auto_report_md(lens_report, &fixes, count, directory, project_name);
 
-            print_report_locations(&report_output_dir, args.html);
-            if args.open
-                && let Err(e) = open_report(&report_output_dir, args.html)
-            {
-                eprintln!("Warning: Failed to open report: {}", e);
-            }
-        } else {
-            println!("{}", auto_md);
-        }
+    if !writes_to_file(args) {
+        println!("{}", auto_md);
         return Ok(());
     }
 
-    if lens_report.is_empty() {
-        eprintln!("No findings: nothing matched the selected lenses.");
-        return Ok(());
+    let report_output_dir = determine_report_output_dir(&args.output_path)?;
+    fs::create_dir_all(&report_output_dir).context("Failed to create report output directory")?;
+    fs::write(report_output_dir.join("CODE_SIMPLICITY.md"), &auto_md)
+        .context("Failed to write auto report markdown")?;
+
+    if args.html {
+        let html_title = format!("Auto Simplification Plan - {}", project_name);
+        let html_content = report::render_markdown_to_html(&auto_md, &html_title);
+        fs::write(report_output_dir.join("CODE_SIMPLICITY.html"), html_content)
+            .context("Failed to write auto report HTML")?;
     }
 
-    // Determine output mode: write to file if --output-path, --html, or --open is set
-    let write_to_file = args.output_path.is_some() || args.html || args.open;
+    print_report_locations(&report_output_dir, args.html);
+    open_or_warn(args, &report_output_dir);
+    Ok(())
+}
 
-    if write_to_file {
-        let report_output_dir = determine_report_output_dir(&args.output_path)?;
-        fs::create_dir_all(&report_output_dir)
-            .context("Failed to create report output directory")?;
-
-        generate_report(
-            &lens_report,
-            is_workspace,
-            args.limit,
-            &directory,
-            args.html,
-            &project_name,
-            &report_output_dir,
-        )?;
-
-        print_report_locations(&report_output_dir, args.html);
-
-        if let Some(issue_number) = args.ai_fix {
-            handle_ai_fix_from_file(
-                issue_number,
-                &report_output_dir,
-                &lens_report.complexity_files,
-                &directory,
-            )?;
-        }
-
-        if args.open
-            && let Err(e) = open_report(&report_output_dir, args.html)
-        {
-            eprintln!("Warning: Failed to open report: {}", e);
-        }
-    } else {
-        // Default: output markdown to stdout
+/// The ranked report, with `--ai-fix` applied when asked for.
+fn emit_report(
+    args: &SimplifyArgs,
+    lens_report: &MultiLensReport,
+    is_workspace: bool,
+    directory: &Path,
+    project_name: &str,
+) -> Result<()> {
+    if !writes_to_file(args) {
         let md_content = create_report_md(
-            &lens_report,
+            lens_report,
             is_workspace,
             args.limit,
-            &directory,
-            &project_name,
+            directory,
+            project_name,
         );
-
-        if let Some(issue_number) = args.ai_fix {
-            handle_ai_fix_to_stdout(
+        match args.ai_fix {
+            Some(issue_number) => handle_ai_fix_to_stdout(
                 &md_content,
                 issue_number,
                 &lens_report.complexity_files,
-                &directory,
-            );
-        } else {
-            println!("{}", md_content);
+                directory,
+            ),
+            None => println!("{}", md_content),
         }
+        return Ok(());
     }
 
+    let report_output_dir = determine_report_output_dir(&args.output_path)?;
+    fs::create_dir_all(&report_output_dir).context("Failed to create report output directory")?;
+
+    generate_report(
+        lens_report,
+        is_workspace,
+        args.limit,
+        directory,
+        args.html,
+        project_name,
+        &report_output_dir,
+    )?;
+    print_report_locations(&report_output_dir, args.html);
+
+    if let Some(issue_number) = args.ai_fix {
+        handle_ai_fix_from_file(
+            issue_number,
+            &report_output_dir,
+            &lens_report.complexity_files,
+            directory,
+        )?;
+    }
+    open_or_warn(args, &report_output_dir);
     Ok(())
 }
 

@@ -54,6 +54,113 @@ function intentFor(gate: Gate, option: GateOption): WireIntent {
   }
 }
 
+function section(heading: string | null, body: string, mono = false): HTMLElement {
+  return el(
+    "div",
+    { class: "gate-section" },
+    heading !== null && el("div", { class: "gate-heading" }, heading),
+    el("div", { class: mono ? "gate-body mono" : "gate-body" }, body),
+  );
+}
+
+const advice = (text: string | null): HTMLElement | null =>
+  text === null ? null : el("p", { class: "gate-advice quiet" }, text);
+
+/** What the question says, apart from its title and its buttons. */
+function bodyFor(g: Gate): HTMLElement[] {
+  const parts = ((): Array<HTMLElement | null> => {
+    switch (g.kind) {
+      case "scope":
+        return [...g.sections.map((s) => section(s.heading, s.body)), advice(g.advice)];
+      case "web":
+        return [section("URL", g.url, true), g.tool === null ? null : section("Requested by", g.tool, true)];
+      case "tool":
+        return [section(null, g.description), advice(g.note)];
+    }
+  })();
+  return parts.filter((p): p is HTMLElement => p !== null);
+}
+
+function kickerFor(g: Gate): string {
+  return { scope: "Sandbox access", web: "Network request", tool: "Tool approval" }[g.kind];
+}
+
+function titleFor(g: Gate): string {
+  return g.kind === "scope" ? g.title : g.kind === "web" ? g.domain : g.tool;
+}
+
+function makeOption(option: GateOption, onClick: (event: MouseEvent, option: GateOption) => void): OptionEls {
+  const button = el("button", {
+    type: "button",
+    class: option.granting ? "btn btn-grant" : "btn btn-primary",
+    "data-granting": String(option.granting),
+  }, option.label);
+  button.addEventListener("click", (event) => onClick(event, option));
+  return { option, button, hint: el("span", { class: "opt-hint quiet" }) };
+}
+
+/**
+ * Read-before-grant reporting: tells the server whether the scope/web question
+ * on screen is being *read* (visible, focused document), in order, so a late
+ * "visible" can never overtake a "hidden".
+ */
+interface ReadReporter {
+  /** The scope/web question now on screen, or null when there is none. */
+  show(id: string | null): void;
+  /** The stream (re)connected: say again what the server was last told. */
+  resync(): void;
+  destroy(): void;
+}
+
+function createReadReporter(): ReadReporter {
+  let reportId: string | null = null; // the scope/web question on screen, if any
+  let reported: string | null = null; // the one the server was last told is visible
+  let queue: Promise<void> = Promise.resolve();
+
+  function report(r: WireReport): void {
+    queue = queue.then(() => postReport(r)).catch(() => {});
+  }
+
+  function evaluate(): void {
+    const readable = reportId !== null && document.visibilityState === "visible" && document.hasFocus();
+    if (reported !== null && (!readable || reported !== reportId)) {
+      report({ type: "gate_hidden", decision_id: reported });
+      reported = null;
+    }
+    if (readable && reported === null && reportId !== null) {
+      reported = reportId;
+      report({ type: "gate_visible", decision_id: reportId });
+    }
+  }
+
+  const triggers: Array<[EventTarget, string]> = [
+    [document, "visibilitychange"],
+    [window, "focus"],
+    [window, "blur"],
+  ];
+  for (const [target, type] of triggers) target.addEventListener(type, evaluate);
+  const onPageHide = (): void => show(null);
+  window.addEventListener("pagehide", onPageHide);
+
+  function show(id: string | null): void {
+    reportId = id;
+    evaluate();
+  }
+
+  return {
+    show,
+    resync() {
+      if (reported !== null) report({ type: "gate_visible", decision_id: reported });
+      else evaluate();
+    },
+    destroy() {
+      for (const [target, type] of triggers) target.removeEventListener(type, evaluate);
+      window.removeEventListener("pagehide", onPageHide);
+      show(null);
+    },
+  };
+}
+
 export interface GateView extends Mounted<Gates | null> {
   /** The stream (re)connected: the server may know nothing of what this tab shows, so say it again. */
   resync(): void;
@@ -72,6 +179,7 @@ export function mount(root: HTMLElement): GateView {
   panel.hidden = true;
   root.appendChild(panel);
 
+  const reporter = createReadReporter();
   let gate: Gate | null = null;
   let structure = "";
   let options: OptionEls[] = [];
@@ -95,13 +203,13 @@ export function mount(root: HTMLElement): GateView {
     }
   }
 
+  /** A script cannot make a trusted event; a human at the keyboard or a pointer can. */
+  function isConsidered(event: MouseEvent): boolean {
+    return event.isTrusted && performance.now() - shownAt >= SETTLE_MS;
+  }
+
   function onClick(event: MouseEvent, g: Gate, option: GateOption): void {
-    if (option.granting) {
-      // A script cannot make a trusted event; a human at the keyboard or a
-      // pointer can, and has had to move to this button to do it.
-      if (!event.isTrusted) return;
-      if (performance.now() - shownAt < SETTLE_MS) return;
-    }
+    if (option.granting && !isConsidered(event)) return;
     void answer(g, option);
   }
 
@@ -115,75 +223,15 @@ export function mount(root: HTMLElement): GateView {
     }
   });
 
-  // ── read-before-grant reporting ──
-
-  let reportId: string | null = null; // the scope/web question on screen, if any
-  let reported: string | null = null; // the one the server was last told is visible
-  let queue: Promise<void> = Promise.resolve();
-
-  function report(r: WireReport): void {
-    // In order, so a late "visible" can never overtake a "hidden".
-    queue = queue.then(() => postReport(r)).catch(() => {});
-  }
-
-  function evaluate(): void {
-    const readable = reportId !== null && document.visibilityState === "visible" && document.hasFocus();
-    if (reported !== null && (!readable || reported !== reportId)) {
-      report({ type: "gate_hidden", decision_id: reported });
-      reported = null;
-    }
-    if (readable && reported === null && reportId !== null) {
-      reported = reportId;
-      report({ type: "gate_visible", decision_id: reportId });
-    }
-  }
-
-  const triggers: Array<[EventTarget, string]> = [
-    [document, "visibilitychange"],
-    [window, "focus"],
-    [window, "blur"],
-  ];
-  for (const [target, type] of triggers) target.addEventListener(type, evaluate);
-  const onPageHide = (): void => {
-    reportId = null;
-    evaluate();
-  };
-  window.addEventListener("pagehide", onPageHide);
-
   // ── drawing ──
 
   function build(g: Gate): void {
     shownAt = performance.now();
-    options = g.options.map((option) => {
-      const button = el("button", {
-        type: "button",
-        class: option.granting ? "btn btn-grant" : "btn btn-primary",
-        "data-granting": String(option.granting),
-      }, option.label);
-      const hint = el("span", { class: "opt-hint quiet" });
-      button.addEventListener("click", (event) => onClick(event, g, option));
-      return { option, button, hint };
-    });
-
-    const body: HTMLElement[] = [];
-    if (g.kind === "scope") {
-      for (const s of g.sections) {
-        body.push(el("div", { class: "gate-section" }, el("div", { class: "gate-heading" }, s.heading), el("div", { class: "gate-body" }, s.body)));
-      }
-      if (g.advice !== null) body.push(el("p", { class: "gate-advice quiet" }, g.advice));
-    } else if (g.kind === "web") {
-      body.push(el("div", { class: "gate-section" }, el("div", { class: "gate-heading" }, "URL"), el("div", { class: "gate-body mono" }, g.url)));
-      if (g.tool !== null) body.push(el("div", { class: "gate-section" }, el("div", { class: "gate-heading" }, "Requested by"), el("div", { class: "gate-body mono" }, g.tool)));
-    } else {
-      body.push(el("div", { class: "gate-section" }, el("div", { class: "gate-body" }, g.description)));
-      if (g.note !== null) body.push(el("p", { class: "gate-advice quiet" }, g.note));
-    }
-
-    const title = g.kind === "scope" ? g.title : g.kind === "web" ? g.domain : g.tool;
-    setText(kicker, g.kind === "scope" ? "Sandbox access" : g.kind === "web" ? "Network request" : "Tool approval");
+    options = g.options.map((option) => makeOption(option, (event, o) => onClick(event, g, o)));
+    setText(kicker, kickerFor(g));
     content.replaceChildren(
-      el("h2", { id: "gate-title", class: g.kind === "scope" ? "gate-title" : "gate-title mono" }, title),
-      ...body,
+      el("h2", { id: "gate-title", class: g.kind === "scope" ? "gate-title" : "gate-title mono" }, titleFor(g)),
+      ...bodyFor(g),
       el("div", { class: "gate-options" }, ...options.map((o) => el("div", { class: "opt" }, o.button, o.hint))),
     );
   }
@@ -200,21 +248,21 @@ export function mount(root: HTMLElement): GateView {
     });
   }
 
+  function clear(): void {
+    setHidden(panel, true);
+    structure = "";
+    options = [];
+    content.replaceChildren();
+    document.title = BASE_TITLE;
+    reporter.show(null);
+  }
+
   return {
     update(gates) {
       const top = gates?.top ?? null;
       const previous = gate;
       gate = top;
-      if (top === null) {
-        setHidden(panel, true);
-        structure = "";
-        options = [];
-        content.replaceChildren();
-        document.title = BASE_TITLE;
-        reportId = null;
-        evaluate();
-        return;
-      }
+      if (top === null) return clear();
       const next = structureOf(top);
       if (previous === null || next !== structure) {
         structure = next;
@@ -225,18 +273,11 @@ export function mount(root: HTMLElement): GateView {
       setText(count, waiting > 1 ? `1 of ${waiting} waiting` : "");
       setHidden(panel, false);
       document.title = TITLE_PREFIX + BASE_TITLE;
-      reportId = top.kind === "tool" ? null : idOf(top);
-      evaluate();
+      reporter.show(top.kind === "tool" ? null : idOf(top));
     },
-    resync() {
-      if (reported !== null) report({ type: "gate_visible", decision_id: reported });
-      else evaluate();
-    },
+    resync: reporter.resync,
     destroy() {
-      for (const [target, type] of triggers) target.removeEventListener(type, evaluate);
-      window.removeEventListener("pagehide", onPageHide);
-      reportId = null;
-      evaluate();
+      reporter.destroy();
       document.title = BASE_TITLE;
       panel.remove();
     },

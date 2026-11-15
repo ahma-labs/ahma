@@ -3149,64 +3149,34 @@ async fn record_failure_diagnostics(
     // the async path (the result is delivered later as text), so attach the
     // grant -> restart -> retry remediation as an operation alert. Mirrors the
     // typed `RuntimeDenial` the sync path returns.
-    let target_and_access = if let Some(hit) = sandbox::scan_denial_streams(stderr_str, stdout_str)
-    {
-        let base_scope = sandbox.scopes().first().cloned();
-        let base_wd = working_dir.or(base_scope.as_deref());
-        let in_scope = if let Some(wd) = base_wd {
-            sandbox.is_path_in_scope_in_dir(&hit.path, wd)
-        } else {
-            sandbox.is_path_in_scope(&hit.path)
-        };
-        if !in_scope {
-            let target = sandbox::grant_channel::resolve_grant_target(&hit.path, base_wd, sandbox);
-            Some((target, hit.access))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let mut explained = target_and_access.is_some();
-    if target_and_access.is_none()
-        && let Some(note) = sandbox::signal_denial_note(stderr_str, stdout_str)
-            .or_else(|| sandbox::gpu_denial_note(stderr_str, stdout_str))
-            .or_else(|| sandbox::setuid_denial_note(stderr_str, stdout_str))
-            .or_else(|| sandbox::launch_services_denial_note(stderr_str, stdout_str))
-    {
-        op_monitor.append_alert(op_id, note).await;
-        explained = true;
-    }
-
-    if let Some((target, access)) = target_and_access {
-        // The alert below is transient; this line is the durable copy of the
-        // same structured denial (SPEC R5.4.7).
-        audit::record_sandbox_denial(Some(op_id), &target, access.label(), tool).await;
-        let remediation = sandbox::grant_channel::runtime_denial_remediation(&target, access);
-        tracing::warn!(
-            "Operation {} hit an out-of-scope sandbox denial on {}: {}",
-            op_id,
-            target.display(),
-            remediation
-        );
-        op_monitor.append_alert(op_id, remediation).await;
-    } else {
-        // The grant flow above only fires for *out-of-scope* denials. The
-        // sibling failure — an in-scope EPERM from macOS provenance/sccache
-        // contamination — produces no kernel event and would otherwise surface
-        // as a bare `os error 1`. Diagnose it and attach the remediation as an
-        // alert so the user gets an actionable line, not an errno.
-        if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
-            let remediation = remediation_in_workspace(&hint, sandbox, working_dir);
-            tracing::warn!(
-                "Operation {} failed with sandbox diagnostic ({:?}): {}",
-                op_id,
-                hint.kind,
-                remediation
-            );
-            op_monitor.append_alert(op_id, remediation).await;
+    let mut explained = false;
+    match out_of_scope_runtime_denial(sandbox, stderr_str, stdout_str, working_dir) {
+        Some((target, access)) => {
+            alert_out_of_scope_denial(op_monitor, op_id, tool, &target, access).await;
             explained = true;
+        }
+        None => {
+            if let Some(note) = non_path_denial_note(stderr_str, stdout_str) {
+                op_monitor.append_alert(op_id, note).await;
+                explained = true;
+            }
+            // The grant flow above only fires for *out-of-scope* denials. The
+            // sibling failure — an in-scope EPERM from macOS provenance/sccache
+            // contamination — produces no kernel event and would otherwise surface
+            // as a bare `os error 1`. Diagnose it and attach the remediation as an
+            // alert so the user gets an actionable line, not an errno.
+            if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str)
+            {
+                let remediation = remediation_in_workspace(&hint, sandbox, working_dir);
+                tracing::warn!(
+                    "Operation {} failed with sandbox diagnostic ({:?}): {}",
+                    op_id,
+                    hint.kind,
+                    remediation
+                );
+                op_monitor.append_alert(op_id, remediation).await;
+                explained = true;
+            }
         }
     }
 
@@ -3230,6 +3200,57 @@ async fn record_failure_diagnostics(
             .append_alert(op_id, QUIET_REFUSAL_NOTE.to_string())
             .await;
     }
+}
+
+/// The denied path and access when the streams name a path outside the sandbox
+/// scope, resolved to the directory a grant should offer.
+fn out_of_scope_runtime_denial(
+    sandbox: &sandbox::Sandbox,
+    stderr_str: &str,
+    stdout_str: &str,
+    working_dir: Option<&Path>,
+) -> Option<(std::path::PathBuf, ahma_common::config::ScopeAccess)> {
+    let hit = sandbox::scan_denial_streams(stderr_str, stdout_str)?;
+    let base_scope = sandbox.scopes().first().cloned();
+    let base_wd = working_dir.or(base_scope.as_deref());
+    let in_scope = match base_wd {
+        Some(wd) => sandbox.is_path_in_scope_in_dir(&hit.path, wd),
+        None => sandbox.is_path_in_scope(&hit.path),
+    };
+    if in_scope {
+        return None;
+    }
+    let target = sandbox::grant_channel::resolve_grant_target(&hit.path, base_wd, sandbox);
+    Some((target, hit.access))
+}
+
+/// A denial that names no path but a signal, the GPU, a setuid binary or Launch
+/// Services: nothing to grant, only something to explain.
+fn non_path_denial_note(stderr_str: &str, stdout_str: &str) -> Option<String> {
+    sandbox::signal_denial_note(stderr_str, stdout_str)
+        .or_else(|| sandbox::gpu_denial_note(stderr_str, stdout_str))
+        .or_else(|| sandbox::setuid_denial_note(stderr_str, stdout_str))
+        .or_else(|| sandbox::launch_services_denial_note(stderr_str, stdout_str))
+}
+
+async fn alert_out_of_scope_denial(
+    op_monitor: &OperationMonitor,
+    op_id: &str,
+    tool: &str,
+    target: &Path,
+    access: ahma_common::config::ScopeAccess,
+) {
+    // The alert below is transient; this line is the durable copy of the
+    // same structured denial (SPEC R5.4.7).
+    audit::record_sandbox_denial(Some(op_id), target, access.label(), tool).await;
+    let remediation = sandbox::grant_channel::runtime_denial_remediation(target, access);
+    tracing::warn!(
+        "Operation {} hit an out-of-scope sandbox denial on {}: {}",
+        op_id,
+        target.display(),
+        remediation
+    );
+    op_monitor.append_alert(op_id, remediation).await;
 }
 
 #[allow(clippy::too_many_arguments)]

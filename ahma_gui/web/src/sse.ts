@@ -24,15 +24,17 @@ export function createSseParser(): SseParser {
   let eventName = "";
   let dataLines: string[] = [];
 
-  function line(text: string, out: SseEvent[]): void {
-    if (text === "") {
-      if (dataLines.length > 0) {
-        out.push({ event: eventName === "" ? "message" : eventName, data: dataLines.join("\n") });
-      }
-      eventName = "";
-      dataLines = [];
-      return;
+  /** A blank line: dispatch the event gathered so far, if it has any data. */
+  function dispatch(out: SseEvent[]): void {
+    if (dataLines.length > 0) {
+      out.push({ event: eventName === "" ? "message" : eventName, data: dataLines.join("\n") });
     }
+    eventName = "";
+    dataLines = [];
+  }
+
+  function line(text: string, out: SseEvent[]): void {
+    if (text === "") return dispatch(out);
     if (text.startsWith(":")) return;
     const colon = text.indexOf(":");
     const field = colon === -1 ? text : text.slice(0, colon);
@@ -43,36 +45,43 @@ export function createSseParser(): SseParser {
     // `id` and `retry` are not used by this page.
   }
 
+  /** Drop what is not content: a leading BOM, and the \n that completes a \r from the last chunk. */
+  function trimChunk(chunk: string): string {
+    let text = chunk;
+    if (text.length === 0) return text;
+    if (!started) {
+      started = true;
+      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    }
+    if (skipLf) {
+      if (text.startsWith("\n")) text = text.slice(1);
+      skipLf = false;
+    }
+    return text;
+  }
+
+  /** Where the next line starts after the terminator at `at`; steers `ends` past a \r\n pair. */
+  function nextLineStart(at: number, ends: RegExp): number {
+    if (pending[at] !== "\r") return at + 1;
+    if (at + 1 >= pending.length) {
+      skipLf = true; // the \n, if any, arrives in the next chunk
+      return at + 1;
+    }
+    if (pending[at + 1] !== "\n") return at + 1;
+    ends.lastIndex = at + 2;
+    return at + 2;
+  }
+
   return {
     feed(chunk: string): SseEvent[] {
-      let text = chunk;
-      if (!started && text.length > 0) {
-        started = true;
-        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-      }
-      if (skipLf && text.length > 0) {
-        if (text.startsWith("\n")) text = text.slice(1);
-        skipLf = false;
-      }
-      pending += text;
+      pending += trimChunk(chunk);
 
       const out: SseEvent[] = [];
       const ends = /[\r\n]/g;
       let start = 0;
       for (let m = ends.exec(pending); m !== null; m = ends.exec(pending)) {
-        const at = m.index;
-        line(pending.slice(start, at), out);
-        if (pending[at] === "\r") {
-          if (at + 1 < pending.length) {
-            if (pending[at + 1] === "\n") ends.lastIndex = at + 2;
-            start = pending[at + 1] === "\n" ? at + 2 : at + 1;
-          } else {
-            skipLf = true;
-            start = at + 1;
-          }
-        } else {
-          start = at + 1;
-        }
+        line(pending.slice(start, m.index), out);
+        start = nextLineStart(m.index, ends);
       }
       pending = pending.slice(start);
       if (pending.length > MAX_PENDING) throw new Error("event stream line too long");
