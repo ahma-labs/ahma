@@ -52,6 +52,9 @@ pub struct AppCtx {
     pub auth: Arc<Auth>,
     pub inputs: mpsc::Sender<WebInput>,
     pub published: watch::Receiver<Arc<Published>>,
+    /// Becomes `true` when the server is stopping: every open event stream then
+    /// says `bye` and ends, so graceful shutdown is not left waiting on a tab.
+    pub stop: watch::Receiver<bool>,
 }
 
 /// The whole router.
@@ -268,24 +271,32 @@ async fn events(State(ctx): State<Arc<AppCtx>>, Extension(tab): Extension<TabId>
         ctx: ctx.clone(),
     };
     let rx = ctx.published.clone();
-    Sse::new(event_stream(rx, guard))
+    let stop = ctx.stop.clone();
+    Sse::new(event_stream(rx, stop, guard))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
 }
 
 fn event_stream(
     rx: watch::Receiver<Arc<Published>>,
+    stop: watch::Receiver<bool>,
     guard: StreamGuard,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     struct State {
         rx: watch::Receiver<Arc<Published>>,
+        stop: watch::Receiver<bool>,
         seen: Option<u64>,
         done: bool,
         _guard: StreamGuard,
     }
+    fn bye(mut st: State) -> Option<(Result<Event, Infallible>, State)> {
+        st.done = true;
+        Some((Ok(Event::default().event("bye").data("")), st))
+    }
     stream::unfold(
         State {
             rx,
+            stop,
             seen: None,
             done: false,
             _guard: guard,
@@ -295,6 +306,9 @@ fn event_stream(
                 if st.done {
                     return None;
                 }
+                if *st.stop.borrow() {
+                    return bye(st);
+                }
                 let current = st.rx.borrow_and_update().clone();
                 // Nothing is published before the session's first presentation.
                 let ready = !current.regions.is_empty();
@@ -303,10 +317,20 @@ fn event_stream(
                     st.seen = Some(current.rev);
                     return Some((Ok(Event::default().event("view").data(data)), st));
                 }
-                if st.rx.changed().await.is_err() {
-                    // The session is gone: say so, and the page stops retrying.
-                    st.done = true;
-                    return Some((Ok(Event::default().event("bye").data("")), st));
+                tokio::select! {
+                    changed = st.rx.changed() => {
+                        if changed.is_err() {
+                            // The session is gone: say so, and the page stops retrying.
+                            return bye(st);
+                        }
+                    }
+                    // A stop, or the sender gone (the server is going): either
+                    // way the loop's check above says bye.
+                    stopped = st.stop.changed() => {
+                        if stopped.is_err() {
+                            return bye(st);
+                        }
+                    }
                 }
             }
         },
@@ -400,6 +424,7 @@ mod tests {
         ctx: Arc<AppCtx>,
         inputs: mpsc::Receiver<WebInput>,
         published: watch::Sender<Arc<Published>>,
+        stop: watch::Sender<bool>,
         code: Arc<std::sync::Mutex<String>>,
     }
 
@@ -415,14 +440,17 @@ mod tests {
         })));
         let (inputs_tx, inputs_rx) = mpsc::channel(capacity);
         let (published_tx, published_rx) = watch::channel(Arc::new(Published::default()));
+        let (stop_tx, stop_rx) = watch::channel(false);
         Harness {
             ctx: Arc::new(AppCtx {
                 auth,
                 inputs: inputs_tx,
                 published: published_rx,
+                stop: stop_rx,
             }),
             inputs: inputs_rx,
             published: published_tx,
+            stop: stop_tx,
             code,
         }
     }
@@ -885,6 +913,40 @@ mod tests {
         drop(h.published);
         let last = next().await;
         assert!(last.contains("event: bye"), "{last}");
+    }
+
+    /// Stopping the server ends every open stream with `bye`. Graceful shutdown
+    /// waits for in-flight responses, and an event stream never finishes on its
+    /// own: without this, stopping with a tab open waited for the browser, and
+    /// the page was never told the server had gone.
+    #[tokio::test]
+    async fn stopping_the_server_says_bye_and_ends_an_open_stream() {
+        use futures::StreamExt;
+        let mut h = harness();
+        let token = paired(&h).await;
+        h.published.send_replace(published(1, &[("log", "{}", 1)]));
+        let r = send(&h.ctx, authed(Method::GET, "/api/events", &token), "").await;
+        assert!(matches!(
+            h.inputs.recv().await,
+            Some(WebInput::TabOpened(_))
+        ));
+        let mut body = r.into_body().into_data_stream();
+        let wait = TestTimeouts::get(TimeoutCategory::HttpRequest);
+        let first = tokio::time::timeout(wait, body.next()).await.unwrap();
+        assert!(first.is_some(), "the first view arrives");
+
+        h.stop.send_replace(true);
+        let bye = tokio::time::timeout(wait, body.next())
+            .await
+            .expect("bye arrives after stop")
+            .expect("the stream is still open for bye")
+            .expect("a chunk");
+        let bye = String::from_utf8(bye.to_vec()).unwrap();
+        assert!(bye.contains("event: bye"), "{bye}");
+        let end = tokio::time::timeout(wait, body.next())
+            .await
+            .expect("the stream ends after bye");
+        assert!(end.is_none(), "nothing follows bye");
     }
 
     /// A stream that goes away tells the frontend, so the session can stop being

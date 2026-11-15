@@ -41,8 +41,10 @@ Criteria in the root SPEC are cited by id, not restated.
 - **First-party page, committed build (R-GUI.10)**.
 - **Disclosure on every start (R-GUI.11)**.
 - `ahma gui [PATH] [--port N] [--no-open]` starts the server, prints the address and the
-  pairing code on the terminal, opens the browser unless told not to, and stops on Ctrl-C
-  (the page is told with a `bye` event).
+  pairing code on the terminal, opens the browser unless told not to, and stops on Ctrl-C:
+  every open event stream is sent `bye` and ends (graceful shutdown would otherwise wait on
+  an open tab forever), the session closes its hub MCP session so the hub stops that
+  session's worker at once, and the whole stop is bounded. A second Ctrl-C exits at once.
 
 ## 3. Requirements Owned Here
 
@@ -67,7 +69,9 @@ What follows is how this crate meets them.
 
 The session's state is not `Send`, so it lives on its own thread with a current-thread
 runtime; the server talks to it through bounded channels (`frontend.rs`). A slow tab skips
-states instead of queueing them.
+states instead of queueing them. A prompt names the session's own MCP session, so the hub
+runs it on the worker scoped to the launch directory even when an editor session is
+attached too (root SPEC R-HUB.6).
 
 ## 4. Non-Functional Requirements
 

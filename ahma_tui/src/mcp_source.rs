@@ -162,11 +162,21 @@ pub fn spawn_mcp_source(
     tx: mpsc::Sender<SourceEvent>,
     workspace_path: Option<std::path::PathBuf>,
 ) -> mpsc::Sender<McpSourceCommand> {
+    spawn_mcp_source_with_handle(connection, tx, workspace_path).0
+}
+
+/// [`spawn_mcp_source`], also returning the task, so a caller can wait for it
+/// to end the MCP session after dropping the command sender.
+pub fn spawn_mcp_source_with_handle(
+    connection: ResolvedConnection,
+    tx: mpsc::Sender<SourceEvent>,
+    workspace_path: Option<std::path::PathBuf>,
+) -> (mpsc::Sender<McpSourceCommand>, tokio::task::JoinHandle<()>) {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         mcp_source_task(connection, tx, cmd_rx, workspace_path).await;
     });
-    cmd_tx
+    (cmd_tx, task)
 }
 
 // ─── Task implementation ──────────────────────────────────────────────────────
