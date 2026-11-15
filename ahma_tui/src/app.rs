@@ -55,6 +55,9 @@ pub async fn run(
     // than left to the drop at end of scope so the terminal is back to normal
     // before anything else this function might print.
     frontend.restore();
+    // End the hub MCP session now, so the hub stops this session's worker
+    // instead of leaving it until the session idles out.
+    session.close(std::time::Duration::from_secs(3)).await;
     result
 }
 
@@ -1599,11 +1602,10 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
 
     let system_prompt = Some(build_system_prompt(state));
 
-    let target_instance_id = state
-        .active_target_instance
-        .as_ref()
-        .filter(|key| state.active_instances.iter().any(|i| &i.id == *key))
-        .cloned();
+    let ChatRoute {
+        target_instance_id,
+        origin_session_id,
+    } = chat_route(state);
 
     state.turn = Some(crate::state::ChatTurn::new(target_instance_id.clone()));
     send_turn_msg(
@@ -1614,8 +1616,29 @@ fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: S
             provider: Some(base_url),
             model: Some(model),
             target_instance_id,
+            origin_session_id,
         },
     );
+}
+
+/// Where a chat turn goes: the window the user chose, else — through
+/// `origin_session_id` — the worker serving this surface's own MCP session,
+/// which is scoped to the directory the surface was launched in (SPEC R-HUB.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatRoute {
+    pub target_instance_id: Option<String>,
+    pub origin_session_id: Option<String>,
+}
+
+pub(crate) fn chat_route(state: &crate::state::AppState) -> ChatRoute {
+    ChatRoute {
+        target_instance_id: state
+            .active_target_instance
+            .as_ref()
+            .filter(|key| state.active_instances.iter().any(|i| &i.id == *key))
+            .cloned(),
+        origin_session_id: state.session_id.clone(),
+    }
 }
 
 /// Send a message a chat turn depends on. Unlike [`send_incoming`], a
@@ -1746,6 +1769,7 @@ pub(crate) fn cancel_turn(state: &mut crate::state::AppState) -> bool {
     };
     send_incoming(ahma_common::hub::ClientMsg::CancelPrompt {
         target_instance_id: turn.target_instance,
+        origin_session_id: state.session_id.clone(),
     });
     end_turn(state);
     push_assistant_message(state, "Cancelled.");
@@ -6899,6 +6923,7 @@ fn analyze_operation(state: &mut crate::state::AppState, key: &crate::state::OpK
             provider: Some(base_url),
             model: Some(model),
             target_instance_id: None,
+            origin_session_id: state.session_id.clone(),
         },
     );
 }
@@ -7418,6 +7443,34 @@ mod tests {
             }
         )));
         assert!(state.turn.is_none(), "an error ends the turn");
+    }
+
+    /// Without a chosen window, a prompt names this surface's own MCP session,
+    /// so the hub runs it on the worker scoped to the launch directory rather
+    /// than refusing to choose between it and an editor session (R-HUB.6).
+    #[test]
+    fn an_untargeted_prompt_names_the_surfaces_own_session() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.session_id = Some("sess-own".into());
+        let route = super::chat_route(&state);
+        assert_eq!(route.target_instance_id, None);
+        assert_eq!(route.origin_session_id.as_deref(), Some("sess-own"));
+    }
+
+    /// A window the user chose with "Chat with this window" wins, and the
+    /// origin still travels so a cancel reaches the same worker.
+    #[test]
+    fn a_chosen_window_is_the_target() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.session_id = Some("sess-own".into());
+        state.active_instances = vec![ahma_common::hub::InstanceInfo {
+            id: "inst-editor".into(),
+            ..Default::default()
+        }];
+        state.active_target_instance = Some("inst-editor".into());
+        let route = super::chat_route(&state);
+        assert_eq!(route.target_instance_id.as_deref(), Some("inst-editor"));
+        assert_eq!(route.origin_session_id.as_deref(), Some("sess-own"));
     }
 
     /// A state with one submitted prompt whose turn has not ended yet.
