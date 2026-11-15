@@ -90,7 +90,12 @@ ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).
 repository other than the session's own — `cd ../other-repo && …`, `git -C`, an absolute
 path into it — asks first, read or write, because the usual reason is a task typed into
 the wrong terminal. **No** stops that command (the next one there asks again); **Yes** lets
-the session keep working there and grants nothing. A yes to a later write there lasts this
+the session keep working there and grants nothing. The prompt names both repositories by
+path (two clones of one remote count as two repositories) and ends with the command that
+stops the asking for routine reads, which you type once:
+`ahma sandbox grant <repo> --read-only --workspace <this workspace>` (add `--session` to
+keep it only for this terminal session; `ahma sandbox revoke <repo>` undoes it). A write
+there still asks. A yes to a later write there lasts this
 session only and is **never** remembered by itself: the result names the
 `ahma sandbox grant <repo> --workspace <this workspace>` you type to keep it. A repository
 you granted this workspace yourself is never asked about, and `ahma doctor` lists such

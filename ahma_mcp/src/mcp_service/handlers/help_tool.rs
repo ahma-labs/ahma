@@ -352,7 +352,9 @@ fn blocked(facts: &HelpFacts) -> String {
          \n\
          Working in another git repository than this session's asks the human first (SPEC \
          R-PERM.11). If the answer is no, the task may have been typed into the wrong \
-         terminal: stop, and ask the human before doing anything more for that repository.\n"
+         terminal: stop, and ask the human before doing anything more for that repository. If \
+         the human wants routine reads there to stop asking, `ahma sandbox grant <repo> \
+         --read-only --workspace <ws>` does it (or call `sandbox_grant` with `access: ro`).\n"
     )
 }
 
