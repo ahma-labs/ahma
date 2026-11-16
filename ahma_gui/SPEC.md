@@ -3,7 +3,7 @@
 * **Status**: Approved (Experimental feature)
 * **License**: AGPL-3.0
 * **Depends on**: `ahma_tui` (the controller, session and `Frontend` trait), `ahma_core`, `ahma_mcp`, `ahma_common`
-* **Used by**: `ahma_bin` (`ahma web`)
+* **Used by**: `ahma_bin` (`ahma web`, `ahma desktop`)
 
 A SPEC states what the crate does now and why. Open work in the whole product is listed once,
 in the root SPEC's Known gaps (§11).
@@ -42,6 +42,10 @@ Criteria in the root SPEC are cited by id, not restated.
   **no host commands (R-GUI.9)**.
 - **First-party page, committed build (R-GUI.10)**.
 - **Disclosure on every start (R-GUI.11)**.
+- **`ahma desktop` (R-DESK)**: `desktop.rs` holds the window (wry and tao, compiled for macOS
+  and Windows only) and the pure policy beside it: the init script, the origin check, why there
+  is no window. `main_thread.rs` hands the window to the process's real main thread.
+  `auth::PairingPolicy::pairing_closed` and `Auth::mint_tab` give the window its token.
 - **Returns to the prompt, stops when unused (R-GUI.12)**: `launch.rs` starts the background
   server and reads its one ready line; `idle.rs` stops a server with no open stream.
 - `ahma web [PATH] [--port N] [--no-open] [--no-copy] [--idle-timeout S]` launches a

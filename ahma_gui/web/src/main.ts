@@ -2,7 +2,7 @@
 // only wires the transport (stream.ts) into the store (store.ts) and the store
 // into the views, drawing each region once per frame and only if it changed.
 
-import { forgetToken, pair, setOnUnauthorized } from "./api.ts";
+import { adoptToken, desktopToken, forgetToken, pair, setOnUnauthorized } from "./api.ts";
 import { el } from "./dom.ts";
 import type { Mounted } from "./dom.ts";
 import { startStream } from "./stream.ts";
@@ -48,6 +48,11 @@ function showFatal(message: string): void {
 
 function endSession(notice: string): void {
   forgetToken();
+  if (linked) {
+    // A desktop window has no code to pair with: its session is its life.
+    showFatal("This window's session has ended. Close the window and run ahma desktop again.");
+    return;
+  }
   showPair(notice);
 }
 
@@ -156,4 +161,12 @@ function startSession(): void {
   schedule();
 }
 
-showPair(null);
+// `ahma desktop`'s own window arrives already holding its token.
+const given = desktopToken();
+const linked = given !== null;
+if (given !== null) {
+  adoptToken(given);
+  startSession();
+} else {
+  showPair(null);
+}

@@ -1,6 +1,8 @@
 // The transport: same-origin fetches with the bearer token. The token lives in
 // this module's `token` variable and nowhere else — not in the URL, storage,
-// cookies, a window property or the DOM — so a reload means pairing again.
+// cookies or the DOM — so a reload means pairing again. The one exception is
+// `ahma desktop`'s own window: there the native host puts the token on a
+// frozen global before this code runs (SPEC R-DESK.2), and nothing pairs.
 
 import type { ErrorBody, WireIntent, WireReport } from "./wire.ts";
 
@@ -22,6 +24,17 @@ export class ApiError extends Error {
 /** Called when an authenticated request is refused as unauthorized. */
 export function setOnUnauthorized(fn: () => void): void {
   onUnauthorized = fn;
+}
+
+/** The token `ahma desktop`'s window was given, if this page is in one. */
+export function desktopToken(): string | null {
+  const host = (globalThis as { __ahmaDesktop?: { token?: unknown } }).__ahmaDesktop;
+  return typeof host?.token === "string" && host.token !== "" ? host.token : null;
+}
+
+/** Use `ahma desktop`'s token: this page needs no pairing. */
+export function adoptToken(given: string): void {
+  token = given;
 }
 
 export function isPaired(): boolean {

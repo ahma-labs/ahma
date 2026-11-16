@@ -28,6 +28,14 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 webbrowser = "1.2"
 
+# `ahma desktop`: a window on the OS's own web engine (WKWebView, WebView2),
+# so it adds no engine to the binary. Only where the engine is part of the OS:
+# on Linux it would be WebKitGTK, a shared library that headless machines lack,
+# which would stop `ahma` from starting at all (SPEC R-DESK.1).
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tao = { version = "0.37.2", default-features = false, features = ["rwh_06"] }
+wry = { version = "=0.57.1", default-features = false }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

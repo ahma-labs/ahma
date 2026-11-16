@@ -9,10 +9,13 @@
 //!
 //! A plain `ahma web` only launches ([`launch`]): the server it starts runs in
 //! the background and stops by itself when no tab is left ([`idle`]).
+//! `ahma desktop` runs the same server with the page in a window of its own
+//! ([`desktop`]), and needs no pairing.
 
 pub mod assets;
 pub mod auth;
 pub mod clipboard;
+pub mod desktop;
 pub mod dto;
 pub mod frontend;
 pub mod guard;
@@ -20,6 +23,7 @@ pub mod headers;
 pub mod idle;
 pub mod launch;
 pub mod listen;
+pub mod main_thread;
 pub mod policy;
 pub mod project;
 pub mod server;
@@ -56,6 +60,75 @@ pub struct WebOptions {
     pub idle_timeout: Option<std::time::Duration>,
     /// Run as the background server a launcher started (internal).
     pub ready_pipe: bool,
+}
+
+/// What `ahma desktop` is started with.
+pub struct DesktopOptions {
+    pub connect: Option<String>,
+    pub profile: Option<String>,
+    pub path: Option<std::path::PathBuf>,
+    pub token_prefs: ahma_tui::TokenPrefs,
+    /// Stay attached to the terminal rather than return to the prompt.
+    pub foreground: bool,
+    /// Run as the background window a launcher started (internal).
+    pub ready_pipe: bool,
+}
+
+impl DesktopOptions {
+    /// The `ahma web` a desktop falls back to where there is no window.
+    fn as_web(&self) -> WebOptions {
+        WebOptions {
+            connect: self.connect.clone(),
+            profile: self.profile.clone(),
+            path: self.path.clone(),
+            token_prefs: self.token_prefs,
+            port: 0,
+            open_browser: true,
+            copy_code: true,
+            foreground: self.foreground,
+            idle_timeout: Some(std::time::Duration::from_secs(60)),
+            ready_pipe: false,
+        }
+    }
+}
+
+/// Run `ahma desktop`: open the page in a window of its own and return to the
+/// prompt, or (with `--foreground`) stay attached until the window closes.
+/// Where the system has no web engine, say so and run `ahma web` instead.
+pub async fn run_desktop(options: DesktopOptions) -> Result<()> {
+    if let Some(reason) = desktop::unavailable_reason() {
+        eprintln!("{reason}");
+        return run_web(options.as_web()).await;
+    }
+    if options.ready_pipe || options.foreground {
+        let web = WebOptions {
+            ready_pipe: options.ready_pipe,
+            open_browser: false,
+            copy_code: false,
+            idle_timeout: None,
+            ..options.as_web()
+        };
+        return serve(web, Reporter::Window).await;
+    }
+    ahma_tui::prepare_connection(options.connect.as_deref(), options.path.as_deref()).await?;
+    let ready = launch::start_server().await?;
+    if let Some(reason) = &ready.unavailable {
+        eprintln!("ahma desktop could not open a window: {reason}. Opening ahma web instead.");
+        return run_launcher(options.as_web()).await;
+    }
+    eprintln!(
+        "ahma desktop opened a window for {}. It stops when you close the window.",
+        workspace_label(options.path.as_deref())
+    );
+    Ok(())
+}
+
+/// The directory a session is for, as a window title or a message shows it.
+fn workspace_label(path: Option<&std::path::Path>) -> String {
+    path.map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ".".into())
 }
 
 /// Run `ahma web`: launch a background server and return, or (with
@@ -124,6 +197,8 @@ enum Reporter {
     Terminal(Arc<tty::Terminal>),
     /// Its launcher, once, on standard output.
     ReadyPipe,
+    /// Nowhere: the one client is this process's own window (`ahma desktop`).
+    Window,
 }
 
 /// Run the browser surface until it is stopped, the session ends, or no tab
@@ -144,6 +219,7 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
         Reporter::ReadyPipe => Pairing::Background {
             copied: options.copy_code,
         },
+        Reporter::Window => Pairing::Linked,
     };
     // The first code, which a launcher may have put on the clipboard.
     let first_code: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
@@ -166,16 +242,18 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
                     let line = launch::ready_line(&launch::Ready {
                         url: url.clone(),
                         code: code.to_string(),
+                        unavailable: None,
                     });
-                    let mut out = std::io::stdout().lock();
-                    let _ = out.write_all(line.as_bytes());
-                    let _ = out.flush();
+                    write_ready_line(&line);
                 }
             })
         }
+        // No code is ever shown: pairing is closed.
+        Reporter::Window => Arc::new(|_: &str| {}),
     };
     let auth = Arc::new(Auth::new(announce).with_policy(PairingPolicy {
         burn_on_reuse: matches!(pairing, Pairing::Background { copied: true }),
+        pairing_closed: pairing == Pairing::Linked,
         ..PairingPolicy::default()
     }));
     if let Reporter::Terminal(terminal) = &reporter {
@@ -216,6 +294,11 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
     let workspace = options.path.clone();
     let profile = options.profile.clone();
     let token_prefs = options.token_prefs;
+    let surface = if pairing == Pairing::Linked {
+        ahma_common::hub::Surface::Desktop
+    } else {
+        ahma_common::hub::Surface::Web
+    };
     let session_thread = std::thread::Builder::new()
         .name("ahma-web-session".into())
         .spawn(move || {
@@ -233,7 +316,7 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
                             token_prefs,
                             initial_command: None,
                             unicode: true,
-                            surface: ahma_common::hub::Surface::Web,
+                            surface,
                             caps: policy::capabilities(),
                         },
                     );
@@ -255,6 +338,49 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
         tokio::spawn(idle::stop_when_idle(idle, timeout, stop.clone()));
     }
 
+    // `ahma desktop`: the window, on the main thread, with the one token.
+    let window = if pairing == Pairing::Linked {
+        let (_tab, token) = auth.mint_tab();
+        match open_window(&url, token, options.path.as_deref()).await {
+            Ok(window) => {
+                if options.ready_pipe {
+                    write_ready_line(&launch::ready_line(&launch::Ready {
+                        url: url.clone(),
+                        code: String::new(),
+                        unavailable: None,
+                    }));
+                }
+                Some(window)
+            }
+            Err(reason) => {
+                if options.ready_pipe {
+                    write_ready_line(&launch::ready_line(&launch::Ready {
+                        url: url.clone(),
+                        code: String::new(),
+                        unavailable: Some(reason.clone()),
+                    }));
+                }
+                stop.send_replace(true);
+                tracing::warn!("desktop: {reason}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (closer, window_closed) = match window {
+        Some(w) => (w.closer, Some(w.closed)),
+        None => (None, None),
+    };
+    let window_closed = async move {
+        match window_closed {
+            Some(closed) => {
+                let _ = closed.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+
     if let Reporter::Terminal(terminal) = &reporter
         && options.open_browser
         && let Err(e) = webbrowser::open(&url)
@@ -269,6 +395,7 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
         _ = tokio::signal::ctrl_c() => None,
         _ = terminated() => None,
         _ = stopped.wait_for(|stop| *stop) => None,
+        _ = window_closed => None,
         finished = finished_rx => Some(finished.unwrap_or(Ok(()))),
     };
     // A second Ctrl-C while shutting down means now.
@@ -282,6 +409,7 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
     // drops the senders the session's frontend listens on, which ends its loop,
     // which closes its hub MCP session and drops its hub subscription.
     stop.send_replace(true);
+    close_window(closer);
     drop(handles);
     if tokio::time::timeout(SHUTDOWN_GRACE, server).await.is_err() {
         tracing::warn!("web: the server did not stop within {SHUTDOWN_GRACE:?}");
@@ -298,6 +426,74 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
     }
     session_result.unwrap_or(Ok(()))
 }
+
+/// Write the one line a launcher reads. Standard output is never written
+/// again (SPEC R5.6.1).
+fn write_ready_line(line: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+}
+
+/// An open `ahma desktop` window: how to close it, and when it closed.
+struct OpenWindow {
+    closer: Option<WindowCloser>,
+    closed: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+type WindowCloser = desktop::window::Closer;
+#[cfg(not(any(target_os = "macos", windows)))]
+type WindowCloser = ();
+
+/// Open the window on the main thread and wait until it has opened (or
+/// could not).
+#[cfg(any(target_os = "macos", windows))]
+async fn open_window(
+    url: &str,
+    token: String,
+    path: Option<&std::path::Path>,
+) -> std::result::Result<OpenWindow, String> {
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let title = format!("ahma — {}", workspace_label(path));
+    let url = url.to_string();
+    main_thread::run(Box::new(move || {
+        desktop::window::run(title, url, token, opened_tx);
+        let _ = closed_tx.send(());
+    }))
+    .map_err(|e| e.to_string())?;
+    let opened = tokio::task::spawn_blocking(move || opened_rx.recv())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|_| "the window closed before it opened".to_string())??;
+    Ok(OpenWindow {
+        closer: Some(opened),
+        closed: closed_rx,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+async fn open_window(
+    _url: &str,
+    _token: String,
+    _path: Option<&std::path::Path>,
+) -> std::result::Result<OpenWindow, String> {
+    Err(desktop::unavailable_reason()
+        .unwrap_or("no window on this system")
+        .to_string())
+}
+
+/// Ask the window to close, if there is one.
+#[cfg(any(target_os = "macos", windows))]
+fn close_window(closer: Option<WindowCloser>) {
+    if let Some(closer) = closer {
+        let _ = closer.send_event(desktop::window::Request::Close);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn close_window(_closer: Option<WindowCloser>) {}
 
 /// Resolves when the process is asked to terminate (`kill`, a logout), so a
 /// background server still closes its session and clears the clipboard.

@@ -2,7 +2,7 @@
 
 `ahma tui` opens a terminal dashboard showing everything ahma is doing on your
 behalf — every editor session's work, every hooked shell command, and the
-commands you run yourself — in one view. (`ahma web` shows the same view in your browser: [docs/web.md](web.md); `ahma desktop` will show it in a window of its own.) It works over SSH, needs no graphical
+commands you run yourself — in one view. (`ahma web` shows the same view in your browser: [docs/web.md](web.md); `ahma desktop` in a window of its own: [docs/desktop.md](desktop.md).) It works over SSH, needs no graphical
 runtime, and is where approval gates are answered.
 
 It is **work-first**: the view you open into is what is being done for you.

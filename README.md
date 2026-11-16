@@ -301,6 +301,17 @@ dependencies, and is trusted with less than the terminal: no host commands, and 
 is saved to settings. ahma's macOS sandbox keeps the commands it runs off the clipboard; use
 `--no-copy` to type the code instead. See [docs/web.md](docs/web.md).
 
+### `ahma desktop` — the same view in a window of its own *(experimental)*
+
+```bash
+ahma desktop
+```
+
+The `ahma web` view in a native window on the operating system's own web engine (macOS and
+Windows), so it adds no browser engine to ahma. The window and its server are one process, so
+there is no pairing code: nothing else can pair with it. Closing the window stops it. On Linux
+it opens `ahma web` instead. See [docs/desktop.md](docs/desktop.md).
+
 ### `ahma_help` — guidance for the AI, from ahma
 
 An agent that hits `Operation not permitted` can ask `ahma_help` what to do instead of
