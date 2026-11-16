@@ -16,8 +16,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ahma_common::config::{
-    AhmaSettings, ScopeAccess, SettingsFile, SettingsTier, ledger_key_command, setting_changes,
-    settings_tier,
+    AhmaSettings, ScopeAccess, SettingsFile, SettingsTier, ledger_key_command, settings_tier,
 };
 use ahma_common::doctor::Fix;
 use ahma_common::scope_grant::{GrantRisk, NewGrant, classify_grant_risk, persist_grant};
@@ -1453,77 +1452,18 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
             ));
             break;
         }
-        let text = |field: &str| c.get(field).and_then(|v| v.as_str()).map(str::to_string);
-        let reason = text("why").map(|w| clean_reason(&w)).unwrap_or_default();
-        let change = match c.get("op").and_then(|o| o.as_str()) {
-            Some("set") => match (text("key"), c.get("value").and_then(json_to_toml_text)) {
-                (Some(key), Some(value)) => Change::Set {
-                    file: file_of(c),
-                    key,
-                    value,
-                },
-                _ => {
-                    out.dropped
-                        .push(format!("change {}: `set` needs a key and a value", i + 1));
-                    continue;
-                }
-            },
-            Some("unset") => match text("key") {
-                Some(key) => Change::Unset {
-                    file: file_of(c),
-                    key,
-                },
-                None => {
-                    out.dropped
-                        .push(format!("change {}: `unset` needs a key", i + 1));
-                    continue;
-                }
-            },
-            Some(op @ ("add" | "remove")) => match (text("key"), text("item")) {
-                (Some(key), Some(item)) if op == "add" => Change::AddToList {
-                    file: file_of(c),
-                    key,
-                    item,
-                },
-                (Some(key), Some(item)) => Change::RemoveFromList {
-                    file: file_of(c),
-                    key,
-                    item,
-                },
-                _ => {
-                    out.dropped
-                        .push(format!("change {}: `{op}` needs a key and an item", i + 1));
-                    continue;
-                }
-            },
-            Some("grant") => match text("path") {
-                Some(path) => Change::GrantPath {
-                    path: PathBuf::from(path),
-                    read_only: c.get("read_only").and_then(|r| r.as_bool()).unwrap_or(true),
-                },
-                None => {
-                    out.dropped
-                        .push(format!("change {}: `grant` needs a path", i + 1));
-                    continue;
-                }
-            },
-            Some("network_allow") => match text("host") {
-                Some(host) => Change::NetworkAllow { host },
-                None => {
-                    out.dropped
-                        .push(format!("change {}: `network_allow` needs a host", i + 1));
-                    continue;
-                }
-            },
-            other => {
-                out.dropped.push(format!(
-                    "change {}: `{}` is not something setup can change",
-                    i + 1,
-                    other.unwrap_or("(no op)")
-                ));
+        let change = match parse_model_change(c, i + 1) {
+            Ok(change) => change,
+            Err(reason) => {
+                out.dropped.push(reason);
                 continue;
             }
         };
+        let reason = c
+            .get("why")
+            .and_then(|v| v.as_str())
+            .map(clean_reason)
+            .unwrap_or_default();
         out.proposals.push(Proposal::new(
             change,
             if reason.is_empty() {
@@ -1535,6 +1475,55 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
         ));
     }
     out
+}
+
+fn parse_model_change(c: &serde_json::Value, index: usize) -> Result<Change, String> {
+    let text = |field: &str| c.get(field).and_then(|v| v.as_str()).map(str::to_string);
+    match c.get("op").and_then(|o| o.as_str()) {
+        Some("set") => match (text("key"), c.get("value").and_then(json_to_toml_text)) {
+            (Some(key), Some(value)) => Ok(Change::Set {
+                file: file_of(c),
+                key,
+                value,
+            }),
+            _ => Err(format!("change {index}: `set` needs a key and a value")),
+        },
+        Some("unset") => match text("key") {
+            Some(key) => Ok(Change::Unset {
+                file: file_of(c),
+                key,
+            }),
+            None => Err(format!("change {index}: `unset` needs a key")),
+        },
+        Some(op @ ("add" | "remove")) => match (text("key"), text("item")) {
+            (Some(key), Some(item)) if op == "add" => Ok(Change::AddToList {
+                file: file_of(c),
+                key,
+                item,
+            }),
+            (Some(key), Some(item)) => Ok(Change::RemoveFromList {
+                file: file_of(c),
+                key,
+                item,
+            }),
+            _ => Err(format!("change {index}: `{op}` needs a key and an item")),
+        },
+        Some("grant") => match text("path") {
+            Some(path) => Ok(Change::GrantPath {
+                path: PathBuf::from(path),
+                read_only: c.get("read_only").and_then(|r| r.as_bool()).unwrap_or(true),
+            }),
+            None => Err(format!("change {index}: `grant` needs a path")),
+        },
+        Some("network_allow") => match text("host") {
+            Some(host) => Ok(Change::NetworkAllow { host }),
+            None => Err(format!("change {index}: `network_allow` needs a host")),
+        },
+        other => Err(format!(
+            "change {index}: `{}` is not something setup can change",
+            other.unwrap_or("(no op)")
+        )),
+    }
 }
 
 /// A user request typed as `/setup set <key> <value>` or `/setup unset <key>`,
@@ -1684,14 +1673,6 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The audit-visible changes between two settings, for a TUI summary.
-pub fn describe_changes(before: &AhmaSettings, after: &AhmaSettings) -> Vec<String> {
-    setting_changes(before, after)
-        .into_iter()
-        .map(|(k, was, now)| format!("{k}: {was} -> {now}"))
-        .collect()
 }
 
 #[cfg(test)]

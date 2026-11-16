@@ -37,10 +37,6 @@ export function adoptToken(given: string): void {
   token = given;
 }
 
-export function isPaired(): boolean {
-  return token !== null;
-}
-
 export function forgetToken(): void {
   token = null;
 }

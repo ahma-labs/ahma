@@ -29,9 +29,6 @@ export function desktopToken() {
 export function adoptToken(given) {
     token = given;
 }
-export function isPaired() {
-    return token !== null;
-}
 export function forgetToken() {
     token = null;
 }

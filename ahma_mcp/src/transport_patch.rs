@@ -114,58 +114,10 @@ where
         async move {
             let mut r = reader.lock().await;
             loop {
-                // Peek/Read logic to handle both Line-Delimited and Content-Length framed messages
-                let mut first_line = String::new();
-                match r.read_line(&mut first_line).await {
-                    Ok(0) => return None, // EOF
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::debug!("[AhmaTransport] Read Error: {}", e);
-                        return None;
-                    }
-                }
-
-                let message_body = if first_line.starts_with("Content-Length:") {
-                    // Header Mode
-                    let len_str = first_line
-                        .trim()
-                        .strip_prefix("Content-Length:")
-                        .unwrap_or("0")
-                        .trim();
-                    let content_len: usize = len_str.parse().unwrap_or(0);
-                    tracing::debug!(
-                        "[AhmaTransport] Detected Header Framing. Content-Length: {}",
-                        content_len
-                    );
-
-                    // Skip remaining headers until empty line
-                    loop {
-                        let mut h = String::new();
-                        if let Ok(n) = r.read_line(&mut h).await {
-                            if n == 0 || h.trim().is_empty() {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Read exact bytes
-                    let mut buf = vec![0u8; content_len];
-                    if let Err(e) = r.read_exact(&mut buf).await {
-                        tracing::debug!("[AhmaTransport] Failed to read body: {}", e);
-                        continue;
-                    }
-                    match String::from_utf8(buf) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::debug!("[AhmaTransport] Invalid UTF-8 body: {}", e);
-                            continue;
-                        }
-                    }
-                } else {
-                    // Line Mode
-                    first_line
+                let message_body = match read_framed_message(&mut *r).await {
+                    FrameRead::Eof => return None,
+                    FrameRead::Skip => continue,
+                    FrameRead::Message(body) => body,
                 };
 
                 // Try to parse as Value to inspect and patch
@@ -191,33 +143,7 @@ where
                     }
                 };
 
-                // --- PATCHING LOGIC ---
-                if let Some(method) = value.get("method").and_then(|v| v.as_str())
-                    && method == "initialize"
-                {
-                    tracing::debug!(
-                        "[AhmaTransport] Detected 'initialize' request. Checking capabilities..."
-                    );
-                    if let Some(params) = value.get_mut("params")
-                        && let Some(caps) = params.get_mut("capabilities")
-                        && let Some(tasks) = caps.get("tasks")
-                    {
-                        if tasks.is_object() {
-                            tracing::debug!(
-                                "[AhmaTransport] Patching: Removing 'tasks' capability object"
-                            );
-                            if let Some(caps_obj) = caps.as_object_mut() {
-                                caps_obj.remove("tasks");
-                            }
-                        } else {
-                            tracing::debug!(
-                                "[AhmaTransport] 'tasks' capability found but not an object: {:?}",
-                                tasks
-                            );
-                        }
-                    }
-                }
-                // -----------------------
+                patch_initialize_capabilities(&mut value);
 
                 // A request carries a method and an id; only a request is
                 // owed an answer (a notification or a response is not).
@@ -234,22 +160,8 @@ where
                         // R5.6.2). Dropping
                         // one left the client waiting on it forever.
                         if let Some(id) = request_id {
-                            let reply = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": {
-                                    "code": -32600,
-                                    "message": format!("Invalid request: {e}"),
-                                },
-                            });
-                            let mut w = writer.lock().await;
-                            let line = format!("{reply}\n");
-                            if let Err(err) = w.write_all(line.as_bytes()).await {
-                                tracing::debug!("[AhmaTransport] Could not answer: {err}");
-                            }
-                            let _ = w.flush().await;
+                            reply_invalid_request(&writer, id, &e).await;
                         }
-                        continue;
                     }
                 }
             }
@@ -274,6 +186,113 @@ where
         }
         Ok(())
     }
+}
+
+enum FrameRead {
+    Message(String),
+    Skip,
+    Eof,
+}
+
+/// Read one line-delimited or Content-Length framed message.
+async fn read_framed_message<R: AsyncBufRead + Unpin>(r: &mut R) -> FrameRead {
+    let mut first_line = String::new();
+    match r.read_line(&mut first_line).await {
+        Ok(0) => return FrameRead::Eof,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!("[AhmaTransport] Read Error: {}", e);
+            return FrameRead::Eof;
+        }
+    }
+
+    if !first_line.starts_with("Content-Length:") {
+        return FrameRead::Message(first_line);
+    }
+
+    let len_str = first_line
+        .trim()
+        .strip_prefix("Content-Length:")
+        .unwrap_or("0")
+        .trim();
+    let content_len: usize = len_str.parse().unwrap_or(0);
+    tracing::debug!(
+        "[AhmaTransport] Detected Header Framing. Content-Length: {}",
+        content_len
+    );
+
+    // Skip remaining headers until empty line
+    loop {
+        let mut h = String::new();
+        if let Ok(n) = r.read_line(&mut h).await {
+            if n == 0 || h.trim().is_empty() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    let mut buf = vec![0u8; content_len];
+    if let Err(e) = r.read_exact(&mut buf).await {
+        tracing::debug!("[AhmaTransport] Failed to read body: {}", e);
+        return FrameRead::Skip;
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => FrameRead::Message(s),
+        Err(e) => {
+            tracing::debug!("[AhmaTransport] Invalid UTF-8 body: {}", e);
+            FrameRead::Skip
+        }
+    }
+}
+
+fn patch_initialize_capabilities(value: &mut Value) {
+    if value.get("method").and_then(|v| v.as_str()) != Some("initialize") {
+        return;
+    }
+    tracing::debug!("[AhmaTransport] Detected 'initialize' request. Checking capabilities...");
+    let Some(caps) = value
+        .get_mut("params")
+        .and_then(|p| p.get_mut("capabilities"))
+    else {
+        return;
+    };
+    let Some(tasks) = caps.get("tasks") else {
+        return;
+    };
+    if tasks.is_object() {
+        tracing::debug!("[AhmaTransport] Patching: Removing 'tasks' capability object");
+        if let Some(caps_obj) = caps.as_object_mut() {
+            caps_obj.remove("tasks");
+        }
+    } else {
+        tracing::debug!(
+            "[AhmaTransport] 'tasks' capability found but not an object: {:?}",
+            tasks
+        );
+    }
+}
+
+async fn reply_invalid_request<W: AsyncWrite + Unpin>(
+    writer: &Mutex<W>,
+    id: Value,
+    err: &serde_json::Error,
+) {
+    let reply = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32600,
+            "message": format!("Invalid request: {err}"),
+        },
+    });
+    let mut w = writer.lock().await;
+    let line = format!("{reply}\n");
+    if let Err(write_err) = w.write_all(line.as_bytes()).await {
+        tracing::debug!("[AhmaTransport] Could not answer: {write_err}");
+    }
+    let _ = w.flush().await;
 }
 
 #[cfg(test)]

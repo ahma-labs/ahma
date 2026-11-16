@@ -81,25 +81,7 @@ async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result
     let drifts = crate::setup::detect_mcp_config_drifts();
 
     if args.dry_run {
-        if !drifts.is_empty() {
-            println!(
-                "[dry-run] Detected {} outdated MCP configuration(s) that would be updated with backups (.bak):",
-                drifts.len()
-            );
-            for drift in &drifts {
-                println!(
-                    "  - {} ({})",
-                    drift.platform_name,
-                    drift.config_path.display()
-                );
-            }
-        }
-        if args.install_hooks {
-            println!(
-                "[dry-run] Would run {} setup --hooks --auto",
-                binary_path.display()
-            );
-        }
+        print_dry_run_setup(&drifts, args.install_hooks, binary_path);
         return Ok(());
     }
 
@@ -108,8 +90,9 @@ async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result
         return Ok(());
     }
 
+    let interactive = can_prompt_for_setup();
     if !drifts.is_empty() {
-        if can_prompt_for_setup() {
+        let should_apply = if interactive {
             println!();
             println!("Detected outdated MCP server configuration(s):");
             for drift in &drifts {
@@ -119,44 +102,20 @@ async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result
                     drift.config_path.display()
                 );
             }
-            if prompt_yes_no(
+            prompt_yes_no(
                 "Update outdated MCP configuration(s) and create backups (.bak)? [Y/n]: ",
                 true,
             )
             .await?
-            {
-                for drift in &drifts {
-                    if let Err(e) = drift.apply_update() {
-                        eprintln!(
-                            "Warning: failed to update MCP config for {}: {e}",
-                            drift.platform_name
-                        );
-                    } else {
-                        println!(
-                            "✓ Updated and backed up MCP config for {}",
-                            drift.platform_name
-                        );
-                    }
-                }
-            }
         } else {
-            for drift in &drifts {
-                if let Err(e) = drift.apply_update() {
-                    eprintln!(
-                        "Warning: failed to update MCP config for {}: {e}",
-                        drift.platform_name
-                    );
-                } else {
-                    println!(
-                        "✓ Updated and backed up MCP config for {}",
-                        drift.platform_name
-                    );
-                }
-            }
+            true
+        };
+        if should_apply {
+            apply_mcp_drifts(&drifts);
         }
     }
 
-    if !can_prompt_for_setup() {
+    if !interactive {
         run_setup_skills_only_auto(binary_path).await?;
         return Ok(());
     }
@@ -177,6 +136,48 @@ async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result
     }
 
     Ok(())
+}
+
+fn print_dry_run_setup(
+    drifts: &[crate::setup::McpConfigDrift],
+    install_hooks: bool,
+    binary_path: &Path,
+) {
+    if !drifts.is_empty() {
+        println!(
+            "[dry-run] Detected {} outdated MCP configuration(s) that would be updated with backups (.bak):",
+            drifts.len()
+        );
+        for drift in drifts {
+            println!(
+                "  - {} ({})",
+                drift.platform_name,
+                drift.config_path.display()
+            );
+        }
+    }
+    if install_hooks {
+        println!(
+            "[dry-run] Would run {} setup --hooks --auto",
+            binary_path.display()
+        );
+    }
+}
+
+fn apply_mcp_drifts(drifts: &[crate::setup::McpConfigDrift]) {
+    for drift in drifts {
+        if let Err(e) = drift.apply_update() {
+            eprintln!(
+                "Warning: failed to update MCP config for {}: {e}",
+                drift.platform_name
+            );
+        } else {
+            println!(
+                "✓ Updated and backed up MCP config for {}",
+                drift.platform_name
+            );
+        }
+    }
 }
 
 #[cfg(test)]

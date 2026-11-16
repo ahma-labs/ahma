@@ -207,25 +207,24 @@ enum Reporter {
 /// The same session and controller as `ahma tui`, behind a loopback-only
 /// listener that a tab pairs with using a code only the human who started it
 /// was shown (SPEC R-GUI).
-async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
-    let connection =
-        ahma_tui::prepare_connection(options.connect.as_deref(), options.path.as_deref()).await?;
+struct PairingSetup {
+    auth: Arc<Auth>,
+    pairing: Pairing,
+    first_code: Arc<OnceLock<String>>,
+    clear_code: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 
-    let (listeners, port) = listen::bind(options.port).await?;
-    let url = format!("http://127.0.0.1:{port}/");
-
+fn build_pairing(reporter: &Reporter, url: &str, copy_code: bool) -> Result<PairingSetup> {
     let pairing = match reporter {
         Reporter::Terminal(_) => Pairing::Terminal,
-        Reporter::ReadyPipe => Pairing::Background {
-            copied: options.copy_code,
-        },
+        Reporter::ReadyPipe => Pairing::Background { copied: copy_code },
         Reporter::Window => Pairing::Linked,
     };
     // The first code, which a launcher may have put on the clipboard.
     let first_code: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
-    let announce: auth::Announce = match &reporter {
+    let announce: auth::Announce = match reporter {
         Reporter::Terminal(terminal) => {
-            terminal.say(&tty::banner(&url));
+            terminal.say(&tty::banner(url));
             let terminal = terminal.clone();
             let first = Arc::new(AtomicBool::new(true));
             Arc::new(move |code: &str| {
@@ -233,7 +232,7 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
             })
         }
         Reporter::ReadyPipe => {
-            let url = url.clone();
+            let url = url.to_string();
             let first_code = first_code.clone();
             Arc::new(move |code: &str| {
                 // Only the first: the launcher reads one line and is gone, and
@@ -256,7 +255,7 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
         pairing_closed: pairing == Pairing::Linked,
         ..PairingPolicy::default()
     }));
-    if let Reporter::Terminal(terminal) = &reporter {
+    if let Reporter::Terminal(terminal) = reporter {
         let auth = auth.clone();
         terminal.on_enter(move || auth.unlock())?;
     }
@@ -273,21 +272,23 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
         }
         _ => None,
     };
-
-    let (frontend, handles) = WebFrontend::new();
-    let stop = Arc::new(tokio::sync::watch::channel(false).0);
-    let idle = Arc::new(idle::Idle::new(std::time::Instant::now()));
-    let ctx = Arc::new(AppCtx {
-        auth: auth.clone(),
-        inputs: handles.inputs.clone(),
-        published: handles.published.clone(),
-        stop: stop.clone(),
-        idle: idle.clone(),
+    Ok(PairingSetup {
+        auth,
         pairing,
-        on_paired: clear_code.clone(),
-    });
-    let app = server::router(ctx);
+        first_code,
+        clear_code,
+    })
+}
 
+fn spawn_session_thread(
+    connection: ahma_tui::ResolvedConnection,
+    options: &WebOptions,
+    pairing: Pairing,
+    frontend: WebFrontend,
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+)> {
     // The session lives on a thread of its own, on its own runtime: its state is
     // not `Send`, and the server talks to it over channels only.
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<Result<()>>();
@@ -332,6 +333,70 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
             let _ = finished_tx.send(result);
         })
         .context("cannot start the session thread")?;
+    Ok((session_thread, finished_rx))
+}
+
+async fn open_desktop_window(
+    url: &str,
+    auth: &Auth,
+    options: &WebOptions,
+    stop: &tokio::sync::watch::Sender<bool>,
+) -> Option<OpenWindow> {
+    let (_tab, token) = auth.mint_tab();
+    let (window, unavailable) = match open_window(url, token, options.path.as_deref()).await {
+        Ok(window) => (Some(window), None),
+        Err(reason) => {
+            stop.send_replace(true);
+            tracing::warn!("desktop: {reason}");
+            (None, Some(reason))
+        }
+    };
+    if options.ready_pipe {
+        write_ready_line(&launch::ready_line(&launch::Ready {
+            url: url.to_string(),
+            code: String::new(),
+            unavailable,
+        }));
+    }
+    window
+}
+
+/// Run the browser surface until it is stopped, the session ends, or no tab
+/// has been connected for the idle timeout.
+///
+/// The same session and controller as `ahma tui`, behind a loopback-only
+/// listener that a tab pairs with using a code only the human who started it
+/// was shown (SPEC R-GUI).
+async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
+    let connection =
+        ahma_tui::prepare_connection(options.connect.as_deref(), options.path.as_deref()).await?;
+
+    let (listeners, port) = listen::bind(options.port).await?;
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let PairingSetup {
+        auth,
+        pairing,
+        first_code,
+        clear_code,
+    } = build_pairing(&reporter, &url, options.copy_code)?;
+
+    let (frontend, handles) = WebFrontend::new();
+    let stop = Arc::new(tokio::sync::watch::channel(false).0);
+    let idle = Arc::new(idle::Idle::new(std::time::Instant::now()));
+    let ctx = Arc::new(AppCtx {
+        auth: auth.clone(),
+        inputs: handles.inputs.clone(),
+        published: handles.published.clone(),
+        stop: stop.clone(),
+        idle: idle.clone(),
+        pairing,
+        on_paired: clear_code.clone(),
+    });
+    let app = server::router(ctx);
+
+    let (session_thread, finished_rx) =
+        spawn_session_thread(connection, &options, pairing, frontend)?;
 
     let server = tokio::spawn(listen::serve(listeners, app, stop.subscribe()));
     if let Some(timeout) = options.idle_timeout {
@@ -340,31 +405,7 @@ async fn serve(options: WebOptions, reporter: Reporter) -> Result<()> {
 
     // `ahma desktop`: the window, on the main thread, with the one token.
     let window = if pairing == Pairing::Linked {
-        let (_tab, token) = auth.mint_tab();
-        match open_window(&url, token, options.path.as_deref()).await {
-            Ok(window) => {
-                if options.ready_pipe {
-                    write_ready_line(&launch::ready_line(&launch::Ready {
-                        url: url.clone(),
-                        code: String::new(),
-                        unavailable: None,
-                    }));
-                }
-                Some(window)
-            }
-            Err(reason) => {
-                if options.ready_pipe {
-                    write_ready_line(&launch::ready_line(&launch::Ready {
-                        url: url.clone(),
-                        code: String::new(),
-                        unavailable: Some(reason.clone()),
-                    }));
-                }
-                stop.send_replace(true);
-                tracing::warn!("desktop: {reason}");
-                None
-            }
-        }
+        open_desktop_window(&url, &auth, &options, &stop).await
     } else {
         None
     };

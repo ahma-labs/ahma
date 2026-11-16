@@ -25,6 +25,33 @@ export function startStream(handlers) {
     void run(handlers, controller.signal);
     return () => controller.abort();
 }
+async function consumeStream(body, h, onDeliver) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    const parser = createSseParser();
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done)
+            return false;
+        for (const event of parser.feed(decoder.decode(value, { stream: true }))) {
+            if (event.event === "bye") {
+                h.onState("closed");
+                return true;
+            }
+            if (event.event !== "view")
+                continue;
+            let message;
+            try {
+                message = JSON.parse(event.data);
+            }
+            catch {
+                continue; // a malformed event is dropped; the next one replaces it
+            }
+            onDeliver(); // a stream that delivers is healthy; only a failing one backs off
+            h.onView(message);
+        }
+    }
+}
 async function run(h, signal) {
     let attempt = 0;
     h.onState("connecting");
@@ -34,31 +61,8 @@ async function run(h, signal) {
             if (res.body === null)
                 throw new Error("no body");
             h.onState("live");
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            const parser = createSseParser();
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done)
-                    break;
-                for (const event of parser.feed(decoder.decode(value, { stream: true }))) {
-                    if (event.event === "bye") {
-                        h.onState("closed");
-                        return;
-                    }
-                    if (event.event !== "view")
-                        continue;
-                    let message;
-                    try {
-                        message = JSON.parse(event.data);
-                    }
-                    catch {
-                        continue; // a malformed event is dropped; the next one replaces it
-                    }
-                    attempt = 0; // a stream that delivers is healthy; only a failing one backs off
-                    h.onView(message);
-                }
-            }
+            if (await consumeStream(res.body, h, () => { attempt = 0; }))
+                return;
         }
         catch (err) {
             if (signal.aborted)

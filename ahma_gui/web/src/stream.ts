@@ -43,6 +43,35 @@ export function startStream(handlers: StreamHandlers): () => void {
   return () => controller.abort();
 }
 
+async function consumeStream(
+  body: ReadableStream<Uint8Array>,
+  h: StreamHandlers,
+  onDeliver: () => void,
+): Promise<boolean> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const parser = createSseParser();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return false;
+    for (const event of parser.feed(decoder.decode(value, { stream: true }))) {
+      if (event.event === "bye") {
+        h.onState("closed");
+        return true;
+      }
+      if (event.event !== "view") continue;
+      let message: unknown;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        continue; // a malformed event is dropped; the next one replaces it
+      }
+      onDeliver(); // a stream that delivers is healthy; only a failing one backs off
+      h.onView(message);
+    }
+  }
+}
+
 async function run(h: StreamHandlers, signal: AbortSignal): Promise<void> {
   let attempt = 0;
   h.onState("connecting");
@@ -51,28 +80,7 @@ async function run(h: StreamHandlers, signal: AbortSignal): Promise<void> {
       const res = await openEvents(signal);
       if (res.body === null) throw new Error("no body");
       h.onState("live");
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      const parser = createSseParser();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        for (const event of parser.feed(decoder.decode(value, { stream: true }))) {
-          if (event.event === "bye") {
-            h.onState("closed");
-            return;
-          }
-          if (event.event !== "view") continue;
-          let message: unknown;
-          try {
-            message = JSON.parse(event.data);
-          } catch {
-            continue; // a malformed event is dropped; the next one replaces it
-          }
-          attempt = 0; // a stream that delivers is healthy; only a failing one backs off
-          h.onView(message);
-        }
-      }
+      if (await consumeStream(res.body, h, () => { attempt = 0; })) return;
     } catch (err) {
       if (signal.aborted) return;
       if (err instanceof ApiError && err.status === 401) {

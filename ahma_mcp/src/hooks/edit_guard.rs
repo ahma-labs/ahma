@@ -152,39 +152,37 @@ pub fn edited_paths(input: &Value) -> Vec<String> {
 }
 
 fn collect_paths(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for key in PATH_KEYS {
-                if let Some(p) = map.get(*key).and_then(Value::as_str) {
-                    out.push(p.to_string());
-                }
-            }
-            // Lists of edits (`files`, `replacements`, `edits`) and patch
-            // bodies (Codex `apply_patch`, under whatever key carries them).
-            for (key, v) in map {
-                match v {
-                    Value::Array(items) => {
-                        for item in items {
-                            if let Some(s) = item.as_str() {
-                                if key == "files" {
-                                    out.push(s.to_string());
-                                } else {
-                                    // `["apply_patch", "*** Begin Patch…"]`
-                                    out.extend(patch_paths(s));
-                                }
-                            } else {
-                                collect_paths(item, out);
-                            }
-                        }
-                    }
-                    Value::String(s) => out.extend(patch_paths(s)),
-                    Value::Object(_) => collect_paths(v, out),
-                    _ => {}
-                }
-            }
+    if let Some(s) = value.as_str() {
+        out.extend(patch_paths(s));
+        return;
+    }
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    for key in PATH_KEYS {
+        if let Some(p) = map.get(*key).and_then(Value::as_str) {
+            out.push(p.to_string());
         }
-        Value::String(s) => out.extend(patch_paths(s)),
-        _ => {}
+    }
+    // Lists of edits (`files`, `replacements`, `edits`) and patch
+    // bodies (Codex `apply_patch`, under whatever key carries them).
+    for (key, v) in map {
+        match v {
+            Value::Array(items) => collect_array_paths(key, items, out),
+            Value::String(_) | Value::Object(_) => collect_paths(v, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_array_paths(key: &str, items: &[Value], out: &mut Vec<String>) {
+    for item in items {
+        match item.as_str() {
+            Some(s) if key == "files" => out.push(s.to_string()),
+            // `["apply_patch", "*** Begin Patch…"]`
+            Some(s) => out.extend(patch_paths(s)),
+            None => collect_paths(item, out),
+        }
     }
 }
 

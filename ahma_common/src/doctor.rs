@@ -732,6 +732,7 @@ fn check_global_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
 /// One a human typed is a deliberate setup: one line of information, never a question.
 fn check_cross_repo_grants(settings: &AhmaSettings, home: Option<&Path>, out: &mut Vec<Finding>) {
     let mut unconfirmed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut unconfirmed_lines: Vec<String> = Vec::new();
     let mut confirmed: Vec<String> = Vec::new();
     for scope in &settings.sandbox.persistent_scopes {
         let Some(ws) = scope.workspace.as_deref() else {
@@ -743,39 +744,31 @@ fn check_cross_repo_grants(settings: &AhmaSettings, home: Option<&Path>, out: &m
             continue;
         }
         if scope.granted_by.as_deref() == Some(crate::scope_grant::GRANTED_BY_HARNESS_DIALOG) {
+            let on = scope
+                .granted_at
+                .as_deref()
+                .map(|d| format!(" on {d}"))
+                .unwrap_or_default();
+            unconfirmed_lines.push(format!(
+                "Commands in {} may write {}, another repository: a yes in a dialog \
+                 granted this{on}, and no one has confirmed it. If that task was typed into \
+                 the wrong terminal, revoke it. To keep it, run `ahma sandbox grant {} \
+                 --workspace {}`.",
+                ws.display(),
+                scope.path.display(),
+                scope.path.display(),
+                ws.display()
+            ));
             unconfirmed.push((scope.path.clone(), ws.to_path_buf()));
         } else {
             confirmed.push(format!("{} from {}", scope.path.display(), ws.display()));
         }
     }
     if !unconfirmed.is_empty() {
-        let lines: Vec<String> = unconfirmed
-            .iter()
-            .map(|(path, ws)| {
-                let on = settings
-                    .sandbox
-                    .persistent_scopes
-                    .iter()
-                    .find(|s| &s.path == path && s.workspace.as_deref() == Some(ws.as_path()))
-                    .and_then(|s| s.granted_at.as_deref())
-                    .map(|d| format!(" on {d}"))
-                    .unwrap_or_default();
-                format!(
-                    "Commands in {} may write {}, another repository: a yes in a dialog \
-                     granted this{on}, and no one has confirmed it. If that task was typed into \
-                     the wrong terminal, revoke it. To keep it, run `ahma sandbox grant {} \
-                     --workspace {}`.",
-                    ws.display(),
-                    path.display(),
-                    path.display(),
-                    ws.display()
-                )
-            })
-            .collect();
         out.push(Finding {
             level: Level::Warn,
             title: "A dialog let a workspace write another repository".into(),
-            detail: lines.join(" "),
+            detail: unconfirmed_lines.join(" "),
             fix: Some(Fix::RevokeScopes(unconfirmed)),
         });
     }

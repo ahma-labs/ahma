@@ -457,60 +457,27 @@ pub fn runs_sudo(command: &str) -> bool {
 /// kept byte for byte otherwise; quoted text, a `sudo` that is an argument, and everything from a
 /// heredoc (`<<`) on are left alone. A `sudo` already given `-A` is not given another.
 pub fn with_sudo_askpass(command: &str) -> String {
-    let chars: Vec<char> = command.chars().collect();
     let mut out = String::with_capacity(command.len() + 8);
     let mut quote: Option<char> = None;
     let mut at_start = true;
     let mut i = 0;
-    let ends_word = |c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
-    while i < chars.len() {
-        let c = chars[i];
+    while i < command.len() {
+        let rest = &command[i..];
+        let c = rest.chars().next().expect("i < command.len()");
         if let Some(q) = quote {
-            out.push(c);
-            if c == q {
-                quote = None;
-            } else if c == '\\' && q == '"' && i + 1 < chars.len() {
-                i += 1;
-                out.push(chars[i]);
-            }
-            i += 1;
+            i += copy_quoted_char(rest, c, q, &mut quote, &mut out);
             continue;
         }
-        if c == '<' && chars.get(i + 1) == Some(&'<') {
-            out.extend(&chars[i..]);
+        if rest.starts_with("<<") {
+            out.push_str(rest);
             break;
         }
-        if at_start {
-            if c.is_whitespace() && c != '\n' {
-                out.push(c);
-                i += 1;
-                continue;
-            }
-            let end = (i..chars.len())
-                .find(|&j| ends_word(chars[j]))
-                .unwrap_or(chars.len());
-            let word: String = chars[i..end].iter().collect();
-            let assignment =
-                word.contains('=') && !word.starts_with('-') && !word.contains(['"', '\'']);
-            if assignment || BEFORE_SUDO.contains(&word.as_str()) {
-                out.push_str(&word);
-                i = end;
-                continue;
-            }
-            at_start = false;
-            if word == "sudo" {
-                out.push_str("sudo");
-                let next: String = chars[end..]
-                    .iter()
-                    .skip_while(|c| **c == ' ' || **c == '\t')
-                    .take_while(|c| !c.is_whitespace())
-                    .collect();
-                if next != "-A" {
-                    out.push_str(" -A");
-                }
-                i = end;
-                continue;
-            }
+        if at_start
+            && !(c.is_whitespace() && c != '\n')
+            && let Some(next_i) = try_consume_sudo_prefix(rest, i, &mut at_start, &mut out)
+        {
+            i = next_i;
+            continue;
         }
         match c {
             '\'' | '"' => quote = Some(c),
@@ -518,9 +485,60 @@ pub fn with_sudo_askpass(command: &str) -> String {
             _ => {}
         }
         out.push(c);
-        i += 1;
+        i += c.len_utf8();
     }
     out
+}
+
+fn copy_quoted_char(
+    rest: &str,
+    c: char,
+    q: char,
+    quote: &mut Option<char>,
+    out: &mut String,
+) -> usize {
+    out.push(c);
+    let mut step = c.len_utf8();
+    if c == q {
+        *quote = None;
+    } else if c == '\\'
+        && q == '"'
+        && let Some(escaped) = rest[step..].chars().next()
+    {
+        out.push(escaped);
+        step += escaped.len_utf8();
+    }
+    step
+}
+
+fn try_consume_sudo_prefix(
+    rest: &str,
+    i: usize,
+    at_start: &mut bool,
+    out: &mut String,
+) -> Option<usize> {
+    let ends_word = |c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
+    let end_rel = rest.find(ends_word).unwrap_or(rest.len());
+    let word = &rest[..end_rel];
+    let assignment = word.contains('=') && !word.starts_with('-') && !word.contains(['"', '\'']);
+    if assignment || BEFORE_SUDO.contains(&word) {
+        out.push_str(word);
+        return Some(i + end_rel);
+    }
+    *at_start = false;
+    if word == "sudo" {
+        out.push_str("sudo");
+        let next = rest[end_rel..]
+            .trim_start_matches([' ', '\t'])
+            .split(char::is_whitespace)
+            .next()
+            .unwrap_or("");
+        if next != "-A" {
+            out.push_str(" -A");
+        }
+        return Some(i + end_rel);
+    }
+    None
 }
 
 /// The digest a command is recorded and matched under: of the command with
@@ -1103,43 +1121,47 @@ pub fn group(refusals: &[Refusal], home: Option<&Path>, scopes: &[PathBuf]) -> V
             programs: r.programs.clone(),
         })
         .collect();
-    loop {
-        let mut merged = None;
-        'pairs: for i in 0..questions.len() {
-            for j in (i + 1)..questions.len() {
-                let (a, b) = (&questions[i].dir, &questions[j].dir);
-                // Identical directories are one question. Anything wider, even
-                // a directory one of them already names, is a widening for the
-                // other and must pass the same test.
-                let target = if a == b {
-                    Some(a.clone())
-                } else {
-                    common_ancestor(a, b).filter(|c| widening_is_safe(c, home, scopes))
-                };
-                if let Some(dir) = target {
-                    merged = Some((i, j, dir));
-                    break 'pairs;
-                }
-            }
-        }
-        let Some((i, j, dir)) = merged else {
-            return questions;
-        };
+    while let Some((i, j, dir)) = find_mergeable_pair(&questions, home, scopes) {
         let absorbed = questions.remove(j);
         let into = &mut questions[i];
         into.dir = dir;
         if absorbed.access == ScopeAccess::Rw {
             into.access = ScopeAccess::Rw;
         }
-        for path in absorbed.covers {
-            if !into.covers.contains(&path) {
-                into.covers.push(path);
+        extend_unique(&mut into.covers, absorbed.covers);
+        extend_unique(&mut into.programs, absorbed.programs);
+    }
+    questions
+}
+
+fn find_mergeable_pair(
+    questions: &[Question],
+    home: Option<&Path>,
+    scopes: &[PathBuf],
+) -> Option<(usize, usize, PathBuf)> {
+    for i in 0..questions.len() {
+        for j in (i + 1)..questions.len() {
+            let (a, b) = (&questions[i].dir, &questions[j].dir);
+            // Identical directories are one question. Anything wider, even
+            // a directory one of them already names, is a widening for the
+            // other and must pass the same test.
+            let target = if a == b {
+                Some(a.clone())
+            } else {
+                common_ancestor(a, b).filter(|c| widening_is_safe(c, home, scopes))
+            };
+            if let Some(dir) = target {
+                return Some((i, j, dir));
             }
         }
-        for program in absorbed.programs {
-            if !into.programs.contains(&program) {
-                into.programs.push(program);
-            }
+    }
+    None
+}
+
+fn extend_unique<T: PartialEq>(dest: &mut Vec<T>, src: Vec<T>) {
+    for item in src {
+        if !dest.contains(&item) {
+            dest.push(item);
         }
     }
 }
