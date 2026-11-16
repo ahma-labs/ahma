@@ -498,15 +498,32 @@ async fn test_call_tool_disabled_subcommand() -> Result<()> {
 
 // ============= EXECUTION MODE TESTS =============
 
-/// Test synchronous execution mode
-#[tokio::test]
-async fn test_synchronous_execution_mode() -> Result<()> {
+async fn setup_client_with_tool(
+    tool_name: &str,
+    tool_json: &serde_json::Value,
+) -> Result<(
+    tempfile::TempDir,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+)> {
     init_test_logging();
-
     let temp_dir = tempdir()?;
     let tools_dir = temp_dir.path().join(".ahma");
     std::fs::create_dir_all(&tools_dir)?;
+    std::fs::write(
+        tools_dir.join(format!("{tool_name}.json")),
+        serde_json::to_string_pretty(tool_json)?,
+    )?;
+    let client = ClientBuilder::new()
+        .tools_dir(tools_dir)
+        .working_dir(temp_dir.path())
+        .build()
+        .await?;
+    Ok((temp_dir, client))
+}
 
+/// Test synchronous execution mode
+#[tokio::test]
+async fn test_synchronous_execution_mode() -> Result<()> {
     // Tool configured for synchronous execution
     let tool_json = json!({
         "name": "sync_echo",
@@ -522,17 +539,7 @@ async fn test_synchronous_execution_mode() -> Result<()> {
             ]
         }]
     });
-
-    std::fs::write(
-        tools_dir.join("sync_echo.json"),
-        serde_json::to_string_pretty(&tool_json)?,
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(tools_dir)
-        .working_dir(temp_dir.path())
-        .build()
-        .await?;
+    let (temp_dir, client) = setup_client_with_tool("sync_echo", &tool_json).await?;
 
     let mut params = Map::new();
     params.insert("message".to_string(), json!("hello world"));
@@ -560,12 +567,6 @@ async fn test_synchronous_execution_mode() -> Result<()> {
 /// Test asynchronous execution mode (default)
 #[tokio::test]
 async fn test_async_execution_mode() -> Result<()> {
-    init_test_logging();
-
-    let temp_dir = tempdir()?;
-    let tools_dir = temp_dir.path().join(".ahma");
-    std::fs::create_dir_all(&tools_dir)?;
-
     // Tool without synchronous flag (defaults to async)
     let tool_json = json!({
         "name": "async_echo",
@@ -580,17 +581,7 @@ async fn test_async_execution_mode() -> Result<()> {
             ]
         }]
     });
-
-    std::fs::write(
-        tools_dir.join("async_echo.json"),
-        serde_json::to_string_pretty(&tool_json)?,
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(tools_dir)
-        .working_dir(temp_dir.path())
-        .build()
-        .await?;
+    let (temp_dir, client) = setup_client_with_tool("async_echo", &tool_json).await?;
 
     let mut params = Map::new();
     params.insert("message".to_string(), json!("async test"));
@@ -625,12 +616,6 @@ async fn test_async_execution_mode() -> Result<()> {
 /// Test explicit execution_mode argument override
 #[tokio::test]
 async fn test_explicit_execution_mode_argument() -> Result<()> {
-    init_test_logging();
-
-    let temp_dir = tempdir()?;
-    let tools_dir = temp_dir.path().join(".ahma");
-    std::fs::create_dir_all(&tools_dir)?;
-
     let tool_json = json!({
         "name": "mode_test",
         "description": "Test execution mode override",
@@ -641,17 +626,7 @@ async fn test_explicit_execution_mode_argument() -> Result<()> {
             "description": "Default subcommand"
         }]
     });
-
-    std::fs::write(
-        tools_dir.join("mode_test.json"),
-        serde_json::to_string_pretty(&tool_json)?,
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(tools_dir)
-        .working_dir(temp_dir.path())
-        .build()
-        .await?;
+    let (temp_dir, client) = setup_client_with_tool("mode_test", &tool_json).await?;
 
     // Request synchronous execution via argument
     let mut params = Map::new();
@@ -675,12 +650,6 @@ async fn test_explicit_execution_mode_argument() -> Result<()> {
 /// Test calling nested subcommands
 #[tokio::test]
 async fn test_nested_subcommand_execution() -> Result<()> {
-    init_test_logging();
-
-    let temp_dir = tempdir()?;
-    let tools_dir = temp_dir.path().join(".ahma");
-    std::fs::create_dir_all(&tools_dir)?;
-
     let tool_json = json!({
         "name": "nested_tool",
         "description": "Tool with nested subcommands",
@@ -702,17 +671,7 @@ async fn test_nested_subcommand_execution() -> Result<()> {
             }
         ]
     });
-
-    std::fs::write(
-        tools_dir.join("nested_tool.json"),
-        serde_json::to_string_pretty(&tool_json)?,
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(tools_dir)
-        .working_dir(temp_dir.path())
-        .build()
-        .await?;
+    let (temp_dir, client) = setup_client_with_tool("nested_tool", &tool_json).await?;
 
     // Call nested subcommand with underscore-separated path
     let mut params = Map::new();
@@ -736,14 +695,6 @@ async fn test_nested_subcommand_execution() -> Result<()> {
 /// Test working_directory parameter handling
 #[tokio::test]
 async fn test_working_directory_parameter() -> Result<()> {
-    init_test_logging();
-
-    let temp_dir = tempdir()?;
-    let tools_dir = temp_dir.path().join(".ahma");
-    let work_dir = temp_dir.path().join("work");
-    std::fs::create_dir_all(&tools_dir)?;
-    std::fs::create_dir_all(&work_dir)?;
-
     let tool_json = json!({
         "name": "pwd_test",
         "description": "Test working directory",
@@ -755,17 +706,9 @@ async fn test_working_directory_parameter() -> Result<()> {
             "description": "Print working directory"
         }]
     });
-
-    std::fs::write(
-        tools_dir.join("pwd_test.json"),
-        serde_json::to_string_pretty(&tool_json)?,
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(tools_dir)
-        .working_dir(temp_dir.path())
-        .build()
-        .await?;
+    let (temp_dir, client) = setup_client_with_tool("pwd_test", &tool_json).await?;
+    let work_dir = temp_dir.path().join("work");
+    std::fs::create_dir_all(&work_dir)?;
 
     let mut params = Map::new();
     params.insert(
@@ -792,12 +735,6 @@ async fn test_working_directory_parameter() -> Result<()> {
 /// Test default working directory when not specified
 #[tokio::test]
 async fn test_default_working_directory() -> Result<()> {
-    init_test_logging();
-
-    let temp_dir = tempdir()?;
-    let tools_dir = temp_dir.path().join(".ahma");
-    std::fs::create_dir_all(&tools_dir)?;
-
     let tool_json = json!({
         "name": "default_wd",
         "description": "Test default working directory",
@@ -809,17 +746,7 @@ async fn test_default_working_directory() -> Result<()> {
             "description": "Echo test"
         }]
     });
-
-    std::fs::write(
-        tools_dir.join("default_wd.json"),
-        serde_json::to_string_pretty(&tool_json)?,
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(tools_dir)
-        .working_dir(temp_dir.path())
-        .build()
-        .await?;
+    let (_temp_dir, client) = setup_client_with_tool("default_wd", &tool_json).await?;
 
     // Call without working_directory - should use default "."
     let call_param = CallToolRequestParams::new("default_wd").with_arguments(Map::new());
@@ -836,12 +763,6 @@ async fn test_default_working_directory() -> Result<()> {
 /// Test timeout parameter handling
 #[tokio::test]
 async fn test_timeout_parameter() -> Result<()> {
-    init_test_logging();
-
-    let temp_dir = tempdir()?;
-    let tools_dir = temp_dir.path().join(".ahma");
-    std::fs::create_dir_all(&tools_dir)?;
-
     let tool_json = json!({
         "name": "timeout_test",
         "description": "Test timeout parameter",
@@ -853,17 +774,7 @@ async fn test_timeout_parameter() -> Result<()> {
             "description": "Echo test"
         }]
     });
-
-    std::fs::write(
-        tools_dir.join("timeout_test.json"),
-        serde_json::to_string_pretty(&tool_json)?,
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(tools_dir)
-        .working_dir(temp_dir.path())
-        .build()
-        .await?;
+    let (temp_dir, client) = setup_client_with_tool("timeout_test", &tool_json).await?;
 
     let mut params = Map::new();
     params.insert("timeout_seconds".to_string(), json!(60));

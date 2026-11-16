@@ -71,8 +71,18 @@ fn is_tool_disabled_in(tool_name: &str, workspace_dir: &std::path::Path) -> bool
 }
 
 /// Initialize verbose logging for tests.
-pub fn init_test_logging() {
-    let _ = crate::utils::logging::init_logging("trace", false);
+pub use crate::utils::logging::init_test_logging;
+
+/// Build a `SandboxMode::Strict` sandbox for a single scope with `livelog = false` and `tmp_access = false`.
+pub fn strict_sandbox(scope: &std::path::Path, no_temp_files: bool) -> crate::sandbox::Sandbox {
+    crate::sandbox::Sandbox::new(
+        vec![scope.to_path_buf()],
+        crate::sandbox::SandboxMode::Strict,
+        no_temp_files,
+        false,
+        false,
+    )
+    .expect("build sandbox")
 }
 
 /// Strip ANSI escape sequences

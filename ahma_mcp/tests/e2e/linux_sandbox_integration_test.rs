@@ -12,6 +12,7 @@
 // This entire test file is Linux-specific - skip compilation on other platforms
 #![cfg(target_os = "linux")]
 
+use ahma_mcp::test_utils::assertions::assert_command_success;
 use landlock::{
     ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
 };
@@ -221,16 +222,7 @@ fn test_landlock_executes_echo() {
     let output = run_sandboxed_command(temp.path(), "/bin/sh", "echo 'hello world'", temp.path())
         .expect("Failed to execute sandboxed command");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Landlock sandbox should allow echo. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "Landlock sandbox should allow echo");
     assert!(
         stdout.contains("hello world"),
         "Output should contain 'hello world'. Got: {}",
@@ -247,16 +239,7 @@ fn test_landlock_executes_pwd() {
     let output = run_sandboxed_command(temp.path(), "/bin/sh", "pwd", temp.path())
         .expect("Failed to execute sandboxed command");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Landlock sandbox should allow pwd. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "Landlock sandbox should allow pwd");
 
     // pwd should return the temp directory path
     let stdout_trimmed = stdout.trim();
@@ -280,16 +263,7 @@ fn test_landlock_executes_ls() {
     let output = run_sandboxed_command(temp.path(), "/bin/sh", "ls -la", temp.path())
         .expect("Failed to execute sandboxed command");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Landlock sandbox should allow ls. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "Landlock sandbox should allow ls");
     assert!(
         stdout.contains("testfile.txt"),
         "ls output should contain our test file. Got: {}",
@@ -311,16 +285,7 @@ fn test_landlock_allows_writes_in_scope() {
     )
     .expect("Failed to execute sandboxed command");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Landlock should allow writes in sandbox scope. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "Landlock should allow writes in sandbox scope");
     assert!(
         stdout.contains("test content"),
         "Should be able to read written file. Got: {}",
@@ -398,16 +363,8 @@ fn test_landlock_handles_complex_shell_commands() {
     )
     .expect("Failed to execute sandboxed command");
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Landlock sandbox should handle pipes. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "Landlock sandbox should handle pipes");
+    let stdout = stdout.trim().to_string();
     // Should find 3 lines containing "line"
     assert_eq!(
         stdout, "3",
@@ -436,16 +393,7 @@ fn test_landlock_works_with_bash() {
     )
     .expect("Failed to execute sandboxed command");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Landlock sandbox should work with bash. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "Landlock sandbox should work with bash");
     assert!(
         stdout.contains("hello"),
         "Bash variable expansion should work. Got: {}",

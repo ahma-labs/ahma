@@ -98,6 +98,19 @@ pub fn assert_formatted_json_contains(raw: &str, expected: &[&str]) {
     }
 }
 
+/// Assert that a subprocess succeeded, printing exit code, stdout, and stderr on failure.
+/// Returns lossy-decoded `stdout` for follow-up assertions.
+pub fn assert_command_success(output: &std::process::Output, context: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{context}. Exit: {:?}, stdout: {stdout}, stderr: {stderr}",
+        output.status.code(),
+    );
+    stdout
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

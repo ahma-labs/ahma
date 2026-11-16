@@ -3,15 +3,11 @@
 use crate::common;
 
 use ahma_common::timeouts::TestTimeouts;
-use common::spawn_test_server;
 use serde_json::Value;
 
 #[tokio::test]
 async fn test_health_check_version_and_restart() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     // 1. Probe /health
     let resp = client

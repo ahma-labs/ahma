@@ -4063,17 +4063,7 @@ mod tests {
                 mode: "http".to_string(),
                 scope: "/project".to_string(),
                 label: "Cursor".to_string(),
-                client: None,
-                session_id: None,
-                client_pid: None,
-                sampling: false,
-                elicitation: false,
-                ended_epoch_ms: None,
-                scopes: vec![],
-                read_scopes: vec![],
-                grants: vec![],
-                enforcement: None,
-                native_terminal: None,
+                ..Default::default()
             }],
         };
         let mut buf = Vec::<u8>::new();
@@ -5560,17 +5550,7 @@ mod tests {
             mode: mode.into(),
             scope: "/w".into(),
             label: "L".into(),
-            client: None,
-            session_id: None,
-            client_pid: None,
-            sampling: false,
-            elicitation: false,
-            ended_epoch_ms: None,
-            scopes: vec![],
-            read_scopes: vec![],
-            grants: vec![],
-            enforcement: None,
-            native_terminal: None,
+            ..Default::default()
         }
     }
 
@@ -5821,16 +5801,7 @@ mod tests {
             scope: "/w".into(),
             label: "hook".into(),
             client: Some("claude-code".into()),
-            session_id: None,
-            client_pid: None,
-            sampling: false,
-            elicitation: false,
-            ended_epoch_ms: None,
-            scopes: vec![],
-            read_scopes: vec![],
-            grants: vec![],
-            enforcement: None,
-            native_terminal: None,
+            ..Default::default()
         };
         hub.instances.lock().await.insert("i1".into(), info.clone());
         hub.record_op_event("i1", &started_ev("op-1")).await;
@@ -6161,17 +6132,7 @@ mod tests {
                 mode: "stdio".into(),
                 scope: "/ws".into(),
                 label: "ahma".into(),
-                client: None,
-                session_id: None,
-                client_pid: None,
-                sampling: false,
-                elicitation: false,
-                ended_epoch_ms: None,
-                scopes: vec![],
-                read_scopes: vec![],
-                grants: vec![],
-                enforcement: None,
-                native_terminal: None,
+                ..Default::default()
             },
         );
         hub.record_op_event("i1", &started_ev("op-1")).await;

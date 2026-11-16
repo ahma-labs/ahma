@@ -3,7 +3,18 @@
 //! These were previously copy-pasted verbatim across several `#[cfg(test)]`
 //! modules (`shell::resolution`, `mcp_service::subcommand`).
 
-use crate::config::SubcommandConfig;
+use crate::config::{SubcommandConfig, ToolConfig};
+
+/// Build an enabled [`ToolConfig`] with `..Default::default()` for optional fields.
+pub fn make_tool_config(name: &str, command: &str) -> ToolConfig {
+    ToolConfig {
+        name: name.to_string(),
+        description: format!("{name} tool"),
+        command: command.to_string(),
+        enabled: true,
+        ..Default::default()
+    }
+}
 
 pub fn make_subcommand(name: &str, enabled: bool) -> SubcommandConfig {
     SubcommandConfig {

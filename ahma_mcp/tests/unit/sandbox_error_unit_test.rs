@@ -173,14 +173,7 @@ fn test_validate_path_triggers_format_scopes_single_scope() {
     let scope = tempdir().unwrap();
     let other = tempdir().unwrap();
 
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let sandbox = ahma_mcp::test_utils::strict_sandbox(scope.path(), false);
 
     // Write a real file outside the scope so canonicalize() can resolve it
     let bad_file = other.path().join("bad.txt");
@@ -261,14 +254,7 @@ fn test_validate_path_no_temp_files_blocks_temp_dir_scope() {
         return;
     }
 
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        true,
-        false,
-        false,
-    )
-    .unwrap();
+    let sandbox = ahma_mcp::test_utils::strict_sandbox(scope.path(), true);
 
     // A file within the scope (which is in /tmp) should be blocked by no-temp-files.
     let file = scope.path().join("blocked.txt");

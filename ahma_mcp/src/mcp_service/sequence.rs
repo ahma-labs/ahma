@@ -602,27 +602,7 @@ mod tests {
     }
 
     fn make_dummy_tool_config() -> ToolConfig {
-        ToolConfig {
-            name: "test_tool".to_string(),
-            description: "Test tool".to_string(),
-            command: "test".to_string(),
-            subcommand: None,
-            input_schema: None,
-            timeout_seconds: None,
-            synchronous: None,
-            hints: Default::default(),
-            enabled: true,
-            guidance_key: None,
-            sequence: None,
-            step_delay_ms: None,
-            availability_check: None,
-            install_instructions: None,
-            monitor_level: None,
-            monitor_stream: None,
-            tool_type: None,
-            livelog: None,
-            ..Default::default()
-        }
+        crate::test_utils::config_builders::make_tool_config("test_tool", "test")
     }
 
     // ============= format_step_started_message tests =============

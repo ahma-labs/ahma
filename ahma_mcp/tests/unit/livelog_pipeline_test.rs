@@ -98,30 +98,6 @@ async fn alerts_for(monitor: &OperationMonitor, op_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Run the pipeline against the default LLM completion service, the one every
-/// test here exercises; only the operation, config and cancellation vary.
-async fn run_pipeline(
-    op_id: &str,
-    config: &LivelogConfig,
-    runtime: &ahma_mcp::config::LivelogRuntime,
-    sandbox: &Arc<Sandbox>,
-    working_dir: &std::path::Path,
-    token: CancellationToken,
-    monitor: &Arc<OperationMonitor>,
-) {
-    run_livelog_pipeline(
-        op_id,
-        config,
-        runtime,
-        sandbox,
-        working_dir,
-        token,
-        monitor.clone(),
-        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
-    )
-    .await;
-}
-
 fn make_sandbox(temp_dir: &std::path::Path) -> Arc<Sandbox> {
     Arc::new(
         Sandbox::new(
@@ -135,6 +111,70 @@ fn make_sandbox(temp_dir: &std::path::Path) -> Arc<Sandbox> {
     )
 }
 
+struct PipelineFixture {
+    op_id: &'static str,
+    _temp_dir: tempfile::TempDir,
+    working_dir: std::path::PathBuf,
+    sandbox: Arc<Sandbox>,
+    monitor: Arc<OperationMonitor>,
+    server: MockServer,
+}
+
+impl PipelineFixture {
+    async fn new(op_id: &'static str) -> Self {
+        let temp_dir = tempdir().unwrap();
+        let working_dir = temp_dir.path().to_path_buf();
+        let sandbox = make_sandbox(&working_dir);
+        let monitor = make_monitor();
+        register_op(&monitor, op_id).await;
+        let server = MockServer::start().await;
+        Self {
+            op_id,
+            _temp_dir: temp_dir,
+            working_dir,
+            sandbox,
+            monitor,
+            server,
+        }
+    }
+
+    async fn mount_chat(&self, response: ResponseTemplate) {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+    }
+
+    async fn run(
+        &self,
+        config: &LivelogConfig,
+        runtime: Option<&ahma_mcp::config::LivelogRuntime>,
+        token: CancellationToken,
+    ) -> Vec<String> {
+        let default_rt;
+        let rt = match runtime {
+            Some(r) => r,
+            None => {
+                default_rt = default_runtime(config);
+                &default_rt
+            }
+        };
+        run_livelog_pipeline(
+            self.op_id,
+            config,
+            rt,
+            &self.sandbox,
+            &self.working_dir,
+            token,
+            self.monitor.clone(),
+            Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+        )
+        .await;
+        alerts_for(&self.monitor, self.op_id).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -142,39 +182,18 @@ fn make_sandbox(temp_dir: &std::path::Path) -> Arc<Sandbox> {
 /// When the LLM returns "CLEAN", no alert should be recorded.
 #[tokio::test]
 async fn test_livelog_pipeline_clean_response_no_alert() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
-        .mount(&server)
+    let fx = PipelineFixture::new("test-op-clean").await;
+    fx.mount_chat(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "echo",
         vec!["INFO everything is fine".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-clean").await;
-
-    run_pipeline(
-        "test-op-clean",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
-    let alerts = alerts_for(&monitor, "test-op-clean").await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert!(
         alerts.is_empty(),
         "expected no alerts for CLEAN response, got: {:?}",
@@ -186,41 +205,20 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
 /// summary and the raw log context.
 #[tokio::test]
 async fn test_livelog_pipeline_issue_detected_sends_alert() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response(
-            "NullPointerException at MainActivity line 42",
-        )))
-        .mount(&server)
-        .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    let fx = PipelineFixture::new("test-op-issue").await;
+    fx.mount_chat(ResponseTemplate::new(200).set_body_json(make_llm_response(
+        "NullPointerException at MainActivity line 42",
+    )))
+    .await;
 
     let config = make_config(
         "echo",
         vec!["FATAL EXCEPTION: NullPointerException".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-issue").await;
-
-    run_pipeline(
-        "test-op-issue",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
-    let alerts = alerts_for(&monitor, "test-op-issue").await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert_eq!(alerts.len(), 1, "expected exactly one alert: {:?}", alerts);
     let alert = &alerts[0];
     assert!(
@@ -236,44 +234,23 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
 /// The cooldown window suppresses a second alert fired within cooldown_seconds.
 #[tokio::test]
 async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
-    let server = MockServer::start().await;
+    let fx = PipelineFixture::new("test-op-cooldown").await;
     // Always return an "issue detected" response.
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(make_llm_response("Error: crash detected")),
-        )
-        .mount(&server)
-        .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    fx.mount_chat(
+        ResponseTemplate::new(200).set_body_json(make_llm_response("Error: crash detected")),
+    )
+    .await;
 
     // Two lines = two chunks (chunk_max_lines = 1), but cooldown = 300s.
     let mut config = make_config(
         "printf",
         vec!["line1\\nline2\\n".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for errors",
     );
     config.cooldown_seconds = 300; // very long cooldown
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-cooldown").await;
-
-    run_pipeline(
-        "test-op-cooldown",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
-    let alerts = alerts_for(&monitor, "test-op-cooldown").await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     // First chunk triggers alert; second chunk should be silenced by cooldown.
     assert_eq!(
         alerts.len(),
@@ -288,23 +265,17 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
 async fn test_livelog_pipeline_cancellation_stops_pipeline() {
     // Use `sleep` as an "infinite" source that never exits on its own.
     // We cancel immediately after spawning.
-    let server = MockServer::start().await;
     // LLM is never reached because we cancel before any chunk is produced.
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    let fx = PipelineFixture::new("test-op-cancel").await;
 
     let config = make_config(
         "sleep",
         vec!["60".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
 
     let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-cancel").await;
-
     // Cancel after a short delay so the pipeline can actually start.
     let token_clone = token.clone();
     tokio::spawn(async move {
@@ -313,16 +284,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
     });
 
     let start = std::time::Instant::now();
-    run_pipeline(
-        "test-op-cancel",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
+    let alerts = fx.run(&config, None, token).await;
     let elapsed = start.elapsed();
 
     // Should finish well before the 60s sleep timeout.
@@ -332,7 +294,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
         elapsed
     );
     assert!(
-        alerts_for(&monitor, "test-op-cancel").await.is_empty(),
+        alerts.is_empty(),
         "no alerts expected after immediate cancellation"
     );
 }
@@ -341,83 +303,41 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
 /// and continues to the next chunk.
 #[tokio::test]
 async fn test_livelog_pipeline_llm_http_500_graceful() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
-        .mount(&server)
+    let fx = PipelineFixture::new("test-op-500").await;
+    fx.mount_chat(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "echo",
         vec!["ERROR something broke".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for errors",
     );
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-500").await;
-
     // Pipeline should complete without panic/hang despite LLM 500.
-    run_pipeline(
-        "test-op-500",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
 
     // The LLM error means no alert is generated (the error is logged, not propagated).
-    assert!(
-        alerts_for(&monitor, "test-op-500").await.is_empty(),
-        "LLM 500 should not produce an alert"
-    );
+    assert!(alerts.is_empty(), "LLM 500 should not produce an alert");
 }
 
 /// LLM returning invalid JSON should be handled gracefully — no crash, no alert.
 #[tokio::test]
 async fn test_livelog_pipeline_llm_malformed_json_graceful() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("not valid json {{{"))
-        .mount(&server)
+    let fx = PipelineFixture::new("test-op-bad-json").await;
+    fx.mount_chat(ResponseTemplate::new(200).set_body_string("not valid json {{{"))
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "echo",
         vec!["WARN something fishy".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for warnings",
     );
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-bad-json").await;
-
-    run_pipeline(
-        "test-op-bad-json",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert!(
-        alerts_for(&monitor, "test-op-bad-json").await.is_empty(),
+        alerts.is_empty(),
         "malformed LLM JSON should not produce an alert"
     );
 }
@@ -425,42 +345,24 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
 /// With cooldown=0, every chunk that triggers an LLM issue should fire an alert.
 #[tokio::test]
 async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
-    let server = MockServer::start().await;
+    let fx = PipelineFixture::new("test-op-zero-cd").await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("Bug detected!")))
         .expect(2) // two chunks → two LLM calls
-        .mount(&server)
+        .mount(&fx.server)
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     // Two lines with chunk_max_lines=1 → two chunks.
     let mut config = make_config(
         "printf",
         vec!["line1\\nline2\\n".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for bugs",
     );
     config.cooldown_seconds = 0; // no suppression
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-zero-cd").await;
-
-    run_pipeline(
-        "test-op-zero-cd",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
-    let alerts = alerts_for(&monitor, "test-op-zero-cd").await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert_eq!(
         alerts.len(),
         2,
@@ -472,37 +374,20 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
 /// A source command that does not exist should not crash the pipeline.
 #[tokio::test]
 async fn test_livelog_pipeline_source_not_found_graceful() {
-    let server = MockServer::start().await;
     // LLM mock is set up but should never be reached.
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    let fx = PipelineFixture::new("test-op-not-found").await;
 
     let config = make_config(
         "this_command_definitely_does_not_exist_12345",
         vec![],
-        &server.uri(),
+        &fx.server.uri(),
         "unused",
     );
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-not-found").await;
-
     // Should complete without panicking.
-    run_pipeline(
-        "test-op-not-found",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert!(
-        alerts_for(&monitor, "test-op-not-found").await.is_empty(),
+        alerts.is_empty(),
         "no alerts expected when source command not found"
     );
 }
@@ -511,7 +396,7 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
 /// so no alert fires even though the mock would flag anything it received.
 #[tokio::test]
 async fn test_livelog_prefilter_excludes_all_lines_no_llm_call() {
-    let server = MockServer::start().await;
+    let fx = PipelineFixture::new("test-op-prefilter-none").await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
@@ -519,39 +404,21 @@ async fn test_livelog_prefilter_excludes_all_lines_no_llm_call() {
                 .set_body_json(make_llm_response("ISSUE: would-be crash detected")),
         )
         .expect(0) // the LLM must NOT be called when nothing passes the filter
-        .mount(&server)
+        .mount(&fx.server)
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     let mut config = make_config(
         "echo",
         vec!["INFO perfectly benign line".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
     // Only forward lines that look like errors; the benign INFO line is dropped.
     config.prefilter_regex = Some(r"(?i)\b(FATAL|error|exception)\b".to_string());
 
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-prefilter-none").await;
-
-    run_pipeline(
-        "test-op-prefilter-none",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        CancellationToken::new(),
-        &monitor,
-    )
-    .await;
-
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert!(
-        alerts_for(&monitor, "test-op-prefilter-none")
-            .await
-            .is_empty(),
+        alerts.is_empty(),
         "filtered-out lines must not reach the LLM"
     );
 }
@@ -559,41 +426,21 @@ async fn test_livelog_prefilter_excludes_all_lines_no_llm_call() {
 /// A line that matches the pre-filter still reaches the LLM and produces an alert.
 #[tokio::test]
 async fn test_livelog_prefilter_passes_matching_line() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(make_llm_response("Crash: NPE in onCreate")),
-        )
-        .mount(&server)
-        .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    let fx = PipelineFixture::new("test-op-prefilter-pass").await;
+    fx.mount_chat(
+        ResponseTemplate::new(200).set_body_json(make_llm_response("Crash: NPE in onCreate")),
+    )
+    .await;
 
     let mut config = make_config(
         "echo",
         vec!["FATAL EXCEPTION: boom".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
     config.prefilter_regex = Some(r"(?i)\bFATAL\b".to_string());
 
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-prefilter-pass").await;
-
-    run_pipeline(
-        "test-op-prefilter-pass",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        CancellationToken::new(),
-        &monitor,
-    )
-    .await;
-
-    let alerts = alerts_for(&monitor, "test-op-prefilter-pass").await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert_eq!(
         alerts.len(),
         1,
@@ -606,40 +453,21 @@ async fn test_livelog_prefilter_passes_matching_line() {
 /// line forwarded (the bad regex is ignored, not a hard error).
 #[tokio::test]
 async fn test_livelog_invalid_prefilter_falls_back_to_pass_all() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("Issue: boom")))
-        .mount(&server)
+    let fx = PipelineFixture::new("test-op-prefilter-bad").await;
+    fx.mount_chat(ResponseTemplate::new(200).set_body_json(make_llm_response("Issue: boom")))
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     let mut config = make_config(
         "echo",
         vec!["FATAL boom".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
     config.prefilter_regex = Some("(unclosed".to_string()); // invalid regex
 
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-prefilter-bad").await;
-
-    run_pipeline(
-        "test-op-prefilter-bad",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        CancellationToken::new(),
-        &monitor,
-    )
-    .await;
-
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert_eq!(
-        alerts_for(&monitor, "test-op-prefilter-bad").await.len(),
+        alerts.len(),
         1,
         "invalid regex should not suppress monitoring"
     );
@@ -653,32 +481,18 @@ async fn test_livelog_invalid_prefilter_falls_back_to_pass_all() {
 /// pipeline exits immediately at the `resolve()` call without spawning anything.
 #[tokio::test]
 async fn test_livelog_pipeline_llm_resolve_error_exits_early() {
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    let fx = PipelineFixture::new("op-resolve-err").await;
 
     let mut config = make_config("echo", vec!["hello".to_string()], "http://unused", "prompt");
     // Point api_key to a var that is guaranteed not to be set in the environment.
     config.llm_provider.api_key = Some("${_AHMA_LIVELOG_COVER_MISSING_KEY_XYZ789_}".to_string());
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "op-resolve-err").await;
-
     let runtime = default_runtime(&config);
-
-    run_pipeline(
-        "op-resolve-err",
-        &config,
-        &runtime,
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
+    let alerts = fx
+        .run(&config, Some(&runtime), CancellationToken::new())
+        .await;
     assert!(
-        alerts_for(&monitor, "op-resolve-err").await.is_empty(),
+        alerts.is_empty(),
         "LLM resolve error must produce no alerts"
     );
 }
@@ -692,29 +506,19 @@ async fn test_livelog_pipeline_llm_resolve_error_exits_early() {
 /// for-loop body in that helper).
 #[tokio::test]
 async fn test_livelog_pipeline_clear_command_executes_before_source() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
-        .mount(&server)
+    let fx = PipelineFixture::new("op-clear-cmd").await;
+    fx.mount_chat(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     // source_command = "echo"; clear_command = ["--cleared"] → runs `echo --cleared`
     // which exits 0.  The source itself outputs one line that the LLM marks CLEAN.
     let mut config = make_config(
         "echo",
         vec!["source output".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "detect issues",
     );
     config.clear_command = Some(vec!["--cleared".to_string()]);
-
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "op-clear-cmd").await;
 
     // Construct a runtime with `clear = true` (default) AND a non-empty `env`
     // so that `apply_env`'s for-loop body is executed for coverage.
@@ -722,20 +526,13 @@ async fn test_livelog_pipeline_clear_command_executes_before_source() {
     runtime.clear = true;
     runtime.env = vec![("AHMA_LIVELOG_CLEAR_TEST".to_string(), "1".to_string())];
 
-    run_pipeline(
-        "op-clear-cmd",
-        &config,
-        &runtime,
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
+    let alerts = fx
+        .run(&config, Some(&runtime), CancellationToken::new())
+        .await;
 
     // Monitoring ran to completion without panic; CLEAN → no alert.
     assert!(
-        alerts_for(&monitor, "op-clear-cmd").await.is_empty(),
+        alerts.is_empty(),
         "clear command + CLEAN LLM response should produce no alert"
     );
 }
@@ -744,20 +541,14 @@ async fn test_livelog_pipeline_clear_command_executes_before_source() {
 /// `config.clear_command` is present.  No crash, no alert.
 #[tokio::test]
 async fn test_livelog_pipeline_clear_command_skipped_when_runtime_clear_false() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
-        .mount(&server)
+    let fx = PipelineFixture::new("op-no-clear").await;
+    fx.mount_chat(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     let mut config = make_config(
         "echo",
         vec!["one line".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "detect issues",
     );
     config.clear_command = Some(vec!["--skipped".to_string()]);
@@ -765,23 +556,11 @@ async fn test_livelog_pipeline_clear_command_skipped_when_runtime_clear_false() 
     let mut runtime = default_runtime(&config);
     runtime.clear = false; // disable clear
 
-    let token = CancellationToken::new();
-    let monitor = make_monitor();
-    register_op(&monitor, "op-no-clear").await;
-
-    run_pipeline(
-        "op-no-clear",
-        &config,
-        &runtime,
-        &sandbox,
-        temp_dir.path(),
-        token,
-        &monitor,
-    )
-    .await;
-
+    let alerts = fx
+        .run(&config, Some(&runtime), CancellationToken::new())
+        .await;
     assert!(
-        alerts_for(&monitor, "op-no-clear").await.is_empty(),
+        alerts.is_empty(),
         "clear=false + CLEAN response should produce no alert"
     );
 }
@@ -794,44 +573,23 @@ async fn test_livelog_pipeline_clear_command_skipped_when_runtime_clear_false() 
 /// alert is emitted — that JSON means "clean", not a prose issue report.
 #[tokio::test]
 async fn test_structured_output_issue_false_no_alert() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(make_llm_response(r#"{"issue":false}"#)),
-        )
-        .mount(&server)
-        .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    let fx = PipelineFixture::new("test-op-struct-clean").await;
+    fx.mount_chat(
+        ResponseTemplate::new(200).set_body_json(make_llm_response(r#"{"issue":false}"#)),
+    )
+    .await;
 
     let mut config = make_config(
         "echo",
         vec!["INFO perfectly fine".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
     config.structured_output = true;
 
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-struct-clean").await;
-
-    run_pipeline(
-        "test-op-struct-clean",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        CancellationToken::new(),
-        &monitor,
-    )
-    .await;
-
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert!(
-        alerts_for(&monitor, "test-op-struct-clean")
-            .await
-            .is_empty(),
+        alerts.is_empty(),
         "structured issue:false must not produce an alert"
     );
 }
@@ -840,40 +598,20 @@ async fn test_structured_output_issue_false_no_alert() {
 /// `issue:true`, the alert is formatted with level, summary, and optional fields.
 #[tokio::test]
 async fn test_structured_output_issue_true_formats_alert() {
-    let server = MockServer::start().await;
+    let fx = PipelineFixture::new("test-op-struct-issue").await;
     let json_resp = r#"{"issue":true,"level":"FATAL","summary":"NullPointerException in MainActivity","exception_class":"java.lang.NullPointerException","top_frame":"MainActivity.onCreate(MainActivity.kt:42)"}"#;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response(json_resp)))
-        .mount(&server)
+    fx.mount_chat(ResponseTemplate::new(200).set_body_json(make_llm_response(json_resp)))
         .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
 
     let mut config = make_config(
         "echo",
         vec!["FATAL EXCEPTION: NPE".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
     config.structured_output = true;
 
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-struct-issue").await;
-
-    run_pipeline(
-        "test-op-struct-issue",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        CancellationToken::new(),
-        &monitor,
-    )
-    .await;
-
-    let alerts = alerts_for(&monitor, "test-op-struct-issue").await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert_eq!(
         alerts.len(),
         1,
@@ -903,42 +641,22 @@ async fn test_structured_output_issue_true_formats_alert() {
 /// alert so no alert is silently dropped.
 #[tokio::test]
 async fn test_structured_output_non_json_falls_back_to_plain_text_alert() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(make_llm_response("FATAL: NPE in com.example.app")),
-        )
-        .mount(&server)
-        .await;
-
-    let temp_dir = tempdir().unwrap();
-    let sandbox = make_sandbox(temp_dir.path());
+    let fx = PipelineFixture::new("test-op-struct-prose").await;
+    fx.mount_chat(
+        ResponseTemplate::new(200)
+            .set_body_json(make_llm_response("FATAL: NPE in com.example.app")),
+    )
+    .await;
 
     let mut config = make_config(
         "echo",
         vec!["FATAL EXCEPTION main".to_string()],
-        &server.uri(),
+        &fx.server.uri(),
         "look for crashes",
     );
     config.structured_output = true;
 
-    let monitor = make_monitor();
-    register_op(&monitor, "test-op-struct-prose").await;
-
-    run_pipeline(
-        "test-op-struct-prose",
-        &config,
-        &default_runtime(&config),
-        &sandbox,
-        temp_dir.path(),
-        CancellationToken::new(),
-        &monitor,
-    )
-    .await;
-
-    let alerts = alerts_for(&monitor, "test-op-struct-prose").await;
+    let alerts = fx.run(&config, None, CancellationToken::new()).await;
     assert_eq!(
         alerts.len(),
         1,
