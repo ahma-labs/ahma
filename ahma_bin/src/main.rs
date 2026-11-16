@@ -195,12 +195,16 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Subcommands::Gui(gui_args) => {
-            tracing::info!("Starting the browser interface");
-            ahma_gui::run_gui(ahma_gui::GuiOptions {
-                connect: gui_args.connect.clone(),
-                profile: gui_args.profile.clone(),
-                path: gui_args.path.clone(),
+        Subcommands::Gui { .. } => anyhow::bail!("{}", ahma_mcp::shell::renamed_gui_message()),
+        Subcommands::Web(web_args) => {
+            if let Some(legacy) = &web_args.legacy {
+                anyhow::bail!("{}", legacy.redirect());
+            }
+            tracing::info!("Starting ahma web");
+            ahma_gui::run_web(ahma_gui::WebOptions {
+                connect: web_args.connect.clone(),
+                profile: web_args.profile.clone(),
+                path: web_args.path.clone(),
                 token_prefs: tui_token_prefs(
                     cli.minimize_tokens,
                     cli.no_minimize_tokens,
@@ -208,8 +212,13 @@ async fn run() -> Result<()> {
                     cli.no_small_model_harness,
                     cli.context_length,
                 ),
-                port: gui_args.port,
-                open_browser: !gui_args.no_open,
+                port: web_args.port,
+                open_browser: !web_args.no_open,
+                copy_code: !web_args.no_copy,
+                foreground: web_args.foreground,
+                idle_timeout: (web_args.idle_timeout > 0)
+                    .then(|| std::time::Duration::from_secs(web_args.idle_timeout)),
+                ready_pipe: web_args.ready_pipe,
             })
             .await
         }

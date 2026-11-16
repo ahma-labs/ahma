@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guardrails for the `ahma gui` page (SPEC R-GUI.2, R-GUI.5, R-GUI.10).
+# Guardrails for the `ahma web` page (SPEC R-GUI.2, R-GUI.5, R-GUI.10).
 #
 # Static, needs no Node: a grep over the TypeScript source and a look at the lockfile.
 # (The committed-build check, which does need Node, is the `web` job in build.yml.)

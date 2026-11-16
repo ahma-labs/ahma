@@ -409,7 +409,7 @@ mod tests {
     /// has shown yet.
     fn session_with_a_question() -> Session {
         let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
-        state.surface = ahma_common::hub::Surface::Gui;
+        state.surface = ahma_common::hub::Surface::Web;
         state.caps = gui_caps();
         let mut gate = ScopeGrantGate::from_request(ScopeGrantRequest {
             decision_id: "q".into(),

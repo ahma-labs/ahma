@@ -1,7 +1,10 @@
-// The pairing screen: the human types the short single-use code their terminal
-// shows. The server decides whether it is right; this shows what it said.
+// The pairing screen: the human pastes the short single-use code `ahma web`
+// copied to their clipboard, or types it from their terminal. The server
+// decides whether it is right; this shows what it said. The page never reads
+// the clipboard itself: the human pastes.
 import { ApiError } from "../api.js";
 import { el, setText } from "../dom.js";
+import { looksLikeFullCode } from "../format.js";
 export function mount(root, deps) {
     const input = el("input", {
         type: "text",
@@ -18,8 +21,7 @@ export function mount(root, deps) {
     const message = el("p", { id: "pair-message", class: "pair-message", role: "alert" });
     const form = el("form", { class: "pair-form" }, el("label", { for: "pair-code", class: "pair-label" }, "Pairing code"), el("div", { class: "pair-row" }, input, button), message);
     let busy = false;
-    form.addEventListener("submit", (event) => {
-        event.preventDefault(); // never a navigation; the code goes to /api/pair by fetch
+    const submit = () => {
         const code = input.value.trim();
         if (busy || code === "")
             return;
@@ -36,8 +38,19 @@ export function mount(root, deps) {
             busy = false;
             button.disabled = false;
         });
+    };
+    form.addEventListener("submit", (event) => {
+        event.preventDefault(); // never a navigation; the code goes to /api/pair by fetch
+        submit();
     });
-    const card = el("main", { class: "pair" }, el("div", { class: "pair-card" }, el("h1", { class: "pair-title" }, "ahma"), el("p", { class: "pair-help" }, "Enter the code shown in your terminal to watch and answer from this browser."), form));
+    // A pasted code is whole: send it without waiting for a click.
+    input.addEventListener("paste", () => {
+        queueMicrotask(() => {
+            if (looksLikeFullCode(input.value))
+                submit();
+        });
+    });
+    const card = el("main", { class: "pair" }, el("div", { class: "pair-card" }, el("h1", { class: "pair-title" }, "ahma"), el("p", { class: "pair-help" }, "Paste the pairing code ahma web copied to your clipboard (⌘V or Ctrl+V), or type the one shown in your terminal, to watch and answer from this browser."), form));
     root.appendChild(card);
     input.focus();
     return {

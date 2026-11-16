@@ -85,7 +85,7 @@ pub async fn run_tui(
 }
 
 /// Find the server a surface will watch, making sure the one per-user hub exists
-/// first: what `ahma tui` and `ahma gui` both do before they show anything, so
+/// first: what `ahma tui` and `ahma web` both do before they show anything, so
 /// they cannot find different servers.
 ///
 /// Problems that are not fatal are pushed as startup notices rather than

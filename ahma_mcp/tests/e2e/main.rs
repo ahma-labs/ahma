@@ -59,4 +59,5 @@ mod test_utils_coverage_test;
 mod tools_dir_auto_detection_test;
 mod transport_patch_extended_test;
 mod update_tools_unit_test;
+mod web_background_server_test;
 mod windows_sandbox_integration_test;

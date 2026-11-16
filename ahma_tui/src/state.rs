@@ -2108,7 +2108,7 @@ pub struct AppState {
     /// What this session may do (SPEC R-GUI.9). The terminal may do everything.
     pub caps: Capabilities,
     /// The surface this session runs on: who its answers and setting changes
-    /// are attributed to (SPEC R-GUI.7). `ahma tui` is the default; `ahma gui`
+    /// are attributed to (SPEC R-GUI.7). `ahma tui` is the default; `ahma web`
     /// sets its own.
     pub surface: ahma_common::hub::Surface,
     pub windows: Vec<TuiWindow>,

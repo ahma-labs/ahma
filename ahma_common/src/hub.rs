@@ -1106,8 +1106,10 @@ pub enum Surface {
     /// `ahma tui`.
     #[default]
     Tui,
-    /// `ahma gui`.
-    Gui,
+    /// `ahma web`: the page in the default browser.
+    Web,
+    /// `ahma desktop`: the same page in ahma's own window.
+    Desktop,
 }
 
 impl Surface {
@@ -1115,7 +1117,8 @@ impl Surface {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tui => "tui",
-            Self::Gui => "gui",
+            Self::Web => "web",
+            Self::Desktop => "desktop",
         }
     }
 
@@ -1138,7 +1141,9 @@ impl Surface {
 pub fn answer_surface(wire: Option<&str>) -> &'static str {
     match wire {
         None | Some("tui") => "tui",
-        Some("gui") => "gui",
+        // `gui` is what `ahma web` sent while it was called `ahma gui`.
+        Some("web") | Some("gui") => "web",
+        Some("desktop") => "desktop",
         Some(_) => "unknown",
     }
 }
@@ -7248,11 +7253,11 @@ mod answer_surface_tests {
             target_instance_id: None,
             advice: None,
             advice_followed: None,
-            surface: Some("gui".into()),
+            surface: Some("web".into()),
         };
         assert_eq!(
             serde_json::to_value(&from_gui).unwrap()["surface"],
-            json!("gui")
+            json!("web")
         );
 
         // An answer from a build that predates the field still reads.
@@ -7273,9 +7278,9 @@ mod answer_surface_tests {
             decision_id: "w1".into(),
             decision: WebApprovalDecision::Deny,
             target_instance_id: None,
-            surface: Some("gui".into()),
+            surface: Some("web".into()),
         };
-        assert_eq!(serde_json::to_value(&web).unwrap()["surface"], json!("gui"));
+        assert_eq!(serde_json::to_value(&web).unwrap()["surface"], json!("web"));
         let routed = HubMsg::SubmitWebApproval {
             decision_id: "w1".into(),
             decision: WebApprovalDecision::Deny,
@@ -7296,19 +7301,28 @@ mod answer_surface_tests {
     fn only_a_known_surface_is_recorded_and_none_means_the_tui() {
         assert_eq!(answer_surface(None), "tui");
         assert_eq!(answer_surface(Some("tui")), "tui");
-        assert_eq!(answer_surface(Some("gui")), "gui");
+        assert_eq!(answer_surface(Some("web")), "web");
+        assert_eq!(answer_surface(Some("desktop")), "desktop");
+        // `ahma web` was `ahma gui` until 0.22.19: an answer from that build
+        // came from the browser surface.
+        assert_eq!(answer_surface(Some("gui")), "web");
         assert_eq!(answer_surface(Some("harness")), "unknown");
         assert_eq!(answer_surface(Some("<script>")), "unknown");
         assert_eq!(answer_surface(Some("")), "unknown");
     }
 
     #[test]
-    fn a_surface_names_itself_and_only_a_gui_says_so_on_the_wire() {
+    fn a_surface_names_itself_and_only_a_non_terminal_says_so_on_the_wire() {
         assert_eq!(Surface::Tui.as_str(), "tui");
-        assert_eq!(Surface::Gui.as_str(), "gui");
+        assert_eq!(Surface::Web.as_str(), "web");
+        assert_eq!(Surface::Desktop.as_str(), "desktop");
         assert_eq!(Surface::Tui.on_wire(), None);
-        assert_eq!(Surface::Gui.on_wire().as_deref(), Some("gui"));
-        assert_eq!(answer_surface(Surface::Gui.on_wire().as_deref()), "gui");
+        assert_eq!(Surface::Web.on_wire().as_deref(), Some("web"));
+        assert_eq!(answer_surface(Surface::Web.on_wire().as_deref()), "web");
+        assert_eq!(
+            answer_surface(Surface::Desktop.on_wire().as_deref()),
+            "desktop"
+        );
         assert_eq!(answer_surface(Surface::Tui.on_wire().as_deref()), "tui");
     }
 
@@ -7319,7 +7333,7 @@ mod answer_surface_tests {
             decision_id: "w1".into(),
             decision: WebApprovalDecision::Deny,
             target_instance_id: None,
-            surface: Some("gui".into()),
+            surface: Some("web".into()),
         };
         let ClientMsg::SubmitWebApproval {
             decision_id,
@@ -7337,7 +7351,7 @@ mod answer_surface_tests {
         };
         assert_eq!(
             serde_json::to_value(&routed).unwrap()["surface"],
-            json!("gui")
+            json!("web")
         );
     }
 }

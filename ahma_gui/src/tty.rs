@@ -1,12 +1,13 @@
 //! The controlling terminal (SPEC R-GUI.2).
 //!
 //! The pairing code is the proof that whoever opens the page is at the keyboard
-//! that started `ahma gui`. A command running in ahma's sandbox can read the
+//! that started `ahma web`. A command running in ahma's sandbox can read the
 //! process list, the environment of other processes on some systems, and the
 //! browser's own files — but not this terminal. So the code is written here and
 //! nowhere else: not standard output, which a harness may capture and a pipe may
 //! carry, and not a file. With no terminal there is nowhere safe to put it, and
-//! `ahma gui` does not start.
+//! `ahma web --foreground` does not start (a plain `ahma web` copies the code to
+//! the clipboard instead, see `crate::launch`).
 
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
@@ -31,7 +32,7 @@ impl Terminal {
             .write(true)
             .open(out_path)
             .with_context(|| {
-                "ahma gui needs a terminal: it shows a pairing code there that you type \
+                "ahma web needs a terminal: it shows a pairing code there that you type \
                  into the page, which proves the page was opened by whoever started it. \
                  Run it from a terminal, not from a script or a pipe."
             })?;
@@ -59,7 +60,7 @@ impl Terminal {
     pub fn on_enter(&self, on_enter: impl Fn() + Send + 'static) -> Result<()> {
         let input = self.input.try_clone().context("cannot read the terminal")?;
         std::thread::Builder::new()
-            .name("ahma-gui-tty".into())
+            .name("ahma-web-tty".into())
             .spawn(move || {
                 let mut lines = BufReader::new(input).lines();
                 while let Some(Ok(_)) = lines.next() {
@@ -74,7 +75,7 @@ impl Terminal {
 /// What is shown when the server is up.
 pub fn banner(url: &str) -> String {
     format!(
-        "\nahma gui is listening on this machine only.\n  Address  {url}\n\
+        "\nahma web is listening on this machine only.\n  Address  {url}\n\
          Type the pairing code below into the page. Press Enter here if pairing locks; \
          Ctrl-C stops the server.\n\
          The browser you pair, and its extensions, can do whatever the page can: \

@@ -286,19 +286,20 @@ animation, and a task inside expands into its live output.
 
 See [docs/tui.md](docs/tui.md) and [docs/doctor.md](docs/doctor.md).
 
-### Browser GUI — the same view in a tab *(experimental)*
+### `ahma web` — the same view in your browser *(experimental)*
 
 ```bash
-ahma gui
+ahma web
 ```
 
-The work view, chat and permission questions of `ahma tui` in a browser. It listens on this
-machine only (127.0.0.1 and ::1, no option to widen it), and a tab is paired by a code that
-`ahma gui` prints on your terminal and you type into the page, so a process that cannot read
-your terminal cannot use it. It refuses requests that did not come from its own page, serves
-a first-party page with no runtime dependencies, and is trusted with less than the terminal:
-no host commands, and no answer that is saved to settings. Use an SSH port-forward to reach it
-from another machine. See [docs/gui.md](docs/gui.md).
+The work view, chat and permission questions of `ahma tui` in a browser tab, for the directory
+you run it in. It returns to the prompt at once, copies a single-use pairing code to your
+clipboard for you to paste into the page, and stops by itself a minute after its last tab
+closes. It listens on this machine only (127.0.0.1 and ::1, no option to widen it), refuses
+requests that did not come from its own page, serves a first-party page with no runtime
+dependencies, and is trusted with less than the terminal: no host commands, and no answer that
+is saved to settings. ahma's macOS sandbox keeps the commands it runs off the clipboard; use
+`--no-copy` to type the code instead. See [docs/web.md](docs/web.md).
 
 ### `ahma_help` — guidance for the AI, from ahma
 

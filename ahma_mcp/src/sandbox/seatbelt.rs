@@ -134,7 +134,7 @@ impl Sandbox {
 (allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
 (allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
 {exec_config_deny_rules}{network_rules}{socket_connect_denies}{agent_connect_denies}{hub_denies}(allow mach-lookup)
-(allow ipc-posix-shm*)
+{pasteboard_denies}(allow ipc-posix-shm*)
 {broker_rules}"#,
             working_dir = wd_str,
             working_dir_write = working_dir_write,
@@ -154,6 +154,7 @@ impl Sandbox {
             hub_denies = hub_denies,
             agent_connect_denies = agent_connect_denies,
             broker_rules = broker_rules(),
+            pasteboard_denies = pasteboard_denies(),
         );
 
         tracing::debug!("Generated macOS Sandbox (Seatbelt) profile:\n{}", profile);
@@ -697,6 +698,22 @@ fn broker_rules() -> String {
         .collect()
 }
 
+/// The Mach services behind the clipboard: the pasteboard server, by its
+/// current and its legacy name.
+pub(crate) const PASTEBOARD_SERVICES: &[&str] = &["com.apple.pasteboard.1", "com.apple.pboard"];
+
+/// SPEC R6.2.15: no clipboard inside the sandbox. `ahma web` copies its
+/// pairing code to the clipboard for the human to paste; a command the agent
+/// runs that could read it could pair a tab and answer its own questions.
+/// `pbcopy`, `pbpaste` and `osascript`'s `the clipboard` all go through this
+/// server. Emitted after `(allow mach-lookup)`: the last matching rule wins.
+fn pasteboard_denies() -> String {
+    PASTEBOARD_SERVICES
+        .iter()
+        .map(|service| format!("(deny mach-lookup (global-name \"{service}\"))\n"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::core::Sandbox;
@@ -746,6 +763,33 @@ mod tests {
         let p = sb.generate_seatbelt_profile_test(dir.path());
         assert!(p.contains("(allow network*)"));
         assert!(!p.contains("(deny network-outbound (remote ip"));
+    }
+
+    /// SPEC R6.2.15: a sandboxed command cannot read or write the clipboard.
+    /// `ahma web` puts its pairing code there, and an agent's command that
+    /// could read it could pair a tab and answer its own questions. The deny
+    /// comes after the blanket mach-lookup allow, so under last-match-wins
+    /// it holds.
+    #[test]
+    fn the_pasteboard_is_denied_after_the_mach_lookup_allow() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        let allow = p.find("(allow mach-lookup)").expect("the blanket allow");
+        for service in super::PASTEBOARD_SERVICES {
+            let deny = format!("(deny mach-lookup (global-name \"{service}\"))");
+            let at = p
+                .find(&deny)
+                .unwrap_or_else(|| panic!("{deny} missing:\n{p}"));
+            assert!(at > allow, "{service} must be denied after the allow");
+        }
     }
 
     /// The read-only lane may write xcrun's cache file and nothing else under

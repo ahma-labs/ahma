@@ -367,7 +367,7 @@ mod tests {
 
     fn state(caps: Capabilities) -> AppState {
         let mut state = AppState::new("http://127.0.0.1:9", "HTTP", true);
-        state.surface = ahma_common::hub::Surface::Gui;
+        state.surface = ahma_common::hub::Surface::Web;
         state.caps = caps;
         state
     }

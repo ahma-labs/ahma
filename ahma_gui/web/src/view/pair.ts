@@ -1,8 +1,11 @@
-// The pairing screen: the human types the short single-use code their terminal
-// shows. The server decides whether it is right; this shows what it said.
+// The pairing screen: the human pastes the short single-use code `ahma web`
+// copied to their clipboard, or types it from their terminal. The server
+// decides whether it is right; this shows what it said. The page never reads
+// the clipboard itself: the human pastes.
 
 import { ApiError } from "../api.ts";
 import { el, setText } from "../dom.ts";
+import { looksLikeFullCode } from "../format.ts";
 import type { Mounted } from "../dom.ts";
 
 export interface PairDeps {
@@ -34,8 +37,7 @@ export function mount(root: HTMLElement, deps: PairDeps): Mounted<{ notice: stri
   );
 
   let busy = false;
-  form.addEventListener("submit", (event) => {
-    event.preventDefault(); // never a navigation; the code goes to /api/pair by fetch
+  const submit = () => {
     const code = input.value.trim();
     if (busy || code === "") return;
     busy = true;
@@ -51,12 +53,26 @@ export function mount(root: HTMLElement, deps: PairDeps): Mounted<{ notice: stri
         busy = false;
         button.disabled = false;
       });
+  };
+  form.addEventListener("submit", (event) => {
+    event.preventDefault(); // never a navigation; the code goes to /api/pair by fetch
+    submit();
+  });
+  // A pasted code is whole: send it without waiting for a click.
+  input.addEventListener("paste", () => {
+    queueMicrotask(() => {
+      if (looksLikeFullCode(input.value)) submit();
+    });
   });
 
   const card = el(
     "main",
     { class: "pair" },
-    el("div", { class: "pair-card" }, el("h1", { class: "pair-title" }, "ahma"), el("p", { class: "pair-help" }, "Enter the code shown in your terminal to watch and answer from this browser."), form),
+    el("div", { class: "pair-card" }, el("h1", { class: "pair-title" }, "ahma"), el(
+        "p",
+        { class: "pair-help" },
+        "Paste the pairing code ahma web copied to your clipboard (⌘V or Ctrl+V), or type the one shown in your terminal, to watch and answer from this browser.",
+      ), form),
   );
   root.appendChild(card);
   input.focus();
