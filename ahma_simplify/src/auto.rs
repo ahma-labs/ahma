@@ -49,92 +49,115 @@ pub fn prioritize_fixes(
     }
 
     let mut candidates: Vec<PrioritizedFix> = Vec::new();
+    collect_complexity_fixes(report, base_dir, &mut candidates);
+    collect_reuse_fixes(report, base_dir, &mut candidates);
+    collect_altitude_fixes(report, base_dir, &mut candidates);
+    collect_dead_code_fixes(report, base_dir, &mut candidates);
 
-    // 1. Complexity Lens candidates
+    // Sort descending by value_score; tie-break on target for deterministic order
+    candidates.sort_by(|a, b| {
+        b.value_score
+            .partial_cmp(&a.value_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.target.cmp(&b.target))
+    });
+
+    candidates.truncate(limit);
+    for (idx, fix) in candidates.iter_mut().enumerate() {
+        fix.rank = idx + 1;
+    }
+    candidates
+}
+
+fn collect_complexity_fixes(
+    report: &MultiLensReport,
+    base_dir: &Path,
+    out: &mut Vec<PrioritizedFix>,
+) {
     for file in &report.complexity_files {
         // Only prioritize files that have meaningful complexity or hotspots
-        if file.score < 90.0 || file.peak_cognitive >= 10.0 || !file.hotspots.is_empty() {
-            let base_val = (100.0 - file.score).max(5.0);
-            let peak_val = file.peak_cognitive * 1.5;
-            let value_score = base_val + peak_val;
-
-            let rel_path = get_relative_path(Path::new(&file.path), base_dir);
-            let rel_str = rel_path.display().to_string();
-
-            let mut hotspots_desc = String::new();
-            if !file.hotspots.is_empty() {
-                hotspots_desc.push_str("\nHOTSPOT FUNCTIONS TO REFACTOR:\n");
-                for (h_idx, h) in file.hotspots.iter().enumerate() {
-                    hotspots_desc.push_str(&format!(
-                        "  {}. `{}` (lines {}-{}, cognitive: {:.0}, cyclomatic: {:.0}, SLOC: {:.0})\n",
-                        h_idx + 1,
-                        h.name,
-                        h.start_line,
-                        h.end_line,
-                        h.cognitive,
-                        h.cyclomatic,
-                        h.sloc
-                    ));
-                }
-            }
-
-            let culprit = crate::report::identify_culprit(file);
-            let action_plan = format!(
-                "TARGET: {}\n\
-                 SIMPLICITY: {:.0}% | CULPRIT: {}\n\
-                 METRICS: Cognitive={:.0}, PeakCognitive={:.0}, MI={:.1}, SLOC={:.0}{}\n\n\
-                 ACTION STEPS:\n\
-                 1. Read the target file and the listed hotspot functions.\n\
-                 2. Evaluate critically: Is complexity volume-driven (many match arms, config fields)\n\
-                    or tangled control flow / deep nesting?\n\
-                 3. If genuinely complex, edit ONLY the listed hotspot functions:\n\
-                    - Introduce early returns and guard clauses to reduce nesting depth\n\
-                    - Extract well-scoped helper functions with clear, single responsibilities\n\
-                    - Preserve public signatures and observable behaviors\n\
-                 4. Verify with compiler checks and test suite (`cargo nextest run`).\n\
-                 5. Re-check improvement with `ahma simplify . --verify {}`.",
-                rel_str,
-                file.score,
-                culprit,
-                file.cognitive,
-                file.peak_cognitive,
-                file.mi,
-                file.sloc,
-                hotspots_desc,
-                rel_str
-            );
-
-            candidates.push(PrioritizedFix {
-                rank: 0,
-                lens: Lens::Complexity,
-                target: rel_str.clone(),
-                value_score,
-                title: format!("Refactor complexity hotspots in {}", rel_str),
-                summary: format!(
-                    "Simplicity: {:.0}%, Peak Cognitive: {:.0}, MI: {:.1}, SLOC: {:.0}",
-                    file.score, file.peak_cognitive, file.mi, file.sloc
-                ),
-                action_plan,
-            });
+        if file.score >= 90.0 && file.peak_cognitive < 10.0 && file.hotspots.is_empty() {
+            continue;
         }
-    }
+        let base_val = (100.0 - file.score).max(5.0);
+        let peak_val = file.peak_cognitive * 1.5;
+        let value_score = base_val + peak_val;
 
-    // 2. Reuse Lens candidates (Duplicate Code Blocks)
+        let rel_path = get_relative_path(Path::new(&file.path), base_dir);
+        let rel_str = rel_path.display().to_string();
+
+        let mut hotspots_desc = String::new();
+        if !file.hotspots.is_empty() {
+            hotspots_desc.push_str("\nHOTSPOT FUNCTIONS TO REFACTOR:\n");
+            for (h_idx, h) in file.hotspots.iter().enumerate() {
+                hotspots_desc.push_str(&format!(
+                    "  {}. `{}` (lines {}-{}, cognitive: {:.0}, cyclomatic: {:.0}, SLOC: {:.0})\n",
+                    h_idx + 1,
+                    h.name,
+                    h.start_line,
+                    h.end_line,
+                    h.cognitive,
+                    h.cyclomatic,
+                    h.sloc
+                ));
+            }
+        }
+
+        let culprit = crate::report::identify_culprit(file);
+        let action_plan = format!(
+            "TARGET: {}\n\
+             SIMPLICITY: {:.0}% | CULPRIT: {}\n\
+             METRICS: Cognitive={:.0}, PeakCognitive={:.0}, MI={:.1}, SLOC={:.0}{}\n\n\
+             ACTION STEPS:\n\
+             1. Read the target file and the listed hotspot functions.\n\
+             2. Evaluate critically: Is complexity volume-driven (many match arms, config fields)\n\
+                or tangled control flow / deep nesting?\n\
+             3. If genuinely complex, edit ONLY the listed hotspot functions:\n\
+                - Introduce early returns and guard clauses to reduce nesting depth\n\
+                - Extract well-scoped helper functions with clear, single responsibilities\n\
+                - Preserve public signatures and observable behaviors\n\
+             4. Verify with compiler checks and test suite (`cargo nextest run`).\n\
+             5. Re-check improvement with `ahma simplify . --verify {}`.",
+            rel_str,
+            file.score,
+            culprit,
+            file.cognitive,
+            file.peak_cognitive,
+            file.mi,
+            file.sloc,
+            hotspots_desc,
+            rel_str
+        );
+
+        out.push(PrioritizedFix {
+            rank: 0,
+            lens: Lens::Complexity,
+            target: rel_str.clone(),
+            value_score,
+            title: format!("Refactor complexity hotspots in {}", rel_str),
+            summary: format!(
+                "Simplicity: {:.0}%, Peak Cognitive: {:.0}, MI: {:.1}, SLOC: {:.0}",
+                file.score, file.peak_cognitive, file.mi, file.sloc
+            ),
+            action_plan,
+        });
+    }
+}
+
+fn collect_reuse_fixes(report: &MultiLensReport, base_dir: &Path, out: &mut Vec<PrioritizedFix>) {
     for group in &report.duplicates {
         let copies = group.locations.len();
         let wasted_lines = copies.saturating_sub(1) * group.line_count;
         let value_score = (wasted_lines as f64) * 2.0;
 
-        let mut loc_strings = Vec::new();
-        for loc in &group.locations {
-            let rel = get_relative_path(&loc.file, base_dir);
-            loc_strings.push(format!(
-                "{}:{}-{}",
-                rel.display(),
-                loc.start_line,
-                loc.end_line
-            ));
-        }
+        let loc_strings: Vec<String> = group
+            .locations
+            .iter()
+            .map(|loc| {
+                let rel = get_relative_path(&loc.file, base_dir);
+                format!("{}:{}-{}", rel.display(), loc.start_line, loc.end_line)
+            })
+            .collect();
         let target_str = loc_strings.join(", ");
 
         let mut loc_list_md = String::new();
@@ -165,7 +188,7 @@ pub fn prioritize_fixes(
             copies, group.line_count, wasted_lines, loc_list_md, sample_preview, copies
         );
 
-        candidates.push(PrioritizedFix {
+        out.push(PrioritizedFix {
             rank: 0,
             lens: Lens::Reuse,
             target: target_str,
@@ -181,8 +204,13 @@ pub fn prioritize_fixes(
             action_plan,
         });
     }
+}
 
-    // 3. Altitude Lens candidates (Thin-Wrapper Delegation Chains)
+fn collect_altitude_fixes(
+    report: &MultiLensReport,
+    base_dir: &Path,
+    out: &mut Vec<PrioritizedFix>,
+) {
     for chain in &report.altitude_chains {
         let value_score = (chain.depth as f64) * 25.0;
 
@@ -224,7 +252,7 @@ pub fn prioritize_fixes(
             chain.depth, chain_steps, chain.description, last_callee
         );
 
-        candidates.push(PrioritizedFix {
+        out.push(PrioritizedFix {
             rank: 0,
             lens: Lens::Altitude,
             target: target_str,
@@ -237,8 +265,13 @@ pub fn prioritize_fixes(
             action_plan,
         });
     }
+}
 
-    // 4. Dead Code Lens candidates (Unreferenced Exports)
+fn collect_dead_code_fixes(
+    report: &MultiLensReport,
+    base_dir: &Path,
+    out: &mut Vec<PrioritizedFix>,
+) {
     for sym in &report.dead_symbols {
         let value_score = match sym.kind {
             SymbolKind::Function | SymbolKind::Method => 35.0,
@@ -269,7 +302,7 @@ pub fn prioritize_fixes(
             sym.name
         );
 
-        candidates.push(PrioritizedFix {
+        out.push(PrioritizedFix {
             rank: 0,
             lens: Lens::DeadCode,
             target: target_str,
@@ -283,21 +316,6 @@ pub fn prioritize_fixes(
             action_plan,
         });
     }
-
-    // Sort descending by value_score; tie-break on target for deterministic order
-    candidates.sort_by(|a, b| {
-        b.value_score
-            .partial_cmp(&a.value_score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.target.cmp(&b.target))
-    });
-
-    let mut top_fixes: Vec<PrioritizedFix> = candidates.into_iter().take(limit).collect();
-    for (idx, fix) in top_fixes.iter_mut().enumerate() {
-        fix.rank = idx + 1;
-    }
-
-    top_fixes
 }
 
 /// Render the prioritized auto-simplification report as Markdown.

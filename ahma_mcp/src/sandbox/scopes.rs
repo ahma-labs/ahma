@@ -163,39 +163,53 @@ fn canonicalize_scopes_with_home(
     };
 
     for scope in scopes {
-        if mode != SandboxMode::Test && (is_filesystem_root(&scope) || scope == Path::new("")) {
+        let (canonical, alias) =
+            canonicalize_single_scope(&scope, cwd.as_deref(), mode, context, home)?;
+        push_unique(canonical);
+        if let Some(alias) = alias {
+            push_unique(alias);
+        }
+    }
+    Ok(canonicalized)
+}
+
+fn canonicalize_single_scope(
+    scope: &Path,
+    cwd: Option<&Path>,
+    mode: SandboxMode,
+    context: &str,
+    home: Option<&Path>,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    if mode != SandboxMode::Test && (is_filesystem_root(scope) || scope == Path::new("")) {
+        return Err(anyhow!(
+            "Filesystem root or empty path is not a valid sandbox scope \
+             (path: '{}', OS: {}). {}",
+            scope.display(),
+            std::env::consts::OS,
+            context
+        ));
+    }
+
+    let absolute_alias = if scope.is_absolute() {
+        Some(scope.to_path_buf())
+    } else {
+        cwd.map(|c| normalize_path_lexically(&c.join(scope)))
+    };
+
+    let canonical = match dunce::canonicalize(scope) {
+        Ok(c) => c,
+        Err(_) if mode == SandboxMode::Test => scope.to_path_buf(),
+        Err(e) => {
             return Err(anyhow!(
-                "Filesystem root or empty path is not a valid sandbox scope \
-                 (path: '{}', OS: {}). {}",
+                "Failed to canonicalize sandbox scope '{}': {}",
                 scope.display(),
-                std::env::consts::OS,
-                context
+                e
             ));
         }
+    };
 
-        let absolute_alias = if scope.is_absolute() {
-            Some(scope.clone())
-        } else {
-            cwd.as_ref()
-                .map(|c| normalize_path_lexically(&c.join(&scope)))
-        };
-
-        let canonical = match dunce::canonicalize(&scope) {
-            Ok(c) => c,
-            Err(e) => {
-                if mode == SandboxMode::Test {
-                    scope.clone()
-                } else {
-                    return Err(anyhow!(
-                        "Failed to canonicalize sandbox scope '{}': {}",
-                        scope.display(),
-                        e
-                    ));
-                }
-            }
-        };
-
-        if mode != SandboxMode::Test && is_filesystem_root(&canonical) {
+    if mode != SandboxMode::Test {
+        if is_filesystem_root(&canonical) {
             return Err(anyhow!(
                 "Filesystem root is not a valid sandbox scope \
                  (resolved from '{}', OS: {}). {}",
@@ -204,51 +218,46 @@ fn canonicalize_scopes_with_home(
                 context
             ));
         }
-
-        // SPEC R5.2.4: the home directory and anything above it are hard
-        // rejections, checked here (post-canonicalization) so a symlinked or
-        // differently-cased spelling cannot walk past it (R5.7).
-        if mode != SandboxMode::Test {
-            match home_breadth(&canonical, home) {
-                HomeBreadth::Contained => {}
-                HomeBreadth::HomeItself => {
-                    return Err(anyhow!(
-                        "Your home directory is not a valid sandbox scope: '{}' exposes every \
-                         dotfile, key and credential under it (resolved from '{}', OS: {}). \
-                         Scope to the project you are working on, or to a container directory \
-                         under your home directory (e.g. ~/github, or ~/github/myproject). {}",
-                        canonical.display(),
-                        scope.display(),
-                        std::env::consts::OS,
-                        context
-                    ));
-                }
-                HomeBreadth::AboveHome => {
-                    return Err(anyhow!(
-                        "'{}' is an ancestor of your home directory and is not a valid sandbox \
-                         scope: it spans every user account on this machine, which is materially \
-                         the same as scoping to the filesystem root (resolved from '{}', OS: {}). \
-                         Scope to the project you are working on, or to a container directory \
-                         under your home directory (e.g. ~/github, or ~/github/myproject). {}",
-                        canonical.display(),
-                        scope.display(),
-                        std::env::consts::OS,
-                        context
-                    ));
-                }
-            }
-        }
-
-        push_unique(canonical.clone());
-
-        if let Some(alias) = absolute_alias {
-            let alias = normalize_path_lexically(&alias);
-            if alias != canonical {
-                push_unique(alias);
-            }
-        }
+        check_home_breadth(scope, &canonical, home, context)?;
     }
-    Ok(canonicalized)
+
+    let alias = absolute_alias
+        .map(|a| normalize_path_lexically(&a))
+        .filter(|a| a != &canonical);
+    Ok((canonical, alias))
+}
+
+/// SPEC R5.2.4: the home directory and anything above it are hard rejections,
+/// checked here (post-canonicalization) so a symlinked or differently-cased
+/// spelling cannot walk past it (R5.7).
+fn check_home_breadth(
+    scope: &Path,
+    canonical: &Path,
+    home: Option<&Path>,
+    context: &str,
+) -> Result<()> {
+    let headline = match home_breadth(canonical, home) {
+        HomeBreadth::Contained => return Ok(()),
+        HomeBreadth::HomeItself => format!(
+            "Your home directory is not a valid sandbox scope: '{}' exposes every \
+             dotfile, key and credential under it",
+            canonical.display()
+        ),
+        HomeBreadth::AboveHome => format!(
+            "'{}' is an ancestor of your home directory and is not a valid sandbox \
+             scope: it spans every user account on this machine, which is materially \
+             the same as scoping to the filesystem root",
+            canonical.display()
+        ),
+    };
+    Err(anyhow!(
+        "{headline} (resolved from '{}', OS: {}). \
+         Scope to the project you are working on, or to a container directory \
+         under your home directory (e.g. ~/github, or ~/github/myproject). {}",
+        scope.display(),
+        std::env::consts::OS,
+        context
+    ))
 }
 
 /// Normalize a path lexically (without filesystem access).

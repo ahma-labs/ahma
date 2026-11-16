@@ -4264,15 +4264,7 @@ mod tests {
             label: "ahma".into(),
             client: Some(client.into()),
             session_id: Some(format!("sess-{id}")),
-            client_pid: None,
-            sampling: false,
-            elicitation: false,
-            ended_epoch_ms: None,
-            scopes: vec![],
-            read_scopes: vec![],
-            grants: vec![],
-            enforcement: None,
-            native_terminal: None,
+            ..Default::default()
         }
     }
 

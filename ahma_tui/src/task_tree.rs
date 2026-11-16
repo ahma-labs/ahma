@@ -471,16 +471,7 @@ mod tests {
             scope: scope.into(),
             label: label.into(),
             client: client.map(String::from),
-            session_id: None,
-            client_pid: None,
-            sampling: false,
-            elicitation: false,
-            ended_epoch_ms: None,
-            scopes: vec![],
-            read_scopes: vec![],
-            grants: vec![],
-            enforcement: None,
-            native_terminal: None,
+            ..Default::default()
         }
     }
 

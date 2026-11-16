@@ -13,6 +13,7 @@
 // This entire test file is macOS-specific - skip compilation on other platforms
 #![cfg(target_os = "macos")]
 
+use ahma_mcp::test_utils::{assertions::assert_command_success, strict_sandbox};
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
@@ -114,16 +115,7 @@ fn test_seatbelt_profile_executes_echo() {
         .output()
         .expect("Failed to execute sandbox-exec");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "sandbox-exec should succeed for echo. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "sandbox-exec should succeed for echo");
     assert!(
         stdout.contains("hello world"),
         "Output should contain 'hello world'. Got: {}",
@@ -145,16 +137,7 @@ fn test_seatbelt_profile_executes_pwd() {
         .output()
         .expect("Failed to execute sandbox-exec");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "sandbox-exec should succeed for pwd. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let _stdout = assert_command_success(&output, "sandbox-exec should succeed for pwd");
 }
 
 /// Test that ls works within the sandbox
@@ -176,16 +159,7 @@ fn test_seatbelt_profile_executes_ls() {
         .output()
         .expect("Failed to execute sandbox-exec");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "sandbox-exec should succeed for ls. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "sandbox-exec should succeed for ls");
     assert!(
         stdout.contains("testfile.txt"),
         "ls output should contain our test file. Got: {}",
@@ -213,16 +187,8 @@ fn test_seatbelt_profile_allows_writes_in_scope() {
         .output()
         .expect("Failed to execute sandbox-exec");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "sandbox-exec should allow writes in sandbox scope. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout =
+        assert_command_success(&output, "sandbox-exec should allow writes in sandbox scope");
     assert!(
         stdout.contains("test content"),
         "Should be able to read written file. Got: {}",
@@ -303,16 +269,8 @@ fn test_seatbelt_profile_handles_complex_shell_commands() {
         .output()
         .expect("Failed to execute sandbox-exec");
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "sandbox-exec should handle pipes. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "sandbox-exec should handle pipes");
+    let stdout = stdout.trim().to_string();
     // Should find 3 lines containing "line"
     assert_eq!(
         stdout, "3",
@@ -335,16 +293,7 @@ fn test_seatbelt_profile_works_with_bash() {
         .output()
         .expect("Failed to execute sandbox-exec");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "sandbox-exec should work with bash. Exit: {:?}, stdout: {}, stderr: {}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
+    let stdout = assert_command_success(&output, "sandbox-exec should work with bash");
     assert!(
         stdout.contains("hello"),
         "Bash variable expansion should work. Got: {}",
@@ -407,7 +356,7 @@ fn test_sandbox_exec_is_available() {
 #[test]
 fn test_credential_read_deny_is_kernel_enforced() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_credential_read_denies};
+    use ahma_mcp::sandbox::set_credential_read_denies;
 
     let scope = TempDir::new().expect("scope dir");
     let secret_dir = TempDir::new().expect("secret dir");
@@ -420,14 +369,7 @@ fn test_credential_read_deny_is_kernel_enforced() {
     // `no_temp_files = true` so the profile does not emit a blanket
     // /private/var/folders read-allow that would override the deny (TempDir lives
     // under /var/folders on macOS).
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        true,  // no_temp_files
-        false, // livelog
-        false, // tmp_access
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), true);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     set_credential_read_denies(Vec::new());
 
@@ -473,9 +415,7 @@ fn test_credential_read_deny_is_kernel_enforced() {
 #[test]
 fn test_ssh_keys_are_unreadable_whatever_their_name() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{
-        Sandbox, SandboxMode, default_credential_read_denies, set_credential_read_denies,
-    };
+    use ahma_mcp::sandbox::{default_credential_read_denies, set_credential_read_denies};
 
     let scope = TempDir::new().expect("scope dir");
     let home = TempDir::new().expect("home dir");
@@ -497,14 +437,7 @@ fn test_ssh_keys_are_unreadable_whatever_their_name() {
     // SAFETY: nextest runs each test in its own process.
     unsafe { std::env::set_var("HOME", &h) };
     set_credential_read_denies(default_credential_read_denies(&h));
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        true,  // no_temp_files: the fake home lives under /var/folders
-        false, // livelog
-        false, // tmp_access
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), true);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     set_credential_read_denies(Vec::new());
 
@@ -535,7 +468,6 @@ fn test_ssh_keys_are_unreadable_whatever_their_name() {
 #[test]
 fn test_container_daemon_sockets_refuse_a_sandboxed_connect() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     use std::os::unix::net::UnixListener;
 
     let scope = TempDir::new().expect("scope dir");
@@ -559,14 +491,7 @@ fn test_container_daemon_sockets_refuse_a_sandboxed_connect() {
     }
     // SAFETY: nextest runs each test in its own process.
     unsafe { std::env::set_var("HOME", &h) };
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        true,  // no_temp_files: the fake home lives under /var/folders
-        false, // livelog
-        false, // tmp_access
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), true);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
 
     let connects = |sandboxed: bool, sock: &Path| -> bool {
@@ -610,7 +535,7 @@ fn test_container_daemon_sockets_refuse_a_sandboxed_connect() {
 #[test]
 fn test_a_sandboxed_command_cannot_reach_the_hub() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, SshAgentMode, set_ssh_agent_mode};
+    use ahma_mcp::sandbox::{SshAgentMode, set_ssh_agent_mode};
     use std::os::unix::net::UnixListener;
 
     /// Files this test made in the runtime directory, removed however it ends.
@@ -663,14 +588,7 @@ fn test_a_sandboxed_command_cannot_reach_the_hub() {
         cleanup.0.push(secret.clone());
     }
 
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        true,  // no_temp_files
-        false, // livelog
-        false, // tmp_access
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), true);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
 
     let run = |sandboxed: bool, program: &str, args: &[&str]| -> bool {
@@ -739,7 +657,6 @@ async fn test_a_sandboxed_command_reaches_its_ssh_broker() {
         Broker, Decision, KeySources, SignConsent, SignRequest,
     };
     use ahma_mcp::credentials::ssh_agent::host::{BrokerLease, agent_dir};
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     use std::sync::Arc;
 
     struct Deny;
@@ -765,14 +682,7 @@ UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
     let lease = BrokerLease::start(broker, &agent_dir().expect("agent dir")).expect("lease");
 
     let scope = TempDir::new().expect("scope");
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        true,
-        false,
-        false,
-    )
-    .expect("sandbox");
+    let sandbox = strict_sandbox(scope.path(), true);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     let socket = lease.socket().to_path_buf();
     let out = tokio::task::spawn_blocking(move || {
@@ -810,7 +720,7 @@ fn test_a_sandboxed_command_reaches_the_broker_and_not_the_humans_agent() {
     skip_if_nested_sandbox!();
     use ahma_mcp::credentials::ssh_agent::consent::adopt_upstream;
     use ahma_mcp::credentials::ssh_agent::host::agent_dir;
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, SshAgentMode, set_ssh_agent_mode};
+    use ahma_mcp::sandbox::{SshAgentMode, set_ssh_agent_mode};
     use std::os::unix::net::UnixListener;
 
     /// The broker-directory socket, removed however the test ends.
@@ -846,14 +756,7 @@ fn test_a_sandboxed_command_reaches_the_broker_and_not_the_humans_agent() {
     let _ = std::fs::remove_file(&broker.0);
     let _broker_listener = listen(&broker.0);
 
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        true,  // no_temp_files: the stand-in agent lives under /var/folders
-        false, // livelog
-        false, // tmp_access
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), true);
     let connects = |profile: Option<&str>, sock: &Path| -> bool {
         let mut cmd = match profile {
             Some(profile) => {
@@ -903,7 +806,6 @@ async fn test_a_refusal_is_reported_from_the_kernels_record() {
     skip_if_nested_sandbox!();
     use ahma_mcp::adapter::Adapter;
     use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
     use std::sync::Arc;
 
@@ -922,16 +824,7 @@ async fn test_a_refusal_is_reported_from_the_kernels_record() {
     let scope = dir_in_target("ahma-kernel-record-scope-");
     let outside = dir_in_target("ahma-kernel-record-outside-");
     let target = dunce::canonicalize(outside.path()).unwrap().join("x.lock");
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![scope.path().to_path_buf()],
-            SandboxMode::Strict,
-            true,
-            false,
-            false,
-        )
-        .expect("sandbox"),
-    );
+    let sandbox = Arc::new(strict_sandbox(scope.path(), true));
     let adapter = Adapter::new(
         Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
             std::time::Duration::from_secs(30),
@@ -1002,7 +895,6 @@ async fn test_a_refusal_is_reported_from_the_kernels_record() {
 #[test]
 fn test_worktree_git_operations_are_allowed_and_hooks_denied_in_kernel() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 
     let tmp = TempDir::new().expect("temp dir");
     let main_repo = tmp.path().join("main");
@@ -1043,14 +935,7 @@ fn test_worktree_git_operations_are_allowed_and_hooks_denied_in_kernel() {
     );
 
     // 3. Create sandbox scoped to the worktree
-    let sandbox = Sandbox::new(
-        vec![wt.clone()],
-        SandboxMode::Strict,
-        false, // no_temp_files
-        false, // livelog
-        false, // tmp_access
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(&wt, false);
     let profile = sandbox.generate_seatbelt_profile_test(&wt);
 
     // 4. Test: Sandboxed git commit inside worktree MUST succeed
@@ -1149,7 +1034,6 @@ fn test_worktree_git_operations_are_allowed_and_hooks_denied_in_kernel() {
 #[test]
 fn test_poisoned_gitdir_pointer_cannot_widen_sandbox_in_kernel() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 
     let tmp = TempDir::new().expect("temp dir");
     let root = dunce::canonicalize(tmp.path()).unwrap();
@@ -1168,14 +1052,7 @@ fn test_poisoned_gitdir_pointer_cannot_widen_sandbox_in_kernel() {
     // uses it: `TempDir` lives under `/var/folders`, and the default temp rules
     // grant that whole subtree — which would let the "escape" succeed for a
     // reason that has nothing to do with git dirs.
-    let sandbox = Sandbox::new(
-        vec![ws.clone()],
-        SandboxMode::Strict,
-        true,  // no_temp_files
-        false, // livelog
-        false, // tmp_access
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(&ws, true);
 
     // Step 1: the poisoning write is inside the workspace and must be permitted.
     let poison = Command::new("sandbox-exec")
@@ -1232,7 +1109,7 @@ fn test_poisoned_gitdir_pointer_cannot_widen_sandbox_in_kernel() {
 #[test]
 fn sandboxed_kill_of_foreign_pid_is_denied() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_signal_other_processes};
+    use ahma_mcp::sandbox::set_signal_other_processes;
 
     let scope = TempDir::new().expect("scope dir");
     // The "other session": a process this sandbox did not start.
@@ -1243,14 +1120,7 @@ fn sandboxed_kill_of_foreign_pid_is_denied() {
     let foreign_pid = foreign.id();
 
     set_signal_other_processes(false);
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     assert!(
         profile.contains("(allow signal (target same-sandbox))"),
@@ -1288,18 +1158,11 @@ fn sandboxed_kill_of_foreign_pid_is_denied() {
 #[test]
 fn sandboxed_kill_of_own_child_succeeds() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_signal_other_processes};
+    use ahma_mcp::sandbox::set_signal_other_processes;
 
     let scope = TempDir::new().expect("scope dir");
     set_signal_other_processes(false);
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
 
     let ok = Command::new("sandbox-exec")
@@ -1379,20 +1242,13 @@ fn run_probe_in(profile: &str, bin: &Path, cwd: &Path) -> String {
 #[test]
 fn default_profile_hides_metal_device() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_allow_gpu};
+    use ahma_mcp::sandbox::set_allow_gpu;
     let scope = TempDir::new().expect("scope dir");
     let Some(bin) = metal_probe(scope.path()) else {
         return;
     };
     set_allow_gpu(false);
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     assert!(
         !profile.contains("iokit-open"),
@@ -1416,20 +1272,13 @@ fn default_profile_hides_metal_device() {
 #[test]
 fn gpu_allowed_profile_exposes_metal_device() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_allow_gpu};
+    use ahma_mcp::sandbox::set_allow_gpu;
     let scope = TempDir::new().expect("scope dir");
     let Some(bin) = metal_probe(scope.path()) else {
         return;
     };
     set_allow_gpu(true);
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     set_allow_gpu(false);
     assert!(
@@ -1454,7 +1303,6 @@ fn gpu_allowed_profile_exposes_metal_device() {
 #[test]
 fn an_xcrun_tool_runs_in_the_read_only_lane() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     let scope = TempDir::new().expect("scope dir");
     let tmp = std::env::temp_dir();
     if let Ok(entries) = std::fs::read_dir(&tmp) {
@@ -1464,14 +1312,7 @@ fn an_xcrun_tool_runs_in_the_read_only_lane() {
             }
         }
     }
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_read_only_seatbelt_profile_test(scope.path());
     let out = Command::new("sandbox-exec")
         .args(["-p", &profile, "strings", "/bin/ls"])
@@ -1500,7 +1341,6 @@ fn an_xcrun_tool_runs_in_the_read_only_lane() {
 fn an_app_opened_from_the_sandbox_never_runs_outside_it() {
     skip_if_nested_sandbox!();
     use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     use std::os::unix::fs::PermissionsExt;
     let scope = TempDir::new().expect("scope dir");
     let outside = TempDir::new().expect("outside dir");
@@ -1546,14 +1386,7 @@ fn an_app_opened_from_the_sandbox_never_runs_outside_it() {
     }
     std::fs::remove_file(&marker).unwrap();
 
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     let out = Command::new("sandbox-exec")
         .args(["-p", &profile, "open", "-g"])
@@ -1632,19 +1465,12 @@ do {
 #[test]
 fn metal_compute_runs_with_allow_gpu_and_not_without() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_allow_gpu};
+    use ahma_mcp::sandbox::set_allow_gpu;
     let scope = TempDir::new().expect("scope dir");
     let Some(bin) = metal_compute_probe(scope.path()) else {
         return;
     };
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     set_allow_gpu(false);
     let off = run_probe_in(
         &sandbox.generate_seatbelt_profile_test(scope.path()),
@@ -1708,19 +1534,11 @@ fn swift_probe(dir: &Path, name: &str, source: &str, want: &str) -> Option<std::
 #[test]
 fn a_webkit_view_runs_in_the_default_sandbox() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     let scope = TempDir::new().expect("scope dir");
     let Some(bin) = swift_probe(scope.path(), "webkit_probe", WEBKIT_SRC, "JS 2") else {
         return;
     };
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let out = run_probe_in(
         &sandbox.generate_seatbelt_profile_test(scope.path()),
         &bin,
@@ -1755,16 +1573,8 @@ app.run()
 #[test]
 fn a_sandboxed_command_can_open_its_own_terminal() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     let scope = TempDir::new().expect("scope dir");
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     let out = Command::new("sandbox-exec")
         .args([
@@ -1797,7 +1607,6 @@ fn a_sandboxed_command_can_open_its_own_terminal() {
 #[test]
 fn a_sandboxed_command_cannot_reach_another_terminal() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     let (mut master, mut slave) = (-1, -1);
     let mut name = [0 as libc::c_char; 128];
     // SAFETY: `name` is large enough for a pty path, and the null termios and
@@ -1826,14 +1635,7 @@ fn a_sandboxed_command_cannot_reach_another_terminal() {
     assert!(baseline.success(), "unsandboxed write to {tty}");
 
     let scope = TempDir::new().expect("scope dir");
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     let out = Command::new("sandbox-exec")
         .args(["-p", &profile, "sh", "-c", &write_to_tty])
@@ -1859,16 +1661,8 @@ fn a_sandboxed_command_cannot_reach_another_terminal() {
 #[test]
 fn sandboxed_pgrep_and_ahma_ps_can_list_processes() {
     skip_if_nested_sandbox!();
-    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     let scope = TempDir::new().expect("scope dir");
-    let sandbox = Sandbox::new(
-        vec![scope.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .expect("build sandbox");
+    let sandbox = strict_sandbox(scope.path(), false);
     let profile = sandbox.generate_seatbelt_profile_test(scope.path());
     assert!(profile.contains("(allow process-info*)"), "{profile}");
 

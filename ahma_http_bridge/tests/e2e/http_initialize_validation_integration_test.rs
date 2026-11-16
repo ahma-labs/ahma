@@ -7,15 +7,11 @@
 
 use crate::common;
 
-use common::spawn_test_server;
 use serde_json::Value;
 
 #[tokio::test]
 async fn test_initialize_missing_protocol_version_fails_fast() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let malformed_initialize = serde_json::json!({
         "jsonrpc": "2.0",
@@ -72,10 +68,7 @@ async fn test_initialize_missing_protocol_version_fails_fast() {
 
 #[tokio::test]
 async fn test_initialize_with_stale_session_header_succeeds() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let initialize_req = serde_json::json!({
         "jsonrpc": "2.0",

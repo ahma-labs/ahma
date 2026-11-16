@@ -5,15 +5,11 @@
 
 use crate::common;
 
-use common::spawn_test_server;
 use reqwest::StatusCode;
 
 #[tokio::test]
 async fn test_sse_without_session_header_returns_404() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let resp = client
         .get(format!("{}/mcp", server.base_url()))
@@ -26,10 +22,7 @@ async fn test_sse_without_session_header_returns_404() {
 
 #[tokio::test]
 async fn test_sse_with_unknown_session_returns_404() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let resp = client
         .get(format!("{}/mcp", server.base_url()))

@@ -25,10 +25,7 @@ const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 /// Covers handle_session_isolated_request path for "Request without session ID".
 #[tokio::test]
 async fn test_missing_session_id_json() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let req = json!({
         "jsonrpc": "2.0",
@@ -66,10 +63,7 @@ async fn test_missing_session_id_json() {
 /// Covers check_session_exists.
 #[tokio::test]
 async fn test_nonexistent_session_json() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let req = json!({
         "jsonrpc": "2.0",
@@ -110,10 +104,7 @@ async fn test_nonexistent_session_json() {
 /// Covers handle_initialize_sse.
 #[tokio::test]
 async fn test_sse_initialize_returns_sse_stream() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let req = json!({
         "jsonrpc": "2.0",
@@ -158,10 +149,7 @@ async fn test_sse_initialize_returns_sse_stream() {
 /// Covers handle_session_isolated_request_sse missing-session path.
 #[tokio::test]
 async fn test_sse_missing_session_id() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let req = json!({
         "jsonrpc": "2.0",
@@ -188,10 +176,7 @@ async fn test_sse_missing_session_id() {
 /// Test: POST with Accept: text/event-stream and nonexistent session ID returns 404.
 #[tokio::test]
 async fn test_sse_nonexistent_session() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let req = json!({
         "jsonrpc": "2.0",
@@ -223,10 +208,7 @@ async fn test_sse_nonexistent_session() {
 /// Covers try_lock_sandbox_from_roots with missing/invalid roots.
 #[tokio::test]
 async fn test_client_response_invalid_roots() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let init_req = json!({
         "jsonrpc": "2.0",
@@ -564,10 +546,7 @@ async fn test_task_vault_inheritance_and_staged_delete_sse() {
 /// close the transport channel, producing BrokenPipe on the next stdin write.
 #[tokio::test]
 async fn test_sse_notification_initialized() {
-    let server = spawn_test_server()
-        .await
-        .expect("Failed to spawn test server");
-    let client = common::make_h2_client();
+    let (server, client) = common::spawn_test_server_with_client().await;
 
     let init_req = json!({
         "jsonrpc": "2.0",

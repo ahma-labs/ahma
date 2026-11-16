@@ -19,27 +19,7 @@ use std::time::Duration;
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn make_tool_config(name: &str) -> ToolConfig {
-    ToolConfig {
-        name: name.to_string(),
-        description: format!("Test tool {name}"),
-        command: "echo".to_string(),
-        subcommand: None,
-        input_schema: None,
-        timeout_seconds: None,
-        synchronous: None,
-        hints: Default::default(),
-        enabled: true,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
-        monitor_level: None,
-        monitor_stream: None,
-        tool_type: None,
-        livelog: None,
-        ..Default::default()
-    }
+    ahma_mcp::test_utils::config_builders::make_tool_config(name, "echo")
 }
 
 async fn make_service(initial_configs: HashMap<String, ToolConfig>) -> AhmaMcpService {

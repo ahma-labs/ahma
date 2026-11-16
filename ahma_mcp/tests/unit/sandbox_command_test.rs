@@ -7,20 +7,18 @@
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use tempfile::tempdir;
 
+fn make_sandbox(mode: SandboxMode) -> (tempfile::TempDir, Sandbox) {
+    let td = tempdir().unwrap();
+    let sandbox = Sandbox::new(vec![td.path().to_path_buf()], mode, false, false, false).unwrap();
+    (td, sandbox)
+}
+
 // ── Sandbox::create_command via public API ────────────────────────────────────
 
 /// Test mode: create_command for a simple program returns a valid Command.
 #[test]
 fn test_sandbox_create_command_test_mode_echo() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Test);
     let result = sandbox.create_command("echo", &["world".to_string()], td.path());
     assert!(
         result.is_ok(),
@@ -31,15 +29,7 @@ fn test_sandbox_create_command_test_mode_echo() {
 /// Test mode: create_command with zero args succeeds.
 #[test]
 fn test_sandbox_create_command_no_args() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Test);
     let result = sandbox.create_command("true", &[], td.path());
     assert!(result.is_ok());
 }
@@ -49,15 +39,7 @@ fn test_sandbox_create_command_no_args() {
 /// the call should at minimum not panic and return Ok.
 #[test]
 fn test_sandbox_create_command_cargo_program() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Test);
     let result = sandbox.create_command("cargo", &["check".to_string()], td.path());
     assert!(result.is_ok(), "Cargo command should succeed in test mode");
 }
@@ -65,15 +47,7 @@ fn test_sandbox_create_command_cargo_program() {
 /// Test mode: create_command with a path-like cargo program still triggers env.
 #[test]
 fn test_sandbox_create_command_path_to_cargo() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Test);
     // A full path like /usr/local/bin/cargo has file_name() == "cargo"
     let result = sandbox.create_command("/usr/local/bin/cargo", &[], td.path());
     assert!(result.is_ok());
@@ -84,15 +58,7 @@ fn test_sandbox_create_command_path_to_cargo() {
 /// Test mode: create_shell_command returns a valid Command.
 #[test]
 fn test_sandbox_create_shell_command_test_mode() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Test);
 
     #[cfg(not(target_os = "windows"))]
     let shell = "sh";
@@ -109,15 +75,7 @@ fn test_sandbox_create_shell_command_test_mode() {
 /// Strict mode: create_shell_command should succeed on all supported platforms.
 #[test]
 fn test_sandbox_create_shell_command_strict_mode() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Strict);
 
     #[cfg(not(target_os = "windows"))]
     let shell = "sh";
@@ -136,15 +94,7 @@ fn test_sandbox_create_shell_command_strict_mode() {
 /// Strict mode create_command for a basic program should succeed.
 #[test]
 fn test_sandbox_create_command_strict_mode_basic() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Strict);
 
     let result = sandbox.create_command("echo", &["hi".to_string()], td.path());
     assert!(
@@ -157,15 +107,7 @@ fn test_sandbox_create_command_strict_mode_basic() {
 /// This exercises the fully constructed Command end-to-end.
 #[tokio::test]
 async fn test_sandbox_create_command_spawns_successfully() {
-    let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(
-        vec![td.path().to_path_buf()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let (td, sandbox) = make_sandbox(SandboxMode::Test);
 
     #[cfg(not(target_os = "windows"))]
     let (program, args) = ("echo", vec!["spawn_test".to_string()]);

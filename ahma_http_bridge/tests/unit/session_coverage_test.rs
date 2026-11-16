@@ -27,6 +27,21 @@ fn create_test_session_manager(default_scope: Option<PathBuf>) -> Arc<SessionMan
     Arc::new(SessionManager::new(config))
 }
 
+fn setup_session_manager() -> (tempfile::TempDir, Arc<SessionManager>) {
+    let temp = tempdir().expect("Failed to create temp dir");
+    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
+    (temp, session_manager)
+}
+
+async fn setup_session() -> (tempfile::TempDir, Arc<SessionManager>, String) {
+    let (temp, session_manager) = setup_session_manager();
+    let session_id = session_manager
+        .create_session()
+        .await
+        .expect("Should create session");
+    (temp, session_manager, session_id)
+}
+
 // =============================================================================
 // URI Parsing Tests - parse_file_uri_to_path via lock_sandbox
 // =============================================================================
@@ -34,13 +49,7 @@ fn create_test_session_manager(default_scope: Option<PathBuf>) -> Arc<SessionMan
 /// Test that file:// URIs with percent-encoded characters are decoded correctly
 #[tokio::test]
 async fn test_uri_percent_encoding_decoding() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Path with spaces encoded as %20
     #[cfg(not(windows))]
@@ -80,13 +89,7 @@ async fn test_uri_percent_encoding_decoding() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_uri_localhost_form() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // file://localhost/path/to/project is valid per RFC 8089
     let roots = vec![McpRoot {
@@ -115,13 +118,7 @@ async fn test_uri_localhost_form() {
 /// Test that query strings and fragments are stripped from URIs
 #[tokio::test]
 async fn test_uri_query_and_fragment_stripped() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Some clients may add query or fragment to file URIs
     #[cfg(not(windows))]
@@ -160,13 +157,7 @@ async fn test_uri_query_and_fragment_stripped() {
 /// Test that non-file:// URIs are rejected (returns empty roots error)
 #[tokio::test]
 async fn test_non_file_uri_rejected() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Only file:// URIs are valid for sandbox scope
     let roots = vec![McpRoot {
@@ -196,13 +187,7 @@ async fn test_non_file_uri_rejected() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_relative_path_rejected() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // file:// must be followed by absolute path starting with /
     let roots = vec![McpRoot {
@@ -218,13 +203,7 @@ async fn test_relative_path_rejected() {
 /// Test that malformed percent-encoding fails gracefully
 #[tokio::test]
 async fn test_malformed_percent_encoding_rejected() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Incomplete percent encoding: %2 instead of %20
     let roots = vec![McpRoot {
@@ -245,13 +224,7 @@ async fn test_malformed_percent_encoding_rejected() {
 /// Test multiple roots with mixed valid and invalid URIs
 #[tokio::test]
 async fn test_mixed_valid_invalid_roots() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Mix of valid and invalid URIs - should accept the valid ones
     #[cfg(not(windows))]
@@ -318,13 +291,7 @@ async fn test_mixed_valid_invalid_roots() {
 /// Test is_handshake_timed_out returns None when sandbox is locked
 #[tokio::test]
 async fn test_handshake_timeout_returns_none_when_locked() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Lock the sandbox
     #[cfg(not(windows))]
@@ -355,13 +322,7 @@ async fn test_handshake_timeout_returns_none_when_locked() {
 /// Test is_handshake_timed_out returns None before timeout elapses
 #[tokio::test]
 async fn test_handshake_not_timed_out_initially() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     let session = session_manager
         .get_session(&session_id)
@@ -382,13 +343,7 @@ async fn test_handshake_not_timed_out_initially() {
 /// Test get_sandbox_scope returns first scope when multiple roots exist
 #[tokio::test]
 async fn test_get_sandbox_scope_returns_first() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager
-        .create_session()
-        .await
-        .expect("Should create session");
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     #[cfg(not(windows))]
     let (uri1, uri2, expected_first) = (
@@ -437,8 +392,7 @@ async fn test_get_sandbox_scope_returns_first() {
 /// Test session_count reflects active sessions
 #[tokio::test]
 async fn test_session_count_tracking() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
+    let (_temp, session_manager) = setup_session_manager();
 
     assert_eq!(session_manager.session_count(), 0, "Initially no sessions");
 
@@ -476,8 +430,7 @@ async fn test_session_count_tracking() {
 /// Test send_message fails for non-existent session
 #[tokio::test]
 async fn test_send_message_nonexistent_session() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
+    let (_temp, session_manager) = setup_session_manager();
 
     let fake_session_id = "nonexistent-session-id";
     let message = serde_json::json!({"test": "message"});
@@ -499,8 +452,7 @@ async fn test_send_message_nonexistent_session() {
 /// Test send_request fails for non-existent session
 #[tokio::test]
 async fn test_send_request_nonexistent_session() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
+    let (_temp, session_manager) = setup_session_manager();
 
     let fake_session_id = "nonexistent-session-id";
     let request = serde_json::json!({
@@ -526,10 +478,7 @@ async fn test_send_request_nonexistent_session() {
 /// Test send_message fails for terminated session
 #[tokio::test]
 async fn test_send_message_terminated_session() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager.create_session().await.unwrap();
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Terminate the session
     session_manager
@@ -548,10 +497,7 @@ async fn test_send_message_terminated_session() {
 /// Test handle_roots_changed before sandbox lock is allowed
 #[tokio::test]
 async fn test_roots_changed_before_lock_allowed() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager.create_session().await.unwrap();
+    let (_temp, session_manager, session_id) = setup_session().await;
 
     // Call handle_roots_changed BEFORE locking sandbox
     let result = session_manager.handle_roots_changed(&session_id).await;
@@ -575,8 +521,7 @@ async fn test_roots_changed_before_lock_allowed() {
 /// Test all termination reasons can be used
 #[tokio::test]
 async fn test_termination_reasons() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
+    let (_temp, session_manager) = setup_session_manager();
 
     // Test each termination reason
     let reasons = [
@@ -606,8 +551,7 @@ async fn test_termination_reasons() {
 /// Test terminating non-existent session is a no-op
 #[tokio::test]
 async fn test_terminate_nonexistent_session_noop() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
+    let (_temp, session_manager) = setup_session_manager();
 
     let result = session_manager
         .terminate_session("nonexistent", SessionTerminationReason::ClientRequested)
@@ -626,10 +570,7 @@ async fn test_terminate_nonexistent_session_noop() {
 /// Test handshake state queries on session object
 #[tokio::test]
 async fn test_session_handshake_state_queries() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager.create_session().await.unwrap();
+    let (_temp, session_manager, session_id) = setup_session().await;
     let session = session_manager.get_session(&session_id).unwrap();
 
     // Initial state
@@ -653,10 +594,7 @@ async fn test_session_handshake_state_queries() {
 /// Test subscribe returns a broadcast receiver
 #[tokio::test]
 async fn test_session_subscribe() {
-    let temp = tempdir().expect("Failed to create temp dir");
-    let session_manager = create_test_session_manager(Some(temp.path().to_path_buf()));
-
-    let session_id = session_manager.create_session().await.unwrap();
+    let (_temp, session_manager, session_id) = setup_session().await;
     let session = session_manager.get_session(&session_id).unwrap();
 
     // Should be able to subscribe to SSE events

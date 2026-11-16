@@ -2828,11 +2828,23 @@ mod tests {
             .expect("service")
     }
 
-    async fn make_service() -> AhmaMcpService {
+    async fn make_service_and_monitor() -> (AhmaMcpService, Arc<OperationMonitor>) {
         let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
             TestTimeouts::scale_secs(30),
         )));
-        make_service_with_monitor(monitor, Arc::new(None)).await
+        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        (service, monitor)
+    }
+
+    async fn make_service_with_guidance(guidance: GuidanceConfig) -> AhmaMcpService {
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::scale_secs(30),
+        )));
+        make_service_with_monitor(monitor, Arc::new(Some(guidance))).await
+    }
+
+    async fn make_service() -> AhmaMcpService {
+        make_service_and_monitor().await.0
     }
 
     fn call_tool_params(name: &str, args: serde_json::Value) -> CallToolRequestParams {
@@ -2866,10 +2878,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_status_filters_by_tools_and_id() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         // Active operation
         let op_active = Operation::new(
@@ -2936,10 +2945,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_success_includes_hint_block() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let op = Operation::new(
             "op_to_cancel".to_string(),
@@ -2968,10 +2974,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_all_cancels_every_in_flight_operation() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         for id in ["op_x", "op_y"] {
             let mut op = Operation::new(id.to_string(), "t".to_string(), "d".to_string(), None);
@@ -2998,10 +3001,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_all_with_nothing_running_is_graceful() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let service = make_service().await;
 
         let args = json!({"all": true}).as_object().unwrap().clone();
         let result = service.handle_cancel(args).await.expect("cancel all");
@@ -3010,10 +3010,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_terminal_operation_reports_already_terminal() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let mut op = Operation::new(
             "op_terminal".to_string(),
@@ -3045,10 +3042,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_success_without_reason_uses_default_message() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let op = Operation::new(
             "op_no_reason".to_string(),
@@ -3067,10 +3061,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_already_failed_reports_failed() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let mut op = Operation::new(
             "op_failed".to_string(),
@@ -3089,10 +3080,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_already_cancelled_reports_cancelled() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let mut op = Operation::new(
             "op_cancelled".to_string(),
@@ -3111,10 +3099,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_cancel_already_timed_out_reports_timed_out() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let mut op = Operation::new(
             "op_timed_out".to_string(),
@@ -3141,10 +3126,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_await_id_in_history_reports_already_completed() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let op_id = "op_done".to_string();
         let op = Operation::new(
@@ -3185,10 +3167,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_await_filtered_no_pending_but_recently_completed_lists_history() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let op_id = "op_recent".to_string();
         let op = Operation::new(
@@ -3221,10 +3200,7 @@ mod tests {
 
     #[tokio::test]
     async fn calculate_intelligent_timeout_uses_max_of_default_and_ops() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let mut op = Operation::new(
             "op_long".to_string(),
@@ -3255,13 +3231,7 @@ mod tests {
         guidance_blocks.insert("my_tool".to_string(), "GUIDE".to_string());
         let guidance = GuidanceConfig { guidance_blocks };
 
-        let service = make_service_with_monitor(
-            Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-                TestTimeouts::scale_secs(30),
-            ))),
-            Arc::new(Some(guidance)),
-        )
-        .await;
+        let service = make_service_with_guidance(guidance).await;
 
         let tool_config = ToolConfig {
             name: "my_tool".to_string(),
@@ -3693,13 +3663,7 @@ mod tests {
         let mut guidance_blocks = std::collections::HashMap::new();
         guidance_blocks.insert("gk".to_string(), "GUIDE".to_string());
         let guidance = GuidanceConfig { guidance_blocks };
-        let service = make_service_with_monitor(
-            Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-                TestTimeouts::scale_secs(30),
-            ))),
-            Arc::new(Some(guidance)),
-        )
-        .await;
+        let service = make_service_with_guidance(guidance).await;
 
         let cfg = cfg_from(json!({
             "name": "mytool", "description": "DESC", "command": "echo",
@@ -4415,10 +4379,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_most_recent_background_op_cancels_latest() {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+        let (service, monitor) = make_service_and_monitor().await;
 
         let mut op = Operation::new(
             "bg1".to_string(),

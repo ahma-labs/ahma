@@ -1890,6 +1890,81 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // The harness owns this call's lifetime (SPEC R-SETUP.2.1).
     let limit = payload.intent.limit(&cfg);
     let limit_secs = limit.map_or(NO_LIMIT_SECS, |l| l.secs);
+    let (adapter, reporter) = build_hook_adapter(
+        &cfg,
+        &payload,
+        &hook_scopes,
+        sandbox,
+        limit_secs,
+        deferred_to_outer_sandbox,
+    )?;
+
+    let result =
+        execute_with_signal_forwarding(&adapter, &payload.cwd, &payload.command, limit_secs).await;
+
+    // The command is done; give its terminal event a brief moment to reach the
+    // hub before this process exits. Bounded and short (SPEC R-HUB.8): a
+    // user's command must never wait on observability, so a hub that is
+    // absent or slow costs this much and no more.
+    if let Some(reporter) = reporter {
+        flush_hook_report(reporter).await;
+    }
+
+    // A grant approved for this run is remembered only if the run shows it
+    // helped (SPEC R-PERM.10.3).
+    if let Some(trial) = trial {
+        eprintln!(
+            "{}",
+            harness_ask::finish_trial(trial, trial_outcome(&result))
+        );
+    }
+
+    match result {
+        Ok(output) => {
+            // Not `println!` (SPEC R5.6.1): the hook's stdout is a pipe to the
+            // editor's hook engine, not a terminal, and `println!` panics
+            // unconditionally on a write error — a broken pipe here (Windows OS
+            // error 232, EPIPE on Unix) would kill the hook with a stack trace
+            // instead of a log line. This is the same reasoning the file already
+            // applies to `write_exec_output` a few hundred lines up.
+            crate::utils::stdio::emit_stdout_text(&succeeded_output(&output, &requester))?;
+            Ok(())
+        }
+        // The sandbox initialized successfully (the `initialize_sandbox` arms
+        // above handle the "cannot sandbox" case), so the command DID run inside
+        // the sandbox. A non-zero exit — a failed build/test, a `grep` with no
+        // match, OR a write the kernel sandbox correctly denied — is the
+        // command's own result and is surfaced verbatim. We deliberately do NOT
+        // re-run it unsandboxed here: doing so would (1) misreport every ordinary
+        // command failure as "sandbox unavailable / BLOCKED", which is exactly
+        // what made hooks look like they were blocking CLI calls, and (2) let a
+        // command the sandbox just blocked succeed on the unsandboxed retry — a
+        // silent confinement bypass. The SPEC R5.5.3 unsandboxed fallback applies
+        // only when the sandbox cannot be initialized at all.
+        //
+        // One refinement: when the failure was an out-of-scope *runtime* denial
+        // (`SandboxError::RuntimeDenial`), append an actionable `ahma sandbox
+        // grant ...` recovery line so the agent gets a next step instead of a raw
+        // `os error 1`. The native-terminal hook uses the CLI grant path (not the
+        // MCP grant/restart tools).
+        Err(e) => match e.downcast_ref::<crate::adapter::time_limit::LimitReached>() {
+            Some(stopped) => Err(anyhow!(time_limit_message(stopped, limit))),
+            None => report_shell_execution_error(e, &requester, Path::new(&payload.cwd)),
+        },
+    }
+}
+
+fn build_hook_adapter(
+    cfg: &AppConfig,
+    payload: &WrappedShellPayload,
+    #[cfg_attr(not(unix), allow(unused_variables))] hook_scopes: &[PathBuf],
+    sandbox: std::sync::Arc<crate::sandbox::Sandbox>,
+    limit_secs: u64,
+    deferred_to_outer_sandbox: bool,
+) -> Result<(
+    std::sync::Arc<crate::adapter::Adapter>,
+    Option<crate::hub_reporter::ReporterHandle>,
+)> {
     let monitor_config = crate::operation_monitor::MonitorConfig::with_timeout(
         std::time::Duration::from_secs(limit_secs),
     );
@@ -1955,19 +2030,26 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
                 crate::sandbox::upstream_agent(),
                 cfg.settings_origin.user_settings_file(),
                 harness_ask::harness_pid(),
-                hook_scopes.clone(),
+                hook_scopes.to_vec(),
             )
             .for_workspace(harness_ask::workspace_for(Path::new(&payload.cwd)))
             .for_command(&payload.command),
         )),
         None => adapter,
     };
-    let adapter = std::sync::Arc::new(adapter);
+    Ok((std::sync::Arc::new(adapter), reporter))
+}
 
+async fn execute_with_signal_forwarding(
+    adapter: &crate::adapter::Adapter,
+    cwd: &str,
+    command: &str,
+    limit_secs: u64,
+) -> Result<String> {
     let mut adapter_args = serde_json::Map::new();
     adapter_args.insert(
         "command".to_string(),
-        serde_json::Value::String(payload.command.clone()),
+        serde_json::Value::String(command.to_string()),
     );
     adapter_args.insert("c_flag".to_string(), serde_json::Value::Bool(true));
 
@@ -1975,6 +2057,13 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let subcommand_config = crate::AhmaMcpService::build_shell_subcommand_config(
         timeout,
         &crate::adapter::ExecutionMode::Synchronous,
+    );
+    let exec = adapter.execute_sync_in_dir(
+        crate::shell_pool::platform_shell_program(),
+        Some(adapter_args),
+        cwd,
+        timeout,
+        Some(&subcommand_config),
     );
 
     // Cancelling the hook must take the whole command tree with it. Dropping the
@@ -1989,19 +2078,13 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // output would do nothing. Restoring `SIG_DFL` and re-raising exits with the
     // conventional `128 + signo` status instead.
     #[cfg(unix)]
-    let result = {
+    {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt()).ok();
         let mut sigterm = signal(SignalKind::terminate()).ok();
 
         tokio::select! {
-            res = adapter.execute_sync_in_dir(
-                crate::shell_pool::platform_shell_program(),
-                Some(adapter_args),
-                &payload.cwd,
-                timeout,
-                Some(&subcommand_config),
-            ) => res,
+            res = exec => res,
             _ = async {
                 match &mut sigint {
                     Some(s) => s.recv().await,
@@ -2015,67 +2098,10 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
                 }
             } => die_by_signal(libc::SIGTERM),
         }
-    };
+    }
     #[cfg(not(unix))]
-    let result = adapter
-        .execute_sync_in_dir(
-            crate::shell_pool::platform_shell_program(),
-            Some(adapter_args),
-            &payload.cwd,
-            timeout,
-            Some(&subcommand_config),
-        )
-        .await;
-
-    // The command is done; give its terminal event a brief moment to reach the
-    // hub before this process exits. Bounded and short (SPEC R-HUB.8): a
-    // user's command must never wait on observability, so a hub that is
-    // absent or slow costs this much and no more.
-    if let Some(reporter) = reporter {
-        flush_hook_report(reporter).await;
-    }
-
-    // A grant approved for this run is remembered only if the run shows it
-    // helped (SPEC R-PERM.10.3).
-    if let Some(trial) = trial {
-        eprintln!(
-            "{}",
-            harness_ask::finish_trial(trial, trial_outcome(&result))
-        );
-    }
-
-    match result {
-        Ok(output) => {
-            // Not `println!` (SPEC R5.6.1): the hook's stdout is a pipe to the
-            // editor's hook engine, not a terminal, and `println!` panics
-            // unconditionally on a write error — a broken pipe here (Windows OS
-            // error 232, EPIPE on Unix) would kill the hook with a stack trace
-            // instead of a log line. This is the same reasoning the file already
-            // applies to `write_exec_output` a few hundred lines up.
-            crate::utils::stdio::emit_stdout_text(&succeeded_output(&output, &requester))?;
-            Ok(())
-        }
-        // The sandbox initialized successfully (the `initialize_sandbox` arms
-        // above handle the "cannot sandbox" case), so the command DID run inside
-        // the sandbox. A non-zero exit — a failed build/test, a `grep` with no
-        // match, OR a write the kernel sandbox correctly denied — is the
-        // command's own result and is surfaced verbatim. We deliberately do NOT
-        // re-run it unsandboxed here: doing so would (1) misreport every ordinary
-        // command failure as "sandbox unavailable / BLOCKED", which is exactly
-        // what made hooks look like they were blocking CLI calls, and (2) let a
-        // command the sandbox just blocked succeed on the unsandboxed retry — a
-        // silent confinement bypass. The SPEC R5.5.3 unsandboxed fallback applies
-        // only when the sandbox cannot be initialized at all.
-        //
-        // One refinement: when the failure was an out-of-scope *runtime* denial
-        // (`SandboxError::RuntimeDenial`), append an actionable `ahma sandbox
-        // grant ...` recovery line so the agent gets a next step instead of a raw
-        // `os error 1`. The native-terminal hook uses the CLI grant path (not the
-        // MCP grant/restart tools).
-        Err(e) => match e.downcast_ref::<crate::adapter::time_limit::LimitReached>() {
-            Some(stopped) => Err(anyhow!(time_limit_message(stopped, limit))),
-            None => report_shell_execution_error(e, &requester, Path::new(&payload.cwd)),
-        },
+    {
+        exec.await
     }
 }
 
@@ -2513,65 +2539,9 @@ fn ask_first_if_refused_before(
     let Ok(cwd) = extract_command_cwd(input, &tool.tool_input) else {
         return decision;
     };
-    // `sudo` is setuid, so no sandbox runs it, and it has no terminal for its password here:
-    // ask at once to run the command once outside the sandbox, with no doomed run first
-    // (SPEC R-ESCAPE.4). Asked once per command per harness session, as every escape is.
-    let sudo_ask = if ahma_common::harness_asks::runs_sudo(&tool.command) {
-        harness_ask::record_escape(Path::new(&cwd), &tool.command, SUDO_BLOCKED);
-        harness_ask::next_escape_ask(Path::new(&cwd), session_id, &tool.command)
-    } else {
-        None
-    };
-    // A command that works in another repository asks first, read or write (SPEC R-PERM.11).
-    let repo_ask = harness_ask::next_repo_ask(
-        Path::new(&cwd),
-        session_id,
-        &tool.command,
-        &cfg.persistent_scopes,
-    );
-    let next_grant_ask = || {
-        harness_ask::next_ask(
-            Path::new(&cwd),
-            session_id,
-            &tool.command,
-            &cfg.persistent_scopes,
-        )
-    };
-    let (reason, token) = match (sudo_ask, repo_ask) {
-        (Some((refusal, token)), _) => (harness_ask::escape_ask_reason(&refusal), token),
-        (None, Some((repo, workspace, token))) => {
-            (harness_ask::repo_ask_reason(&repo, &workspace), token)
-        }
-        (None, None) => match next_grant_ask() {
-            Some((question, token)) => {
-                let (workspace, binding) = harness_ask::approval_binding(
-                    &question,
-                    Path::new(&cwd),
-                    &cfg.persistent_scopes,
-                );
-                (
-                    harness_ask::ask_reason(&question, &workspace, &binding),
-                    token,
-                )
-            }
-            // A signature the SSH key broker refused (SPEC R-CRED.3).
-            None => match harness_ask::next_ssh_ask(
-                Path::new(&cwd),
-                session_id,
-                &tool.command,
-                cfg.settings_origin.user_settings_file().as_deref(),
-            ) {
-                Some((refusal, token)) => (harness_ask::ssh_ask_reason(&refusal), token),
-                // This exact command was refused what nothing allows: offer one
-                // run outside the sandbox (SPEC R-ESCAPE).
-                None => {
-                    match harness_ask::next_escape_ask(Path::new(&cwd), session_id, &tool.command) {
-                        Some((refusal, token)) => (harness_ask::escape_ask_reason(&refusal), token),
-                        None => return decision,
-                    }
-                }
-            },
-        },
+    let Some((reason, token)) = next_prior_ask(Path::new(&cwd), session_id, &tool.command, cfg)
+    else {
+        return decision;
     };
     match build_wrapped_shell_command(
         args.scope,
@@ -2588,6 +2558,52 @@ fn ask_first_if_refused_before(
         },
         Err(_) => decision,
     }
+}
+
+fn next_prior_ask(
+    cwd: &Path,
+    session_id: &str,
+    command: &str,
+    cfg: &AppConfig,
+) -> Option<(String, String)> {
+    // `sudo` is setuid, so no sandbox runs it, and it has no terminal for its password here:
+    // ask at once to run the command once outside the sandbox, with no doomed run first
+    // (SPEC R-ESCAPE.4). Asked once per command per harness session, as every escape is.
+    if ahma_common::harness_asks::runs_sudo(command) {
+        harness_ask::record_escape(cwd, command, SUDO_BLOCKED);
+        if let Some((refusal, token)) = harness_ask::next_escape_ask(cwd, session_id, command) {
+            return Some((harness_ask::escape_ask_reason(&refusal), token));
+        }
+    }
+    // A command that works in another repository asks first, read or write (SPEC R-PERM.11).
+    if let Some((repo, workspace, token)) =
+        harness_ask::next_repo_ask(cwd, session_id, command, &cfg.persistent_scopes)
+    {
+        return Some((harness_ask::repo_ask_reason(&repo, &workspace), token));
+    }
+    if let Some((question, token)) =
+        harness_ask::next_ask(cwd, session_id, command, &cfg.persistent_scopes)
+    {
+        let (workspace, binding) =
+            harness_ask::approval_binding(&question, cwd, &cfg.persistent_scopes);
+        return Some((
+            harness_ask::ask_reason(&question, &workspace, &binding),
+            token,
+        ));
+    }
+    // A signature the SSH key broker refused (SPEC R-CRED.3).
+    if let Some((refusal, token)) = harness_ask::next_ssh_ask(
+        cwd,
+        session_id,
+        command,
+        cfg.settings_origin.user_settings_file().as_deref(),
+    ) {
+        return Some((harness_ask::ssh_ask_reason(&refusal), token));
+    }
+    // This exact command was refused what nothing allows: offer one
+    // run outside the sandbox (SPEC R-ESCAPE).
+    harness_ask::next_escape_ask(cwd, session_id, command)
+        .map(|(refusal, token)| (harness_ask::escape_ask_reason(&refusal), token))
 }
 
 /// Compute the hook decision for a given tool invocation.

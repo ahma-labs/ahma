@@ -18,27 +18,7 @@ use tempfile::TempDir;
 // ============= Helper Functions =============
 
 fn create_test_tool_config(name: &str, command: &str) -> ToolConfig {
-    ToolConfig {
-        name: name.to_string(),
-        description: format!("{} tool", name),
-        command: command.to_string(),
-        subcommand: None,
-        input_schema: None,
-        timeout_seconds: None,
-        synchronous: None,
-        hints: Default::default(),
-        enabled: true,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
-        monitor_level: None,
-        monitor_stream: None,
-        tool_type: None,
-        livelog: None,
-        ..Default::default()
-    }
+    ahma_mcp::test_utils::config_builders::make_tool_config(name, command)
 }
 
 fn create_tool_config_with_subcommands(
@@ -46,27 +26,9 @@ fn create_tool_config_with_subcommands(
     command: &str,
     subcommands: Vec<SubcommandConfig>,
 ) -> ToolConfig {
-    ToolConfig {
-        name: name.to_string(),
-        description: format!("{} tool", name),
-        command: command.to_string(),
-        subcommand: Some(subcommands),
-        input_schema: None,
-        timeout_seconds: None,
-        synchronous: None,
-        hints: Default::default(),
-        enabled: true,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
-        monitor_level: None,
-        monitor_stream: None,
-        tool_type: None,
-        livelog: None,
-        ..Default::default()
-    }
+    let mut cfg = ahma_mcp::test_utils::config_builders::make_tool_config(name, command);
+    cfg.subcommand = Some(subcommands);
+    cfg
 }
 
 fn create_subcommand(name: &str) -> SubcommandConfig {

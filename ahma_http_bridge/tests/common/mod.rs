@@ -44,6 +44,15 @@ pub fn make_h2_client() -> reqwest::Client {
         .expect("Failed to build HTTP/2 test client")
 }
 
+/// Spawn a default test server and build an HTTP/2 client for it.
+pub async fn spawn_test_server_with_client() -> (TestServerInstance, reqwest::Client) {
+    let server = spawn_test_server()
+        .await
+        .expect("Failed to spawn test server");
+    let client = make_h2_client();
+    (server, client)
+}
+
 /// Spawn and handshake a test MCP server/client, then verify required tools exist.
 ///
 /// Returns `None` (skip) when infrastructure setup fails or required tools are missing.

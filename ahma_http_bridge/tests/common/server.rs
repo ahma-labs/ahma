@@ -500,7 +500,7 @@ async fn wait_for_health_or_cleanup(
 
 /// Spawn a new test server with dynamic port allocation.
 pub async fn spawn_test_server() -> Result<TestServerInstance, String> {
-    spawn_test_server_with_timeout(None).await
+    spawn_test_server_inner(None, true, Authentication::Open).await
 }
 
 /// Spawn a new test server with a custom handshake timeout.

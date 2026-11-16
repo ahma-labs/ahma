@@ -583,40 +583,64 @@ mod linux {
             return Err(err);
         }
         if pid == 0 {
-            let mode: libc::c_uint = 0o600;
-            let (step, errno) = match mounts.enter() {
-                Err(f) => (f.step as i32, f.errno),
-                Ok(()) => {
-                    let fd = unsafe {
-                        libc::open(
-                            probe_file.as_ptr(),
-                            libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
-                            mode,
-                        )
-                    };
-                    if fd >= 0 {
-                        unsafe { libc::close(fd) };
-                        (Step::Verify as i32, 0)
-                    } else {
-                        let errno = Failure::last(Step::Verify).errno;
-                        if errno == libc::EROFS {
-                            (0, 0)
-                        } else {
-                            (Step::Verify as i32, errno)
-                        }
-                    }
-                }
-            };
-            let mut report = [0u8; 8];
-            report[..4].copy_from_slice(&step.to_ne_bytes());
-            report[4..].copy_from_slice(&errno.to_ne_bytes());
-            unsafe {
-                libc::write(write_end, report.as_ptr().cast(), report.len());
-                libc::_exit(0);
-            }
+            run_probe_child(&mounts, &probe_file, write_end);
         }
 
         unsafe { libc::close(write_end) };
+        let report = read_probe_report(read_end);
+        unsafe { libc::close(read_end) };
+        reap_child(pid);
+
+        Ok(match report {
+            Some((step, errno)) => verdict(step, errno),
+            None => verdict(-1, 0),
+        })
+    }
+
+    /// Child half of [`probe_inner`]: enter the read-only namespace, attempt a
+    /// write under the bind mount, write `(step, errno)` to `write_end`, and
+    /// `_exit(0)` without running destructors.
+    fn run_probe_child(mounts: &DenyTierMounts, probe_file: &CStr, write_end: libc::c_int) -> ! {
+        let (step, errno) = match mounts.enter() {
+            Err(f) => (f.step as i32, f.errno),
+            Ok(()) => verify_ro_bind(probe_file),
+        };
+        let mut report = [0u8; 8];
+        report[..4].copy_from_slice(&step.to_ne_bytes());
+        report[4..].copy_from_slice(&errno.to_ne_bytes());
+        // SAFETY: `write_end` is a valid pipe fd and `report` is an 8-byte stack buffer.
+        unsafe {
+            libc::write(write_end, report.as_ptr().cast(), report.len());
+            libc::_exit(0);
+        }
+    }
+
+    /// Verify that creating `probe_file` inside the read-only bind fails with `EROFS`.
+    fn verify_ro_bind(probe_file: &CStr) -> (i32, i32) {
+        let mode: libc::c_uint = 0o600;
+        // SAFETY: `probe_file` is NUL-terminated.
+        let fd = unsafe {
+            libc::open(
+                probe_file.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: `fd` was just opened by `open`.
+            unsafe { libc::close(fd) };
+            return (Step::Verify as i32, 0);
+        }
+        let errno = Failure::last(Step::Verify).errno;
+        if errno == libc::EROFS {
+            (0, 0)
+        } else {
+            (Step::Verify as i32, errno)
+        }
+    }
+
+    /// Read the 8-byte `(step, errno)` report from `read_end`, retrying `EINTR`.
+    fn read_probe_report(read_end: libc::c_int) -> Option<(i32, i32)> {
         let mut report = [0u8; 8];
         let mut got = 0usize;
         while got < report.len() {
@@ -638,7 +662,15 @@ mod linux {
                 break;
             }
         }
-        unsafe { libc::close(read_end) };
+        if got != report.len() {
+            return None;
+        }
+        let step = i32::from_ne_bytes([report[0], report[1], report[2], report[3]]);
+        let errno = i32::from_ne_bytes([report[4], report[5], report[6], report[7]]);
+        Some((step, errno))
+    }
+
+    fn reap_child(pid: libc::pid_t) {
         let mut status: libc::c_int = 0;
         // SAFETY: reaping our own child.
         while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
@@ -646,12 +678,6 @@ mod linux {
                 break;
             }
         }
-        if got != report.len() {
-            return Ok(verdict(-1, 0));
-        }
-        let step = i32::from_ne_bytes([report[0], report[1], report[2], report[3]]);
-        let errno = i32::from_ne_bytes([report[4], report[5], report[6], report[7]]);
-        Ok(verdict(step, errno))
     }
 }
 

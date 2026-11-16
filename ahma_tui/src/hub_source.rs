@@ -651,17 +651,7 @@ mod tests {
             mode: "stdio".to_string(),
             scope: "/test".to_string(),
             label: label.to_string(),
-            client: None,
-            session_id: None,
-            client_pid: None,
-            sampling: false,
-            elicitation: false,
-            ended_epoch_ms: None,
-            scopes: vec![],
-            read_scopes: vec![],
-            grants: vec![],
-            enforcement: None,
-            native_terminal: None,
+            ..Default::default()
         }
     }
 
