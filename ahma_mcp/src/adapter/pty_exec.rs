@@ -78,6 +78,7 @@ pub(super) async fn run_pty_operation(
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
     ssh_auth_sock: Option<&Path>,
+    keep_leftovers: bool,
 ) -> (crate::adapter::audit::Outcome, Option<i32>) {
     #[cfg(windows)]
     {
@@ -106,6 +107,7 @@ pub(super) async fn run_pty_operation(
         op_id,
         monitor,
         ssh_auth_sock,
+        keep_leftovers,
     )
     .await
 }
@@ -135,9 +137,41 @@ mod unix {
     /// observes the exit and reports it over `exit_tx`.
     struct PtyChildKiller {
         pid: i32,
+        /// The run the command is, so that what it leaves running ends with
+        /// it (SPEC R-PROC.5).
+        run: Option<crate::sandbox::leftovers::Run>,
+    }
+
+    impl Drop for PtyChildKiller {
+        fn drop(&mut self) {
+            // A command that was cancelled, timed out or dropped: nothing to
+            // wait for, and no thread to block on a grace.
+            if let Some(run) = self.run.take() {
+                for leftover in crate::sandbox::leftovers::end_at_once(&run) {
+                    tracing::info!(
+                        "stopped {} (pid {}), left running by a terminal command that ended \
+                         (SPEC R-PROC.5)",
+                        leftover.name,
+                        leftover.pid
+                    );
+                }
+            }
+        }
     }
 
     impl PtyChildKiller {
+        /// End what the command left running, once it has itself ended, and
+        /// return it for the command's result. The drop then finds nothing.
+        async fn end_leftovers(&mut self) -> Vec<crate::sandbox::leftovers::Leftover> {
+            let Some(run) = self.run.take() else {
+                return Vec::new();
+            };
+            // The process table is read through a synchronous API.
+            tokio::task::spawn_blocking(move || crate::sandbox::leftovers::end(&run))
+                .await
+                .unwrap_or_default()
+        }
+
         fn kill(&self) {
             // The child called setsid(), so its pid is also its process-group
             // id — kill the whole group to take down shell descendants.
@@ -158,12 +192,18 @@ mod unix {
         command_str: &str,
         working_dir: &Path,
         ssh_auth_sock: Option<&Path>,
+        keep_leftovers: bool,
     ) -> Result<PtyParts> {
         use anyhow::Context;
 
-        let wrapped = sandbox
+        let mut wrapped = sandbox
             .create_shell_command(platform_shell_program(), command_str, working_dir)
             .context("failed to build sandboxed PTY command")?;
+        // A command a human declared long-running may leave its server
+        // running (SPEC R2.7.10, R-PROC.5).
+        if keep_leftovers {
+            crate::sandbox::leftovers::keep(&mut wrapped);
+        }
         let std_wrapped = wrapped.as_std();
 
         // Open the pseudo-terminal pair.
@@ -248,6 +288,7 @@ mod unix {
         let mut child = cmd.spawn().context("failed to spawn PTY command")?;
         let killer = PtyChildKiller {
             pid: child.id() as i32,
+            run: crate::sandbox::leftovers::Run::of(&wrapped, Some(child.id())),
         };
 
         let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -303,25 +344,31 @@ mod unix {
         op_id: &str,
         monitor: &Arc<OperationMonitor>,
         ssh_auth_sock: Option<&Path>,
+        keep_leftovers: bool,
     ) -> (crate::adapter::audit::Outcome, Option<i32>) {
         use crate::adapter::audit::Outcome;
 
         let start_time = Instant::now();
 
-        let (killer, mut line_rx, mut exit_rx) =
-            match setup_pty(sandbox, command_str, working_dir, ssh_auth_sock) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    monitor
-                        .update_status(
-                            op_id,
-                            OperationStatus::Failed,
-                            Some(Value::String(format!("Failed to start PTY command: {e}"))),
-                        )
-                        .await;
-                    return (Outcome::Failed, None);
-                }
-            };
+        let (mut killer, mut line_rx, mut exit_rx) = match setup_pty(
+            sandbox,
+            command_str,
+            working_dir,
+            ssh_auth_sock,
+            keep_leftovers,
+        ) {
+            Ok(parts) => parts,
+            Err(e) => {
+                monitor
+                    .update_status(
+                        op_id,
+                        OperationStatus::Failed,
+                        Some(Value::String(format!("Failed to start PTY command: {e}"))),
+                    )
+                    .await;
+                return (Outcome::Failed, None);
+            }
+        };
 
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
         let mut collected = crate::adapter::BoundedLineCollector::default();
@@ -382,6 +429,11 @@ mod unix {
         };
 
         spill_writer.finish().await;
+        // The command has ended: what it left running ends too, and its result
+        // names it (SPEC R-PROC.5).
+        if let Some(line) = crate::sandbox::leftovers::note(&killer.end_leftovers().await) {
+            monitor.append_alert(op_id, line).await;
+        }
 
         let exit_code = exit_status.unwrap_or(-1);
         let success = exit_code == 0;
@@ -473,6 +525,92 @@ mod tests {
         )))
     }
 
+    /// SPEC R-PROC.5: a terminal command that leaves a process running has it
+    /// stopped when it ends, and the operation names it, as on the plain
+    /// path; a command a human declared long-running keeps what it started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_command_ends_and_names_what_it_left_running() {
+        if !pty_available() {
+            eprintln!("skipping: PTY allocation denied in this environment");
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        // A program that waits, started in the background as `nohup` would
+        // (a terminal that closes hangs up on its jobs; one that ignores the
+        // hangup is the one that stays). The script prints its pid and
+        // returns once the program is up.
+        let script = format!(
+            "trap '' HUP\n\
+             AHMA_TEST_LEFTOVER_WAITER=1 '{}' sandbox::leftovers::tests::waits_to_be_stopped \
+             --exact --ignored --nocapture >up.ready 2>/dev/null &\necho pid=$!\n\
+             until grep -q waiter-ready up.ready; do sleep 0.05; done\n",
+            std::env::current_exe().unwrap().display()
+        );
+        std::fs::write(temp.path().join("leaves.sh"), script).unwrap();
+        let limit = TestTimeouts::scale_secs(30).as_millis() as u64;
+        let run = async |op_id: &str, keep: bool| {
+            let monitor = test_monitor();
+            monitor
+                .add_operation(Operation::new(
+                    op_id.to_string(),
+                    "pty_test".to_string(),
+                    "sh leaves.sh".to_string(),
+                    None,
+                ))
+                .await;
+            run_pty_operation(
+                &sandbox,
+                "sh leaves.sh",
+                temp.path(),
+                limit,
+                &CancellationToken::new(),
+                op_id,
+                &monitor,
+                None,
+                keep,
+            )
+            .await;
+            let op = monitor
+                .check_completion_history_pub(op_id)
+                .await
+                .expect("operation should be in completion history");
+            assert_eq!(op.state, OperationStatus::Completed, "{:?}", op.result);
+            let stdout = op.result.as_ref().and_then(|r| r.get("stdout")).cloned();
+            let pid: libc::pid_t = stdout
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .and_then(|out| out.lines().find_map(|l| l.trim().strip_prefix("pid=")))
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or_else(|| panic!("the script prints its pid: {stdout:?}"));
+            (pid, op.alerts)
+        };
+        let alive = |pid: libc::pid_t| {
+            // SAFETY: signal 0 only asks whether the pid exists.
+            let there = unsafe { libc::kill(pid, 0) == 0 };
+            there && !crate::sandbox::leftovers::is_zombie(pid as u32)
+        };
+
+        let (left, alerts) = run("pty-leaves", false).await;
+        assert!(
+            alerts
+                .iter()
+                .any(|a| a.contains("ahma: stopped") && a.contains(&format!("(pid {left})"))),
+            "{alerts:?}"
+        );
+        assert!(!alive(left), "what the command left running is gone");
+
+        let (kept, alerts) = run("pty-kept", true).await;
+        assert!(
+            !alerts.iter().any(|a| a.contains("ahma: stopped")),
+            "{alerts:?}"
+        );
+        assert!(alive(kept), "a declared command's process stays");
+        // SAFETY: the pid is the waiter this test started.
+        unsafe { libc::kill(kept, libc::SIGKILL) };
+    }
+
     /// Happy path: run `echo hello` through the PTY pipeline and assert the
     /// operation completes successfully with the expected captured output.
     ///
@@ -509,6 +647,7 @@ mod tests {
             op_id,
             &monitor,
             None,
+            false,
         )
         .await;
 
@@ -563,6 +702,7 @@ mod tests {
             op_id,
             &monitor,
             Some(&broker),
+            false,
         )
         .await;
 
@@ -614,6 +754,7 @@ mod tests {
             op_id,
             &monitor,
             None,
+            false,
         )
         .await;
 
@@ -660,6 +801,7 @@ mod tests {
             op_id,
             &monitor,
             None,
+            false,
         )
         .await;
 
@@ -703,6 +845,7 @@ mod tests {
             op_id,
             &monitor,
             None,
+            false,
         )
         .await;
 
@@ -749,6 +892,7 @@ mod tests {
             op_id,
             &monitor,
             None,
+            false,
         )
         .await;
 

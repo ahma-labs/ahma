@@ -66,7 +66,8 @@ impl ShellSession {
         // so it is the worst place to orphan a tree: `sh → cargo → rustc` all
         // outlive a bare `kill_on_drop`, which signals only the direct child.
         // `create_command` already made it a process-group leader.
-        let mut child = ProcessGroupGuard::new(child);
+        // What the session leaves running ends with it (SPEC R-PROC.5).
+        let mut child = ProcessGroupGuard::of(&cmd, child);
         let stdin = child
             .child_mut()
             .stdin

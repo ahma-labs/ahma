@@ -179,7 +179,7 @@ pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
 /// designed, not a problem: a sccache server started on a port of its own
 /// (the `sccache` profile's per-workspace port, SPEC R-PERM.5.5, or a port the
 /// user chose) is reached only by clients that asked for that port.
-fn serves_one_workspace(name: &str, environ: &[String]) -> bool {
+pub(crate) fn serves_one_workspace(name: &str, environ: &[String]) -> bool {
     name == "sccache"
         && environ.iter().any(|e| {
             e.strip_prefix("SCCACHE_SERVER_PORT=")

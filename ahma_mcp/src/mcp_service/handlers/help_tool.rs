@@ -375,7 +375,13 @@ fn slow() -> String {
      person needs (a URL, a question) and exit, then ask them in your reply and start the next \
      step when they answer. If it has to stay running, the human can declare it once in their \
      own settings: ahma settings set tools.long_running \"[{command='<the command>', \
-     timeout_secs=14400}]\" — it then runs without holding the queue, with that timeout.\n"
+     timeout_secs=14400}]\" — it then runs without holding the queue, with that timeout.\n\
+     \n\
+     A process a command leaves running after it returns (`server &`, a daemon a build tool \
+     starts) is stopped when the command ends, and the result names it: inside the sandbox it \
+     would go on serving other programs while able to write only this workspace. To keep a \
+     server, run it as its own command and leave that running (it is an operation you can \
+     `await` or `cancel`); do not background it inside another command.\n"
         .to_string()
 }
 

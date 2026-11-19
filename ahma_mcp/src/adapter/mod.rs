@@ -857,6 +857,12 @@ impl Adapter {
         run.result
     }
 
+    /// Whether a human declared this shell line long-running (SPEC R2.7.10):
+    /// what it starts may stay running after it (R-PROC.5).
+    fn is_declared_long_running(&self, line: &str) -> bool {
+        lane::long_running_entry(line, self.workspace_queue.long_running()).is_some()
+    }
+
     /// The timeout `[tools] long_running` declares for this command line, if
     /// it is one (SPEC R2.7.10); the caller's own `timeout_seconds` wins.
     pub fn declared_timeout(&self, args: Option<&Map<String, serde_json::Value>>) -> Option<u64> {
@@ -958,6 +964,9 @@ impl Adapter {
             Err(e) => return SyncRun::failed(e),
         };
         stamp_lease(&mut cmd, lease);
+        if shell_command.is_some_and(|line| self.is_declared_long_running(line)) {
+            sandbox::leftovers::keep(&mut cmd);
+        }
         #[cfg(unix)]
         let broker = self.lease_credential_broker(&mut cmd, safe_wd, Some(effective_command));
         // The tag the kernel's records of this command's denials carry
@@ -980,7 +989,7 @@ impl Adapter {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
         };
-        let mut guard = ProcessGroupGuard::new(child);
+        let mut guard = ProcessGroupGuard::of(&cmd, child);
 
         // Read stdout/stderr concurrently with `wait()` (not after `wait()`
         // returns) so a chatty child can't fill the pipe buffer and deadlock —
@@ -994,6 +1003,7 @@ impl Adapter {
 
         let wait_res = tokio::time::timeout(timeout, guard.child_mut().wait()).await;
 
+        let left_running;
         let output = match wait_res {
             Err(_) => {
                 // Kill the entire process group so build descendants don't
@@ -1024,6 +1034,8 @@ impl Adapter {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
             Ok(Ok(status)) => {
+                // What the command left running ends with it (SPEC R-PROC.5).
+                left_running = sandbox::leftovers::note(&guard.end_leftovers().await);
                 let _ = guard.disarm();
                 // The child has exited, so its pipes are at (or imminently
                 // reaching) EOF; these joins are not a second wait for the
@@ -1060,6 +1072,13 @@ impl Adapter {
             Some(lines) => match result {
                 Ok(out) => Ok(format!("{out}\n{lines}")),
                 Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
+            },
+            None => result,
+        };
+        let result = match left_running {
+            Some(line) => match result {
+                Ok(out) => Ok(format!("{out}\n{line}")),
+                Err(e) => Err(anyhow::anyhow!("{e}\n\n{line}")),
             },
             None => result,
         };
@@ -1373,6 +1392,8 @@ impl Adapter {
         let (program_with_subcommand, args_vec) = self
             .prepare_command_and_args(command, args.as_ref(), subcommand_config, &safe_wd)
             .await?;
+        let keep_leftovers = shell_command_line(args.as_ref())
+            .is_some_and(|line| self.is_declared_long_running(line));
 
         let op_id = id
             .map(|s| s.to_string())
@@ -1473,6 +1494,7 @@ impl Adapter {
             drift_root,
             display_command,
             watch_handoff: self.watches_handoff(lane),
+            keep_leftovers,
             #[cfg(unix)]
             credential_brokers: self.credential_brokers.clone(),
         }));
@@ -1553,6 +1575,7 @@ impl Adapter {
         #[cfg(unix)]
         let credential_brokers = self.credential_brokers.clone();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
+        let keep_leftovers = self.is_declared_long_running(&command_str);
         // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1604,6 +1627,7 @@ impl Adapter {
                 &op_id_task,
                 &monitor,
                 broker_socket.as_deref(),
+                keep_leftovers,
             )
             .await;
             #[cfg(unix)]
@@ -1854,6 +1878,9 @@ struct AsyncOperationRun {
     display_command: String,
     /// Inventory the trust-handoff deny tier around the run (SPEC R6.1.7).
     watch_handoff: bool,
+    /// A human declared this command long-running (SPEC R2.7.10), so what it
+    /// starts may stay running after it (R-PROC.5).
+    keep_leftovers: bool,
     /// Gives the command an SSH key broker (SPEC R-CRED.1).
     #[cfg(unix)]
     credential_brokers: Option<Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>>,
@@ -1899,6 +1926,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         drift_root,
         display_command,
         watch_handoff,
+        keep_leftovers,
         #[cfg(unix)]
         credential_brokers,
     } = ctx;
@@ -2007,6 +2035,9 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     };
 
     stamp_lease(&mut proc_cmd, lease.as_ref());
+    if keep_leftovers {
+        sandbox::leftovers::keep(&mut proc_cmd);
+    }
     // The command's SSH key broker (SPEC R-CRED.1): a refused signature is an
     // alert on this operation while it still runs (R-CRED.10). Held until the
     // command has finished.
@@ -2779,7 +2810,7 @@ async fn execute_with_streaming(
             return (audit::Outcome::Failed, None);
         }
     };
-    let mut guard = ProcessGroupGuard::new(child);
+    let mut guard = ProcessGroupGuard::of(proc_cmd, child);
 
     let stdout = guard.child_mut().stdout.take().expect("stdout piped");
     let stderr = guard.child_mut().stderr.take().expect("stderr piped");
@@ -2955,6 +2986,12 @@ async fn execute_with_streaming(
         // have already exited.
         match guard.child_mut().try_wait() {
             Ok(Some(_status)) => {
+                // What the command left running ends with it, and its result
+                // says so (SPEC R-PROC.5). Before the drain: a job it left in
+                // the background holds these pipes open.
+                if let Some(line) = sandbox::leftovers::note(&guard.end_leftovers().await) {
+                    op_monitor.append_alert(op_id, line).await;
+                }
                 drain_remaining_stream_lines(
                     &mut stderr_reader,
                     &mut stdout_reader,
@@ -4084,6 +4121,85 @@ mod tests {
             workspace_queue::Lane::Exclusive
         );
         assert_eq!(adapter.declared_timeout(Some(&chained)), None);
+    }
+
+    /// SPEC R-PROC.5: a command that leaves a process running (a script that
+    /// starts a server and returns) has it stopped when the command ends, and
+    /// its result says which process and how to keep one. The same script,
+    /// declared long-running by a human (R2.7.10), keeps what it started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_ends_what_it_left_running_unless_a_human_lets_it_stay() {
+        use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let adapter = adapter.with_workspace_queue(
+            workspace_queue::WorkspaceQueue::with_lock_dir(true, Some(td.path().join("locks")))
+                .with_long_running(vec![ahma_common::config::LongRunningCommand {
+                    command: "sh kept.sh".into(),
+                    timeout_secs: None,
+                }]),
+        );
+        // A program that waits, started in the background; the script prints
+        // its pid and returns once the program is up (until then it is still
+        // the shell's own image, whose environment macOS shows to no one, and
+        // this test's sandbox mode has no kernel mark to find it by instead).
+        let script = |ready: &str| {
+            format!(
+                "AHMA_TEST_LEFTOVER_WAITER=1 '{}' sandbox::leftovers::tests::waits_to_be_stopped \
+                 --exact --ignored --nocapture >{ready} 2>/dev/null &\necho pid=$!\n\
+                 until grep -q waiter-ready {ready}; do sleep 0.05; done\n",
+                std::env::current_exe().unwrap().display()
+            )
+        };
+        std::fs::write(td.path().join("leaves.sh"), script("left.ready")).unwrap();
+        std::fs::write(td.path().join("kept.sh"), script("kept.ready")).unwrap();
+        let limit = TestTimeouts::get(TimeoutCategory::ToolCall).as_secs();
+        let config = crate::AhmaMcpService::build_shell_subcommand_config(
+            Some(limit),
+            &ExecutionMode::Synchronous,
+        );
+        let run = |line: &'static str| {
+            let (adapter, config) = (&adapter, &config);
+            let dir = td.path().to_string_lossy().into_owned();
+            async move {
+                adapter
+                    .execute_sync_in_dir(
+                        crate::shell_pool::platform_shell_program(),
+                        Some(shell_args(line)),
+                        &dir,
+                        Some(limit),
+                        Some(config),
+                    )
+                    .await
+                    .expect("the script succeeds")
+            }
+        };
+        let pid_in = |out: &str| -> libc::pid_t {
+            out.lines()
+                .find_map(|l| l.trim().strip_prefix("pid="))
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or_else(|| panic!("the script prints its pid: {out}"))
+        };
+        // Exited and not yet reaped by its new parent is gone too.
+        // SAFETY: signal 0 only asks whether the pid exists.
+        let alive = |pid: libc::pid_t| {
+            let there = unsafe { libc::kill(pid, 0) == 0 };
+            there && !sandbox::leftovers::is_zombie(pid as u32)
+        };
+
+        let out = run("sh leaves.sh").await;
+        let left = pid_in(&out);
+        assert!(out.contains("ahma: stopped"), "{out}");
+        assert!(out.contains(&format!("(pid {left})")), "{out}");
+        assert!(out.contains("tools.long_running"), "{out}");
+        assert!(!alive(left), "what the command left running is gone");
+
+        let out = run("sh kept.sh").await;
+        let kept = pid_in(&out);
+        assert!(!out.contains("ahma: stopped"), "{out}");
+        assert!(alive(kept), "a declared command's process stays");
+        // SAFETY: the pid is the waiter this test started.
+        unsafe { libc::kill(kept, libc::SIGKILL) };
     }
 
     /// SPEC R2.7.3, R2.7.4: what a hooked command prints while it waits (the
