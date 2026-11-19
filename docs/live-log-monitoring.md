@@ -15,6 +15,7 @@ source_command  →  chunk accumulator  →  LLM  →  Alert event on the operat
 4. The chunk is sent to the LLM with your `detection_prompt`.
 5. If the LLM detects an issue (any response other than `"CLEAN"`), an `Alert` event is recorded on the operation and pushed to the MCP client as a progress notification (and shown in `ahma tui`) — but only if the `cooldown_seconds` window has elapsed since the last alert.
 6. Use `cancel <operation_id>` to stop monitoring.
+7. The operation ends `Completed` when it watched until it was cancelled or its source ended. When it never started watching (the source command could not be started, the log file could not be opened, or the LLM provider settings are unusable) it ends `Failed`, and its result says why.
 
 ## Android Logcat Monitoring
 

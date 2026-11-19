@@ -16,6 +16,29 @@ fn make_op(id: &str, tool: &str, status: OperationStatus) -> Operation {
     op
 }
 
+/// A cancelled or timed-out operation's reason reaches the agent however the
+/// ender stored it: the monitor's own deadline writes `{"reason": …}`, the
+/// executor's deadline and a cancel write the reason as a plain string. Only
+/// the first used to be read, so an executor timeout showed a generic line
+/// instead of its limit and how to raise it.
+#[test]
+fn a_finished_operation_shows_its_reason_however_it_was_stored() {
+    for status in [OperationStatus::TimedOut, OperationStatus::Cancelled] {
+        for result in [
+            json!("timed out after 1800s; raise it with timeout_seconds"),
+            json!({"timed_out": true, "reason": "timed out after 1800s; raise it with timeout_seconds"}),
+        ] {
+            let mut op = make_op("op_1", "run_terminal_command", status);
+            op.result = Some(result.clone());
+            let text = render_completed_operation(&op);
+            assert!(
+                text.contains("raise it with timeout_seconds"),
+                "{status:?} {result}: {text}"
+            );
+        }
+    }
+}
+
 /// An outside service's failure reaches the agent summary-first (SPEC
 /// R-HTTP.3); any other error keeps its whole cause chain.
 #[test]

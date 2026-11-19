@@ -146,12 +146,25 @@ impl PipelineFixture {
             .await;
     }
 
+    /// Run a pipeline expected to start, and return its alerts.
     async fn run(
         &self,
         config: &LivelogConfig,
         runtime: Option<&ahma_mcp::config::LivelogRuntime>,
         token: CancellationToken,
     ) -> Vec<String> {
+        let (outcome, alerts) = self.run_outcome(config, runtime, token).await;
+        outcome.expect("the source starts");
+        alerts
+    }
+
+    /// Run a pipeline and return how it ended (whether it started) and its alerts.
+    async fn run_outcome(
+        &self,
+        config: &LivelogConfig,
+        runtime: Option<&ahma_mcp::config::LivelogRuntime>,
+        token: CancellationToken,
+    ) -> (Result<(), ahma_mcp::livelog::NotStarted>, Vec<String>) {
         let default_rt;
         let rt = match runtime {
             Some(r) => r,
@@ -160,7 +173,7 @@ impl PipelineFixture {
                 &default_rt
             }
         };
-        run_livelog_pipeline(
+        let outcome = run_livelog_pipeline(
             self.op_id,
             config,
             rt,
@@ -171,7 +184,7 @@ impl PipelineFixture {
             Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
         )
         .await;
-        alerts_for(&self.monitor, self.op_id).await
+        (outcome, alerts_for(&self.monitor, self.op_id).await)
     }
 }
 
@@ -384,8 +397,17 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
         "unused",
     );
 
-    // Should complete without panicking.
-    let alerts = fx.run(&config, None, CancellationToken::new()).await;
+    // It never starts watching, and says which source did not start.
+    let (outcome, alerts) = fx
+        .run_outcome(&config, None, CancellationToken::new())
+        .await;
+    let reason = outcome.expect_err("a missing source never starts watching");
+    assert!(
+        reason
+            .0
+            .contains("this_command_definitely_does_not_exist_12345"),
+        "{reason}"
+    );
     assert!(
         alerts.is_empty(),
         "no alerts expected when source command not found"
@@ -488,9 +510,11 @@ async fn test_livelog_pipeline_llm_resolve_error_exits_early() {
     config.llm_provider.api_key = Some("${_AHMA_LIVELOG_COVER_MISSING_KEY_XYZ789_}".to_string());
 
     let runtime = default_runtime(&config);
-    let alerts = fx
-        .run(&config, Some(&runtime), CancellationToken::new())
+    let (outcome, alerts) = fx
+        .run_outcome(&config, Some(&runtime), CancellationToken::new())
         .await;
+    let reason = outcome.expect_err("an unusable provider never starts watching");
+    assert!(reason.0.contains("LLM provider"), "{reason}");
     assert!(
         alerts.is_empty(),
         "LLM resolve error must produce no alerts"

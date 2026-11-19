@@ -1160,6 +1160,19 @@ fn timeout_reason(
     None
 }
 
+/// Why an operation that did not run to its end ended, as its ender stored it:
+/// `{"reason": …}` from the monitor's own deadline, or a plain string from
+/// the executor's deadline and from a cancel. Every reader goes through here,
+/// so a new ender cannot pick a layout one reader understands and another
+/// does not.
+pub(crate) fn ended_reason(result: Option<&Value>) -> Option<&str> {
+    let result = result?;
+    result
+        .get("reason")
+        .and_then(Value::as_str)
+        .or_else(|| result.as_str())
+}
+
 /// Map a terminal [`Operation`] to its unified terminal event.
 ///
 /// Exactly one terminal event is emitted per operation, at the moment it
@@ -1192,16 +1205,9 @@ fn terminal_event_for(op: &Operation) -> OperationEvent {
         },
         OperationStatus::Cancelled => OperationEvent::Cancelled {
             operation_id: op.id.clone(),
-            reason: op
-                .result
-                .as_ref()
-                .and_then(|v| {
-                    v.get("reason")
-                        .and_then(|r| r.as_str())
-                        .or_else(|| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "cancelled".to_string()),
+            reason: ended_reason(op.result.as_ref())
+                .unwrap_or("cancelled")
+                .to_string(),
             duration_ms,
         },
         OperationStatus::TimedOut => OperationEvent::TimedOut {

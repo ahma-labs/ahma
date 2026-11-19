@@ -116,7 +116,7 @@ pub async fn handle_livelog_start(
             .update_status(&op_id_task, OperationStatus::InProgress, None)
             .await;
 
-        run_livelog_pipeline(
+        let outcome = run_livelog_pipeline(
             &op_id_task,
             &livelog_config,
             &runtime_task,
@@ -127,12 +127,9 @@ pub async fn handle_livelog_start(
             llm_service_task,
         )
         .await;
+        crate::livelog::finish_monitoring(&monitor_task, &op_id_task, outcome).await;
 
-        monitor_task
-            .update_status(&op_id_task, OperationStatus::Completed, None)
-            .await;
-
-        info!("livelog_tool: operation '{}' completed", op_id_task);
+        info!("livelog_tool: operation '{}' finished", op_id_task);
     });
 
     Ok(op_id)
