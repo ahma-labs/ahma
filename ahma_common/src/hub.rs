@@ -1602,7 +1602,7 @@ struct PendingApproval {
 /// history file to flush, so "stop" has to run one shutdown choreography, not
 /// `exit(0)` from whichever task noticed first. The hub installs a hook; a
 /// hub without one (embedded in a test, say) refuses the request.
-type ExitHook = Arc<dyn Fn(&str) + Send + Sync>;
+type ExitHook = Arc<dyn Fn(crate::hub_history::StopReason) + Send + Sync>;
 
 /// A question an instance raised that no surface has answered yet.
 #[derive(Debug, Clone)]
@@ -2551,7 +2551,7 @@ where
                 // The composer owns the shutdown choreography (live MCP
                 // sessions to terminate, history to flush, two sockets to
                 // unlink) — it must not be short-circuited from here.
-                Some(hook) => hook("client requested shutdown"),
+                Some(hook) => hook(crate::hub_history::StopReason::ClientShutdown),
                 None => warn!("hub: no exit hook installed; ignoring the shutdown request"),
             }
         }
@@ -6257,9 +6257,9 @@ mod tests {
         let sock = tmp.path().join("hook.sock");
         let server = HubServer::bind_at(sock.clone()).await.expect("bind");
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        server.set_exit_hook(Arc::new(move |reason: &str| {
-            let _ = tx.send(reason.to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::hub_history::StopReason>();
+        server.set_exit_hook(Arc::new(move |reason| {
+            let _ = tx.send(reason);
         }));
         tokio::spawn(async move { server.serve().await });
 
@@ -6270,9 +6270,10 @@ mod tests {
             .await
             .expect("exit hook must run instead of exiting the process")
             .expect("hook sends its reason");
-        assert!(
-            reason.contains("shutdown"),
-            "hook is told why it was called: {reason}"
+        assert_eq!(
+            reason,
+            crate::hub_history::StopReason::ClientShutdown,
+            "hook is told why it was called"
         );
         // The process is still alive, which is the whole point of the hook.
         assert!(sock.exists());

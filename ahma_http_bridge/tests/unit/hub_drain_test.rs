@@ -78,7 +78,7 @@ async fn draining_does_not_stop_anything_by_itself() {
         "a drain must not stop the hub while sessions are still live"
     );
 
-    exit.request("idle");
+    exit.request(ahma_common::hub_history::StopReason::Idle);
     assert_eq!(
         stops.load(Ordering::SeqCst),
         1,
