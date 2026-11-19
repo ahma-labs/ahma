@@ -334,6 +334,28 @@ mod unix {
         }
     }
 
+    /// How long the terminal may stay quiet, after the command has exited,
+    /// before its output is taken as complete. A process a human let stay
+    /// running (`tools.long_running`) keeps the terminal open for as long as it
+    /// lives; its later output is its own, not this command's.
+    const QUIET_AFTER_EXIT: Duration = Duration::from_millis(500);
+
+    /// Read what the command wrote before it exited: until the terminal's end
+    /// of file, or until it has been quiet for [`QUIET_AFTER_EXIT`].
+    async fn drain_after_exit(
+        line_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        mut keep: impl FnMut(String) -> String,
+        spill_writer: &mut spill::SpillWriter,
+        monitor: &Arc<OperationMonitor>,
+        op_id: &str,
+    ) {
+        while let Ok(Some(line)) = tokio::time::timeout(QUIET_AFTER_EXIT, line_rx.recv()).await {
+            let safe = keep(line);
+            spill_writer.write_line(&safe, false).await;
+            monitor.append_output_line(op_id, safe, false).await;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
         sandbox: &Sandbox,
@@ -425,13 +447,37 @@ mod unix {
                         }
                     }
                 }
+
+                // The command itself has exited. On Linux the terminal reaches
+                // end of file only when every process holding it has closed it,
+                // and a process the command left running still holds it: waiting
+                // for that end of file ran every such command to its time limit.
+                // So what it left running ends first (SPEC R-PROC.5), which closes
+                // the terminal, and the rest of the output is read after.
+                status = exit_rx.recv() => {
+                    break status.flatten();
+                }
             }
         };
 
-        spill_writer.finish().await;
         // The command has ended: what it left running ends too, and its result
-        // names it (SPEC R-PROC.5).
-        if let Some(line) = crate::sandbox::leftovers::note(&killer.end_leftovers().await) {
+        // names it (SPEC R-PROC.5). Before the drain: a process it left running
+        // holds the terminal open.
+        let stopped = killer.end_leftovers().await;
+        drain_after_exit(
+            &mut line_rx,
+            |line| {
+                let safe = crate::log_monitor::redact_sensitive_line(&line);
+                collected.push(safe.clone());
+                safe
+            },
+            &mut spill_writer,
+            monitor,
+            op_id,
+        )
+        .await;
+        spill_writer.finish().await;
+        if let Some(line) = crate::sandbox::leftovers::note(&stopped) {
             monitor.append_alert(op_id, line).await;
         }
 
