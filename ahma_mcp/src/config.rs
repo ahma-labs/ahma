@@ -581,7 +581,9 @@ pub struct AvailabilityCheck {
     /// Working directory used for the probe (defaults to project root).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
-    /// Exit codes considered successful (defaults to `[0]`).
+    /// Exit codes considered successful (defaults to `[0]`). A probe that
+    /// could not be started, timed out or ended without an exit code never
+    /// passes, whatever this list holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success_exit_codes: Option<Vec<i32>>,
     /// If true, do not append derived subcommand arguments when constructing the probe command.

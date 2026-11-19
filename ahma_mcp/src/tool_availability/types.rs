@@ -41,11 +41,42 @@ pub(super) struct ProbePlan {
     pub(super) install_instructions: Option<String>,
 }
 
+/// How a probe command ended. Only [`ProbeExit::Exited`] is the program's own
+/// answer; the rest are ahma's, and none of them can count as a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeExit {
+    /// The program ran and exited with this code.
+    Exited(i32),
+    /// The command could not be built or spawned: nothing ran.
+    NotRun,
+    /// It ran past the probe's time limit and was killed.
+    TimedOut,
+    /// It ended without an exit code (a signal), or could not be waited for.
+    Killed,
+}
+
+impl ProbeExit {
+    /// How it ended, for a log line.
+    pub(super) fn describe(self) -> String {
+        match self {
+            Self::Exited(code) => format!("exit {code}"),
+            Self::NotRun => "it never ran".to_string(),
+            Self::TimedOut => "timed out".to_string(),
+            Self::Killed => "ended without an exit code".to_string(),
+        }
+    }
+
+    /// Whether this is an exit the tool declares successful.
+    pub(super) fn passes(self, success_codes: &[i32]) -> bool {
+        matches!(self, Self::Exited(code) if success_codes.contains(&code))
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ProbeOutcome {
     pub(super) plan: ProbePlan,
     pub(super) success: bool,
-    pub(super) exit_code: Option<i32>,
+    pub(super) exit: ProbeExit,
     pub(super) stdout: String,
     pub(super) stderr: String,
 }
@@ -77,30 +108,31 @@ impl ProbeTarget {
 
 impl ProbePlan {
     pub(super) async fn execute(self, sandbox: &crate::sandbox::Sandbox) -> ProbeOutcome {
-        let (exit_code, stdout, stderr) = self.execute_direct(sandbox).await;
-        let success = self.success_codes.contains(&exit_code);
-
+        let (exit, stdout, stderr) = self.execute_direct(sandbox).await;
         ProbeOutcome {
+            success: exit.passes(&self.success_codes),
             plan: self,
-            success,
-            exit_code: Some(exit_code),
+            exit,
             stdout,
             stderr,
         }
     }
 
-    /// Run the probe command directly inside the sandbox, returning
-    /// `(exit_code, stdout, stderr)`.
-    async fn execute_direct(&self, sandbox: &crate::sandbox::Sandbox) -> (i32, String, String) {
+    /// Run the probe command directly inside the sandbox, returning how it
+    /// ended, its stdout and its stderr.
+    async fn execute_direct(
+        &self,
+        sandbox: &crate::sandbox::Sandbox,
+    ) -> (ProbeExit, String, String) {
         let (program, args) = self.prepare_direct_command();
 
         let mut command = match sandbox.create_command(&program, &args, &self.working_dir) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return (
-                    1,
+                    ProbeExit::NotRun,
                     String::new(),
-                    format!("Failed to create sandboxed command: {e}"),
+                    format!("Failed to create sandboxed command for `{program}`: {e}"),
                 );
             }
         };
@@ -121,9 +153,9 @@ impl ProbePlan {
             Ok(child) => child,
             Err(e) => {
                 return (
-                    1,
+                    ProbeExit::NotRun,
                     String::new(),
-                    format!("Failed to spawn sandboxed command: {e}"),
+                    format!("Failed to spawn sandboxed command `{program}`: {e}"),
                 );
             }
         };
@@ -189,16 +221,19 @@ impl ProbePlan {
             std::result::Result<std::process::Output, std::io::Error>,
             tokio::time::error::Elapsed,
         >,
-    ) -> (i32, String, String) {
+    ) -> (ProbeExit, String, String) {
         match result {
             Ok(Ok(output)) => (
-                output.status.code().unwrap_or(-1),
+                output
+                    .status
+                    .code()
+                    .map_or(ProbeExit::Killed, ProbeExit::Exited),
                 String::from_utf8_lossy(&output.stdout).to_string(),
                 String::from_utf8_lossy(&output.stderr).to_string(),
             ),
-            Ok(Err(err)) => (-1, String::new(), err.to_string()),
+            Ok(Err(err)) => (ProbeExit::Killed, String::new(), err.to_string()),
             Err(_) => (
-                -1,
+                ProbeExit::TimedOut,
                 String::new(),
                 format!("probe timed out after {}ms", self.timeout_ms),
             ),
@@ -279,8 +314,12 @@ impl ProbeOutcome {
         };
 
         let message = format!(
-            "{} disabled. Probe command {:?} failed with exit {:?}. stdout: {} stderr: {}",
-            label, self.plan.command, self.exit_code, stdout, stderr
+            "{} disabled. Probe command {:?} failed ({}). stdout: {} stderr: {}",
+            label,
+            self.plan.command,
+            self.exit.describe(),
+            stdout,
+            stderr
         );
         warn!("{message}");
         if let Some(instructions) = self.plan.install_instructions.as_deref() {
@@ -302,9 +341,55 @@ impl ProbeOutcome {
         let stdout = if stdout.is_empty() { "<empty>" } else { stdout };
         let stderr = if stderr.is_empty() { "<empty>" } else { stderr };
         debug!(
-            "Probe success for {:?} (exit {:?}) stdout: {} stderr: {}",
-            self.plan.target, self.exit_code, stdout, stderr,
+            "Probe success for {:?} ({}) stdout: {} stderr: {}",
+            self.plan.target,
+            self.exit.describe(),
+            stdout,
+            stderr,
         );
+    }
+}
+
+/// A probe proves a tool is there by running it. One that never ran (the
+/// command could not be built or spawned) proves nothing, so it never passes,
+/// whatever exit codes the tool declares successful: a probe used to report
+/// exit 1 for "never ran", which a tool accepting exit 1 (`grep`, `diff`)
+/// took as present.
+#[cfg(test)]
+mod probe_exit_tests {
+    use super::*;
+    use crate::sandbox::{Sandbox, SandboxMode};
+
+    #[tokio::test]
+    async fn a_probe_that_never_ran_is_not_a_pass_whatever_codes_count_as_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![temp.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        for codes in [vec![0], vec![0, 1], vec![-1, 0, 1]] {
+            let plan = ProbePlan {
+                target: ProbeTarget::Tool {
+                    name: "missing".to_string(),
+                },
+                command: vec!["ahma-test-no-such-program-xyz".to_string()],
+                working_dir: temp.path().to_path_buf(),
+                success_codes: codes.clone(),
+                timeout_ms: 30_000,
+                install_instructions: None,
+            };
+            let outcome = plan.execute(&sandbox).await;
+            assert!(!outcome.success, "{codes:?}: {outcome:?}");
+            assert!(
+                outcome.stderr.contains("ahma-test-no-such-program-xyz")
+                    || outcome.stderr.to_lowercase().contains("spawn"),
+                "the reason says it never ran: {outcome:?}"
+            );
+        }
     }
 }
 
@@ -352,9 +437,13 @@ mod tests {
             install_instructions: None,
         };
 
-        let (exit_code, _stdout, stderr) = plan.execute_direct(&sandbox).await;
+        let (exit, _stdout, stderr) = plan.execute_direct(&sandbox).await;
 
-        assert_eq!(exit_code, -1, "the probe must report a timeout: {stderr}");
+        assert_eq!(
+            exit,
+            ProbeExit::TimedOut,
+            "the probe must report a timeout: {stderr}"
+        );
         assert!(
             stderr.contains("timed out"),
             "timeout must be named in stderr, got: {stderr}"

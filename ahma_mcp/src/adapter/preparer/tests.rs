@@ -273,6 +273,42 @@ async fn boolean_option_uses_alias_when_true() {
     assert_eq!(args_vec, vec!["-v".to_string()]);
 }
 
+/// The tool schema advertises an option typed `"bool"` as boolean
+/// (`schema::normalize_option_type`), so a client sends it as one, often as
+/// the string `"true"`. The argument processor recognised only `"boolean"`,
+/// and passed `--flag true` for the same option. Every spelling the schema
+/// accepts as boolean is one here too.
+#[tokio::test]
+async fn an_option_typed_bool_is_a_flag_like_one_typed_boolean() {
+    for spelling in ["bool", "boolean"] {
+        let temp_manager = test_temp_manager();
+        let subcommand_config = SubcommandConfig {
+            name: "run".to_string(),
+            description: "test".to_string(),
+            enabled: true,
+            options: Some(vec![CommandOption {
+                alias: Some("v".to_string()),
+                ..make_option("verbose", spelling)
+            }]),
+            ..Default::default()
+        };
+        for value in [json!("true"), json!(true)] {
+            let mut args_map = Map::new();
+            args_map.insert("verbose".to_string(), value.clone());
+            let (_, args_vec) = prepare_command_and_args(
+                "mycmd",
+                Some(&args_map),
+                Some(&subcommand_config),
+                Path::new("."),
+                &temp_manager,
+            )
+            .await
+            .expect("command");
+            assert_eq!(args_vec, vec!["-v".to_string()], "{spelling} {value}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn reserved_runtime_keys_are_not_emitted_as_cli_args() {
     let temp_manager = test_temp_manager();
