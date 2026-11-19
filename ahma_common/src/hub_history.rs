@@ -258,6 +258,72 @@ pub async fn load_recent(path: &Path, cutoff_ms: u64) -> Vec<HistoryRecord> {
     out
 }
 
+/// Why something asked the hub to stop. Each part that can stop it names a
+/// variant; [`StopReason::exit_reason`] is the one, exhaustive mapping to the
+/// recorded [`ExitReason`]. Free-text reasons parsed back with a catch-all
+/// used to turn a reworded reason into "stopped" without a word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    /// Nothing attached for the idle timeout.
+    Idle,
+    /// A drain went quiet and handed over.
+    Drained,
+    /// A drain ran past its cap with work still in flight.
+    DrainCapReached,
+    /// The operating system asked the process to stop.
+    Signal,
+    /// The MCP listener ended by itself.
+    ListenerEnded,
+    /// The MCP listener failed.
+    ListenerFailed(String),
+    /// The stop channel closed.
+    StopRequested,
+    /// A hub client sent `Shutdown`.
+    ClientShutdown,
+    /// The bridge's own idle timeout.
+    BridgeIdleTimeout,
+    /// The bridge was asked to restart.
+    RestartRequested,
+}
+
+impl StopReason {
+    /// What `last-exit.json` records for this stop. `socket_lost` tells a
+    /// drain that began because nobody could reach the hub from one a newer
+    /// build asked for.
+    pub fn exit_reason(&self, socket_lost: bool) -> ExitReason {
+        match self {
+            Self::Idle => ExitReason::Idle,
+            Self::Drained if socket_lost => ExitReason::SocketRemoved,
+            Self::Drained => ExitReason::Upgrade,
+            Self::DrainCapReached => ExitReason::DrainTimeout,
+            Self::ListenerFailed(_) => ExitReason::Failed,
+            Self::Signal
+            | Self::ListenerEnded
+            | Self::StopRequested
+            | Self::ClientShutdown
+            | Self::BridgeIdleTimeout
+            | Self::RestartRequested => ExitReason::Stopped,
+        }
+    }
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("idle"),
+            Self::Drained => f.write_str("drained"),
+            Self::DrainCapReached => f.write_str("drain cap reached"),
+            Self::Signal => f.write_str("signal"),
+            Self::ListenerEnded => f.write_str("listener ended"),
+            Self::ListenerFailed(e) => write!(f, "listener failed: {e}"),
+            Self::StopRequested => f.write_str("stop requested"),
+            Self::ClientShutdown => f.write_str("client requested shutdown"),
+            Self::BridgeIdleTimeout => f.write_str("bridge idle timeout"),
+            Self::RestartRequested => f.write_str("restart requested"),
+        }
+    }
+}
+
 /// Why the hub last exited (SPEC R-LIFECYCLE.4, R-HUB.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

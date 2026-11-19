@@ -30,6 +30,7 @@ use crate::session::{
     DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, DEFAULT_REQUEST_TIMEOUT_SECS,
     DEFAULT_TOOL_CALL_TIMEOUT_SECS, SessionManager, SessionManagerConfig,
 };
+pub use ahma_common::hub_history::StopReason;
 use arc_swap::ArcSwapOption;
 use axum::{
     Json, Router,
@@ -399,7 +400,7 @@ impl BridgeConfig {
 /// the composer. When an exit coordinator is installed the bridge asks; with
 /// none it behaves exactly as it always did.
 pub struct HubExit {
-    request: Box<dyn Fn(&str) + Send + Sync>,
+    request: Box<dyn Fn(StopReason) + Send + Sync>,
     draining: Arc<std::sync::atomic::AtomicBool>,
     /// The bridge's sessions, once it has built them: what the hub asks how
     /// much work is still in flight, and ends at the drain cap. Weak, so the
@@ -417,7 +418,7 @@ impl std::fmt::Debug for HubExit {
 
 impl HubExit {
     /// Build a coordinator whose `request` runs the composer's shutdown.
-    pub fn new(request: Box<dyn Fn(&str) + Send + Sync>) -> Self {
+    pub fn new(request: Box<dyn Fn(StopReason) + Send + Sync>) -> Self {
         Self {
             request,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -426,7 +427,7 @@ impl HubExit {
     }
 
     /// Stop now, for `reason`.
-    pub fn request(&self, reason: &str) {
+    pub fn request(&self, reason: StopReason) {
         (self.request)(reason);
     }
 
@@ -699,7 +700,7 @@ async fn shutdown_idle_bridge(
 ) {
     tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
     if let Some(exit) = exit.as_ref() {
-        exit.request("bridge idle timeout");
+        exit.request(StopReason::BridgeIdleTimeout);
         return;
     }
     session_manager
@@ -1629,7 +1630,7 @@ async fn handle_restart(
             return restart_status_response("draining");
         }
         info!("Restart requested. Asking the hub to stop...");
-        exit.request("restart requested");
+        exit.request(StopReason::RestartRequested);
         return restart_status_response("restarting");
     }
 

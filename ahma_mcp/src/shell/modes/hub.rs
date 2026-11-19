@@ -37,6 +37,7 @@
 
 use crate::shell::cli::AppConfig;
 use ahma_common::hub::{HubBindError, HubServer};
+use ahma_common::hub_history::StopReason;
 use ahma_http_bridge::{BridgeConfig, HubExit, ListenerKind, start_bridge};
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -443,13 +444,13 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
         .await;
 
     // ── One exit path for both halves ────────────────────────────────────────
-    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let exit = Arc::new(HubExit::new(Box::new(move |reason: &str| {
-        let _ = stop_tx.send(reason.to_string());
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<StopReason>();
+    let exit = Arc::new(HubExit::new(Box::new(move |reason| {
+        let _ = stop_tx.send(reason);
     })));
     hub.set_exit_hook({
         let exit = exit.clone();
-        Arc::new(move |reason: &str| exit.request(reason))
+        Arc::new(move |reason| exit.request(reason))
     });
 
     // ── The one listener ─────────────────────────────────────────────────────
@@ -495,14 +496,14 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
         tokio::select! {
             result = &mut serving => {
                 break match result {
-                    Ok(()) => "listener ended".to_string(),
-                    Err(e) => format!("listener failed: {e}"),
+                    Ok(()) => StopReason::ListenerEnded,
+                    Err(e) => StopReason::ListenerFailed(e.to_string()),
                 };
             }
             stop = stop_rx.recv() => {
-                break stop.unwrap_or_else(|| "stop requested".to_string());
+                break stop.unwrap_or(StopReason::StopRequested);
             }
-            _ = &mut signal => break "signal".to_string(),
+            _ = &mut signal => break StopReason::Signal,
             _ = socket_check.tick(), if !hub.relinquished() => {
                 if !socket_watch.still_ours(socket_file_id(&socket)) {
                     // Nobody can reach us by that path any more. Give the
@@ -559,7 +560,7 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
         let record = ahma_common::hub_history::LastExit {
             version: env!("CARGO_PKG_VERSION").to_string(),
             build_id: ahma_common::BUILD_ID.to_string(),
-            reason: exit_reason(&reason, hub.relinquished()),
+            reason: reason.exit_reason(hub.relinquished()),
             at_epoch_ms: ahma_common::keepalive::current_timestamp_ms(),
             interrupted_ops,
         };
@@ -582,22 +583,6 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     // nothing above can touch a successor's files (SPEC R-ISO.3).
     drop(hub);
     Ok(())
-}
-
-/// Classify the reason the serve loop ended, for `last-exit.json`.
-///
-/// `socket_lost` tells a drain the hub started because nobody could reach it
-/// from one a newer build asked for.
-fn exit_reason(reason: &str, socket_lost: bool) -> ahma_common::hub_history::ExitReason {
-    use ahma_common::hub_history::ExitReason;
-    match reason {
-        "idle" => ExitReason::Idle,
-        "drained" if socket_lost => ExitReason::SocketRemoved,
-        "drained" => ExitReason::Upgrade,
-        "drain cap reached" => ExitReason::DrainTimeout,
-        r if r.starts_with("listener failed") => ExitReason::Failed,
-        _ => ExitReason::Stopped,
-    }
 }
 
 /// Build the MCP endpoint's configuration.
@@ -705,7 +690,7 @@ fn spawn_idle_watcher(
                         // reconnects to the successor at once, where a
                         // terminated session would first look like a failing
                         // request.
-                        exit.request("drained");
+                        exit.request(StopReason::Drained);
                     }
                     DrainStep::Interrupt => {
                         tracing::warn!(
@@ -720,7 +705,7 @@ fn spawn_idle_watcher(
                         // Answers each request still waiting with an error
                         // rather than leaving it on a process about to exit.
                         exit.end_sessions().await;
-                        exit.request("drain cap reached");
+                        exit.request(StopReason::DrainCapReached);
                     }
                 }
                 return;
@@ -729,7 +714,7 @@ fn spawn_idle_watcher(
             let sessions_now = active_sessions.load(Ordering::SeqCst);
             let idle_for = clock.observe(hub_now > 0 || sessions_now > 0, now);
             if idle_exit_due(hub_now, sessions_now, idle_for, timeout_secs) {
-                exit.request("idle");
+                exit.request(StopReason::Idle);
                 return;
             }
         }
@@ -1067,19 +1052,27 @@ mod tests {
     #[test]
     fn the_exit_reason_is_classified() {
         use ahma_common::hub_history::ExitReason;
-        assert_eq!(exit_reason("idle", false), ExitReason::Idle);
-        assert_eq!(exit_reason("drained", false), ExitReason::Upgrade);
-        assert_eq!(exit_reason("drained", true), ExitReason::SocketRemoved);
+        assert_eq!(StopReason::Idle.exit_reason(false), ExitReason::Idle);
+        assert_eq!(StopReason::Drained.exit_reason(false), ExitReason::Upgrade);
         assert_eq!(
-            exit_reason("drain cap reached", false),
+            StopReason::Drained.exit_reason(true),
+            ExitReason::SocketRemoved
+        );
+        assert_eq!(
+            StopReason::DrainCapReached.exit_reason(false),
             ExitReason::DrainTimeout
         );
         assert_eq!(
-            exit_reason("listener failed: boom", false),
+            StopReason::ListenerFailed("boom".into()).exit_reason(false),
             ExitReason::Failed
         );
-        assert_eq!(exit_reason("signal", false), ExitReason::Stopped);
-        assert_eq!(exit_reason("hub Shutdown", false), ExitReason::Stopped);
+        assert_eq!(StopReason::Signal.exit_reason(false), ExitReason::Stopped);
+        assert_eq!(
+            StopReason::ClientShutdown.exit_reason(false),
+            ExitReason::Stopped
+        );
+        // The log keeps the words it always had.
+        assert_eq!(StopReason::DrainCapReached.to_string(), "drain cap reached");
     }
 
     /// `0` is an operator saying "stay": a hub started deliberately in a
