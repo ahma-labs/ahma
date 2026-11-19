@@ -486,6 +486,24 @@ mod tests {
             .await;
         }
 
+        /// [`Self::grant`] once the frontend counts the tab as having read the
+        /// question. `visible` only queues its report, so how long ago the
+        /// frontend recorded it depends on the scheduler: a fixed sleep raced
+        /// it on a loaded machine. A refusal for not being armed changes
+        /// nothing, so asking again until it is, within a bound, is safe.
+        async fn grant_once_armed(&self, tab: TabId, option: &str) -> Result<(), IntentError> {
+            use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+            let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::Quick);
+            loop {
+                match self.grant(tab, option).await {
+                    Err(IntentError::NotArmed) if Instant::now() < deadline => {
+                        tokio::time::sleep(TestTimeouts::poll_interval() / 10).await;
+                    }
+                    other => return other,
+                }
+            }
+        }
+
         async fn grant(&self, tab: TabId, option: &str) -> Result<(), IntentError> {
             self.intent(
                 tab,
@@ -639,8 +657,7 @@ mod tests {
         run(&mut session, |d, _| async move {
             d.open(TAB_A).await;
             d.visible(TAB_A).await;
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            assert_eq!(d.grant(TAB_A, &answer).await, Ok(()));
+            assert_eq!(d.grant_once_armed(TAB_A, &answer).await, Ok(()));
         })
         .await;
         assert!(session.state.scope_grant.is_none(), "the answer was taken");
