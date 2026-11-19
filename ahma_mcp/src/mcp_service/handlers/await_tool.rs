@@ -1467,10 +1467,9 @@ mod tests {
         service.operation_monitor.add_operation(op).await;
         service
             .operation_monitor
-            .update_status(
+            .finish(
                 id,
-                OperationStatus::Completed,
-                Some(serde_json::json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(serde_json::json!({"ok": true}))),
             )
             .await;
     }
@@ -1534,10 +1533,9 @@ mod tests {
         let mon = service.operation_monitor.clone();
         let completer = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            mon.update_status(
+            mon.finish(
                 "wait-1",
-                OperationStatus::Completed,
-                Some(serde_json::json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(serde_json::json!({"ok": true}))),
             )
             .await;
         });
@@ -1601,10 +1599,9 @@ mod tests {
         let mon = service.operation_monitor.clone();
         let completer = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            mon.update_status(
+            mon.finish(
                 "wf-1",
-                OperationStatus::Completed,
-                Some(serde_json::json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(serde_json::json!({"ok": true}))),
             )
             .await;
         });
@@ -2212,10 +2209,9 @@ mod liveness_probe_tests {
         let mon = service.operation_monitor.clone();
         let completer = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(79)).await;
-            mon.update_status(
+            mon.finish(
                 "op_probe_3",
-                OperationStatus::Completed,
-                Some(serde_json::json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(serde_json::json!({"ok": true}))),
             )
             .await;
         });

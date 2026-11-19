@@ -129,7 +129,7 @@ pub fn queued_notice(id: &str, ahead: &[HolderInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation_monitor::{MonitorConfig, OperationStatus};
+    use crate::operation_monitor::MonitorConfig;
     use std::time::Duration;
 
     fn monitor() -> OperationMonitor {
@@ -144,10 +144,11 @@ mod tests {
             None,
         ))
         .await;
-        m.update_status(
+        m.finish(
             id,
-            OperationStatus::Completed,
-            Some(serde_json::json!({"stdout": stdout, "stderr": "", "exit_code": 0})),
+            crate::operation_monitor::Terminal::Done(Some(
+                serde_json::json!({"stdout": stdout, "stderr": "", "exit_code": 0}),
+            )),
         )
         .await;
     }
@@ -218,15 +219,14 @@ mod tests {
         ))
         .await;
         let alert = "TRUST-HANDOFF WRITE: /ws/.git/hooks/pre-commit (created) — git runs files";
-        m.update_status(
+        m.finish(
             "op3",
-            OperationStatus::Completed,
-            Some(serde_json::json!({
+            crate::operation_monitor::Terminal::Done(Some(serde_json::json!({
                 "stdout": "line\n".repeat(PIGGYBACK_MAX_CHARS),
                 "stderr": "",
                 "exit_code": 0,
                 "handoff_alert": alert,
-            })),
+            }))),
         )
         .await;
         let op = m.check_completion_history_pub("op3").await.unwrap();

@@ -15,7 +15,7 @@ use tracing::info;
 use crate::{
     config::ToolConfig,
     livelog::run_livelog_pipeline,
-    operation_monitor::{Operation, OperationMonitor, OperationStatus},
+    operation_monitor::{Operation, OperationMonitor},
     sandbox::Sandbox,
 };
 
@@ -112,9 +112,7 @@ pub async fn handle_livelog_start(
             }
         };
 
-        monitor_task
-            .update_status(&op_id_task, OperationStatus::InProgress, None)
-            .await;
+        monitor_task.start(&op_id_task).await;
 
         let outcome = run_livelog_pipeline(
             &op_id_task,

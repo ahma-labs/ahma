@@ -24,9 +24,7 @@ async fn test_operation_timeout_enforcement() {
     monitor.add_operation(op).await;
 
     // Set status to InProgress
-    monitor
-        .update_status(&op_id, OperationStatus::InProgress, None)
-        .await;
+    monitor.start(&op_id).await;
 
     // Trigger timeout check without real waiting
     monitor.check_timeouts().await;
@@ -60,9 +58,7 @@ async fn test_operation_within_timeout_not_timed_out() {
     );
     monitor.add_operation(op).await;
 
-    monitor
-        .update_status("no_timeout_test", OperationStatus::InProgress, None)
-        .await;
+    monitor.start("no_timeout_test").await;
 
     // Check timeouts immediately - operation just started, should not timeout
     monitor.check_timeouts().await;

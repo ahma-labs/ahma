@@ -232,9 +232,7 @@ async fn test_concurrent_cancellation_safety() {
         None,
     );
     monitor.add_operation(op).await;
-    monitor
-        .update_status("race_cancel", OperationStatus::InProgress, None)
-        .await;
+    monitor.start("race_cancel").await;
 
     // Spawn multiple tasks trying to cancel the same operation
     let mut handles = vec![];

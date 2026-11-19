@@ -82,7 +82,7 @@ use crate::{
     config::ToolConfig,
     file_ops::{DefaultFileOpsProvider, DefaultWebPageFetcher, FileOpsProvider, WebPageFetcher},
     llm_service::DefaultLlmCompletionService,
-    operation_monitor::{Operation, OperationStatus},
+    operation_monitor::Operation,
 };
 use serde_json::Value;
 
@@ -2266,9 +2266,7 @@ impl AhmaMcpService {
         let monitor_clone = monitor.clone();
         let llm_service_clone = self.llm_service.clone();
         tokio::spawn(async move {
-            monitor_clone
-                .update_status(&op_id_clone, OperationStatus::InProgress, None)
-                .await;
+            monitor_clone.start(&op_id_clone).await;
 
             let outcome = crate::livelog::run_file_monitor_pipeline(
                 &op_id_clone,
@@ -2895,10 +2893,9 @@ mod tests {
         );
         monitor.add_operation(op_completed).await;
         monitor
-            .update_status(
+            .finish(
                 "op_completed",
-                OperationStatus::Completed,
-                Some(json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(json!({"ok": true}))),
             )
             .await;
 
@@ -3134,10 +3131,9 @@ mod tests {
         );
         monitor.add_operation(op).await;
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(json!({"ok": true}))),
             )
             .await;
 
@@ -3175,10 +3171,9 @@ mod tests {
         );
         monitor.add_operation(op).await;
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(json!({"ok": true}))),
             )
             .await;
 

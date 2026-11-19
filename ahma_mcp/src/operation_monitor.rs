@@ -897,8 +897,10 @@ impl OperationMonitor {
         self.transition(id, status, terminal.into_result()).await
     }
 
-    pub async fn update_status(&self, id: &str, status: OperationStatus, result: Option<Value>) {
-        self.transition(id, status, result).await;
+    /// Mark operation `id` as running: it holds its turn and has started
+    /// (SPEC R2.7.1). Ending it is [`Self::finish`]'s, the only other move.
+    pub async fn start(&self, id: &str) {
+        self.transition(id, OperationStatus::InProgress, None).await;
     }
 
     /// Move `id` to `status` with `result`; whether it moved.
@@ -915,7 +917,7 @@ impl OperationMonitor {
             let from = op.state;
             if op.try_transition(status).is_err() {
                 tracing::debug!(
-                    "update_status: ignoring {:?} for op {} — already terminal ({:?})",
+                    "operation transition: ignoring {:?} for op {} — already terminal ({:?})",
                     status,
                     id,
                     op.state
@@ -1361,10 +1363,11 @@ mod tests {
 
         // 2. Immediately update its status to Completed, which moves it to history
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(serde_json::json!({"result": "success"})),
+                crate::operation_monitor::Terminal::Done(Some(
+                    serde_json::json!({"result": "success"}),
+                )),
             )
             .await;
 
@@ -1404,10 +1407,11 @@ mod tests {
 
         monitor.add_operation(op).await;
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(serde_json::json!({"result": "success"})),
+                crate::operation_monitor::Terminal::Done(Some(
+                    serde_json::json!({"result": "success"}),
+                )),
             )
             .await;
 
@@ -1450,7 +1454,7 @@ mod tests {
 
         // Move to history
         monitor
-            .update_status(&op_id, OperationStatus::Completed, None)
+            .finish(&op_id, crate::operation_monitor::Terminal::Done(None))
             .await;
 
         // Completion history deduplication
@@ -1485,7 +1489,7 @@ mod tests {
             );
             monitor.add_operation(op).await;
             monitor
-                .update_status(&op_id, OperationStatus::Completed, None)
+                .finish(&op_id, crate::operation_monitor::Terminal::Done(None))
                 .await;
         }
 
@@ -1567,10 +1571,9 @@ mod tests {
         });
         tokio::task::yield_now().await;
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(serde_json::json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(serde_json::json!({"ok": true}))),
             )
             .await;
         let completed = waiter.await.expect("waiter task panicked");
@@ -1610,7 +1613,7 @@ mod tests {
         }
     }
 
-    /// Verifies that `update_status` does NOT overwrite a terminal state that was
+    /// Verifies that `finish` does NOT overwrite a terminal state that was
     /// set by a racing concurrent transition.  The guard added in the fix should
     /// keep the first terminal state and discard the later update.
     #[tokio::test]
@@ -1646,13 +1649,14 @@ mod tests {
             "state in history should be Cancelled"
         );
 
-        // Now simulate the background task calling update_status(Completed) after the cancel.
+        // Now simulate the background task calling finish (Completed) after the cancel.
         // With the guard this should be a no-op (op was already removed from active ops).
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(serde_json::json!({"result": "late completion"})),
+                crate::operation_monitor::Terminal::Done(Some(
+                    serde_json::json!({"result": "late completion"}),
+                )),
             )
             .await;
 
@@ -1665,7 +1669,7 @@ mod tests {
         );
     }
 
-    /// Verifies that `update_status` blocks a state downgrade (non-terminal
+    /// Verifies that `start` blocks a state downgrade (non-terminal
     /// replacing an already-terminal state) when the op is still in the active map.
     ///
     /// In normal operation terminal ops are removed immediately, so this path is
@@ -1691,10 +1695,8 @@ mod tests {
             ops.insert(op_id.clone(), op_mut);
         }
 
-        // update_status(InProgress) must be rejected because the op is already terminal.
-        monitor
-            .update_status(&op_id, OperationStatus::InProgress, None)
-            .await;
+        // start (InProgress) must be rejected because the op is already terminal.
+        monitor.start(&op_id).await;
 
         let ops = monitor.operations.read().await;
         let op = ops.get(&op_id).unwrap();
@@ -1742,10 +1744,9 @@ mod tests {
 
         // 3. Update status to Completed
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(serde_json::json!({"ok": true})),
+                crate::operation_monitor::Terminal::Done(Some(serde_json::json!({"ok": true}))),
             )
             .await;
 
@@ -2114,7 +2115,7 @@ mod tests {
         add_active_op(&monitor, "done").await;
         // Drive one to a terminal state before the bulk cancel.
         monitor
-            .update_status("done", OperationStatus::Completed, None)
+            .finish("done", crate::operation_monitor::Terminal::Done(None))
             .await;
 
         let cancelled = monitor.cancel_all_operations(None).await;
