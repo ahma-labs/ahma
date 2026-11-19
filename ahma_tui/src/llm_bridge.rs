@@ -153,11 +153,12 @@ fn is_local_default_server(url: &str) -> bool {
     trimmed == "http://localhost:3000" || trimmed == "http://127.0.0.1:3000"
 }
 
-/// Recovers from a `403` on the (possibly cached/reused) MCP session: drops
+/// Recovers from a lost (possibly cached/reused) MCP session — the bridge
+/// answers 404, an older one 403 ([`ahma_core::agent::ToolCallError::is_session_gone`]): drops
 /// it from the process-wide cache, negotiates a fresh one, tells `tx` about
 /// it so subsequent calls reuse it instead of retrying a dead session, and
 /// retries the tool call exactly once.
-async fn retry_tool_call_after_403(
+async fn retry_tool_call_in_a_new_session(
     client: &ahma_http_mcp_client::http_client::HttpClient,
     url: &str,
     mcp: &McpChatConfig,
@@ -174,7 +175,7 @@ async fn retry_tool_call_after_403(
         Ok(sid) => sid,
         Err(e) => return (format!("Error: {e}"), true),
     };
-    // The old session_id was rejected (403); replace it in app state so
+    // The old session_id is gone; replace it in app state so
     // subsequent calls don't keep retrying a dead session before falling
     // back here every time.
     let _ = tx
@@ -238,8 +239,8 @@ async fn call_tool_in_session(
             .await;
     match tool_result {
         Ok((result, failed)) => (result, failed),
-        Err(ref err) if err.contains("HTTP 403") => {
-            retry_tool_call_after_403(&client, &url, mcp, tool, arguments, tx).await
+        Err(ref err) if err.is_session_gone() => {
+            retry_tool_call_in_a_new_session(&client, &url, mcp, tool, arguments, tx).await
         }
         Err(err) => (format!("Error: {err}"), true),
     }

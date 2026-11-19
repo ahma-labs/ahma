@@ -1736,7 +1736,9 @@ async fn spawn_local_tool_call(
     let (request_base_url, client) = cached_http_client(&mcp.base_url)?;
     let url = format!("{}/mcp", request_base_url);
     let session_id = get_or_create_session(&client, &url, mcp).await?;
-    call_mcp_tool_http(&client, &url, &session_id, tool, arguments).await
+    call_mcp_tool_http(&client, &url, &session_id, tool, arguments)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn spawn_external_tool_call_http(
@@ -1747,7 +1749,9 @@ async fn spawn_external_tool_call_http(
     let (request_base, client) = cached_http_client(base_url.trim_end_matches('/'))?;
     let url = format!("{}/mcp", request_base);
     let sid = get_or_create_external_session(&client, &url).await?;
-    call_mcp_tool_http(&client, &url, &sid, tool, arguments).await
+    call_mcp_tool_http(&client, &url, &sid, tool, arguments)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Initialize a session against an *external* Streamable-HTTP MCP server via
@@ -1902,6 +1906,50 @@ fn extract_content_text(res: &serde_json::Value) -> String {
         .join("\n")
 }
 
+/// Why a `tools/call` to an MCP server got no tool result. Its text is what
+/// the agent and the human are shown; its kind is what a caller decides on,
+/// never the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallError {
+    /// The session's sandbox has not settled yet, after the retries
+    /// (HTTP 409). The session is still good.
+    SandboxInitializing { body: String },
+    /// Any other non-2xx answer.
+    Http {
+        status: u16,
+        text: String,
+        body: String,
+    },
+    /// No answer: the request could not be sent or its reply read.
+    Transport(String),
+}
+
+impl ToolCallError {
+    /// The server no longer knows this session, so a new one must be started:
+    /// HTTP 404, as MCP Streamable HTTP specifies, or 403 from an older bridge.
+    pub fn is_session_gone(&self) -> bool {
+        matches!(
+            self,
+            Self::Http {
+                status: 403 | 404,
+                ..
+            }
+        )
+    }
+}
+
+impl std::fmt::Display for ToolCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SandboxInitializing { body } => write!(f, "HTTP 409 Conflict: {body}"),
+            Self::Http { text, body, .. } => write!(f, "HTTP {text}: {body}"),
+            Self::Transport(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ToolCallError {}
+
 /// POST a `tools/call` to the local MCP bridge and parse the response.
 /// Shared by the core agent loop and the TUI's manual tool-call path.
 pub async fn call_mcp_tool_http(
@@ -1910,7 +1958,7 @@ pub async fn call_mcp_tool_http(
     session_id: &str,
     tool: &str,
     arguments: serde_json::Value,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool), ToolCallError> {
     // This call site only carries a bare cached session id (see
     // `SESSION_CACHE`), not the version that session's own `initialize`
     // negotiated, so it echoes the spec's own default. The bridge validates
@@ -1937,11 +1985,17 @@ pub async fn call_mcp_tool_http(
     match session
         .call_tool(tool, arguments, retry)
         .await
-        .map_err(|e| hub_message(&e))?
+        .map_err(|e| ToolCallError::Transport(hub_message(&e)))?
     {
         ToolCallOutcome::Success(json_resp) => Ok(parse_mcp_response(&json_resp)),
-        ToolCallOutcome::SandboxInitializing { body } => Err(format!("HTTP 409 Conflict: {body}")),
-        ToolCallOutcome::HttpError { status, body } => Err(format!("HTTP {status}: {body}")),
+        ToolCallOutcome::SandboxInitializing { body } => {
+            Err(ToolCallError::SandboxInitializing { body })
+        }
+        ToolCallOutcome::HttpError { status, body } => Err(ToolCallError::Http {
+            status: status.as_u16(),
+            text: status.to_string(),
+            body,
+        }),
     }
 }
 
@@ -4410,8 +4464,38 @@ mod tests {
         )
         .await
         .expect_err("500 must error");
+        let err = err.to_string();
         assert!(err.contains("HTTP 500"), "{err}");
         assert!(err.contains("boom-body"), "{err}");
+    }
+
+    /// A session the bridge no longer knows is answered 404 (MCP Streamable
+    /// HTTP; an older bridge said 403), and the caller must start a new one.
+    /// The TUI looked for "HTTP 403" in the error text, so after the bridge
+    /// moved to 404 an expired session was never recovered. The error says
+    /// which kind it is; its text is unchanged.
+    #[tokio::test]
+    async fn a_session_the_bridge_no_longer_knows_is_told_apart_from_other_errors() {
+        for (status, gone) in [
+            (axum::http::StatusCode::NOT_FOUND, true),
+            (axum::http::StatusCode::FORBIDDEN, true),
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, false),
+            (axum::http::StatusCode::BAD_REQUEST, false),
+        ] {
+            let base = mock_post_status(status).await;
+            let url = format!("{}/mcp", base);
+            let err = call_mcp_tool_http(
+                &reqwest::Client::new().into(),
+                &url,
+                "sid",
+                "t",
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err("an error status is an error");
+            assert_eq!(err.is_session_gone(), gone, "{status}: {err}");
+            assert_eq!(err.to_string(), format!("HTTP {status}: boom-body"));
+        }
     }
 
     #[tokio::test]
@@ -4429,6 +4513,7 @@ mod tests {
         )
         .await
         .expect_err("unparseable body must error");
+        let err = err.to_string();
         assert!(err.contains("failed to parse tools/call response"), "{err}");
     }
 

@@ -365,6 +365,11 @@ performing a full `initialize`/`roots/list` handshake and spawning a fresh bridg
 per call. The session id established by a tool call's `get_or_create_session` **must** be fed
 back into `state.session_id` so every later tool call in the turn — and across turns — reuses
 it instead of racing the bridge's session limit.
+When the bridge no longer knows the session (HTTP 404, as MCP Streamable HTTP specifies; 403
+from an older bridge), the call **must** drop it, negotiate a new one, feed that back the same
+way, and retry once. The decision reads the error's kind
+(`ahma_core::agent::ToolCallError::is_session_gone`), never its text: matching "HTTP 403" in
+the message kept working for years after the bridge moved to 404, and never fired again.
 
 ## 4. Non-Functional Requirements
 
