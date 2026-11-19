@@ -398,14 +398,7 @@ impl AhmaMcpService {
         self.emit_vault_tool_call(
             &id,
             "run_terminal_command",
-            &format!(
-                "{{\"working_directory\":\"{}\",\"command\":\"{}\"}}",
-                working_directory,
-                adapter_args
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-            ),
+            &VaultArgs::new(working_directory, cmd_str).to_json(),
         )
         .await;
 
@@ -484,10 +477,9 @@ impl AhmaMcpService {
         self.emit_vault_tool_call(
             &id,
             "run_terminal_command",
-            &format!(
-                "{{\"working_directory\":\"{}\",\"command\":\"{}\",\"session_id\":{:?},\"pty\":{}}}",
-                working_directory, command, session_id, use_pty
-            ),
+            &VaultArgs::new(working_directory, command)
+                .special(session_id, use_pty)
+                .to_json(),
         )
         .await;
 
@@ -574,10 +566,7 @@ impl AhmaMcpService {
             "run_terminal_command",
             cmd_str,
         );
-        let vault_args_summary = format!(
-            "{{\"working_directory\":\"{}\",\"command\":\"{}\"}}",
-            working_directory, cmd_str
-        );
+        let vault_args_summary = VaultArgs::new(working_directory, cmd_str).to_json();
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
@@ -608,6 +597,46 @@ impl AhmaMcpService {
     }
 }
 
+/// The arguments a `run_terminal_command` call records in the task vault's
+/// audit log (`args_summary`), serialized rather than formatted: a command
+/// holds quotes and backslashes, and the line must stay JSON whatever it holds.
+#[derive(serde::Serialize)]
+struct VaultArgs<'a> {
+    working_directory: &'a str,
+    command: &'a str,
+    /// Written for a terminal or session call (as `null` when it has none),
+    /// left out of a plain one, as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<Option<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pty: Option<bool>,
+}
+
+impl<'a> VaultArgs<'a> {
+    fn new(working_directory: &'a str, command: &'a str) -> Self {
+        Self {
+            working_directory,
+            command,
+            session_id: None,
+            pty: None,
+        }
+    }
+
+    /// The fields a terminal or session call adds.
+    fn special(self, session_id: Option<&'a str>, pty: bool) -> Self {
+        Self {
+            session_id: Some(session_id),
+            pty: Some(pty),
+            ..self
+        }
+    }
+
+    fn to_json(&self) -> String {
+        // Serializing borrowed strings and a bool cannot fail.
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::working_directory;
@@ -628,6 +657,32 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
+
+    /// The vault's audit line holds the arguments as JSON (`args_summary`), and
+    /// a reader parses it. A command with a quote or a backslash, and every
+    /// terminal or session call (`session_id` was written with Rust's `{:?}`,
+    /// `Some("s")`), wrote text no JSON reader accepts.
+    #[test]
+    fn vault_args_are_json_whatever_the_command_holds() {
+        use super::VaultArgs;
+        let dir = r#"C:\Users\me\repo "x""#;
+        let command = r#"grep -rn "a\b" src | head"#;
+        let plain: Value = serde_json::from_str(&VaultArgs::new(dir, command).to_json())
+            .expect("a plain call is JSON");
+        assert_eq!(plain, json!({"working_directory": dir, "command": command}));
+
+        for (session_id, pty) in [(Some("s1"), false), (None, true)] {
+            let text = VaultArgs::new(dir, command)
+                .special(session_id, pty)
+                .to_json();
+            let parsed: Value = serde_json::from_str(&text).expect("a session or PTY call is JSON");
+            assert_eq!(
+                parsed,
+                json!({"working_directory": dir, "command": command, "session_id": session_id, "pty": pty}),
+                "{text}"
+            );
+        }
+    }
 
     /// Concatenate all text content of a `CallToolResult` into one String.
     fn result_text(result: &CallToolResult) -> String {
