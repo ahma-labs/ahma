@@ -32,8 +32,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use super::server::{
-    check_bridge_running, is_test_isolated, parse_version, query_uds_health,
-    split_version_and_build_id,
+    check_bridge_running, is_test_isolated, query_uds_health, split_version_and_build_id,
 };
 
 /// How long to wait for a draining hub to release the rendezvous before
@@ -79,7 +78,8 @@ pub fn skew_action(client_semver: &str, client_build: &str, hub_version: &str) -
     // A version string neither side can parse is not evidence the hub is
     // current, so it counts as older: an unreadable version must not become a
     // reason to keep whatever is running.
-    let we_are_newer = match (parse_version(client_semver), parse_version(hub_semver)) {
+    use ahma_common::exe_identity::parse_semver;
+    let we_are_newer = match (parse_semver(client_semver), parse_semver(hub_semver)) {
         (Some(ours), Some(theirs)) => ours > theirs,
         _ => true,
     } || (same_semver && !same_build);
@@ -386,6 +386,16 @@ mod tests {
         );
     }
     use super::*;
+
+    /// A pre-release hub is judged by its version, not dropped as unreadable.
+    /// The parser here rejected `1.2.4-rc1`, and an unreadable version counts as
+    /// older, so a 1.2.3 client drained a newer hub and put itself in its place.
+    #[test]
+    fn a_pre_release_hub_newer_than_us_is_kept() {
+        assert_eq!(skew_action("1.2.3", "b", "1.2.4-rc1+x"), SkewAction::Proxy);
+        assert_eq!(skew_action("1.2.5", "b", "1.2.4-rc1+x"), SkewAction::Drain);
+        assert_eq!(skew_action("1.2.4-rc2", "b", "1.2.3+x"), SkewAction::Drain);
+    }
 
     const OURS: &str = "0.20.2";
     const OUR_BUILD: &str = "abc1234";

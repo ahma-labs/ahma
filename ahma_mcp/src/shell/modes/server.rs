@@ -406,26 +406,11 @@ async fn run_shutdown_handler(
     std::process::exit(0);
 }
 
-/// Run in server mode (stdio MCP server).
-///
-/// # Arguments
-/// * `config` - Immutable application configuration.
-/// * `sandbox` - Sandbox configuration.
-///
-/// # Errors
-/// Returns an error if the server fails to start or encounters a fatal error.
 // The functions below are the cross-crate chokepoint for bridge
 // liveness/version/restart checks (see AGENTS.md): every surface that needs
 // to know whether a bridge is up, what version it reports, or must ask it to
 // restart — including `ahma_tui` — calls through here rather than
 // reimplementing the raw HTTP/1.0-over-`UnixStream` and `reqwest` probes.
-pub fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = v.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
-}
 
 /// A running bridge's self-reported version and (if any) the sandbox scope it
 /// is actually configured for. `default_sandbox_scope` lets a caller decide
@@ -1127,54 +1112,6 @@ mod tests {
             session_id: None,
             client_pid: None,
         }
-    }
-
-    // ------------------------------------------------------------------
-    // parse_version
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_version_valid() {
-        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("0.0.0"), Some((0, 0, 0)));
-    }
-
-    #[test]
-    fn test_parse_version_large_numbers() {
-        assert_eq!(
-            parse_version("4294967295.4294967295.4294967295"),
-            Some((u32::MAX, u32::MAX, u32::MAX))
-        );
-    }
-
-    #[test]
-    fn test_parse_version_overflow_is_none() {
-        // One past u32::MAX must fail to parse.
-        assert_eq!(parse_version("4294967296.0.0"), None);
-    }
-
-    #[test]
-    fn test_parse_version_too_few_parts() {
-        assert_eq!(parse_version("1"), None);
-        assert_eq!(parse_version("1.2"), None);
-    }
-
-    #[test]
-    fn test_parse_version_non_numeric() {
-        assert_eq!(parse_version("a.b.c"), None);
-        assert_eq!(parse_version("1.2.x"), None);
-        assert_eq!(parse_version("1.x.3"), None);
-    }
-
-    #[test]
-    fn test_parse_version_empty() {
-        assert_eq!(parse_version(""), None);
-    }
-
-    #[test]
-    fn test_parse_version_ignores_extra_parts() {
-        // Only the first three dot-separated components are consumed.
-        assert_eq!(parse_version("1.2.3.4"), Some((1, 2, 3)));
     }
 
     // ------------------------------------------------------------------
