@@ -63,7 +63,7 @@ pub use pty_exec::pty_available;
 pub use types::{AsyncExecOptions, ExecutionMode};
 
 use crate::operation_monitor::{
-    CommandOutput, Operation, OperationMonitor, OperationStatus, Terminal,
+    CommandOutput, Operation, OperationMonitor, OperationStatus, Stream, Terminal,
 };
 use crate::retry::{self, RetryConfig};
 use crate::sandbox;
@@ -1574,9 +1574,7 @@ impl Adapter {
             None => anyhow::bail!("operation {op_id} vanished before start"),
         };
 
-        let timeout_ms = timeout
-            .map(|t| t * 1000)
-            .unwrap_or_else(|| self.shell_pool.config().command_timeout.as_millis() as u64);
+        let limit = command_limit(&self.shell_pool, timeout);
         let monitor = self.monitor.clone();
         let sandbox = self.sandbox.clone();
         let command_str = command_str.to_string();
@@ -1633,7 +1631,7 @@ impl Adapter {
                 &sandbox,
                 &command_str,
                 &safe_wd,
-                timeout_ms,
+                limit,
                 &cancellation_token,
                 &op_id_task,
                 &monitor,
@@ -1720,9 +1718,7 @@ impl Adapter {
             None => anyhow::bail!("operation {op_id} vanished before start"),
         };
 
-        let timeout_duration = timeout
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| self.shell_pool.config().command_timeout);
+        let timeout_duration = command_limit(&self.shell_pool, timeout);
         let monitor = self.monitor.clone();
         let sandbox = self.sandbox.clone();
         let sessions = self.shell_sessions.clone();
@@ -1915,6 +1911,15 @@ impl BoundedLineCollector {
             ..CommandOutput::default()
         }
     }
+}
+
+/// A command's time limit: its own `timeout_seconds` when it asked for one,
+/// else the configured default. One `Duration` from here on; the paths used
+/// to carry it as milliseconds in some places and seconds in others.
+fn command_limit(shell_pool: &ShellPoolManager, timeout_secs: Option<u64>) -> Duration {
+    timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| shell_pool.config().command_timeout)
 }
 
 /// Context for a single background async operation task.
@@ -2119,9 +2124,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         sandbox::kernel_denials::remember_tag(&op_id, tag);
     }
 
-    let timeout_ms = timeout_secs
-        .map(|t| t * 1000)
-        .unwrap_or_else(|| shell_pool.config().command_timeout.as_millis() as u64);
+    let limit = command_limit(&shell_pool, timeout_secs);
 
     let drift = (lane != workspace_queue::Lane::Service).then_some(DriftProbe {
         root: drift_root,
@@ -2143,7 +2146,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // Log-monitor alerting only runs when a config was provided.
     let (outcome, exit_code) = execute_with_streaming(
         &mut proc_cmd,
-        timeout_ms,
+        limit,
         log_monitor_config,
         &cancellation_token,
         &op_id,
@@ -2721,9 +2724,9 @@ async fn run_session_operation(
             line = line_rx.recv() => {
                 if let Some(line) = line {
                     let safe = crate::log_monitor::redact_sensitive_line(&line);
-                    spill_writer.write_line(&safe, false).await;
+                    spill_writer.write_line(&safe, Stream::Stdout).await;
                     collected.push(safe.clone());
-                    monitor.append_output_line(op_id, safe, false).await;
+                    monitor.append_output_line(op_id, safe, Stream::Stdout).await;
                 }
                 // None can only happen after exec completes (sender dropped);
                 // the exec branch below handles termination.
@@ -2736,9 +2739,11 @@ async fn run_session_operation(
     // Drain any lines still buffered in the channel.
     while let Ok(line) = line_rx.try_recv() {
         let safe = crate::log_monitor::redact_sensitive_line(&line);
-        spill_writer.write_line(&safe, false).await;
+        spill_writer.write_line(&safe, Stream::Stdout).await;
         collected.push(safe.clone());
-        monitor.append_output_line(op_id, safe, false).await;
+        monitor
+            .append_output_line(op_id, safe, Stream::Stdout)
+            .await;
     }
     spill_writer.finish().await;
 
@@ -2747,7 +2752,7 @@ async fn run_session_operation(
 
 /// How a session-protocol command ended, from its terminal result.
 fn finalize_session_result(
-    exec_result: anyhow::Result<i32>,
+    exec_result: Result<Option<i32>, crate::shell_session::SessionError>,
     collected: &BoundedLineCollector,
     session_id: &str,
     op_id: &str,
@@ -2756,9 +2761,11 @@ fn finalize_session_result(
         // Session output is a single merged stream (per-command 2>&1).
         Ok(exit_code) => Terminal::Exited(Box::new(CommandOutput {
             session_id: Some(session_id.to_string()),
-            ..collected.merged_output(Some(exit_code), op_id)
+            ..collected.merged_output(exit_code, op_id)
         })),
-        Err(e) if e.to_string().contains("timed out") => Terminal::TimedOut(e.to_string()),
+        Err(e @ crate::shell_session::SessionError::TimedOut(_)) => {
+            Terminal::TimedOut(e.to_string())
+        }
         Err(e) => Terminal::Failed(e.to_string()),
     }
 }
@@ -2794,7 +2801,7 @@ async fn cancel_operation_timed_out(
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_streaming(
     proc_cmd: &mut tokio::process::Command,
-    timeout_ms: u64,
+    limit: Duration,
     monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
@@ -2843,10 +2850,10 @@ async fn execute_with_streaming(
     let mut collected_stdout = BoundedLineCollector::default();
     let mut collected_stderr = BoundedLineCollector::default();
 
-    let timeout_deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let timeout_deadline = tokio::time::Instant::now() + limit;
     // Warn once at 80% of the limit (SPEC R2.6.6), so a healthy job near it
     // is not stopped without notice.
-    let near_limit_at = tokio::time::Instant::now() + Duration::from_millis(timeout_ms * 8 / 10);
+    let near_limit_at = tokio::time::Instant::now() + limit.mul_f64(0.8);
     let mut warned_near_limit = false;
 
     let mut still_running_interval = tokio::time::interval(Duration::from_secs(10));
@@ -2901,7 +2908,7 @@ async fn execute_with_streaming(
             _ = tokio::time::sleep_until(near_limit_at), if !warned_near_limit => {
                 warned_near_limit = true;
                 op_monitor
-                    .append_alert(op_id, time_limit::near_limit(timeout_ms.div_ceil(1000)))
+                    .append_alert(op_id, time_limit::near_limit(limit.as_millis().div_ceil(1000) as u64))
                     .await;
             }
 
@@ -2981,7 +2988,7 @@ async fn execute_with_streaming(
                 } else {
                     stderr_done = true;
                 }
-                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, &mut spill).await;
+                handle_stream_line(result, Stream::Stderr, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, &mut spill).await;
             }
 
             // Read stdout line
@@ -2992,7 +2999,7 @@ async fn execute_with_streaming(
                 } else {
                     stdout_done = true;
                 }
-                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, &mut spill).await;
+                handle_stream_line(result, Stream::Stdout, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, &mut spill).await;
             }
         }
 
@@ -3067,7 +3074,7 @@ async fn drain_remaining_stream_lines(
     while let Ok(Some(line)) = stderr_reader.next_line().await {
         process_streaming_line(
             &line,
-            true,
+            Stream::Stderr,
             collected_stderr,
             log_monitor,
             op_id,
@@ -3079,7 +3086,7 @@ async fn drain_remaining_stream_lines(
     while let Ok(Some(line)) = stdout_reader.next_line().await {
         process_streaming_line(
             &line,
-            false,
+            Stream::Stdout,
             collected_stdout,
             log_monitor,
             op_id,
@@ -3431,7 +3438,7 @@ async fn handle_cancellation(monitor: &Arc<OperationMonitor>, op_id: &str) {
 /// signals (`Ok(None)`), and logs a warning on read errors.
 async fn handle_stream_line(
     result: Result<Option<String>, std::io::Error>,
-    is_stderr: bool,
+    stream: Stream,
     collector: &mut BoundedLineCollector,
     log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     op_id: &str,
@@ -3442,7 +3449,7 @@ async fn handle_stream_line(
         Ok(Some(line)) => {
             process_streaming_line(
                 &line,
-                is_stderr,
+                stream,
                 collector,
                 log_monitor,
                 op_id,
@@ -3453,8 +3460,7 @@ async fn handle_stream_line(
         }
         Ok(None) => {}
         Err(e) => {
-            let stream = if is_stderr { "stderr" } else { "stdout" };
-            tracing::warn!("Error reading {} for {}: {}", stream, op_id, e);
+            tracing::warn!("Error reading {} for {}: {}", stream.name(), op_id, e);
         }
     }
 }
@@ -3466,7 +3472,7 @@ async fn handle_stream_line(
 /// `Alert` — no direct dispatcher access is needed here.
 async fn process_streaming_line(
     line: &str,
-    is_stderr: bool,
+    stream: Stream,
     collector: &mut BoundedLineCollector,
     log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     op_id: &str,
@@ -3477,15 +3483,15 @@ async fn process_streaming_line(
 
     // The spill file records every redacted line — the faithful full record,
     // independent of the bounded tail.
-    spill.write_line(&safe_line, is_stderr).await;
+    spill.write_line(&safe_line, stream).await;
 
     collector.push(safe_line.clone());
     op_monitor
-        .append_output_line(op_id, safe_line, is_stderr)
+        .append_output_line(op_id, safe_line, stream)
         .await;
 
     if let Some(log_monitor) = log_monitor
-        && let Some(snapshot) = log_monitor.process_line(line, is_stderr)
+        && let Some(snapshot) = log_monitor.process_line(line, stream.is_stderr())
     {
         // The full notification snapshot (trigger + recent context) is stored
         // and emitted as a single `Alert` event so every subscriber — MCP
