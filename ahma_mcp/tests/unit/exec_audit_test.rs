@@ -46,19 +46,40 @@ fn audit_log_path() -> PathBuf {
 
 /// Read every complete event currently in the audit log.
 ///
-/// Parsing is strict on purpose: a partially written or interleaved line fails
-/// here, which is the JSONL invariant the concurrency test relies on.
+/// Parsing is strict on purpose: an interleaved line fails here, which is the
+/// JSONL invariant the concurrency test relies on. A line is complete once its
+/// newline is written; text after the last newline is a write still in
+/// progress, which a reader polling while operations run can observe, and is
+/// left for the next read rather than taken for a torn line.
 async fn read_events() -> Vec<Value> {
     let path = audit_log_path();
     let contents = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-    contents
-        .lines()
+    complete_lines(&contents)
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
             serde_json::from_str(l)
                 .unwrap_or_else(|e| panic!("audit line must be complete JSON ({e}): {l}"))
         })
         .collect()
+}
+
+/// The lines of `contents` that end in a newline.
+fn complete_lines(contents: &str) -> impl Iterator<Item = &str> {
+    let complete = contents.rfind('\n').map_or("", |end| &contents[..end]);
+    complete.lines()
+}
+
+/// The reader takes only finished lines, so a write in progress is neither an
+/// event nor an error, and a finished line that is not JSON still fails.
+#[test]
+fn a_line_still_being_written_is_left_for_the_next_read() {
+    let text = "{\"a\":1}\n{\"b\":2}\n{\"c\":";
+    assert_eq!(
+        complete_lines(text).collect::<Vec<_>>(),
+        ["{\"a\":1}", "{\"b\":2}"]
+    );
+    assert_eq!(complete_lines("").count(), 0);
+    assert_eq!(complete_lines("{\"partial").count(), 0);
 }
 
 /// Events belonging to one operation id, in file order.
