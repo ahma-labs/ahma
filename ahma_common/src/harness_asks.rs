@@ -333,6 +333,24 @@ impl ShellSplitter {
 /// command that works in another repository; what it misses is asked about at the first
 /// refusal, as before.
 pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    command_folders(command, cwd, home)
+        .into_iter()
+        .map(|f| f.path)
+        .collect()
+}
+
+/// One folder a shell line names ([`command_folders`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedFolder {
+    pub path: PathBuf,
+    /// The line moves into it (`cd <dir>`, `-C <dir>`) and runs from there, where a plain
+    /// argument (`ls <dir>`) only looks at it. Moving in is what a task typed into the wrong
+    /// terminal does first (SPEC R-PERM.11).
+    pub entered: bool,
+}
+
+/// [`command_paths`], with how each folder is named: moved into, or passed as an argument.
+pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<NamedFolder> {
     let expand = |word: &str, base: &Path| -> Option<PathBuf> {
         if word.is_empty() || word.contains(['$', '`', '*', '?', '[']) {
             return None;
@@ -359,22 +377,31 @@ pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Path
             if first && word == "cd" {
                 if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
                     here = target.clone();
-                    paths.push(target);
+                    paths.push(NamedFolder {
+                        path: target,
+                        entered: true,
+                    });
                 }
                 break;
             }
             first = false;
             if word == "-C" {
-                if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
-                    paths.push(target);
+                if let Some(path) = words.next().and_then(|t| expand(t, &here)) {
+                    paths.push(NamedFolder {
+                        path,
+                        entered: true,
+                    });
                 }
             } else if (word.starts_with('/')
                 || Path::new(word).is_absolute()
                 || word == "~"
                 || word.starts_with("~/"))
-                && let Some(p) = expand(word, &here)
+                && let Some(path) = expand(word, &here)
             {
-                paths.push(p);
+                paths.push(NamedFolder {
+                    path,
+                    entered: false,
+                });
             }
         }
     }
@@ -936,6 +963,36 @@ pub struct WorkspaceAsks {
     /// The yeses to them, per harness session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos_acknowledged: Vec<RepoAck>,
+    /// Other repositories a plain read was let through with a one-line note, per harness
+    /// session, so the note is said once (SPEC R-PERM.11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_noted: Vec<RepoAck>,
+}
+
+/// Record that a plain read of `repo` from this workspace was noted in `session_id`. `true` the
+/// first time: the note is said once per harness session, never on every command.
+pub fn note_repo_read(
+    dir: &Path,
+    workspace: &Path,
+    session_id: &str,
+    repo: &Path,
+    now: u64,
+) -> Result<bool> {
+    update(dir, workspace, now, |asks| {
+        if asks
+            .repos_noted
+            .iter()
+            .any(|a| a.session_id == session_id && a.repo == repo)
+        {
+            return false;
+        }
+        asks.repos_noted.push(RepoAck {
+            session_id: session_id.to_string(),
+            repo: repo.to_path_buf(),
+            at: now,
+        });
+        true
+    })
 }
 
 /// Whether the human said yes, in `session_id`, to this workspace working in `repo`.
@@ -1232,6 +1289,8 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
     asks.repos_asked
         .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
     asks.repos_acknowledged
+        .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
+    asks.repos_noted
         .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
 }
 
@@ -1659,6 +1718,16 @@ mod tests {
         );
         assert!(p("cargo build && ls src").is_empty());
         assert!(p("ls $HOME/x /w/*/y `pwd`").is_empty());
+        // Moving into a folder is told apart from looking at it (SPEC R-PERM.11).
+        let entered = |c: &str| -> Vec<bool> {
+            command_folders(c, cwd, home)
+                .iter()
+                .map(|f| f.entered)
+                .collect()
+        };
+        assert_eq!(entered("cd /w/neubit4 && ls /w/other"), [true, false]);
+        assert_eq!(entered("git -C /w/neubit4 status"), [true]);
+        assert_eq!(entered("ls /w/neubit4/rust ~/notes"), [false, false]);
         // A heredoc is a POSIX shell's; on Windows the line is split literally.
         #[cfg(not(windows))]
         assert!(

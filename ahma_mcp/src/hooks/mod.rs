@@ -2539,9 +2539,10 @@ fn ask_first_if_refused_before(
     let Ok(cwd) = extract_command_cwd(input, &tool.tool_input) else {
         return decision;
     };
-    let Some((reason, token)) = next_prior_ask(Path::new(&cwd), session_id, &tool.command, cfg)
-    else {
-        return decision;
+    let (reason, token) = match next_prior_step(Path::new(&cwd), session_id, &tool.command, cfg) {
+        Some(PriorStep::Ask { reason, token }) => (reason, token),
+        Some(PriorStep::Note(line)) => return with_note(decision, line),
+        None => return decision,
     };
     match build_wrapped_shell_command(
         args.scope,
@@ -2560,36 +2561,68 @@ fn ask_first_if_refused_before(
     }
 }
 
-fn next_prior_ask(
+/// What precedes a hooked command: a question in the harness's dialog, or one line said with
+/// the command as it runs.
+enum PriorStep {
+    Ask { reason: String, token: String },
+    Note(String),
+}
+
+/// `decision`, with `line` added to what the agent and the human are told as the command runs.
+fn with_note(mut decision: HooksDecision, line: String) -> HooksDecision {
+    if let HooksDecision::AllowRewrite { disclosure, .. } = &mut decision {
+        *disclosure = Some(match disclosure.take() {
+            Some(scope) => format!("{scope}\n{line}"),
+            None => line,
+        });
+    }
+    decision
+}
+
+fn next_prior_step(
     cwd: &Path,
     session_id: &str,
     command: &str,
     cfg: &AppConfig,
-) -> Option<(String, String)> {
+) -> Option<PriorStep> {
+    let ask = |(reason, token): (String, String)| PriorStep::Ask { reason, token };
     // `sudo` is setuid, so no sandbox runs it, and it has no terminal for its password here:
     // ask at once to run the command once outside the sandbox, with no doomed run first
     // (SPEC R-ESCAPE.4). Asked once per command per harness session, as every escape is.
     if ahma_common::harness_asks::runs_sudo(command) {
         harness_ask::record_escape(cwd, command, SUDO_BLOCKED);
         if let Some((refusal, token)) = harness_ask::next_escape_ask(cwd, session_id, command) {
-            return Some((harness_ask::escape_ask_reason(&refusal), token));
+            return Some(ask((harness_ask::escape_ask_reason(&refusal), token)));
         }
     }
-    // A command that works in another repository asks first, read or write (SPEC R-PERM.11).
-    if let Some((repo, workspace, token)) =
-        harness_ask::next_repo_ask(cwd, session_id, command, &cfg.persistent_scopes)
-    {
-        return Some((harness_ask::repo_ask_reason(&repo, &workspace), token));
+    // A command that works in another repository asks first; one that only looks there runs,
+    // and says so once (SPEC R-PERM.11).
+    let mut looked_at = None;
+    match harness_ask::next_repo_step(cwd, session_id, command, &cfg.persistent_scopes) {
+        Some(harness_ask::RepoStep::Ask {
+            repo,
+            workspace,
+            token,
+        }) => {
+            return Some(ask((
+                harness_ask::repo_ask_reason(&repo, &workspace),
+                token,
+            )));
+        }
+        Some(harness_ask::RepoStep::Read { repo, workspace }) => {
+            looked_at = Some((repo, workspace))
+        }
+        None => {}
     }
     if let Some((question, token)) =
         harness_ask::next_ask(cwd, session_id, command, &cfg.persistent_scopes)
     {
         let (workspace, binding) =
             harness_ask::approval_binding(&question, cwd, &cfg.persistent_scopes);
-        return Some((
+        return Some(ask((
             harness_ask::ask_reason(&question, &workspace, &binding),
             token,
-        ));
+        )));
     }
     // A signature the SSH key broker refused (SPEC R-CRED.3).
     if let Some((refusal, token)) = harness_ask::next_ssh_ask(
@@ -2598,12 +2631,16 @@ fn next_prior_ask(
         command,
         cfg.settings_origin.user_settings_file().as_deref(),
     ) {
-        return Some((harness_ask::ssh_ask_reason(&refusal), token));
+        return Some(ask((harness_ask::ssh_ask_reason(&refusal), token)));
     }
     // This exact command was refused what nothing allows: offer one
     // run outside the sandbox (SPEC R-ESCAPE).
-    harness_ask::next_escape_ask(cwd, session_id, command)
-        .map(|(refusal, token)| (harness_ask::escape_ask_reason(&refusal), token))
+    if let Some((refusal, token)) = harness_ask::next_escape_ask(cwd, session_id, command) {
+        return Some(ask((harness_ask::escape_ask_reason(&refusal), token)));
+    }
+    // Nothing is asked, so the command runs: the note is recorded only now, when it is said.
+    let (repo, workspace) = looked_at?;
+    harness_ask::repo_read_note(&repo, &workspace, session_id).map(PriorStep::Note)
 }
 
 /// Compute the hook decision for a given tool invocation.
