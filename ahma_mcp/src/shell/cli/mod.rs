@@ -1815,7 +1815,7 @@ pub enum SettingsCommand {
         #[arg(long)]
         origin: bool,
     },
-    /// Set one setting, e.g. `ahma settings set tools.timeout_secs 3600`. Edits the key in its own table (never adds a second one), refuses an unknown key or a value of the wrong type, and leaves a file that parses; prints the old and new value. A string needs no quotes; lists and tables are TOML (`'["a", "b"]'`). One line, safe to paste into any shell.
+    /// Set one setting, e.g. `ahma settings set tools.timeout_secs 3600`. Edits the key in its own table (never adds a second one), refuses an unknown key or a value of the wrong type, and leaves a file that parses. Prints the old and new value, what the setting does, whether the change applies to every repository or only this one, and the command that undoes it. A string needs no quotes; lists and tables are TOML (`'["a", "b"]'`), and a list replaces the whole previous list (the entries dropped are named). One line, safe to paste into any shell.
     Set {
         /// `<table>.<key>`, as `ahma settings show` lists them.
         key: String,

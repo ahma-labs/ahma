@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use ahma_common::config::{
     AhmaSettings, ScopeAccess, SettingsFile, SettingsTier, ledger_key_command, settings_tier,
+    undo_command,
 };
 use ahma_common::doctor::Fix;
 use ahma_common::scope_grant::{GrantRisk, NewGrant, classify_grant_risk, persist_grant};
@@ -470,29 +471,6 @@ fn current_list(file: &Path, key: &str) -> Result<Vec<String>, Refusal> {
 
 fn list_literal(items: &[String]) -> String {
     toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect()).to_string()
-}
-
-/// `ahma settings set`/`unset` for `key`, the way a human would undo to `before`.
-fn undo_command(file: SettingsFile, key: &str, before: &str) -> String {
-    let scope = if file == SettingsFile::Project {
-        " --project"
-    } else {
-        ""
-    };
-    // Back to the default is `unset`, which also leaves the file tidy.
-    let is_default = ahma_common::config::setting_docs()
-        .iter()
-        .any(|d| d.dotted() == key && d.default == before);
-    if before == "(unset)" || is_default {
-        format!("ahma settings unset{scope} {key}")
-    } else if before.contains('\'') {
-        format!(
-            "ahma settings set{scope} {key} \"{}\"",
-            before.replace('"', "\\\"")
-        )
-    } else {
-        format!("ahma settings set{scope} {key} '{before}'")
-    }
 }
 
 fn setting_risk(key: &str) -> Risk {

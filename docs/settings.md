@@ -38,6 +38,32 @@ key it lists every setting, marking the ones a repository may also set. It reads
 only text built into ahma, so an agent can run it inside the sandbox
 (SPEC R-CFG11).
 
+### What `settings set` prints
+
+The values before and after, then what the change means, in sentences:
+
+```text
+tools.long_running changed in /Users/you/.ahma/settings.toml
+  was: [{ command = "make serve" }]
+  now: [{ command = "scripts/review", timeout_secs = 86400 }]
+
+What it does: Commands that run for hours or wait for a person. A command line that starts with one of these, in any repository, runs beside builds and tests instead of waiting its turn, with its own timeout; the sandbox is unchanged (SPEC R2.7.10).
+Where it applies: every repository you work in on this machine. This is your own settings file, and no repository's own file can change it.
+No longer in the list: { command = "make serve" }. `settings set` replaces the whole list, so to keep an entry, set the list again with every entry you want.
+To undo: ahma settings set tools.long_running '[{ command = "make serve" }]'
+```
+
+- **Where it applies** depends on the file written. Your own
+  `~/.ahma/settings.toml` reaches every repository on this machine; for a
+  preference, a repository's own file can still override it there. `--project`
+  reaches this repository only. A file named with `--path` reaches nothing until
+  ahma is started with `--settings-path` naming it.
+- **A list is replaced, not added to.** Entries the new value no longer holds
+  are named, so one dropped by accident is visible at once. To keep them, set
+  the list again with every entry.
+- **To undo** is the one command that restores the previous value (`unset` when
+  that was the default). (SPEC R-CFG10.8.)
+
 ### What `settings set` will and will not write
 
 - **`--project`** edits this repository's `.ahma/settings.toml`. Only preferences
@@ -245,7 +271,7 @@ sessions, and a running one after it restarts (the agent's `restart` tool).
 | `workspace_queue` | `true` | Writers run one at a time per workspace, in arrival order (SPEC R2.7). Off restores unordered async — only sensible with `execution_mode = "sync"`. |
 | `edit_guard` | `true` | ahma's own `write_file`/`replace_in_file`/`multi_edit`/`apply_patch` refuse an edit while a command that may rewrite sources runs in that workspace (SPEC R2.7.8). Builds and tests never block an edit. |
 | `source_readers` | `[]` | This project's own commands that only read sources, matched as a prefix of the command line in whole words (`["scripts/heavy", "make test"]`). Edits proceed while one runs. |
-| `long_running` | `[]` | Commands that wait for a person or run for hours (`[{ command = "scripts/audition ask", timeout_secs = 14400 }]`). A line that is exactly one of them runs without the write-queue lease, with its own timeout. Security tier: your own settings file only, never a repository's (SPEC R2.7.10). |
+| `long_running` | `[]` | Commands that wait for a person or run for hours (`[{ command = "scripts/audition ask", timeout_secs = 14400 }]`). A line that is exactly one of them runs without the write-queue lease, with its own timeout; leading `cd <dir> &&` steps and a longer path to the same program still match. Security tier: your own settings file only, never a repository's (SPEC R2.7.10). |
 
 Details: SPEC R2.1, R2.4, R2.7.
 

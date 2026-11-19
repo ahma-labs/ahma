@@ -298,7 +298,9 @@ fn run_settings_set(
     project: bool,
     origin_ctx: &SettingsOriginCtx,
 ) -> Result<()> {
-    use ahma_common::config::{AhmaSettings, SettingsFile, settings_path};
+    use ahma_common::config::{
+        AhmaSettings, SettingsFile, SettingsReach, describe_setting_change, settings_path,
+    };
     let target = if project {
         origin_ctx.project_settings_file.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -312,15 +314,11 @@ fn run_settings_set(
         })?
     };
     let edit = AhmaSettings::set_in_file(&target, key, value)?;
-    if edit.before == edit.after {
-        println!("{key} is already {} ({})", edit.after, target.display());
-    } else {
-        println!(
-            "{key}: {} -> {} ({})",
-            edit.before,
-            edit.after,
-            target.display()
-        );
+    print!(
+        "{}",
+        describe_setting_change(key, &edit, &target, SettingsReach::of(&target))
+    );
+    if edit.before != edit.after {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
             &chrono::Local::now().to_rfc3339(),
             "cli",

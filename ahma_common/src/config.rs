@@ -2795,7 +2795,7 @@ impl AhmaSettings {
             toml_str_list(&d.tools.source_readers),
         );
         w.setting(
-            "Commands that run for hours or wait for a person; they run without the write queue's lease (SPEC R2.7.10).",
+            "Commands that run for hours or wait for a person. A command line that starts with one of these, in any repository, runs beside builds and tests instead of waiting its turn, with its own timeout; the sandbox is unchanged (SPEC R2.7.10).",
             "long_running",
             toml_long_running(&self.tools.long_running),
             toml_long_running(&d.tools.long_running),
@@ -3798,6 +3798,171 @@ pub fn explain_setting(doc: &SettingDoc) -> String {
         who,
         how_to_change(&doc.table, &doc.key),
     )
+}
+
+/// Where a change to one settings file takes effect (SPEC R-CFG10.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsReach {
+    /// The user's own `~/.ahma/settings.toml`: every repository on this machine.
+    EveryRepository,
+    /// A repository's `.ahma/settings.toml`: that repository and no other.
+    ThisRepository,
+    /// A file named with `--path`: read only by an ahma started with
+    /// `--settings-path`.
+    OnlyThisFile,
+}
+
+impl SettingsReach {
+    /// What a write to `path` reaches.
+    pub fn of(path: &Path) -> Self {
+        if settings_path().is_some_and(|user| user == path) {
+            Self::EveryRepository
+        } else if SettingsFile::for_path(path) == SettingsFile::Project {
+            Self::ThisRepository
+        } else {
+            Self::OnlyThisFile
+        }
+    }
+
+    /// The sentence that finishes "Where it applies: " for `tier` in `path`.
+    fn sentence(self, tier: SettingsTier, path: &Path) -> String {
+        match (self, tier) {
+            (Self::EveryRepository, SettingsTier::Security) => {
+                "every repository you work in on this machine. This is your own settings file, \
+                 and no repository's own file can change it."
+                    .to_string()
+            }
+            (Self::EveryRepository, SettingsTier::Preference) => {
+                "every repository you work in on this machine, except one whose own \
+                 .ahma/settings.toml sets this key (`ahma settings show --origin`, run there, \
+                 says which file wins)."
+                    .to_string()
+            }
+            (Self::ThisRepository, _) => {
+                "this repository only: the file is its own .ahma/settings.toml. Your other \
+                 repositories are unaffected, and another checkout of this one gets the change \
+                 when the file is committed and pulled."
+                    .to_string()
+            }
+            (Self::OnlyThisFile, _) => format!(
+                "only an ahma started with `--settings-path {}`. Your own ~/.ahma/settings.toml \
+                 is unchanged.",
+                path.display()
+            ),
+        }
+    }
+
+    /// The flag that makes `ahma settings set` write the same file again.
+    fn flag(self, path: &Path) -> String {
+        match self {
+            Self::EveryRepository => String::new(),
+            Self::ThisRepository => " --project".to_string(),
+            Self::OnlyThisFile => {
+                let file = path.display().to_string();
+                if file.contains(char::is_whitespace) {
+                    format!(" --path '{file}'")
+                } else {
+                    format!(" --path {file}")
+                }
+            }
+        }
+    }
+}
+
+/// `ahma settings set`/`unset` for `key`, the way a human would undo to `before`.
+pub fn undo_command(file: SettingsFile, key: &str, before: &str) -> String {
+    let flag = if file == SettingsFile::Project {
+        " --project"
+    } else {
+        ""
+    };
+    undo_with_flag(flag, key, before)
+}
+
+fn undo_with_flag(flag: &str, key: &str, before: &str) -> String {
+    // Back to the default is `unset`, which also leaves the file tidy.
+    let is_default = setting_docs()
+        .iter()
+        .any(|d| d.dotted() == key && d.default == before);
+    if before == "(unset)" || is_default {
+        format!("ahma settings unset{flag} {key}")
+    } else if before.contains('\'') {
+        format!(
+            "ahma settings set{flag} {key} \"{}\"",
+            before.replace('"', "\\\"")
+        )
+    } else {
+        format!("ahma settings set{flag} {key} '{before}'")
+    }
+}
+
+/// The entries of a TOML list value, each as TOML text; `None` for anything
+/// that is not a list.
+fn list_entries(value: &str) -> Option<Vec<toml::Value>> {
+    let table: toml::Table = toml::from_str(&format!("v = {value}")).ok()?;
+    match table.get("v")? {
+        toml::Value::Array(entries) => Some(entries.clone()),
+        _ => None,
+    }
+}
+
+/// What `ahma settings set`/`unset` prints (SPEC R-CFG10.8): the value before
+/// and after, then in sentences what the setting does, where the change
+/// applies, which list entries are gone, and the command that undoes it.
+///
+/// The description is the setting's own ([`setting_docs`]), so this, the
+/// settings file and `ahma settings explain` cannot disagree (R-CFG11.2).
+pub fn describe_setting_change(
+    key: &str,
+    edit: &SettingsEdit,
+    path: &Path,
+    reach: SettingsReach,
+) -> String {
+    use std::fmt::Write as _;
+
+    let changed = edit.before != edit.after;
+    let file = path.display();
+    let mut out = if changed {
+        format!(
+            "{key} changed in {file}\n  was: {}\n  now: {}\n\n",
+            edit.before, edit.after
+        )
+    } else {
+        format!(
+            "{key} is already {} in {file}. Nothing changed.\n\n",
+            edit.after
+        )
+    };
+    let doc = setting_docs().iter().find(|d| d.dotted() == key);
+    if let Some(doc) = doc {
+        let _ = writeln!(out, "What it does: {}", doc.doc);
+    }
+    let tier = doc.map_or(SettingsTier::Security, SettingDoc::tier);
+    let _ = writeln!(out, "Where it applies: {}", reach.sentence(tier, path));
+    if !changed {
+        return out;
+    }
+    if let (Some(before), Some(after)) = (list_entries(&edit.before), list_entries(&edit.after)) {
+        let gone: Vec<String> = before
+            .iter()
+            .filter(|entry| !after.contains(entry))
+            .map(ToString::to_string)
+            .collect();
+        if !gone.is_empty() {
+            let _ = writeln!(
+                out,
+                "No longer in the list: {}. `settings set` replaces the whole list, so to keep \
+                 an entry, set the list again with every entry you want.",
+                gone.join("; ")
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "To undo: {}",
+        undo_with_flag(&reach.flag(path), key, &edit.before)
+    );
+    out
 }
 
 /// Atomic TOML write (temp sibling → rename), with a pid-scoped temp name so two
@@ -6375,6 +6540,136 @@ mod project_settings_tests {
             AhmaSettings::parse("[tools]\nlong_running = [{ cmd = \"x\" }]\n").is_err(),
             "a misspelt field is refused, not ignored"
         );
+    }
+
+    /// R-CFG10.8, the field case: a human replaced a list of one entry with a
+    /// list of another and was shown only `old -> new`. The result says what
+    /// the setting does, that it reaches every repository, which entry is gone,
+    /// and the command that puts the old value back.
+    #[test]
+    fn a_changed_setting_says_what_it_does_where_it_applies_and_what_was_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.toml");
+        let old = r#"{ command = "coach_eval run", timeout_secs = 14400 }"#;
+        let new = r#"{ command = "scripts/audition", timeout_secs = 86400 }"#;
+        let edit = SettingsEdit {
+            before: format!("[{old}]"),
+            after: format!("[{new}]"),
+        };
+        let text = describe_setting_change(
+            "tools.long_running",
+            &edit,
+            &file,
+            SettingsReach::EveryRepository,
+        );
+        assert!(
+            text.starts_with(&format!(
+                "tools.long_running changed in {}\n  was: [{old}]\n  now: [{new}]\n",
+                file.display()
+            )),
+            "{text}"
+        );
+        let doc = setting_docs()
+            .iter()
+            .find(|d| d.dotted() == "tools.long_running")
+            .unwrap();
+        assert!(
+            text.contains(&doc.doc),
+            "the setting's own description: {text}"
+        );
+        assert!(text.contains("every repository"), "{text}");
+        assert!(
+            text.contains("no repository's own file can change it"),
+            "a security-tier key: {text}"
+        );
+        assert!(
+            text.contains(&format!("No longer in the list: {old}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "To undo: ahma settings set tools.long_running '[{old}]'"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("\n\n\n"), "{text}");
+    }
+
+    /// A repository's file reaches that repository only, and a file named with
+    /// `--path` reaches nothing unless ahma is started with it.
+    #[test]
+    fn a_changed_setting_names_the_one_repository_or_file_it_reaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.toml");
+        let edit = SettingsEdit {
+            before: "1800".into(),
+            after: "90000".into(),
+        };
+        let project = describe_setting_change(
+            "tools.timeout_secs",
+            &edit,
+            &file,
+            SettingsReach::ThisRepository,
+        );
+        assert!(project.contains("this repository only"), "{project}");
+        assert!(
+            project.contains("To undo: ahma settings unset --project tools.timeout_secs"),
+            "back to the default is `unset`: {project}"
+        );
+        assert!(!project.contains("No longer in the list"), "{project}");
+
+        let yours = describe_setting_change(
+            "tools.timeout_secs",
+            &edit,
+            &file,
+            SettingsReach::EveryRepository,
+        );
+        assert!(
+            yours.contains("except one whose own .ahma/settings.toml sets this key"),
+            "a preference a repository may override: {yours}"
+        );
+
+        let other = describe_setting_change(
+            "tools.timeout_secs",
+            &edit,
+            &file,
+            SettingsReach::OnlyThisFile,
+        );
+        assert!(
+            other.contains(&format!("--settings-path {}", file.display())),
+            "{other}"
+        );
+        assert!(
+            other.contains(&format!("--path {}", file.display())),
+            "the undo names the same file: {other}"
+        );
+    }
+
+    /// Setting a key to the value it has changes nothing, and says so, but
+    /// still says where that value applies.
+    #[test]
+    fn an_unchanged_setting_says_nothing_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.toml");
+        let edit = SettingsEdit {
+            before: "90000".into(),
+            after: "90000".into(),
+        };
+        let text = describe_setting_change(
+            "tools.timeout_secs",
+            &edit,
+            &file,
+            SettingsReach::EveryRepository,
+        );
+        assert!(
+            text.starts_with(&format!(
+                "tools.timeout_secs is already 90000 in {}. Nothing changed.",
+                file.display()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("every repository"), "{text}");
+        assert!(!text.contains("To undo"), "{text}");
     }
 
     fn write_project(dir: &Path, body: &str) -> PathBuf {
