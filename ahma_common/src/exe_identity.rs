@@ -93,8 +93,10 @@ impl ExeIdentity {
     }
 }
 
-/// `major.minor.patch`, ignoring any pre-release or build suffix.
-fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+/// `major.minor.patch`, ignoring any pre-release or build suffix
+/// (`1.2.4-rc1+abc` is `(1, 2, 4)`). The one version parser: a second one that
+/// rejected pre-release versions made a hub client treat a newer hub as older.
+pub fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
     let core = v.split(['-', '+']).next()?;
     let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
     Some((parts.next()??, parts.next()??, parts.next()??))
@@ -103,6 +105,16 @@ fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_is_its_numeric_core() {
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("1.2.4-rc1+abc"), Some((1, 2, 4)));
+        assert_eq!(parse_semver("0.22.18+deadbeef"), Some((0, 22, 18)));
+        for bad in ["", "1", "1.2", "a.b.c", "1.2.x", "1.x.3"] {
+            assert_eq!(parse_semver(bad), None, "{bad:?}");
+        }
+    }
 
     fn id(version: &str, build_id: &str, mtime_ms: u64) -> ExeIdentity {
         ExeIdentity {

@@ -419,8 +419,6 @@ fn parse_status_2xx(response: &[u8]) -> bool {
     false
 }
 
-#[cfg(test)]
-use ahma_mcp::shell::modes::server::parse_version;
 use ahma_mcp::shell::modes::server::{
     BridgeHealth, query_tcp_health, query_uds_health, trigger_tcp_restart, trigger_uds_restart,
 };
@@ -673,16 +671,6 @@ mod tests {
                 let _ = conn.shutdown().await;
             }
         })
-    }
-
-    #[test]
-    fn parse_version_valid_partial_invalid() {
-        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
-        assert_eq!(parse_version("1.2.3.4"), Some((1, 2, 3)));
-        assert_eq!(parse_version("1.2"), None);
-        assert_eq!(parse_version("x.y.z"), None);
-        assert_eq!(parse_version(""), None);
     }
 
     #[test]
