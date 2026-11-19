@@ -50,6 +50,7 @@ mod mcp_service_coverage_improvement_test;
 mod moves_within_the_scope_test;
 mod network_grant_tiers_test;
 mod operation_monitor;
+mod operation_result_shapes_test;
 mod package_cache_write_test;
 mod path_security_edge_cases_test;
 mod path_security_test;

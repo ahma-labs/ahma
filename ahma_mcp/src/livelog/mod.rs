@@ -208,17 +208,12 @@ pub async fn finish_monitoring(
     op_id: &str,
     outcome: Result<(), NotStarted>,
 ) {
-    use crate::operation_monitor::OperationStatus;
-    let (status, result) = match outcome {
-        Ok(()) => (OperationStatus::Completed, None),
-        Err(NotStarted(reason)) => (
-            OperationStatus::Failed,
-            Some(serde_json::Value::String(format!(
-                "monitoring never started: {reason}"
-            ))),
-        ),
+    use crate::operation_monitor::Terminal;
+    let terminal = match outcome {
+        Ok(()) => Terminal::Done(None),
+        Err(NotStarted(reason)) => Terminal::Failed(format!("monitoring never started: {reason}")),
     };
-    monitor.update_status(op_id, status, result).await;
+    monitor.finish(op_id, terminal).await;
 }
 
 /// Run the live-log pipeline until cancelled or the source process exits.

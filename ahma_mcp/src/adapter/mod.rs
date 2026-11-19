@@ -62,7 +62,9 @@ pub use preparer::{
 pub use pty_exec::pty_available;
 pub use types::{AsyncExecOptions, ExecutionMode};
 
-use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
+use crate::operation_monitor::{
+    CommandOutput, Operation, OperationMonitor, OperationStatus, Terminal,
+};
 use crate::retry::{self, RetryConfig};
 use crate::sandbox;
 use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch, HandoffWatchMode};
@@ -1862,73 +1864,60 @@ fn interpret_sync_command_output(output: std::process::Output) -> Result<String,
     Ok(combine_stdout_stderr(stdout, stderr))
 }
 
-/// How a PTY or session command ended, as its runner reports it. The runner
-/// does not publish it: the caller first gives up the workspace lease and the
-/// guards around the run, then [`Finished::publish`]es, so a caller woken by
-/// the terminal state never finds the workspace still held (SPEC R2.7.1).
-#[must_use = "a finished operation must be published once its lease is released"]
-pub(crate) struct Finished {
-    status: OperationStatus,
-    result: Option<Value>,
-    outcome: audit::Outcome,
-    exit_code: Option<i32>,
+impl From<&Terminal> for audit::Outcome {
+    /// The audit record's view of an ending: the same verdict as the state.
+    fn from(terminal: &Terminal) -> Self {
+        match terminal.status() {
+            OperationStatus::Completed => Self::Completed,
+            OperationStatus::TimedOut => Self::TimedOut,
+            OperationStatus::Cancelled => Self::Cancelled,
+            OperationStatus::Failed | OperationStatus::Pending | OperationStatus::InProgress => {
+                Self::Failed
+            }
+        }
+    }
 }
 
-impl Finished {
-    /// The command exited with `code`; `result` is the operation's result.
-    pub(crate) fn exited(code: Option<i32>, result: Value) -> Self {
-        let success = code == Some(0);
-        Self {
-            status: if success {
-                OperationStatus::Completed
-            } else {
-                OperationStatus::Failed
-            },
-            result: Some(result),
-            outcome: if success {
-                audit::Outcome::Completed
-            } else {
-                audit::Outcome::Failed
-            },
-            exit_code: code,
-        }
-    }
+/// Publishing how a command ended. A PTY or session runner returns its
+/// [`Terminal`] without publishing it: the caller first gives up the workspace
+/// lease and the guards around the run, then publishes, so a caller woken by
+/// the terminal state never finds the workspace still held (SPEC R2.7.1).
+pub(crate) trait PublishEnding {
+    /// Finish the operation, and return what the audit record of the call's
+    /// end carries.
+    async fn publish(
+        self,
+        monitor: &OperationMonitor,
+        op_id: &str,
+    ) -> (audit::Outcome, Option<i32>);
+}
 
-    /// It did not run to an exit of its own.
-    pub(crate) fn failed(reason: String) -> Self {
-        Self::ended(OperationStatus::Failed, audit::Outcome::Failed, reason)
-    }
-
-    pub(crate) fn timed_out(reason: String) -> Self {
-        Self::ended(OperationStatus::TimedOut, audit::Outcome::TimedOut, reason)
-    }
-
-    pub(crate) fn cancelled() -> Self {
-        Self::ended(
-            OperationStatus::Cancelled,
-            audit::Outcome::Cancelled,
-            "Operation was cancelled".to_string(),
-        )
-    }
-
-    fn ended(status: OperationStatus, outcome: audit::Outcome, reason: String) -> Self {
-        Self {
-            status,
-            result: Some(Value::String(reason)),
-            outcome,
-            exit_code: None,
-        }
-    }
-
-    /// Publish the terminal state, and return what the audit record of the
-    /// call's end carries.
-    pub(crate) async fn publish(
+impl PublishEnding for Terminal {
+    async fn publish(
         self,
         monitor: &OperationMonitor,
         op_id: &str,
     ) -> (audit::Outcome, Option<i32>) {
-        monitor.update_status(op_id, self.status, self.result).await;
-        (self.outcome, self.exit_code)
+        let audited = (audit::Outcome::from(&self), self.exit_code());
+        monitor.finish(op_id, self).await;
+        audited
+    }
+}
+
+impl BoundedLineCollector {
+    /// The result of a command whose output is one merged stream (a PTY, a
+    /// session): `stderr` is empty and has no counts of its own.
+    fn merged_output(&self, exit_code: Option<i32>, op_id: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: self.rendered_output(),
+            exit_code,
+            stdout_truncated_lines: self.dropped_lines(),
+            stdout_truncated_bytes: self.dropped_bytes(),
+            output_file: spill::operation_spill_path(op_id)
+                .to_string_lossy()
+                .into_owned(),
+            ..CommandOutput::default()
+        }
     }
 }
 
@@ -2648,13 +2637,7 @@ async fn fail_operation_with_error(
     error_message: String,
 ) {
     tracing::error!("{}", error_message);
-    monitor
-        .update_status(
-            op_id,
-            OperationStatus::Failed,
-            Some(Value::String(error_message)),
-        )
-        .await;
+    monitor.finish(op_id, Terminal::Failed(error_message)).await;
 }
 
 /// Give a task a 250 ms grace period then abort it if still running,
@@ -2703,7 +2686,7 @@ async fn run_session_operation(
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
-) -> Finished {
+) -> Terminal {
     let mut spill_writer = spill::SpillWriter::create(op_id).await;
     let mut collected = BoundedLineCollector::default();
 
@@ -2738,7 +2721,7 @@ async fn run_session_operation(
                 // the child kills the shell and its children.
                 sessions.remove_session(session_id).await;
                 spill_writer.finish().await;
-                return Finished::cancelled();
+                return Terminal::Cancelled("Operation was cancelled".to_string());
             }
 
             line = line_rx.recv() => {
@@ -2774,23 +2757,15 @@ fn finalize_session_result(
     collected: &BoundedLineCollector,
     session_id: &str,
     op_id: &str,
-) -> Finished {
+) -> Terminal {
     match exec_result {
-        Ok(exit_code) => {
-            let final_output = json!({
-                // Session output is a single merged stream (per-command 2>&1).
-                "stdout": collected.rendered_output(),
-                "stderr": "",
-                "exit_code": exit_code,
-                "session_id": session_id,
-                "stdout_truncated_lines": collected.dropped_lines(),
-                "stdout_truncated_bytes": collected.dropped_bytes(),
-                "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
-            });
-            Finished::exited(Some(exit_code), final_output)
-        }
-        Err(e) if e.to_string().contains("timed out") => Finished::timed_out(e.to_string()),
-        Err(e) => Finished::failed(e.to_string()),
+        // Session output is a single merged stream (per-command 2>&1).
+        Ok(exit_code) => Terminal::Exited(Box::new(CommandOutput {
+            session_id: Some(session_id.to_string()),
+            ..collected.merged_output(Some(exit_code), op_id)
+        })),
+        Err(e) if e.to_string().contains("timed out") => Terminal::TimedOut(e.to_string()),
+        Err(e) => Terminal::Failed(e.to_string()),
     }
 }
 
@@ -2805,11 +2780,7 @@ async fn cancel_operation_timed_out(
         time_limit::how_to_raise(duration_ms.div_ceil(1000))
     );
     monitor
-        .update_status(
-            op_id,
-            OperationStatus::TimedOut,
-            Some(Value::String(timeout_reason)),
-        )
+        .finish(op_id, Terminal::TimedOut(timeout_reason))
         .await;
 }
 
@@ -3360,11 +3331,7 @@ async fn finalize_streaming_operation(
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
     tracing::debug!("Operation {} process exited after {}ms", op_id, duration_ms);
-    let exit_code = exit_status
-        .as_ref()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(-1);
+    let exit_code = exit_status.as_ref().ok().and_then(|s| s.code());
     let success = exit_status.as_ref().is_ok_and(|s| s.success());
     if success {
         // Nothing to read back for an operation that succeeded.
@@ -3405,25 +3372,26 @@ async fn finalize_streaming_operation(
         None => None,
     };
 
-    let mut final_output = json!({
-        "stdout": stdout_str,
-        "stderr": stderr_str,
-        "exit_code": exit_code,
-        "stdout_truncated_lines": collected_stdout.dropped_lines(),
-        "stderr_truncated_lines": collected_stderr.dropped_lines(),
-        "stdout_truncated_bytes": collected_stdout.dropped_bytes(),
-        "stderr_truncated_bytes": collected_stderr.dropped_bytes(),
+    let mut output = CommandOutput {
+        stdout: stdout_str,
+        stderr: stderr_str,
+        exit_code,
+        stdout_truncated_lines: collected_stdout.dropped_lines(),
+        stderr_truncated_lines: Some(collected_stderr.dropped_lines()),
+        stdout_truncated_bytes: collected_stdout.dropped_bytes(),
+        stderr_truncated_bytes: Some(collected_stderr.dropped_bytes()),
         // Complete output record — query with file tools (tail/grep) when the
         // inline stdout/stderr above was truncated.
-        "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
-    });
-    if let Some(changed) = changed_during_run {
-        final_output["changed_during_run"] = changed;
-    }
+        output_file: spill::operation_spill_path(op_id)
+            .to_string_lossy()
+            .into_owned(),
+        changed_during_run,
+        ..CommandOutput::default()
+    };
     if let Some(report) = handoff_report {
         let alert = report.render_alert();
-        final_output["handoff_writes"] = report.to_json();
-        final_output["handoff_alert"] = json!(alert);
+        output.handoff_writes = Some(report.to_json());
+        output.handoff_alert = Some(alert.clone());
         // Before the terminal transition, while the operation is still active:
         // the `Alert` event is what the hub and the TUI show.
         op_monitor.append_alert(op_id, alert).await;
@@ -3443,23 +3411,11 @@ async fn finalize_streaming_operation(
     // (SPEC R2.7.1).
     drop(lease.take());
 
-    let status = if success {
-        OperationStatus::Completed
-    } else {
-        OperationStatus::Failed
-    };
     // The terminal event emitted by this transition carries the result to all
     // subscribers (MCP progress push, hub, TUI).
-    op_monitor
-        .update_status(op_id, status, Some(final_output))
-        .await;
-
-    let outcome = if success {
-        audit::Outcome::Completed
-    } else {
-        audit::Outcome::Failed
-    };
-    (outcome, exit_status.as_ref().ok().and_then(|s| s.code()))
+    Terminal::Exited(Box::new(output))
+        .publish(op_monitor, op_id)
+        .await
 }
 
 /// Handle cancellation of an operation — shared logic for both execution paths.
@@ -3468,10 +3424,9 @@ async fn finalize_streaming_operation(
 /// to all subscribers.
 async fn handle_cancellation(monitor: &Arc<OperationMonitor>, op_id: &str) {
     monitor
-        .update_status(
+        .finish(
             op_id,
-            OperationStatus::Cancelled,
-            Some(Value::String("Operation was cancelled".to_string())),
+            Terminal::Cancelled("Operation was cancelled".to_string()),
         )
         .await;
 }
