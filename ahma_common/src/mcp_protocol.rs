@@ -20,6 +20,24 @@ pub const MCP_PROTOCOL_VERSION_2026_07_28: &str = "2026-07-28";
 /// Stateful MCP protocol revision with tools/call notifications.
 pub const MCP_PROTOCOL_VERSION_2025_11_25: &str = "2025-11-25";
 
+/// The revisions ahma advertises in a `server/discover` answer, newest first.
+pub const ADVERTISED_PROTOCOL_VERSIONS: &[&str] = &[
+    MCP_PROTOCOL_VERSION_2026_07_28,
+    MCP_PROTOCOL_VERSION_2025_11_25,
+];
+
+/// The revisions an HTTP transport accepts in the `MCP-Protocol-Version`
+/// header: every advertised one first, then the older revisions a client may
+/// still be pinned to. Kept beside [`ADVERTISED_PROTOCOL_VERSIONS`] so the two
+/// cannot disagree: a bridge once advertised a revision it then refused.
+pub const ACCEPTED_PROTOCOL_VERSIONS: &[&str] = &[
+    MCP_PROTOCOL_VERSION_2026_07_28,
+    MCP_PROTOCOL_VERSION_2025_11_25,
+    REQUESTED_PROTOCOL_VERSION,
+    DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    "2024-11-05",
+];
+
 /// The protocol revision ahma's own clients request at `initialize`.
 pub const REQUESTED_PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -45,6 +63,14 @@ pub fn negotiated_protocol_version(init_response: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_advertised_revision_is_accepted() {
+        for v in ADVERTISED_PROTOCOL_VERSIONS {
+            assert!(ACCEPTED_PROTOCOL_VERSIONS.contains(v), "{v}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

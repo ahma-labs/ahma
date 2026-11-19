@@ -189,7 +189,7 @@ pub struct Session {
     /// Channel to send messages to the subprocess.
     sender: Mutex<mpsc::Sender<String>>,
     /// Map of pending request IDs to response channels
-    pending_requests: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    pending_requests: Arc<DashMap<RpcId, oneshot::Sender<Value>>>,
     /// Broadcast channel for SSE events from this session.
     /// Each message is `(event_id, json_string)`.
     broadcast_tx: broadcast::Sender<(u64, String)>,
@@ -237,9 +237,9 @@ pub struct Session {
     /// Client capabilities sent in initialize request
     pub capabilities: Mutex<Option<Value>>,
     /// Map of pending routed request IDs to response channels
-    pub routed_requests: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    pub routed_requests: Arc<DashMap<RpcId, oneshot::Sender<Value>>>,
     /// Map of pending server-to-client request IDs to their method name (e.g. roots/list)
-    pub pending_client_requests: Arc<DashMap<String, String>>,
+    pub pending_client_requests: Arc<DashMap<RpcId, String>>,
     /// Semaphore limiting concurrent routed sampling requests to the client (default: 3).
     /// A bounded semaphore replaces the old 1-at-a-time Mutex so that up to N sampling
     /// requests can be in-flight simultaneously, preventing head-of-line blocking when
@@ -763,14 +763,52 @@ pub struct SessionManager {
     terminated_sessions: DashMap<String, TerminatedSessionInfo>,
 }
 
+/// A JSON-RPC id, as the key of the maps that pair a response with the
+/// request it answers: its canonical JSON text. `"1"` and `1` are different
+/// ids and stay different keys; three hand-written normalisers used to turn
+/// both into `1`, so a response to one completed a request for the other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RpcId(String);
+
+impl RpcId {
+    /// The key of an id known to be present. A `null` id keys as `null`,
+    /// which no request is ever registered under, so it matches nothing.
+    pub fn of(id: &Value) -> Self {
+        Self(id.to_string())
+    }
+
+    /// The id of a request, or `None` for an absent or `null` id (a
+    /// notification, which nothing waits for).
+    pub fn of_request(request: &Value) -> Option<Self> {
+        match request.get("id")? {
+            Value::Null => None,
+            id => Some(Self::of(id)),
+        }
+    }
+
+    /// The key for an id ahma minted itself as a string (`route_…`,
+    /// `liveness_…`): the same key the client's answer carrying it produces.
+    pub fn minted(id: &str) -> Self {
+        Self::of(&Value::String(id.to_string()))
+    }
+
+    /// The id as it is written in a JSON-RPC message, with its own type:
+    /// an answer to request `5` carries `5`, not `"5"`.
+    pub fn to_value(&self) -> Value {
+        serde_json::from_str(&self.0).unwrap_or(Value::Null)
+    }
+}
+
+impl std::fmt::Display for RpcId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Extract the request ID from a JSON-RPC request value.
 /// Returns `None` for absent or null IDs (notifications).
-fn extract_request_id(request: &Value) -> Option<String> {
-    match request.get("id")? {
-        Value::Null => None,
-        Value::String(s) => Some(s.clone()),
-        id => Some(id.to_string()),
-    }
+fn extract_request_id(request: &Value) -> Option<RpcId> {
+    RpcId::of_request(request)
 }
 
 /// Register a pending request and return the receiver used to await its response.
@@ -779,15 +817,15 @@ fn extract_request_id(request: &Value) -> Option<String> {
 /// sender would drop the earlier request's response channel, failing a
 /// healthy request with "Response channel closed".
 fn register_pending_request(
-    pending: &DashMap<String, oneshot::Sender<Value>>,
-    id: Option<&String>,
+    pending: &DashMap<RpcId, oneshot::Sender<Value>>,
+    id: Option<&RpcId>,
 ) -> Result<Option<oneshot::Receiver<Value>>> {
     let Some(id) = id else {
         return Ok(None);
     };
     match pending.entry(id.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
-            Err(BridgeError::DuplicateRequestId { id: id.clone() })
+            Err(BridgeError::DuplicateRequestId { id: id.to_string() })
         }
         dashmap::mapref::entry::Entry::Vacant(slot) => {
             let (tx, rx) = oneshot::channel();
@@ -798,7 +836,7 @@ fn register_pending_request(
 }
 
 /// Remove a pending request registration if one exists.
-fn clear_pending_request(pending: &DashMap<String, oneshot::Sender<Value>>, id: Option<&str>) {
+fn clear_pending_request(pending: &DashMap<RpcId, oneshot::Sender<Value>>, id: Option<&RpcId>) {
     if let Some(id) = id {
         pending.remove(id);
     }
@@ -806,8 +844,8 @@ fn clear_pending_request(pending: &DashMap<String, oneshot::Sender<Value>>, id: 
 
 /// Remove and return the sender for a pending request, if present.
 fn take_pending_request(
-    pending: &DashMap<String, oneshot::Sender<Value>>,
-    id: &str,
+    pending: &DashMap<RpcId, oneshot::Sender<Value>>,
+    id: &RpcId,
 ) -> Option<oneshot::Sender<Value>> {
     pending.remove(id).map(|(_, sender)| sender)
 }
@@ -829,11 +867,11 @@ const PEER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// — or, if the drop never happens, as unbounded silence, which is the worst
 /// failure mode there is: indistinguishable from a slow server.
 fn fail_pending_requests(
-    pending: &DashMap<String, oneshot::Sender<Value>>,
+    pending: &DashMap<RpcId, oneshot::Sender<Value>>,
     session_id: &str,
     message: &str,
 ) {
-    let ids: Vec<String> = pending.iter().map(|entry| entry.key().clone()).collect();
+    let ids: Vec<RpcId> = pending.iter().map(|entry| entry.key().clone()).collect();
     if ids.is_empty() {
         return;
     }
@@ -846,7 +884,7 @@ fn fail_pending_requests(
         if let Some(sender) = take_pending_request(pending, &id) {
             let _ = sender.send(serde_json::json!({
                 "jsonrpc": "2.0",
-                "id": id,
+                "id": id.to_value(),
                 "error": { "code": -32603, "message": message }
             }));
         }
@@ -862,8 +900,8 @@ fn fail_pending_requests(
 /// from the liveness probe (SPEC RB.4) and refuse the id's reuse (R8.3.7).
 pub struct InFlightRequest {
     response_rx: Option<oneshot::Receiver<Value>>,
-    id: Option<String>,
-    pending: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    id: Option<RpcId>,
+    pending: Arc<DashMap<RpcId, oneshot::Sender<Value>>>,
     default_timeout: Duration,
 }
 
@@ -898,8 +936,8 @@ async fn await_response(
     response_rx: Option<&mut oneshot::Receiver<Value>>,
     timeout: Option<Duration>,
     default_timeout: Duration,
-    id_opt: &Option<String>,
-    pending: &DashMap<String, oneshot::Sender<Value>>,
+    id_opt: &Option<RpcId>,
+    pending: &DashMap<RpcId, oneshot::Sender<Value>>,
 ) -> Result<Value> {
     let Some(rx) = response_rx else {
         return Ok(serde_json::json!({"jsonrpc": "2.0", "result": null}));
@@ -911,7 +949,7 @@ async fn await_response(
             "Response channel closed".to_string(),
         )),
         Err(_) => {
-            clear_pending_request(pending, id_opt.as_deref());
+            clear_pending_request(pending, id_opt.as_ref());
             Err(BridgeError::Timeout)
         }
     }
@@ -1008,14 +1046,11 @@ fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
 /// is still there (SPEC R2.6.5.3).
 const PING_METHOD: &str = "ping";
 
-/// The map key for a JSON-RPC id already known to be present: the raw string
-/// for a string id, its JSON rendering otherwise (ids may legitimately be
-/// numbers). Deliberately *not* [`extract_request_id`], which maps a `null` id
-/// to `None`; here a `null` id keys as `"null"`, matches no registered pending
-/// request, and so falls through to the broadcast — the behaviour the inline
-/// version in [`dispatch_subprocess_line`] has always had.
-fn json_id_key(id: &Value) -> String {
-    id.as_str().map_or_else(|| id.to_string(), str::to_string)
+/// The map key for a JSON-RPC id already known to be present ([`RpcId::of`]).
+/// Unlike [`extract_request_id`], a `null` id keys as `null`, matches no
+/// registered pending request, and so falls through to the broadcast.
+fn json_id_key(id: &Value) -> RpcId {
+    RpcId::of(id)
 }
 
 /// Timestamp prefix shared by the colored frame echoes.
@@ -1204,22 +1239,23 @@ fn deliver_ping_answer(session: &Arc<Session>, json_str: String) {
 /// Returns `true` iff the client answered within `timeout`.
 async fn ping_session_client(session: &Arc<Session>, timeout: Duration) -> bool {
     let ping_id = format!("liveness_{}", Uuid::new_v4());
+    let key = RpcId::minted(&ping_id);
     let (tx, rx) = oneshot::channel();
-    session.routed_requests.insert(ping_id.clone(), tx);
+    session.routed_requests.insert(key.clone(), tx);
 
     let payload = serde_json::json!({"jsonrpc": "2.0", "id": ping_id, "method": PING_METHOD});
     let sent = serde_json::to_string(&payload)
         .ok()
         .is_some_and(|json_str| session.broadcast(json_str).is_ok());
     if !sent {
-        session.routed_requests.remove(&ping_id);
+        session.routed_requests.remove(&key);
         return false;
     }
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(_)) => true,
         _ => {
-            session.routed_requests.remove(&ping_id);
+            session.routed_requests.remove(&key);
             false
         }
     }
@@ -1238,11 +1274,11 @@ enum SubprocessFrame {
     /// No `id`: a notification. Broadcast only.
     Notification,
     /// `id`, no `method`: a response to a request the bridge may be holding.
-    Response { id: String },
+    Response { id: RpcId },
     /// The subprocess's liveness `ping` (SPEC R2.6.5.3), answered by the bridge.
     Ping { id: Value },
     /// `id` plus `method`: a server → client request, forwarded to the client.
-    Request { id: String, method: String },
+    Request { id: RpcId, method: String },
 }
 
 /// Classify a parsed subprocess frame. A `method` that is present but is not a
@@ -1887,7 +1923,7 @@ impl SessionManager {
             .send_serialized_to_subprocess(json_str, "Failed to send to subprocess")
             .await
         {
-            clear_pending_request(&session.pending_requests, id.as_deref());
+            clear_pending_request(&session.pending_requests, id.as_ref());
             return Err(err);
         }
 
@@ -2478,7 +2514,7 @@ mod session_logic_tests {
             .expect("ping id is a string")
             .to_string();
 
-        let (_, sender) = session.routed_requests.remove(&ping_id).expect(
+        let (_, sender) = session.routed_requests.remove(&RpcId::minted(&ping_id)).expect(
             "ping id must be registered in routed_requests, exactly like a routed sampling request",
         );
         sender
@@ -2936,7 +2972,9 @@ mod session_logic_tests {
     fn dispatch_routes_response_to_pending_request() {
         let (session, _rx) = make_test_session();
         let (tx, mut resp_rx) = oneshot::channel();
-        session.pending_requests.insert("req-1".to_string(), tx);
+        session
+            .pending_requests
+            .insert(RpcId::of(&json!("req-1")), tx);
 
         dispatch_subprocess_line(
             &session,
@@ -2946,7 +2984,11 @@ mod session_logic_tests {
         let received = resp_rx.try_recv().expect("response routed to caller");
         assert_eq!(received["result"]["ok"], true);
         // Pending entry consumed.
-        assert!(!session.pending_requests.contains_key("req-1"));
+        assert!(
+            !session
+                .pending_requests
+                .contains_key(&RpcId::of(&json!("req-1")))
+        );
     }
 
     #[test]
@@ -2962,7 +3004,7 @@ mod session_logic_tests {
         assert_eq!(
             session
                 .pending_client_requests
-                .get("srv-7")
+                .get(&RpcId::of(&json!("srv-7")))
                 .map(|m| m.value().clone()),
             Some("roots/list".to_string())
         );
@@ -2981,7 +3023,7 @@ mod session_logic_tests {
         let (session, _rx) = make_test_session();
         let mut sub = session.subscribe();
         let (tx, mut resp_rx) = oneshot::channel();
-        session.pending_requests.insert("5".to_string(), tx);
+        session.pending_requests.insert(RpcId::of(&json!(5)), tx);
 
         dispatch_subprocess_line(
             &session,
@@ -2991,7 +3033,7 @@ mod session_logic_tests {
         );
 
         assert!(
-            session.pending_requests.contains_key("5"),
+            session.pending_requests.contains_key(&RpcId::of(&json!(5))),
             "the client's pending call must survive a subprocess request with the same id"
         );
         assert!(
@@ -3001,7 +3043,7 @@ mod session_logic_tests {
         assert_eq!(
             session
                 .pending_client_requests
-                .get("5")
+                .get(&RpcId::of(&json!(5)))
                 .map(|m| m.value().clone()),
             Some("elicitation/create".to_string()),
             "the request is a server-to-client request and must be tracked as one"
@@ -3026,7 +3068,7 @@ mod session_logic_tests {
         // The pending-call collision from the test above, on the ping path: the
         // answer must go back even when the ping's id shadows a pending call.
         let (tx, mut resp_rx) = oneshot::channel();
-        session.pending_requests.insert("9".to_string(), tx);
+        session.pending_requests.insert(RpcId::of(&json!(9)), tx);
 
         dispatch_subprocess_line(
             &session,
@@ -3048,7 +3090,7 @@ mod session_logic_tests {
             "an answered ping is not also forwarded — the client would answer a \
              second time into a request nobody is waiting on"
         );
-        assert!(session.pending_requests.contains_key("9"));
+        assert!(session.pending_requests.contains_key(&RpcId::of(&json!(9))));
         assert!(resp_rx.try_recv().is_err());
     }
 
@@ -3138,45 +3180,68 @@ mod session_logic_tests {
     fn extract_request_id_variants() {
         assert_eq!(
             extract_request_id(&json!({"id": "abc"})),
-            Some("abc".to_string())
+            Some(RpcId::of(&json!("abc")))
         );
         assert_eq!(
             extract_request_id(&json!({"id": 42})),
-            Some("42".to_string())
+            Some(RpcId::of(&json!(42)))
         );
         assert_eq!(extract_request_id(&json!({"id": null})), None);
         assert_eq!(extract_request_id(&json!({"method": "x"})), None);
     }
 
+    /// JSON-RPC ids `"1"` and `1` are different ids. Every normaliser turned
+    /// both into the key `1`, so a response to the number completed whoever
+    /// was waiting on the string.
+    #[test]
+    fn a_string_id_and_a_number_id_are_different_requests() {
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
+        let waiting = extract_request_id(&json!({"id": "1", "method": "tools/call"}));
+        let _rx = register_pending_request(&pending, waiting.as_ref())
+            .expect("registered")
+            .expect("a receiver");
+        let SubprocessFrame::Response { id } =
+            classify_subprocess_frame(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        else {
+            panic!("a response frame");
+        };
+        assert!(
+            take_pending_request(&pending, &id).is_none(),
+            "the response to 1 is not the answer to \"1\""
+        );
+    }
+
     #[test]
     fn register_and_take_pending_request() {
-        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
-        let id = Some("r1".to_string());
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
+        let id = Some(RpcId::of(&json!("r1")));
         let rx = register_pending_request(&pending, id.as_ref()).unwrap();
         assert!(rx.is_some());
-        assert!(pending.contains_key("r1"));
+        assert!(pending.contains_key(id.as_ref().unwrap()));
 
-        let sender = take_pending_request(&pending, "r1");
+        let r1 = RpcId::of(&json!("r1"));
+        let sender = take_pending_request(&pending, &r1);
         assert!(sender.is_some());
-        assert!(!pending.contains_key("r1"));
+        assert!(!pending.contains_key(&r1));
         // Taking again returns None.
-        assert!(take_pending_request(&pending, "r1").is_none());
+        assert!(take_pending_request(&pending, &r1).is_none());
     }
 
     #[test]
     fn register_pending_request_none_id_registers_nothing() {
-        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
         assert!(register_pending_request(&pending, None).unwrap().is_none());
         assert_eq!(pending.len(), 0);
     }
 
     #[test]
     fn clear_pending_request_removes_and_tolerates_none() {
-        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
         let (tx, _rx) = oneshot::channel();
-        pending.insert("c1".to_string(), tx);
-        clear_pending_request(&pending, Some("c1"));
-        assert!(!pending.contains_key("c1"));
+        let c1 = RpcId::of(&json!("c1"));
+        pending.insert(c1.clone(), tx);
+        clear_pending_request(&pending, Some(&c1));
+        assert!(!pending.contains_key(&c1));
         // None id is a no-op (does not panic).
         clear_pending_request(&pending, None);
     }
@@ -3185,7 +3250,7 @@ mod session_logic_tests {
 
     #[tokio::test]
     async fn await_response_none_rx_returns_null_result() {
-        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
         let res = await_response(None, None, Duration::from_secs(60), &None, &pending)
             .await
             .unwrap();
@@ -3194,7 +3259,7 @@ mod session_logic_tests {
 
     #[tokio::test]
     async fn await_response_returns_delivered_value() {
-        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
         let (tx, mut rx) = oneshot::channel();
         tx.send(json!({"jsonrpc": "2.0", "id": "1", "result": "done"}))
             .unwrap();
@@ -3202,7 +3267,7 @@ mod session_logic_tests {
             Some(&mut rx),
             Some(Duration::from_secs(1)),
             Duration::from_secs(60),
-            &Some("1".to_string()),
+            &Some(RpcId::of(&json!("1"))),
             &pending,
         )
         .await
@@ -3212,7 +3277,7 @@ mod session_logic_tests {
 
     #[tokio::test]
     async fn await_response_channel_closed_errors() {
-        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
         let (tx, mut rx) = oneshot::channel::<Value>();
         drop(tx); // sender dropped → recv yields Err
         let err = await_response(
@@ -3229,10 +3294,10 @@ mod session_logic_tests {
 
     #[tokio::test]
     async fn await_response_timeout_clears_pending() {
-        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let pending: DashMap<RpcId, oneshot::Sender<Value>> = DashMap::new();
         let (tx, mut rx) = oneshot::channel::<Value>();
         // Keep tx alive so the channel never delivers and never closes.
-        let id = "timeout-id".to_string();
+        let id = RpcId::of(&json!("timeout-id"));
         pending.insert(id.clone(), oneshot::channel().0);
         let err = await_response(
             Some(&mut rx),
@@ -3457,7 +3522,7 @@ mod session_logic_tests {
         let request = json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"});
 
         let answered = mgr.start_request(&id, &request).await.unwrap();
-        take_pending_request(&session.pending_requests, "5")
+        take_pending_request(&session.pending_requests, &RpcId::of(&json!(5)))
             .expect("registered")
             .send(json!({"jsonrpc": "2.0", "id": 5, "result": {}}))
             .unwrap();
@@ -3480,8 +3545,9 @@ mod session_logic_tests {
         let id = mgr.create_session().await.unwrap();
         let session = mgr.get_session(&id).unwrap();
         let _sub = session.subscribe(); // never answers anything
-        let _in_flight = register_pending_request(&session.pending_requests, Some(&"7".into()))
-            .expect("register in-flight request");
+        let _in_flight =
+            register_pending_request(&session.pending_requests, Some(&RpcId::of(&json!(7))))
+                .expect("register in-flight request");
 
         for _ in 1..=SessionManager::MAX_MISSED_LIVENESS_PINGS {
             mgr.ping_connected_sessions(Duration::from_millis(20), Duration::ZERO)
@@ -3543,7 +3609,7 @@ mod session_logic_tests {
             let ping_id = ping["id"].as_str().unwrap().to_string();
             let (_, sender) = session
                 .routed_requests
-                .remove(&ping_id)
+                .remove(&RpcId::minted(&ping_id))
                 .expect("ping id must be registered in routed_requests");
             sender
                 .send(serde_json::json!({"jsonrpc": "2.0", "id": ping_id, "result": {}}))
@@ -3616,7 +3682,7 @@ mod session_logic_tests {
 
         // A request is in flight when the peer dies.
         let (tx, rx) = oneshot::channel();
-        session.pending_requests.insert("42".to_string(), tx);
+        session.pending_requests.insert(RpcId::of(&json!(42)), tx);
 
         // Play the exit monitor: classify the death, THEN let the bridge see
         // the pipe EOF (the order the race can also produce in production).
@@ -3792,7 +3858,7 @@ mod session_logic_tests {
         let session_id = mgr.create_session().await.unwrap();
         let session = mgr.sessions.get(&session_id).unwrap().clone();
 
-        let rx = register_pending_request(&session.pending_requests, Some(&"7".to_string()))
+        let rx = register_pending_request(&session.pending_requests, Some(&RpcId::of(&json!("7"))))
             .unwrap()
             .expect("a request is now in flight");
 
@@ -3825,9 +3891,10 @@ mod session_logic_tests {
         let session_id = mgr.create_session().await.unwrap();
         let session = mgr.sessions.get(&session_id).unwrap().clone();
 
-        let first_rx = register_pending_request(&session.pending_requests, Some(&"10".to_string()))
-            .unwrap()
-            .expect("first request is in flight");
+        let first_rx =
+            register_pending_request(&session.pending_requests, Some(&RpcId::of(&json!(10))))
+                .unwrap()
+                .expect("first request is in flight");
 
         let err = mgr
             .send_request(
@@ -3843,7 +3910,7 @@ mod session_logic_tests {
         );
 
         // The first request's channel is untouched and still deliverable.
-        let sender = take_pending_request(&session.pending_requests, "10")
+        let sender = take_pending_request(&session.pending_requests, &RpcId::of(&json!(10)))
             .expect("the original request must still be registered");
         sender.send(json!({"id": 10, "result": "ok"})).unwrap();
         assert_eq!(first_rx.await.unwrap()["result"], "ok");
@@ -3867,7 +3934,7 @@ mod session_logic_tests {
             Box::new(|| Box::pin(async { std::future::pending::<()>().await }));
         *session.peer_shutdown.lock().await = Some(hangs_forever);
 
-        let rx = register_pending_request(&session.pending_requests, Some(&"9".to_string()))
+        let rx = register_pending_request(&session.pending_requests, Some(&RpcId::of(&json!(9))))
             .unwrap()
             .expect("a request is now in flight");
 
