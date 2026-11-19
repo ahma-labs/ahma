@@ -176,7 +176,8 @@ pub(super) fn next_repo_step(
     command: &str,
     persistent: &[PersistentScope],
 ) -> Option<RepoStep> {
-    use ahma_common::scope_grant::{GRANTED_BY_HARNESS_DIALOG, grant_applies, other_repository};
+    use ahma_common::grant::GrantedBy;
+    use ahma_common::scope_grant::{grant_applies, other_repository};
     let dir = harness_asks::default_dir()?;
     let workspace = workspace_for(cwd);
     let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
@@ -186,7 +187,7 @@ pub(super) fn next_repo_step(
     granted.extend(crate::sandbox::session_scopes_for(&scopes));
     let granted_by_a_human = |repo: &Path| {
         granted.iter().any(|g| {
-            g.granted_by.as_deref() != Some(GRANTED_BY_HARNESS_DIALOG)
+            GrantedBy::parse(g.granted_by.as_deref()).is_deliberate()
                 && grant_applies(g.workspace.as_deref(), std::slice::from_ref(&workspace))
                 && (repo.starts_with(&g.path) || g.path.starts_with(repo))
         })
@@ -1128,6 +1129,33 @@ mod tests {
             matches!(token_of(decide(&cmd)), (_, _)),
             "ungranted, it asks"
         );
+
+        // A grant the dialog's own yes made is no deliberate setup, saved or for the
+        // session: the session kind is read back as `session grant (harness dialog)`,
+        // which used to count as a human's because it was not the exact dialog mark.
+        for (n, by) in ["harness dialog", "session grant (harness dialog)"]
+            .into_iter()
+            .enumerate()
+        {
+            let repo = tmp.path().join(format!("dialog-made-{n}"));
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            let repo = dunce::canonicalize(&repo).unwrap();
+            let mut dialog = crate::shell::cli::AppConfig::default();
+            dialog.persistent_scopes.push(PersistentScope {
+                path: repo.clone(),
+                access: ScopeAccess::Rw,
+                workspace: Some(ws.clone()),
+                granted_by: Some(by.into()),
+                granted_at: None,
+                note: None,
+                expires_at: None,
+            });
+            let cmd = format!("cd {} && ls", repo.display());
+            assert!(
+                matches!(decide_with(&cmd, &dialog), HooksDecision::AskGrant { .. }),
+                "a grant marked {by:?} still asks"
+            );
+        }
     }
 
     /// SPEC R-PERM.11 (field case 2026-11-18): a session in `~/github/neubit4` ran

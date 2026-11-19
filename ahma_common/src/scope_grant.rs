@@ -1520,11 +1520,7 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
         crate::permissions::GrantKind::FsScope,
         canonical.display().to_string(),
         Some(if grant.access.is_write() { "rw" } else { "ro" }.to_string()),
-        if grant.expires_at.is_some() {
-            crate::permissions::GrantTier::Lease
-        } else {
-            crate::permissions::GrantTier::Always
-        },
+        crate::permissions::GrantTier::for_expiry(grant.expires_at),
         Some(grant.surface.to_string()),
     ));
     Ok(outcome)

@@ -887,7 +887,7 @@ fn check_cross_repo_grants(settings: &AhmaSettings, home: Option<&Path>, out: &m
         {
             continue;
         }
-        if scope.granted_by.as_deref() == Some(crate::scope_grant::GRANTED_BY_HARNESS_DIALOG) {
+        if !crate::grant::GrantedBy::parse(scope.granted_by.as_deref()).is_deliberate() {
             let on = scope
                 .granted_at
                 .as_deref()

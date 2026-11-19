@@ -41,6 +41,7 @@ pub mod event_dispatcher;
 pub mod exe_identity;
 pub mod file_uri;
 pub mod fs_lock;
+pub mod grant;
 pub mod grant_prompt;
 /// Every AI harness ahma knows, listed once; the MCP-client, setup-target and
 /// terminal-hook tables in `ahma_mcp` are views of it.
