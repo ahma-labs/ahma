@@ -130,9 +130,7 @@ pub fn save(path: &Path, entries: &[SavedEntry]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(entries)?)?;
-    std::fs::rename(&tmp, path)?;
+    ahma_common::fs_atomic::write(path, serde_json::to_vec_pretty(entries)?)?;
     Ok(())
 }
 

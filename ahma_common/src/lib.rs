@@ -40,6 +40,7 @@ pub mod doctor;
 pub mod event_dispatcher;
 pub mod exe_identity;
 pub mod file_uri;
+pub mod fs_atomic;
 pub mod fs_lock;
 pub mod grant;
 pub mod grant_prompt;

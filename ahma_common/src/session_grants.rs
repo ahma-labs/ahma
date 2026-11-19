@@ -73,9 +73,7 @@ pub fn record(dir: &Path, grant: &SessionGrant) -> Result<PathBuf> {
     }
     let file = dir.join(file_name(grant));
     let json = serde_json::to_vec_pretty(grant)?;
-    let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &file).with_context(|| format!("rename to {}", file.display()))?;
+    crate::fs_atomic::write(&file, json).with_context(|| format!("write {}", file.display()))?;
     Ok(file)
 }
 
@@ -209,6 +207,50 @@ mod tests {
             granted_at: at,
             granted_by: Some("tui".into()),
         }
+    }
+
+    /// Two writers recording the same grant at once (two hooks approving the
+    /// same folder) both succeed. Every writer staged its file at one fixed
+    /// name, `<file>.json.tmp`, so the second rename found the first had moved
+    /// it away and failed, or renamed a file the other was still writing.
+    #[test]
+    fn writers_recording_the_same_grant_at_once_all_succeed() {
+        let td = tempdir().unwrap();
+        let dir = td.path().join("session-grants");
+        let g = grant(
+            Path::new("/github/neubit4"),
+            Path::new("/github/ahma"),
+            7,
+            1_000,
+        );
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..50)
+                            .filter_map(|_| record(&dir, &g).err().map(|e| format!("{e:#}")))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect()
+        });
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        assert_eq!(active(&dir, 1_100, &|_| true).len(), 1, "one grant, whole");
+        let strays = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .count();
+        assert_eq!(strays, 0, "no staging file left behind");
     }
 
     /// SPEC R-PERM.11: the undo ahma prints ends the grant now, not at the session's end. A

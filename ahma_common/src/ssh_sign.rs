@@ -87,10 +87,8 @@ pub fn record_session(dir: &Path, grant: &SshSignGrant) -> Result<PathBuf> {
         grant.owner_pid.unwrap_or(0),
         &crate::digest::sha256_hex(key.as_bytes())[..16]
     ));
-    let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(grant)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &file).with_context(|| format!("rename to {}", file.display()))?;
+    crate::fs_atomic::write(&file, serde_json::to_vec_pretty(grant)?)
+        .with_context(|| format!("write {}", file.display()))?;
     Ok(file)
 }
 

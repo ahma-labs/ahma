@@ -329,18 +329,7 @@ pub fn last_exit_path_for(socket: &Path) -> PathBuf {
 /// Write `last-exit.json`, owner-only, replacing any previous one whole.
 pub async fn write_last_exit(path: &Path, exit: &LastExit) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(exit).map_err(std::io::Error::other)?;
-    let mut staged = path.as_os_str().to_os_string();
-    staged.push(".tmp");
-    let staged = PathBuf::from(staged);
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&staged).await?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, &json).await?;
-    tokio::io::AsyncWriteExt::flush(&mut file).await?;
-    drop(file);
-    tokio::fs::rename(&staged, path).await
+    crate::fs_atomic::write_with_mode_async(path, json, 0o600).await
 }
 
 /// Read `last-exit.json`, if there is a readable one.

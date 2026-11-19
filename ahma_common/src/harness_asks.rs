@@ -1276,10 +1276,8 @@ fn update<T>(
         .with_context(|| format!("lock {}", file.display()))?;
     let mut asks = load(dir, workspace, now);
     let out = f(&mut asks);
-    let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&asks)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &file).with_context(|| format!("rename to {}", file.display()))?;
+    crate::fs_atomic::write(&file, serde_json::to_vec_pretty(&asks)?)
+        .with_context(|| format!("write {}", file.display()))?;
     Ok(out)
 }
 

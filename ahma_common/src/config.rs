@@ -2506,22 +2506,9 @@ impl AhmaSettings {
         }
         let toml_text = self.render_documented();
 
-        // Atomic write: temp file → rename. The temp name is this writer's
-        // own: one shared name let two writers interleave in one file.
-        let tmp_path = path.with_extension(format!(
-            "toml.{}.{}.tmp",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::write(&tmp_path, toml_text)
-            .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, path).with_context(|| {
-            format!(
-                "Failed to rename {} → {}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
+        // Atomic write: a staging file of this writer's own, then a rename.
+        crate::fs_atomic::write(path, toml_text)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
     }
 
@@ -3989,16 +3976,8 @@ fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
-    let tmp_path = path.with_extension(format!("toml.tmp.{}", std::process::id()));
-    std::fs::write(&tmp_path, text)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "Failed to rename {} → {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })
+    crate::fs_atomic::write(path, text)
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
