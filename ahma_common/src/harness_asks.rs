@@ -364,8 +364,20 @@ pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Na
         };
         Some(path)
     };
+    // A word that only frames the command after it: a loop or conditional keyword, or a
+    // `NAME=value` assignment. `if cd /repo; then …` and `X=1 cd /repo` move in all the same.
+    let frames = |word: &str| {
+        matches!(
+            word,
+            "until" | "while" | "if" | "elif" | "then" | "else" | "do" | "!" | "time"
+        ) || word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
     let mut paths = Vec::new();
     let mut here = cwd.to_path_buf();
+    // A `cd` whose target cannot be read (`cd $r`, `cd -`) may go to any folder the line names.
+    let mut moves_somewhere_unread = false;
     #[cfg(windows)]
     let segments = literal_segments(command);
     #[cfg(not(windows))]
@@ -374,13 +386,24 @@ pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Na
         let mut words = segment.iter().map(String::as_str).peekable();
         let mut first = true;
         while let Some(word) = words.next() {
+            if first && frames(word) {
+                continue;
+            }
             if first && word == "cd" {
-                if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
-                    here = target.clone();
-                    paths.push(NamedFolder {
-                        path: target,
-                        entered: true,
-                    });
+                match words.next() {
+                    Some(t) if t != "-" => match expand(t, &here) {
+                        Some(target) => {
+                            here = target.clone();
+                            paths.push(NamedFolder {
+                                path: target,
+                                entered: true,
+                            });
+                        }
+                        None => moves_somewhere_unread = true,
+                    },
+                    Some(_) => moves_somewhere_unread = true,
+                    // `cd` alone goes home, which is no repository (R-PERM.11).
+                    None => {}
                 }
                 break;
             }
@@ -403,6 +426,11 @@ pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Na
                     entered: false,
                 });
             }
+        }
+    }
+    if moves_somewhere_unread {
+        for folder in &mut paths {
+            folder.entered = true;
         }
     }
     paths
@@ -1728,6 +1756,16 @@ mod tests {
         assert_eq!(entered("cd /w/neubit4 && ls /w/other"), [true, false]);
         assert_eq!(entered("git -C /w/neubit4 status"), [true]);
         assert_eq!(entered("ls /w/neubit4/rust ~/notes"), [false, false]);
+        // A `cd` behind an assignment or a shell keyword moves in all the same.
+        assert_eq!(entered("X=1 cd /w/neubit4 && git status"), [true]);
+        assert_eq!(entered("if cd /w/neubit4; then git status; fi"), [true]);
+        assert_eq!(entered("ls /w/other; ! cd /w/neubit4"), [false, true]);
+        // A `cd` whose target cannot be read may go to any folder the line names.
+        assert_eq!(
+            entered("for r in /w/a /w/b; do cd $r && git log -1; done"),
+            [true, true]
+        );
+        assert_eq!(entered("ls /w/other && cd - && git status"), [true]);
         // A heredoc is a POSIX shell's; on Windows the line is split literally.
         #[cfg(not(windows))]
         assert!(

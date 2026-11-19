@@ -3805,22 +3805,31 @@ pub fn explain_setting(doc: &SettingDoc) -> String {
 pub enum SettingsReach {
     /// The user's own `~/.ahma/settings.toml`: every repository on this machine.
     EveryRepository,
-    /// A repository's `.ahma/settings.toml`: that repository and no other.
+    /// This repository's `.ahma/settings.toml`, written with `--project`: this
+    /// repository and no other.
     ThisRepository,
+    /// A repository's `.ahma/settings.toml` named with `--path`: that
+    /// repository, which need not be the one the command ran in.
+    RepositoryOfFile,
     /// A file named with `--path`: read only by an ahma started with
     /// `--settings-path`.
     OnlyThisFile,
 }
 
 impl SettingsReach {
-    /// What a write to `path` reaches.
-    pub fn of(path: &Path) -> Self {
-        if settings_path().is_some_and(|user| user == path) {
+    /// What a write to `path` reaches. `named_with_path` says the file was
+    /// given with `--path` rather than found (`--project`, or the default).
+    pub fn of(path: &Path, named_with_path: bool) -> Self {
+        // The user's own file by any spelling: a symlinked home, a relative path.
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if settings_path().is_some_and(|user| user == path || real(&user) == real(path)) {
             Self::EveryRepository
-        } else if SettingsFile::for_path(path) == SettingsFile::Project {
-            Self::ThisRepository
-        } else {
+        } else if SettingsFile::for_path(path) != SettingsFile::Project {
             Self::OnlyThisFile
+        } else if named_with_path {
+            Self::RepositoryOfFile
+        } else {
+            Self::ThisRepository
         }
     }
 
@@ -3844,6 +3853,12 @@ impl SettingsReach {
                  when the file is committed and pulled."
                     .to_string()
             }
+            (Self::RepositoryOfFile, _) => {
+                "only the repository this file belongs to: it is that repository's own \
+                 .ahma/settings.toml. Every other repository is unaffected, and another \
+                 checkout of that one gets the change when the file is committed and pulled."
+                    .to_string()
+            }
             (Self::OnlyThisFile, _) => format!(
                 "only an ahma started with `--settings-path {}`. Your own ~/.ahma/settings.toml \
                  is unchanged.",
@@ -3857,7 +3872,9 @@ impl SettingsReach {
         match self {
             Self::EveryRepository => String::new(),
             Self::ThisRepository => " --project".to_string(),
-            Self::OnlyThisFile => {
+            // `--project` would write the file of the repository the command
+            // runs in, which need not be this one.
+            Self::RepositoryOfFile | Self::OnlyThisFile => {
                 let file = path.display().to_string();
                 if file.contains(char::is_whitespace) {
                     format!(" --path '{file}'")
@@ -6642,6 +6659,36 @@ mod project_settings_tests {
         assert!(
             other.contains(&format!("--path {}", file.display())),
             "the undo names the same file: {other}"
+        );
+
+        // A repository's file named with `--path` is that repository's, which need
+        // not be the one the command ran in: `--project` would undo in the wrong one.
+        let theirs = dir.path().join(".ahma").join("settings.toml");
+        assert_eq!(
+            SettingsReach::of(&theirs, true),
+            SettingsReach::RepositoryOfFile
+        );
+        assert_eq!(
+            SettingsReach::of(&theirs, false),
+            SettingsReach::ThisRepository
+        );
+        assert_eq!(SettingsReach::of(&file, true), SettingsReach::OnlyThisFile);
+        let that = describe_setting_change(
+            "tools.timeout_secs",
+            &edit,
+            &theirs,
+            SettingsReach::RepositoryOfFile,
+        );
+        assert!(
+            that.contains("only the repository this file belongs to"),
+            "{that}"
+        );
+        assert!(
+            that.contains(&format!(
+                "To undo: ahma settings unset --path {} tools.timeout_secs",
+                theirs.display()
+            )),
+            "{that}"
         );
     }
 

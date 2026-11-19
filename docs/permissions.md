@@ -92,7 +92,11 @@ typed into the wrong terminal: one that moves into it (`cd ../other-repo && …`
 read or write, and one that names a path in it and may write (`cp /other-repo/a .`). A
 command that only looks there — `ls /other-repo/data`, `grep -r x /other-repo/src | head`,
 every program a plain reader and the repository a plain argument — runs without a
-question; the first one of a session says so in one line. **No** stops that command (the next one there asks again); **Yes** lets
+question; the first one of a session says so in one line. "Only looks" is strict: a
+program that could write or run another program through its own arguments still asks
+(`sed`, `awk`, `sort -o`, `env <program>`, anything under `NAME=value`), so does a `cd`
+behind a keyword or to a variable (`if cd …`, `cd $dir`), and so does a Windows path
+written with backslashes. **No** stops that command (the next one there asks again); **Yes** lets
 the session keep working there and grants nothing. The prompt names both repositories by
 path (two clones of one remote count as two repositories) and ends with the command that
 stops the asking for routine reads, which you type once:

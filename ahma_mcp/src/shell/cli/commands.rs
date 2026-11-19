@@ -301,6 +301,7 @@ fn run_settings_set(
     use ahma_common::config::{
         AhmaSettings, SettingsFile, SettingsReach, describe_setting_change, settings_path,
     };
+    let named_with_path = !project && path.is_some();
     let target = if project {
         origin_ctx.project_settings_file.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -316,7 +317,12 @@ fn run_settings_set(
     let edit = AhmaSettings::set_in_file(&target, key, value)?;
     print!(
         "{}",
-        describe_setting_change(key, &edit, &target, SettingsReach::of(&target))
+        describe_setting_change(
+            key,
+            &edit,
+            &target,
+            SettingsReach::of(&target, named_with_path)
+        )
     );
     if edit.before != edit.after {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(

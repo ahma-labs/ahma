@@ -166,8 +166,10 @@ pub(super) enum RepoStep {
 /// project, and asks nothing.
 ///
 /// A command that moves into the repository (`cd`, `-C`) or may write asks, while the human is
-/// still at the keyboard. A line the write queue's classifier proves only reads (R2.7.4), naming
-/// the repository as a plain argument, is a lookup and not work there: [`RepoStep::Read`].
+/// still at the keyboard. A line that can only look ([`crate::adapter::lane::only_looks`]: every
+/// program a plain reader, none able to write or run another program through its arguments),
+/// naming the repository as a plain argument, is a lookup and not work there:
+/// [`RepoStep::Read`].
 pub(super) fn next_repo_step(
     cwd: &Path,
     session_id: &str,
@@ -214,10 +216,7 @@ pub(super) fn next_repo_step(
                 && !harness_asks::repo_acknowledged(&asks, session_id, repo)
         })
         .collect();
-    let only_reads = matches!(
-        crate::adapter::lane::classify_shell_command(command),
-        crate::adapter::workspace_queue::Lane::ReadOnly
-    );
+    let only_reads = crate::adapter::lane::only_looks(command);
     let works_there = named
         .iter()
         .find(|(_, entered)| *entered || !only_reads)
@@ -1177,32 +1176,53 @@ mod tests {
         };
 
         let data = other.join("analysis_results");
-        let note = note_of(decide(&format!("ls {}", data.display())))
-            .expect("the first plain read of a session says where it reads");
-        assert!(note.contains(&other.display().to_string()), "{note}");
-        assert!(note.contains("different repository"), "{note}");
-        assert!(note.contains("not asked about"), "{note}");
-        assert!(
-            note_of(decide(&format!("grep -rn x {} | head -3", data.display()))).is_none(),
-            "said once per session, not on every command"
-        );
+        // A Windows path is written with `\`, which the classifier does not read as a plain
+        // word, so a lookup there still asks: the relaxation is for lines ahma can read.
+        if cfg!(not(windows)) {
+            let note = note_of(decide(&format!("ls {}", data.display())))
+                .expect("the first plain read of a session says where it reads");
+            assert!(note.contains(&other.display().to_string()), "{note}");
+            assert!(note.contains("different repository"), "{note}");
+            assert!(note.contains("not asked about"), "{note}");
+            assert!(
+                note_of(decide(&format!("grep -rn x {} | head -3", data.display()))).is_none(),
+                "said once per session, not on every command"
+            );
+        }
 
-        // Moving in is what a task typed into the wrong terminal does: still a dialog.
+        // Moving in is what a task typed into the wrong terminal does: still a dialog,
+        // also when the `cd` sits behind an assignment or a keyword, or goes where a
+        // variable says.
         for moves_in in [
             format!("cd {} && ls", other.display()),
             format!("git -C {} status", other.display()),
+            format!("X=1 cd {} && git status", other.display()),
+            format!("if cd {}; then git status; fi", other.display()),
+            format!("for r in {}; do cd $r && git log -1; done", other.display()),
         ] {
             assert!(
                 matches!(decide(&moves_in), HooksDecision::AskGrant { .. }),
                 "{moves_in}"
             );
         }
-        // So is anything that may write, wherever it writes.
-        let copies = format!("cp {}/a.json .", data.display());
-        assert!(
-            matches!(decide(&copies), HooksDecision::AskGrant { .. }),
-            "{copies}"
-        );
+        // So is anything that may write or run a program, wherever it does: a copy, and a
+        // reader whose own arguments can write a file or name a program to run.
+        let d = data.display();
+        for may_write in [
+            format!("cp {d}/a.json ."),
+            format!("sort -o {d}/a.json {d}/a.json"),
+            format!("sed -Ei s/a/b/ {d}/a.json"),
+            format!("uniq a.json {d}/b.json"),
+            format!("env -i {d}/release.sh"),
+            format!("awk -f {d}/x.awk {d}/a.json"),
+            format!("LD_PRELOAD=x ls {d}"),
+            format!("ls {d} > {d}/listing"),
+        ] {
+            assert!(
+                matches!(decide(&may_write), HooksDecision::AskGrant { .. }),
+                "{may_write}"
+            );
+        }
     }
 
     /// SPEC R-PERM.11 (field case 2026-11-15): two clones of one remote

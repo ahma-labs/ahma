@@ -47,7 +47,8 @@ status()                                     → ── Finished since your last
   `NOT started — `git status` is waiting for the workspace; op `op_12` (`cargo nextest run`,
   41s) holds it. Queued because …`. When the cause is one of the project's own programs
   (`scripts/audition unread`), the reason also names the way out: a human adds
-  `{command='scripts/audition'}` to `tools.long_running` (see Limits, below).
+  `{command='scripts/audition'}` to `tools.long_running` (see Limits, below), and it says
+  so when the program must first be run by itself, with nothing piped or chained to it.
 - **Watching CI does not hold the workspace.** `gh run watch`, `gh pr checks --watch` and
   `tail -f` read until their subject ends, which can be most of an hour. They take no lease:
   read-only where the kernel enforces that lane, `service` where it does not. The whole line

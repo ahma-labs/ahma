@@ -700,7 +700,10 @@ fn checkouts_below(folder: &Path) -> Vec<PathBuf> {
 /// commands in that checkout then run without the sandbox; otherwise
 /// information, because the project's own hooks are the project's business.
 fn check_hooks_below(home: Option<&Path>, workspace: &Path, out: &mut Vec<Finding>) {
-    if git_root_of(workspace).is_some() || !project_hook_events(workspace).is_empty() {
+    // Home kept in git (a dotfiles repository) puts every folder under it
+    // "inside a checkout": that one is no project, as in R-PERM.11.
+    let in_a_checkout = git_root_of(workspace).is_some_and(|root| Some(root.as_path()) != home);
+    if in_a_checkout || !project_hook_events(workspace).is_empty() {
         return;
     }
     let user_has_ahma_hook = home
@@ -2335,6 +2338,19 @@ mod hook_and_grant_tool_tests {
         assert_eq!(f.level, Level::Warn);
         assert!(f.detail.contains("without ahma's sandbox"), "{}", f.detail);
         assert!(f.detail.contains("ahma hooks install"), "{}", f.detail);
+    }
+
+    /// A home directory kept in git (dotfiles) is an ancestor `.git` of every
+    /// folder under it, and is no project: the check still runs below it.
+    #[test]
+    fn a_home_kept_in_git_does_not_hide_the_checkouts_below() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        let parent = home.path().join("github");
+        std::fs::create_dir_all(&parent).unwrap();
+        let (near, _far) = folder_of_checkouts(&parent);
+        write_project_settings(&near, "settings.json", PROJECT_HOOK);
+        assert!(above_finding(&run(&input(home.path(), &parent))).is_some());
     }
 
     #[test]
