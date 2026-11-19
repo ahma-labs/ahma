@@ -7,6 +7,13 @@ use std::sync::Arc;
 
 use crate::config::{CommandOption, SubcommandConfig, ToolConfig};
 
+/// Whether an MTDF option's declared type is boolean, by the same reading the
+/// tool schema gives it ([`normalize_option_type`]): what a client is told is
+/// a flag, the argument processor must emit as one.
+pub fn is_boolean_type(option_type: &str) -> bool {
+    normalize_option_type(option_type) == "boolean"
+}
+
 /// Normalizes option types to JSON Schema types.
 pub fn normalize_option_type(option_type: &str) -> &'static str {
     match option_type {
