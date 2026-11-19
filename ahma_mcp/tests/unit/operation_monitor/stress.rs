@@ -36,10 +36,13 @@ async fn test_operation_monitor_concurrent_operations() -> Result<()> {
             // Simulate some work without time-based sleeps
             tokio::task::yield_now().await;
 
-            // Complete the operation using update_status
+            // Complete the operation using finish
             let result = serde_json::json!({"result": format!("completed_{}", i)});
             monitor_clone
-                .update_status(&op_id, OperationStatus::Completed, Some(result))
+                .finish(
+                    &op_id,
+                    ahma_mcp::operation_monitor::Terminal::Done(Some(result)),
+                )
                 .await;
 
             op_id
@@ -97,10 +100,13 @@ async fn test_operation_monitor_rapid_fire_operations() -> Result<()> {
 
         monitor.add_operation(operation).await;
 
-        // Complete immediately using update_status
+        // Complete immediately using finish
         let result = serde_json::json!({"iteration": i});
         monitor
-            .update_status(&op_id, OperationStatus::Completed, Some(result))
+            .finish(
+                &op_id,
+                ahma_mcp::operation_monitor::Terminal::Done(Some(result)),
+            )
             .await;
     }
 
@@ -161,26 +167,20 @@ async fn test_operation_monitor_mixed_operations() -> Result<()> {
     );
     monitor.add_operation(success_op).await;
 
-    // Fail the first operation using update_status
-    let error_result = serde_json::json!({
-        "error": "Simulated failure",
-        "exit_code": 1
-    });
+    // Fail the first operation using finish
     monitor
-        .update_status(
+        .finish(
             "failing_operation",
-            OperationStatus::Failed,
-            Some(error_result),
+            ahma_mcp::operation_monitor::Terminal::Failed("Simulated failure".to_string()),
         )
         .await;
 
     // Complete the second operation
     let success_result = serde_json::json!({"status": "success"});
     monitor
-        .update_status(
+        .finish(
             "success_operation",
-            OperationStatus::Completed,
-            Some(success_result),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(success_result)),
         )
         .await;
 
@@ -239,7 +239,10 @@ async fn test_operation_monitor_basic_functionality() -> Result<()> {
     // Complete the operation
     let result = serde_json::json!({"status": "basic_test_completed"});
     monitor
-        .update_status("basic_test", OperationStatus::Completed, Some(result))
+        .finish(
+            "basic_test",
+            ahma_mcp::operation_monitor::Terminal::Done(Some(result)),
+        )
         .await;
 
     // Verify it's moved to completed operations

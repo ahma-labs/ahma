@@ -521,7 +521,7 @@ mod tests {
 mod redirect_tests {
     use super::*;
     use crate::client_type::McpClientType;
-    use crate::operation_monitor::{MonitorConfig, Operation, OperationStatus};
+    use crate::operation_monitor::{MonitorConfig, Operation};
     use ahma_common::timeouts::TestTimeouts;
     use rmcp::model::NumberOrString;
 
@@ -638,7 +638,7 @@ mod redirect_tests {
         let displaced = router.redirect("op_1", peer, token(2), true).await;
 
         monitor
-            .update_status("op_1", OperationStatus::Completed, None)
+            .finish("op_1", crate::operation_monitor::Terminal::Done(None))
             .await; // the operation actually finishes...
         router.claim_terminal("op_1").await; // ...and the forwarder claims it
 
@@ -676,7 +676,7 @@ mod redirect_tests {
 
         // The operation completes...
         monitor
-            .update_status("op_1", OperationStatus::Completed, None)
+            .finish("op_1", crate::operation_monitor::Terminal::Done(None))
             .await;
         // ...and restore() (from the await's Drop-spawned task) wins the race,
         // running before the forwarder's `claim_terminal`.

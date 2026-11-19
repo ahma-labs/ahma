@@ -2547,10 +2547,9 @@ mod tests {
             ))
             .await;
         monitor
-            .update_status(
+            .finish(
                 "comp-1",
-                OperationStatus::Completed,
-                Some(json!({ "message": "done" })),
+                crate::operation_monitor::Terminal::Done(Some(json!({ "message": "done" }))),
             )
             .await;
         monitor

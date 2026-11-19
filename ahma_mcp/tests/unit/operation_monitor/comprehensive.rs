@@ -47,19 +47,18 @@ async fn test_concurrent_operation_tracking() -> Result<()> {
             barrier_clone.wait().await;
 
             // Update to in-progress
-            monitor_clone
-                .update_status(&op_id, OperationStatus::InProgress, None)
-                .await;
+            monitor_clone.start(&op_id).await;
 
             // Simulate some work without time-based sleeps
             tokio::task::yield_now().await;
 
             // Complete the operation
             monitor_clone
-                .update_status(
+                .finish(
                     &op_id,
-                    OperationStatus::Completed,
-                    Some(json!({"result": format!("completed_{}", i)})),
+                    ahma_mcp::operation_monitor::Terminal::Done(Some(
+                        json!({"result": format!("completed_{}", i)}),
+                    )),
                 )
                 .await;
 
@@ -113,13 +112,7 @@ async fn test_partial_completion_split_between_active_and_history() {
             None,
         );
         monitor.add_operation(op).await;
-        monitor
-            .update_status(
-                &format!("split_op_{}", i),
-                OperationStatus::InProgress,
-                None,
-            )
-            .await;
+        monitor.start(&format!("split_op_{}", i)).await;
     }
 
     // All should be active
@@ -129,7 +122,10 @@ async fn test_partial_completion_split_between_active_and_history() {
     // Complete odd-numbered operations
     for i in (1..10).step_by(2) {
         monitor
-            .update_status(&format!("split_op_{}", i), OperationStatus::Completed, None)
+            .finish(
+                &format!("split_op_{}", i),
+                ahma_mcp::operation_monitor::Terminal::Done(None),
+            )
             .await;
     }
 
@@ -165,10 +161,9 @@ async fn test_memory_cleanup_validation() -> Result<()> {
         // Add and immediately complete operations
         monitor.add_operation(operation).await;
         monitor
-            .update_status(
+            .finish(
                 &op_id,
-                OperationStatus::Completed,
-                Some(json!({"result": i})),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(json!({"result": i}))),
             )
             .await;
     }
@@ -212,16 +207,15 @@ async fn create_mixed_state_operations(monitor: &OperationMonitor, num_ops: usiz
 
         if i % 3 == 0 {
             monitor
-                .update_status(
+                .finish(
                     &op_id,
-                    OperationStatus::Completed,
-                    Some(json!({"performance_result": i})),
+                    ahma_mcp::operation_monitor::Terminal::Done(Some(
+                        json!({"performance_result": i}),
+                    )),
                 )
                 .await;
         } else if i % 3 == 1 {
-            monitor
-                .update_status(&op_id, OperationStatus::InProgress, None)
-                .await;
+            monitor.start(&op_id).await;
         }
         // Every third operation stays Pending
     }
@@ -352,13 +346,18 @@ async fn test_operation_lifecycle_and_state_transitions() -> Result<()> {
     let states_to_test = [OperationStatus::InProgress, OperationStatus::Completed];
 
     for state in &states_to_test {
-        monitor
-            .update_status(
-                op_id,
-                *state,
-                Some(json!({"state": format!("{:?}", state)})),
-            )
-            .await;
+        if state.is_terminal() {
+            monitor
+                .finish(
+                    op_id,
+                    ahma_mcp::operation_monitor::Terminal::Done(Some(
+                        json!({"state": format!("{:?}", state)}),
+                    )),
+                )
+                .await;
+        } else {
+            monitor.start(op_id).await;
+        }
 
         // For terminal states, operation should move to completion history
         if state.is_terminal() {
@@ -437,18 +436,15 @@ async fn test_failed_operation_tracking() {
     );
     monitor.add_operation(op).await;
 
-    monitor
-        .update_status("fail_test", OperationStatus::InProgress, None)
-        .await;
-
-    let error_result = json!({
-        "error": "Compilation failed",
-        "exit_code": 1,
-        "stderr": "error[E0382]: use of moved value"
-    });
+    monitor.start("fail_test").await;
 
     monitor
-        .update_status("fail_test", OperationStatus::Failed, Some(error_result))
+        .finish(
+            "fail_test",
+            ahma_mcp::operation_monitor::Terminal::Failed(
+                "Compilation failed: error[E0382]: use of moved value".into(),
+            ),
+        )
         .await;
 
     // Should be in history with Failed state
@@ -457,7 +453,9 @@ async fn test_failed_operation_tracking() {
 
     assert_eq!(op.state, OperationStatus::Failed);
     assert!(
-        op.result.as_ref().unwrap()["error"]
+        op.result
+            .as_ref()
+            .unwrap()
             .as_str()
             .unwrap()
             .contains("Compilation failed")
@@ -483,9 +481,7 @@ async fn test_shutdown_summary_functionality() -> Result<()> {
         );
 
         monitor.add_operation(operation).await;
-        monitor
-            .update_status(&op_id, OperationStatus::InProgress, None)
-            .await;
+        monitor.start(&op_id).await;
     }
 
     for i in 0..completed_count {
@@ -499,7 +495,10 @@ async fn test_shutdown_summary_functionality() -> Result<()> {
 
         monitor.add_operation(operation).await;
         monitor
-            .update_status(&op_id, OperationStatus::Completed, Some(json!({"done": i})))
+            .finish(
+                &op_id,
+                ahma_mcp::operation_monitor::Terminal::Done(Some(json!({"done": i}))),
+            )
             .await;
     }
 
@@ -590,13 +589,13 @@ async fn test_error_conditions_and_resilience() -> Result<()> {
         monitor.add_operation(operation).await;
 
         // Transition to error state
-        monitor
-            .update_status(
-                &op_id,
-                error_state,
-                Some(json!({"error_type": format!("{:?}", error_state)})),
-            )
-            .await;
+        let reason = format!("{error_state:?}");
+        let ending = match error_state {
+            OperationStatus::Failed => ahma_mcp::operation_monitor::Terminal::Failed(reason),
+            OperationStatus::TimedOut => ahma_mcp::operation_monitor::Terminal::TimedOut(reason),
+            _ => ahma_mcp::operation_monitor::Terminal::Cancelled(reason),
+        };
+        monitor.finish(&op_id, ending).await;
 
         // Verify operation is moved to completion history
         let error_op = monitor.wait_for_operation(&op_id).await;
@@ -618,10 +617,9 @@ async fn test_error_conditions_and_resilience() -> Result<()> {
 
     monitor.add_operation(normal_operation).await;
     monitor
-        .update_status(
+        .finish(
             normal_op_id,
-            OperationStatus::Completed,
-            Some(json!({"success": true})),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(json!({"success": true}))),
         )
         .await;
 

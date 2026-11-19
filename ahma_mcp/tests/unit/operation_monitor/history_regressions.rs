@@ -2,12 +2,12 @@
 //!
 //! These tests pin the interleavings that once produced the endless
 //! notification loop: an operation completing after the notification loop
-//! has already scanned, a late `update_status` on an already-completed
+//! has already scanned, a late `finish` on an already-completed
 //! operation, and mixed-status operations persisting across repeated
 //! history reads. The single-emission guarantee itself is asserted on the
 //! unified event stream in `full_system_integration_bug_test.rs`.
 
-use ahma_mcp::operation_monitor::{MonitorConfig, Operation, OperationMonitor, OperationStatus};
+use ahma_mcp::operation_monitor::{MonitorConfig, Operation, OperationMonitor};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,10 +41,11 @@ async fn test_race_condition_between_completion_and_clearing() {
 
     // The operation completes after that scan.
     monitor
-        .update_status(
+        .finish(
             test_op_id,
-            OperationStatus::Completed,
-            Some(Value::String("race condition test completed".to_string())),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                "race condition test completed".to_string(),
+            ))),
         )
         .await;
 
@@ -62,7 +63,7 @@ async fn test_race_condition_between_completion_and_clearing() {
     }
 }
 
-/// A late `update_status` on an already-completed operation must be ignored:
+/// A late `finish` on an already-completed operation must be ignored:
 /// the operation stays in history with its original result.
 #[tokio::test]
 async fn test_update_status_after_clear_race_condition() {
@@ -80,10 +81,11 @@ async fn test_update_status_after_clear_race_condition() {
     );
     monitor.add_operation(operation).await;
     monitor
-        .update_status(
+        .finish(
             test_op_id,
-            OperationStatus::Completed,
-            Some(Value::String("completed".to_string())),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                "completed".to_string(),
+            ))),
         )
         .await;
 
@@ -92,10 +94,11 @@ async fn test_update_status_after_clear_race_condition() {
 
     // Late-arriving update on the already-completed operation.
     monitor
-        .update_status(
+        .finish(
             test_op_id,
-            OperationStatus::Completed,
-            Some(Value::String("late update".to_string())),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                "late update".to_string(),
+            ))),
         )
         .await;
 
@@ -146,17 +149,17 @@ async fn test_persistent_completion_history_behavior() {
         .await;
 
     monitor
-        .update_status(
+        .finish(
             op1_id,
-            OperationStatus::Failed,
-            Some(Value::String("test failed".to_string())),
+            ahma_mcp::operation_monitor::Terminal::Failed("test failed".to_string()),
         )
         .await;
     monitor
-        .update_status(
+        .finish(
             op2_id,
-            OperationStatus::Completed,
-            Some(Value::String("check succeeded".to_string())),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                "check succeeded".to_string(),
+            ))),
         )
         .await;
 

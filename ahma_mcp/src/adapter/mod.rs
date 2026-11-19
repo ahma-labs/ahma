@@ -1611,9 +1611,7 @@ impl Adapter {
                 return;
             };
             // Running from here, not while it waited its turn (SPEC R2.7.1).
-            monitor
-                .update_status(&op_id_task, OperationStatus::InProgress, None)
-                .await;
+            monitor.start(&op_id_task).await;
             let handoff = if watch_handoff {
                 Some(begin_handoff_watch(&sandbox, &safe_wd).await)
             } else {
@@ -1758,9 +1756,7 @@ impl Adapter {
                 return;
             };
             // Running from here, not while it waited its turn (SPEC R2.7.1).
-            monitor
-                .update_status(&op_id_task, OperationStatus::InProgress, None)
-                .await;
+            monitor.start(&op_id_task).await;
             let handoff = if watch_handoff {
                 Some(begin_handoff_watch(&sandbox, &safe_wd).await)
             } else {
@@ -2040,9 +2036,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         }
     };
 
-    monitor
-        .update_status(&op_id, OperationStatus::InProgress, None)
-        .await;
+    monitor.start(&op_id).await;
 
     // Lifecycle events (Started / terminal) are emitted by the OperationMonitor
     // at each state transition — the single emission point for the unified

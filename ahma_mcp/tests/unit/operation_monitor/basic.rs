@@ -239,9 +239,7 @@ async fn test_operation_monitor_update_status() {
     monitor.add_operation(operation).await;
 
     // Update status to InProgress
-    monitor
-        .update_status("status_test", OperationStatus::InProgress, None)
-        .await;
+    monitor.start("status_test").await;
 
     let updated = monitor.get_operation("status_test").await.unwrap();
     assert_eq!(updated.state, OperationStatus::InProgress);
@@ -249,10 +247,9 @@ async fn test_operation_monitor_update_status() {
     // Update status to Completed with result
     let result = serde_json::json!({"success": true});
     monitor
-        .update_status(
+        .finish(
             "status_test",
-            OperationStatus::Completed,
-            Some(result.clone()),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(result.clone())),
         )
         .await;
 
@@ -346,7 +343,10 @@ async fn test_operation_monitor_get_completed_operations() {
 
     monitor.add_operation(operation).await;
     monitor
-        .update_status("completion_test", OperationStatus::Completed, None)
+        .finish(
+            "completion_test",
+            ahma_mcp::operation_monitor::Terminal::Done(None),
+        )
         .await;
 
     let completed_ops = monitor.get_completed_operations().await;
@@ -466,19 +466,16 @@ async fn test_operation_state_transitions() {
     assert_eq!(op.state, OperationStatus::Pending);
 
     // Transition to InProgress
-    monitor
-        .update_status("transition_test", OperationStatus::InProgress, None)
-        .await;
+    monitor.start("transition_test").await;
     let op = monitor.get_operation("transition_test").await.unwrap();
     assert_eq!(op.state, OperationStatus::InProgress);
     assert!(op.end_time.is_none());
 
     // Transition to Completed
     monitor
-        .update_status(
+        .finish(
             "transition_test",
-            OperationStatus::Completed,
-            Some(serde_json::json!({"done": true})),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(serde_json::json!({"done": true}))),
         )
         .await;
 
@@ -552,21 +549,12 @@ async fn test_operation_monitor_multiple_status_updates() {
     monitor.add_operation(operation).await;
 
     // Multiple rapid updates
+    monitor.start("multi_update").await;
+    monitor.start("multi_update").await;
     monitor
-        .update_status("multi_update", OperationStatus::InProgress, None)
-        .await;
-    monitor
-        .update_status(
+        .finish(
             "multi_update",
-            OperationStatus::InProgress,
-            Some(serde_json::json!({"progress": 50})),
-        )
-        .await;
-    monitor
-        .update_status(
-            "multi_update",
-            OperationStatus::Completed,
-            Some(serde_json::json!({"progress": 100})),
+            ahma_mcp::operation_monitor::Terminal::Done(Some(serde_json::json!({"progress": 100}))),
         )
         .await;
 
@@ -597,19 +585,18 @@ async fn test_wait_for_completion_success() {
     let mut completion_rx = op.subscribe_completion();
     monitor.add_operation(op).await;
 
-    monitor
-        .update_status("wait_test_watch", OperationStatus::InProgress, None)
-        .await;
+    monitor.start("wait_test_watch").await;
 
     // Spawn a task to complete the operation after a short delay
     let monitor_clone = monitor.clone();
     tokio::spawn(async move {
         tokio::task::yield_now().await;
         monitor_clone
-            .update_status(
+            .finish(
                 "wait_test_watch",
-                OperationStatus::Completed,
-                Some(serde_json::json!({"result": "done"})),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(
+                    serde_json::json!({"result": "done"}),
+                )),
             )
             .await;
     });

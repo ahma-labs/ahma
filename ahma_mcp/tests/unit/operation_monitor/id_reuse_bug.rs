@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use ahma_mcp::operation_monitor::{
-        MonitorConfig, Operation, OperationMonitor, OperationStatus,
-    };
+    use ahma_mcp::operation_monitor::{MonitorConfig, Operation, OperationMonitor};
     use serde_json::Value;
     use std::sync::Arc;
     use std::time::Duration;
@@ -27,10 +25,11 @@ mod tests {
         );
         monitor.add_operation(operation1).await;
         monitor
-            .update_status(
+            .finish(
                 op_id,
-                OperationStatus::Completed,
-                Some(Value::String("first completion".to_string())),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                    "first completion".to_string(),
+                ))),
             )
             .await;
 
@@ -53,10 +52,11 @@ mod tests {
         println!("WARNING️  Added second operation with same ID (should overwrite).");
 
         monitor
-            .update_status(
+            .finish(
                 op_id,
-                OperationStatus::Completed,
-                Some(Value::String("second completion".to_string())),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                    "second completion".to_string(),
+                ))),
             )
             .await;
 
@@ -109,10 +109,11 @@ mod tests {
 
         // Complete the operation
         monitor
-            .update_status(
+            .finish(
                 test_op_id,
-                OperationStatus::Completed,
-                Some(Value::String("completion".to_string())),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                    "completion".to_string(),
+                ))),
             )
             .await;
 
@@ -150,9 +151,7 @@ mod tests {
                 None,
             ))
             .await;
-        monitor
-            .update_status(test_op_id, OperationStatus::InProgress, None)
-            .await;
+        monitor.start(test_op_id).await;
         println!("OK Step 1-2: Operation added and in-progress.");
 
         // Step 3: Notification loop runs, finds no completed operations
@@ -165,10 +164,11 @@ mod tests {
 
         // Step 4: Operation completes
         monitor
-            .update_status(
+            .finish(
                 test_op_id,
-                OperationStatus::Completed,
-                Some(Value::String("cargo 1.89.0".to_string())),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                    "cargo 1.89.0".to_string(),
+                ))),
             )
             .await;
         println!("OK Step 4: Operation completed.");
@@ -232,17 +232,19 @@ mod tests {
 
         // Update status to Completed multiple times
         monitor
-            .update_status(
+            .finish(
                 test_op_id,
-                OperationStatus::Completed,
-                Some(Value::String("first completion".to_string())),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                    "first completion".to_string(),
+                ))),
             )
             .await;
         monitor
-            .update_status(
+            .finish(
                 test_op_id,
-                OperationStatus::Completed,
-                Some(Value::String("second completion".to_string())),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                    "second completion".to_string(),
+                ))),
             )
             .await;
         println!("OK Updated status to Completed multiple times.");
@@ -258,10 +260,11 @@ mod tests {
 
         // The operation is now in history. Further updates should be ignored because it's no longer in the active `operations` map.
         monitor
-            .update_status(
+            .finish(
                 test_op_id,
-                OperationStatus::Completed,
-                Some(Value::String("post-history completion".to_string())),
+                ahma_mcp::operation_monitor::Terminal::Done(Some(Value::String(
+                    "post-history completion".to_string(),
+                ))),
             )
             .await;
         println!("OK Attempted post-history status update (should be ignored).");
