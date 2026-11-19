@@ -23,7 +23,7 @@ use anyhow::Result;
 #[cfg(test)]
 use super::PublishEnding;
 use crate::operation_monitor::OperationMonitor;
-use crate::operation_monitor::Terminal;
+use crate::operation_monitor::{Stream, Terminal};
 use crate::sandbox::Sandbox;
 
 /// Returns `true` when a pseudo-terminal can be allocated in this process.
@@ -72,7 +72,7 @@ pub(super) async fn run_pty_operation(
     sandbox: &Sandbox,
     command_str: &str,
     working_dir: &Path,
-    timeout_ms: u64,
+    limit: std::time::Duration,
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
@@ -94,7 +94,7 @@ pub(super) async fn run_pty_operation(
         sandbox,
         command_str,
         working_dir,
-        timeout_ms,
+        limit,
         cancellation_token,
         op_id,
         monitor,
@@ -342,8 +342,10 @@ mod unix {
     ) {
         while let Ok(Some(line)) = tokio::time::timeout(QUIET_AFTER_EXIT, line_rx.recv()).await {
             let safe = keep(line);
-            spill_writer.write_line(&safe, false).await;
-            monitor.append_output_line(op_id, safe, false).await;
+            spill_writer.write_line(&safe, Stream::Stdout).await;
+            monitor
+                .append_output_line(op_id, safe, Stream::Stdout)
+                .await;
         }
     }
 
@@ -352,7 +354,7 @@ mod unix {
         sandbox: &Sandbox,
         command_str: &str,
         working_dir: &Path,
-        timeout_ms: u64,
+        limit: Duration,
         cancellation_token: &tokio_util::sync::CancellationToken,
         op_id: &str,
         monitor: &Arc<OperationMonitor>,
@@ -374,7 +376,7 @@ mod unix {
 
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
         let mut collected = crate::adapter::BoundedLineCollector::default();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let deadline = tokio::time::Instant::now() + limit;
 
         let exit_status: Option<i32> = loop {
             tokio::select! {
@@ -401,9 +403,9 @@ mod unix {
                     match line {
                         Some(line) => {
                             let safe = crate::log_monitor::redact_sensitive_line(&line);
-                            spill_writer.write_line(&safe, false).await;
+                            spill_writer.write_line(&safe, Stream::Stdout).await;
                             collected.push(safe.clone());
-                            monitor.append_output_line(op_id, safe, false).await;
+                            monitor.append_output_line(op_id, safe, Stream::Stdout).await;
                         }
                         None => {
                             // Reader thread finished (PTY master returned
@@ -539,7 +541,7 @@ mod tests {
             std::env::current_exe().unwrap().display()
         );
         std::fs::write(temp.path().join("leaves.sh"), script).unwrap();
-        let limit = TestTimeouts::scale_secs(30).as_millis() as u64;
+        let limit = TestTimeouts::scale_secs(30);
         let run = async |op_id: &str, keep: bool| {
             let monitor = test_monitor();
             monitor
@@ -634,7 +636,7 @@ mod tests {
             &sandbox,
             "echo hello",
             temp.path(),
-            10_000,
+            std::time::Duration::from_millis(10_000),
             &token,
             op_id,
             &monitor,
@@ -691,7 +693,7 @@ mod tests {
             &sandbox,
             "echo \"sock=$SSH_AUTH_SOCK\"",
             temp.path(),
-            10_000,
+            std::time::Duration::from_millis(10_000),
             &CancellationToken::new(),
             op_id,
             &monitor,
@@ -745,7 +747,7 @@ mod tests {
             &sandbox,
             "exit 3",
             temp.path(),
-            10_000,
+            std::time::Duration::from_millis(10_000),
             &token,
             op_id,
             &monitor,
@@ -794,7 +796,7 @@ mod tests {
             &sandbox,
             "sleep 30",
             temp.path(),
-            60_000,
+            std::time::Duration::from_millis(60_000),
             &token,
             op_id,
             &monitor,
@@ -840,7 +842,7 @@ mod tests {
             &sandbox,
             "sleep 30",
             temp.path(),
-            50,
+            std::time::Duration::from_millis(50),
             &token,
             op_id,
             &monitor,
@@ -890,7 +892,7 @@ mod tests {
             &sandbox,
             "echo nope",
             &missing,
-            10_000,
+            std::time::Duration::from_millis(10_000),
             &token,
             op_id,
             &monitor,

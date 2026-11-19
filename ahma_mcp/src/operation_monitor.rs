@@ -45,6 +45,28 @@ pub(crate) const MAX_COMPLETION_HISTORY: usize = 1000;
 /// inherit it.
 pub const DEFAULT_WAIT_FOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Which of a command's output streams a line came from. Named, where a bare
+/// `is_stderr: bool` was passed positionally through every layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    pub fn is_stderr(self) -> bool {
+        self == Self::Stderr
+    }
+
+    /// `"stdout"` or `"stderr"`, for a log line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 /// What a command produced, as its operation's result. One type for every
 /// execution path: the fields a path does not have are left out, so each
 /// path's result keeps exactly the shape it always had.
@@ -595,7 +617,7 @@ impl OperationMonitor {
     /// append in parallel; status readers are not blocked behind output) and
     /// mutates through the operation's own [`SharedTail`] / [`ActivityStamp`]
     /// cells. Fan-out to subscribers shares one `Arc<OperationEvent>` per line.
-    pub async fn append_output_line(&self, id: &str, line: String, is_stderr: bool) {
+    pub async fn append_output_line(&self, id: &str, line: String, stream: Stream) {
         {
             let ops = self.operations.read().await;
             let Some(op) = ops.get(id) else {
@@ -609,13 +631,13 @@ impl OperationMonitor {
         self.events.emit(OperationEvent::OutputLine {
             operation_id: id.to_string(),
             line,
-            is_stderr,
+            is_stderr: stream.is_stderr(),
         });
     }
 
     /// Backwards-compatible wrapper for stdout lines.
     pub async fn append_stdout_line(&self, id: &str, line: String) {
-        self.append_output_line(id, line, false).await;
+        self.append_output_line(id, line, Stream::Stdout).await;
     }
 
     /// Emit a transient `Progress` event on the unified stream without
@@ -1811,10 +1833,10 @@ mod tests {
         monitor.add_operation(op).await;
 
         monitor
-            .append_output_line(&op_id, "hello".to_string(), false)
+            .append_output_line(&op_id, "hello".to_string(), Stream::Stdout)
             .await;
         monitor
-            .append_output_line(&op_id, "oops".to_string(), true)
+            .append_output_line(&op_id, "oops".to_string(), Stream::Stderr)
             .await;
 
         // Started (exactly once)
@@ -2002,7 +2024,7 @@ mod tests {
         add_backdated_op(&monitor, "op", Duration::from_secs(10), None).await;
 
         monitor
-            .append_output_line("op", "progress".to_string(), false)
+            .append_output_line("op", "progress".to_string(), Stream::Stdout)
             .await;
 
         let op = monitor.get_operation("op").await.unwrap();

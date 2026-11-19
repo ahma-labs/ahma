@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -105,13 +105,14 @@ impl ShellSession {
     }
 
     /// Execute one command, streaming each output line through `on_line`.
-    /// Returns the command's exit code.
+    /// Returns the command's exit code, `None` when its end marker could not
+    /// be read.
     async fn execute_streaming(
         &mut self,
         command: &str,
         timeout: Duration,
         on_line: &mut (dyn FnMut(String) + Send),
-    ) -> Result<i32> {
+    ) -> Result<Option<i32>, SessionError> {
         let nonce: u64 = rand::random();
         let marker = format!("__AHMA_SESSION_DONE_{nonce:016x}");
 
@@ -119,21 +120,24 @@ impl ShellSession {
         self.stdin
             .write_all(block.as_bytes())
             .await
-            .context("failed to write command to session shell")?;
+            .context("failed to write command to session shell")
+            .map_err(SessionError::Failed)?;
         self.stdin
             .flush()
             .await
-            .context("failed to flush session shell stdin")?;
+            .context("failed to flush session shell stdin")
+            .map_err(SessionError::Failed)?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let mut line = String::new();
             let read = tokio::time::timeout_at(deadline, self.reader.read_line(&mut line))
                 .await
-                .map_err(|_| anyhow::anyhow!("session command timed out after {timeout:?}"))?
-                .context("failed to read from session shell")?;
+                .map_err(|_| SessionError::TimedOut(timeout))?
+                .context("failed to read from session shell")
+                .map_err(SessionError::Failed)?;
             if read == 0 {
-                bail!("session shell exited unexpectedly (EOF)");
+                return Err(SessionError::ShellExited);
             }
             let line = line.trim_end_matches(['\n', '\r']);
 
@@ -147,8 +151,7 @@ impl ShellSession {
                 let code = rest
                     .strip_prefix('_')
                     .and_then(|r| r.strip_suffix("__"))
-                    .and_then(|c| c.parse::<i32>().ok())
-                    .unwrap_or(-1);
+                    .and_then(|c| c.parse::<i32>().ok());
                 return Ok(code);
             }
             on_line(line.to_string());
@@ -162,6 +165,22 @@ impl ShellSession {
             tracing::warn!("session shell did not reap cleanly after kill");
         }
     }
+}
+
+/// Why a session command did not report an exit code. A caller decides on
+/// the kind; the old text match on "timed out" flipped a timeout to a failure
+/// (or the reverse) the moment a message was reworded.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    /// The command ran past its time limit; the session is gone.
+    #[error("session command timed out after {0:?}")]
+    TimedOut(Duration),
+    /// The session's shell exited while the command ran.
+    #[error("session shell exited unexpectedly (EOF)")]
+    ShellExited,
+    /// The session could not be started, written to or read.
+    #[error("{0:#}")]
+    Failed(anyhow::Error),
 }
 
 /// Manages all persistent shell sessions for one server instance.
@@ -192,13 +211,15 @@ impl ShellSessionManager {
         command: &str,
         timeout: Duration,
         on_line: &mut (dyn FnMut(String) + Send),
-    ) -> Result<i32> {
+    ) -> Result<Option<i32>, SessionError> {
         let session = {
             let mut map = self.sessions.lock().await;
             match map.get(session_id) {
                 Some(s) => Arc::clone(s),
                 None => {
-                    let created = ShellSession::spawn(sandbox, working_dir).await?;
+                    let created = ShellSession::spawn(sandbox, working_dir)
+                        .await
+                        .map_err(SessionError::Failed)?;
                     let arc = Arc::new(Mutex::new(created));
                     map.insert(session_id.to_string(), Arc::clone(&arc));
                     tracing::info!(
@@ -302,7 +323,8 @@ mod tests {
                 &mut |line| lines.push(line),
             )
             .await
-            .expect("session command should run");
+            .expect("session command should run")
+            .expect("the session reports an exit code");
         (code, lines)
     }
 

@@ -68,9 +68,13 @@ impl SpillWriter {
     }
 
     /// Append one output line.  Stderr lines are prefixed with `[stderr] `.
-    pub async fn write_line(&mut self, line: &str, is_stderr: bool) {
+    pub async fn write_line(&mut self, line: &str, stream: crate::operation_monitor::Stream) {
         if let Some(w) = &mut self.inner {
-            let prefix: &[u8] = if is_stderr { b"[stderr] " } else { b"" };
+            let prefix: &[u8] = if stream.is_stderr() {
+                b"[stderr] "
+            } else {
+                b""
+            };
             let failed = w.write_all(prefix).await.is_err()
                 || w.write_all(line.as_bytes()).await.is_err()
                 || w.write_all(b"\n").await.is_err();
@@ -146,8 +150,10 @@ mod tests {
         let mut w = SpillWriter {
             inner: Some(tokio::io::BufWriter::new(file)),
         };
-        w.write_line("hello", false).await;
-        w.write_line("boom", true).await;
+        w.write_line("hello", crate::operation_monitor::Stream::Stdout)
+            .await;
+        w.write_line("boom", crate::operation_monitor::Stream::Stderr)
+            .await;
         w.finish().await;
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
