@@ -10,7 +10,7 @@ use ahma_common::mcp_methods::{
     INITIALIZE_METHOD, INITIALIZED_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
     SUBSCRIPTIONS_LISTEN_METHOD,
 };
-use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_2025_11_25, MCP_PROTOCOL_VERSION_2026_07_28};
+use ahma_common::mcp_protocol::{ADVERTISED_PROTOCOL_VERSIONS, MCP_PROTOCOL_VERSION_2025_11_25};
 use anyhow::{Context, Result, anyhow};
 use rmcp::model::{CustomResult, RequestId, ServerResult};
 use rmcp::service::RoleClient;
@@ -1011,10 +1011,7 @@ where
                         .unwrap_or_else(|| SERVER_INSTRUCTIONS.to_string());
 
                     let discover_result = serde_json::json!({
-                        "supportedVersions": [
-                            MCP_PROTOCOL_VERSION_2026_07_28,
-                            MCP_PROTOCOL_VERSION_2025_11_25
-                        ],
+                        "supportedVersions": ADVERTISED_PROTOCOL_VERSIONS,
                         "capabilities": bridge_capabilities,
                         "instructions": bridge_instructions,
                         "serverInfo": bridge_server_info.clone(),

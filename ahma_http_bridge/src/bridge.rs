@@ -1949,9 +1949,9 @@ fn accepts_sse(headers: &HeaderMap) -> bool {
 /// per-session subprocess (rmcp). This list exists to give a *definitive* 400
 /// to a client pinned to a revision the transport genuinely does not speak,
 /// per the 2025-06-18 Streamable HTTP requirement, rather than failing
-/// somewhere later with a worse message.
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+/// somewhere later with a worse message. It is the shared list, which holds
+/// every revision ahma advertises.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = ahma_common::mcp_protocol::ACCEPTED_PROTOCOL_VERSIONS;
 
 /// Validate the `MCP-Protocol-Version` header (2025-06-18 Streamable HTTP).
 ///
@@ -3660,5 +3660,20 @@ mod transport_guard_tests {
         headers.insert("mcp-protocol-version", HeaderValue::from_static("banana"));
         let resp = validate_protocol_version_header(&headers).expect("must reject");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A client that negotiates a revision `server/discover` advertised must
+    /// be able to send it in the header. The bridge advertised 2026-07-28 and
+    /// answered every later request carrying it with HTTP 400.
+    #[test]
+    fn every_advertised_protocol_version_is_accepted_in_the_header() {
+        for version in ahma_common::mcp_protocol::ADVERTISED_PROTOCOL_VERSIONS {
+            let mut headers = HeaderMap::new();
+            headers.insert("mcp-protocol-version", HeaderValue::from_static(version));
+            assert!(
+                validate_protocol_version_header(&headers).is_none(),
+                "{version} is advertised, so it is accepted"
+            );
+        }
     }
 }

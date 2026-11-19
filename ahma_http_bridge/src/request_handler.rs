@@ -7,7 +7,7 @@ use ahma_common::mcp_methods::{
     SAMPLING_CREATE_MESSAGE_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
     SUBSCRIPTIONS_LISTEN_METHOD, TOOLS_CALL_METHOD,
 };
-use ahma_common::mcp_protocol::{MCP_PROTOCOL_VERSION_2025_11_25, MCP_PROTOCOL_VERSION_2026_07_28};
+use ahma_common::mcp_protocol::ADVERTISED_PROTOCOL_VERSIONS;
 use ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS;
 use axum::{
     body::Body,
@@ -268,8 +268,11 @@ async fn handle_routed_sampling_request(
         .expect("sampling semaphore closed unexpectedly");
 
     let routed_id = format!("route_{}", uuid::Uuid::new_v4());
+    let routed_key = crate::session::RpcId::minted(&routed_id);
     let (tx, rx) = oneshot::channel();
-    target_session.routed_requests.insert(routed_id.clone(), tx);
+    target_session
+        .routed_requests
+        .insert(routed_key.clone(), tx);
 
     // Rewrite the owned payload in place instead of deep-cloning it.
     payload["id"] = serde_json::json!(routed_id);
@@ -280,7 +283,7 @@ async fn handle_routed_sampling_request(
     let json_str = match serde_json::to_string(&payload) {
         Ok(s) => s,
         Err(e) => {
-            target_session.routed_requests.remove(&routed_id);
+            target_session.routed_requests.remove(&routed_key);
             return error_response(
                 original_id,
                 -32603,
@@ -290,7 +293,7 @@ async fn handle_routed_sampling_request(
     };
 
     if target_session.broadcast(json_str).is_err() {
-        target_session.routed_requests.remove(&routed_id);
+        target_session.routed_requests.remove(&routed_key);
         return error_response(
             original_id,
             -32603,
@@ -307,7 +310,7 @@ async fn handle_routed_sampling_request(
         }
         Ok(Err(_)) => error_response(original_id, -32603, "Routed request sender dropped"),
         Err(_) => {
-            target_session.routed_requests.remove(&routed_id);
+            target_session.routed_requests.remove(&routed_key);
             error_response(
                 original_id,
                 JSONRPC_REQUEST_TIMEOUT,
@@ -416,10 +419,7 @@ async fn handle_post_request(
             "version": env!("CARGO_PKG_VERSION"),
         });
         let result = serde_json::json!({
-            "supportedVersions": [
-                MCP_PROTOCOL_VERSION_2026_07_28,
-                MCP_PROTOCOL_VERSION_2025_11_25,
-            ],
+            "supportedVersions": ADVERTISED_PROTOCOL_VERSIONS,
             "capabilities": {
                 "tools": {
                     "listChanged": true,
@@ -1012,10 +1012,8 @@ async fn handle_client_response(
 
     let mut is_roots_list = false;
     if let Some(id_val) = response_id {
-        let id_str = id_val
-            .as_str()
-            .map_or_else(|| id_val.to_string(), str::to_string);
-        match match_client_response_id(session_manager, session_id, &id_str, payload) {
+        let id = crate::session::RpcId::of(id_val);
+        match match_client_response_id(session_manager, session_id, &id, payload) {
             ClientResponseMatch::Routed(response) => return response,
             ClientResponseMatch::RootsList => is_roots_list = true,
             ClientResponseMatch::None => {}
@@ -1074,20 +1072,20 @@ enum ClientResponseMatch {
 fn match_client_response_id(
     session_manager: &SessionManager,
     session_id: &str,
-    id_str: &str,
+    id: &crate::session::RpcId,
     payload: &Value,
 ) -> ClientResponseMatch {
     let Some(session) = session_manager.get_session(session_id) else {
         return ClientResponseMatch::None;
     };
-    if let Some((_, sender)) = session.routed_requests.remove(id_str) {
+    if let Some((_, sender)) = session.routed_requests.remove(id) {
         let _ = sender.send(payload.clone());
         return ClientResponseMatch::Routed(with_session_header(
             json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
             session_id,
         ));
     }
-    if let Some((_, method)) = session.pending_client_requests.remove(id_str)
+    if let Some((_, method)) = session.pending_client_requests.remove(id)
         && method == ROOTS_LIST_METHOD
     {
         return ClientResponseMatch::RootsList;
@@ -3226,7 +3224,9 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         let session = mgr.get_session(&id).unwrap();
         let (tx, rx) = oneshot::channel();
-        session.routed_requests.insert("route-xyz".to_string(), tx);
+        session
+            .routed_requests
+            .insert(crate::session::RpcId::of(&json!("route-xyz")), tx);
 
         let payload = json!({"jsonrpc": "2.0", "id": "route-xyz", "result": {"v": 9}});
         let resp = handle_client_response(&mgr, &id, &payload).await;
@@ -3242,9 +3242,10 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         let session = mgr.get_session(&id).unwrap();
         // Register the pending server→client roots/list request.
-        session
-            .pending_client_requests
-            .insert("rl-7".to_string(), "roots/list".to_string());
+        session.pending_client_requests.insert(
+            crate::session::RpcId::of(&json!("rl-7")),
+            "roots/list".to_string(),
+        );
 
         let temp = tempfile::tempdir().unwrap();
         let payload = json!({
