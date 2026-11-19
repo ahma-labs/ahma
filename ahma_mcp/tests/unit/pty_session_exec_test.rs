@@ -274,3 +274,127 @@ async fn session_echo_round_trip() {
         Some(&serde_json::json!("plain"))
     );
 }
+
+// ─── The workspace queue (SPEC R2.7.1) ───────────────────────────────────────
+
+/// An adapter whose workspace queue is on, with the trust-handoff watch on
+/// too: the watch's closing inventory is real I/O between the command's end
+/// and its report, the gap in which a report published before the release
+/// shows the workspace still held.
+fn queued_adapter(
+    scope: &std::path::Path,
+) -> (Arc<Adapter>, Arc<OperationMonitor>, std::path::PathBuf) {
+    use ahma_mcp::adapter::workspace_queue::WorkspaceQueue;
+    use ahma_mcp::sandbox::handoff_watch::HandoffWatchMode;
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(60),
+    )));
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![scope.to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+    let adapter = Adapter::new(monitor.clone(), shell_pool, sandbox)
+        .unwrap()
+        .with_workspace_queue(WorkspaceQueue::with_lock_dir(
+            true,
+            Some(scope.join(".locks")),
+        ))
+        .with_handoff_watch(HandoffWatchMode::Always);
+    let key = adapter.workspace_key_for(scope);
+    (Arc::new(adapter), monitor, key)
+}
+
+/// A PTY or session command hands the workspace on before anyone can observe
+/// it finished, as a piped command does: a caller woken by the terminal state
+/// must never find the workspace still held by the command it waited for.
+/// Both paths published their result first and released the lease after.
+#[tokio::test]
+async fn pty_and_session_commands_hand_the_workspace_on_before_they_report() {
+    use ahma_mcp::adapter::workspace_queue::LeaseProbe;
+    let temp = tempdir().unwrap();
+    let (adapter, monitor, key) = queued_adapter(temp.path());
+    let wd = temp.path().to_str().unwrap();
+    for round in 0..5 {
+        let session = adapter
+            .execute_session_async("sess", "queue", "echo hi", wd, Some(15), None)
+            .await
+            .expect("session command starts");
+        wait_done(&monitor, &session).await;
+        assert!(
+            matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+            "round {round}: a finished session command still holds the workspace"
+        );
+        #[cfg(unix)]
+        if ahma_mcp::adapter::pty_available() {
+            let pty = adapter
+                .execute_pty_async("pty_test", "echo hi", wd, Some(15), None)
+                .await
+                .expect("pty command starts");
+            wait_done(&monitor, &pty).await;
+            assert!(
+                matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+                "round {round}: a finished PTY command still holds the workspace"
+            );
+        }
+    }
+}
+
+/// A command waiting its turn in the workspace queue is `Pending`, not
+/// `InProgress` (SPEC R2.7.1): the PTY and session paths marked it running
+/// before they waited.
+#[tokio::test]
+async fn a_queued_pty_or_session_command_is_pending_until_its_turn() {
+    use ahma_mcp::adapter::workspace_queue::HolderInfo;
+    use ahma_mcp::operation_monitor::OperationStatus;
+    let temp = tempdir().unwrap();
+    let (adapter, monitor, key) = queued_adapter(temp.path());
+    let wd = temp.path().to_str().unwrap();
+    let held = adapter
+        .workspace_queue()
+        .enqueue(&key, HolderInfo::new("op_holder", "cargo build"))
+        .expect("queue on")
+        .acquire(&tokio_util::sync::CancellationToken::new(), &|_| {})
+        .await
+        .expect("the holder gets the workspace");
+
+    let mut queued = vec![
+        adapter
+            .execute_session_async("sess", "waits", "echo hi", wd, Some(15), None)
+            .await
+            .expect("session command starts"),
+    ];
+    #[cfg(unix)]
+    if ahma_mcp::adapter::pty_available() {
+        queued.push(
+            adapter
+                .execute_pty_async("pty_test", "echo hi", wd, Some(15), None)
+                .await
+                .expect("pty command starts"),
+        );
+    }
+    for id in &queued {
+        let state = monitor
+            .get_operation(id)
+            .await
+            .map(|op| op.state)
+            .expect("registered");
+        assert_eq!(state, OperationStatus::Pending, "{id} waits its turn");
+    }
+    drop(held);
+    for id in &queued {
+        let op = wait_done(&monitor, id).await;
+        assert_eq!(
+            op.state,
+            OperationStatus::Completed,
+            "{id}: {:?}",
+            op.result
+        );
+    }
+}

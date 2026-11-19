@@ -595,6 +595,26 @@ impl Adapter {
         self.retry_config.as_ref()
     }
 
+    /// Run `task` as operation `op_id`'s background task. Its handle is kept
+    /// for [`Self::shutdown`] and dropped when the task ends, however it ends:
+    /// one place, so no early return can leave a handle behind. The handle is
+    /// registered under the lock the task's own removal waits for, so a task
+    /// that ends at once cannot be removed before it is registered.
+    async fn spawn_operation_task(
+        &self,
+        op_id: &str,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let handles = self.task_handles.clone();
+        let id = op_id.to_string();
+        let mut registered = self.task_handles.lock().await;
+        let handle = tokio::spawn(async move {
+            task.await;
+            handles.lock().await.remove(&id);
+        });
+        registered.insert(op_id.to_string(), handle);
+    }
+
     /// Gracefully shuts down the adapter by cancelling active operations, aborting tasks,
     /// and shutting down shell pools. Uses timeouts to avoid hanging indefinitely.
     pub async fn shutdown(&self) {
@@ -1471,9 +1491,7 @@ impl Adapter {
         let command = command.to_string();
         let wd_clone = wd.clone();
 
-        let task_handles = self.task_handles.clone();
-
-        let handle = tokio::spawn(run_async_operation(AsyncOperationRun {
+        let run = run_async_operation(AsyncOperationRun {
             op_id,
             command,
             program: program_with_subcommand,
@@ -1484,7 +1502,6 @@ impl Adapter {
             monitor,
             shell_pool,
             sandbox,
-            task_handles,
             command_executor: self.command_executor.clone(),
             mutex_registry: self.mutex_registry.clone(),
             scope_grant_notifier: self.scope_grant_notifier.clone(),
@@ -1497,13 +1514,8 @@ impl Adapter {
             keep_leftovers,
             #[cfg(unix)]
             credential_brokers: self.credential_brokers.clone(),
-        }));
-
-        // Store the handle for graceful shutdown
-        self.task_handles
-            .lock()
-            .await
-            .insert(op_id_clone.clone(), handle);
+        });
+        self.spawn_operation_task(&op_id_clone, run).await;
 
         Ok(op_id_clone)
     }
@@ -1559,9 +1571,6 @@ impl Adapter {
             Some(op) => op.cancellation_token.clone(),
             None => anyhow::bail!("operation {op_id} vanished before start"),
         };
-        self.monitor
-            .update_status(&op_id, OperationStatus::InProgress, None)
-            .await;
 
         let timeout_ms = timeout
             .map(|t| t * 1000)
@@ -1569,7 +1578,6 @@ impl Adapter {
         let monitor = self.monitor.clone();
         let sandbox = self.sandbox.clone();
         let command_str = command_str.to_string();
-        let task_handles = self.task_handles.clone();
         let op_id_task = op_id.clone();
         let tool_task = tool_name.to_string();
         #[cfg(unix)]
@@ -1584,7 +1592,7 @@ impl Adapter {
             &command_str,
         );
 
-        let handle = tokio::spawn(async move {
+        let task = async move {
             let started = Instant::now();
             // Held until the PTY process is gone.
             let Ok(lease) =
@@ -1598,9 +1606,12 @@ impl Adapter {
                     None,
                 )
                 .await;
-                task_handles.lock().await.remove(&op_id_task);
                 return;
             };
+            // Running from here, not while it waited its turn (SPEC R2.7.1).
+            monitor
+                .update_status(&op_id_task, OperationStatus::InProgress, None)
+                .await;
             let handoff = if watch_handoff {
                 Some(begin_handoff_watch(&sandbox, &safe_wd).await)
             } else {
@@ -1618,7 +1629,7 @@ impl Adapter {
             let broker_socket = broker.as_ref().map(|b| b.socket().to_path_buf());
             #[cfg(not(unix))]
             let broker_socket: Option<std::path::PathBuf> = None;
-            let (outcome, exit_code) = pty_exec::run_pty_operation(
+            let finished = pty_exec::run_pty_operation(
                 &sandbox,
                 &command_str,
                 &safe_wd,
@@ -1643,7 +1654,10 @@ impl Adapter {
             }
             #[cfg(unix)]
             drop(broker);
+            // Hand the workspace on before anyone can observe this operation
+            // as finished (SPEC R2.7.1).
             drop(lease);
+            let (outcome, exit_code) = finished.publish(&monitor, &op_id_task).await;
             audit::record_tool_complete(
                 &op_id_task,
                 outcome,
@@ -1651,9 +1665,8 @@ impl Adapter {
                 exit_code,
             )
             .await;
-            task_handles.lock().await.remove(&op_id_task);
-        });
-        self.task_handles.lock().await.insert(op_id.clone(), handle);
+        };
+        self.spawn_operation_task(&op_id, task).await;
 
         Ok(op_id)
     }
@@ -1706,9 +1719,6 @@ impl Adapter {
             Some(op) => op.cancellation_token.clone(),
             None => anyhow::bail!("operation {op_id} vanished before start"),
         };
-        self.monitor
-            .update_status(&op_id, OperationStatus::InProgress, None)
-            .await;
 
         let timeout_duration = timeout
             .map(Duration::from_secs)
@@ -1718,7 +1728,6 @@ impl Adapter {
         let sessions = self.shell_sessions.clone();
         let session_id = session_id.to_string();
         let command_str = command_str.to_string();
-        let task_handles = self.task_handles.clone();
         let op_id_task = op_id.clone();
         let tool_task = tool_name.to_string();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
@@ -1730,7 +1739,7 @@ impl Adapter {
             &command_str,
         );
 
-        let handle = tokio::spawn(async move {
+        let task = async move {
             let started = Instant::now();
             // Held until the session command is done.
             let Ok(lease) =
@@ -1744,15 +1753,18 @@ impl Adapter {
                     None,
                 )
                 .await;
-                task_handles.lock().await.remove(&op_id_task);
                 return;
             };
+            // Running from here, not while it waited its turn (SPEC R2.7.1).
+            monitor
+                .update_status(&op_id_task, OperationStatus::InProgress, None)
+                .await;
             let handoff = if watch_handoff {
                 Some(begin_handoff_watch(&sandbox, &safe_wd).await)
             } else {
                 None
             };
-            let (outcome, exit_code) = run_session_operation(
+            let finished = run_session_operation(
                 &sessions,
                 &sandbox,
                 &session_id,
@@ -1764,11 +1776,14 @@ impl Adapter {
                 &monitor,
             )
             .await;
-            // As for PTY: the session path publishes its own result.
+            // As for PTY: a deny-tier write reaches the log and the audit trail.
             if let Some(watch) = handoff {
                 let _ = finish_handoff_watch(watch, &op_id_task, &tool_task).await;
             }
+            // Hand the workspace on before anyone can observe this operation
+            // as finished (SPEC R2.7.1).
             drop(lease);
+            let (outcome, exit_code) = finished.publish(&monitor, &op_id_task).await;
             audit::record_tool_complete(
                 &op_id_task,
                 outcome,
@@ -1776,9 +1791,8 @@ impl Adapter {
                 exit_code,
             )
             .await;
-            task_handles.lock().await.remove(&op_id_task);
-        });
-        self.task_handles.lock().await.insert(op_id.clone(), handle);
+        };
+        self.spawn_operation_task(&op_id, task).await;
 
         Ok(op_id)
     }
@@ -1848,6 +1862,76 @@ fn interpret_sync_command_output(output: std::process::Output) -> Result<String,
     Ok(combine_stdout_stderr(stdout, stderr))
 }
 
+/// How a PTY or session command ended, as its runner reports it. The runner
+/// does not publish it: the caller first gives up the workspace lease and the
+/// guards around the run, then [`Finished::publish`]es, so a caller woken by
+/// the terminal state never finds the workspace still held (SPEC R2.7.1).
+#[must_use = "a finished operation must be published once its lease is released"]
+pub(crate) struct Finished {
+    status: OperationStatus,
+    result: Option<Value>,
+    outcome: audit::Outcome,
+    exit_code: Option<i32>,
+}
+
+impl Finished {
+    /// The command exited with `code`; `result` is the operation's result.
+    pub(crate) fn exited(code: Option<i32>, result: Value) -> Self {
+        let success = code == Some(0);
+        Self {
+            status: if success {
+                OperationStatus::Completed
+            } else {
+                OperationStatus::Failed
+            },
+            result: Some(result),
+            outcome: if success {
+                audit::Outcome::Completed
+            } else {
+                audit::Outcome::Failed
+            },
+            exit_code: code,
+        }
+    }
+
+    /// It did not run to an exit of its own.
+    pub(crate) fn failed(reason: String) -> Self {
+        Self::ended(OperationStatus::Failed, audit::Outcome::Failed, reason)
+    }
+
+    pub(crate) fn timed_out(reason: String) -> Self {
+        Self::ended(OperationStatus::TimedOut, audit::Outcome::TimedOut, reason)
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self::ended(
+            OperationStatus::Cancelled,
+            audit::Outcome::Cancelled,
+            "Operation was cancelled".to_string(),
+        )
+    }
+
+    fn ended(status: OperationStatus, outcome: audit::Outcome, reason: String) -> Self {
+        Self {
+            status,
+            result: Some(Value::String(reason)),
+            outcome,
+            exit_code: None,
+        }
+    }
+
+    /// Publish the terminal state, and return what the audit record of the
+    /// call's end carries.
+    pub(crate) async fn publish(
+        self,
+        monitor: &OperationMonitor,
+        op_id: &str,
+    ) -> (audit::Outcome, Option<i32>) {
+        monitor.update_status(op_id, self.status, self.result).await;
+        (self.outcome, self.exit_code)
+    }
+}
+
 /// Context for a single background async operation task.
 struct AsyncOperationRun {
     op_id: String,
@@ -1860,7 +1944,6 @@ struct AsyncOperationRun {
     monitor: Arc<OperationMonitor>,
     shell_pool: Arc<ShellPoolManager>,
     sandbox: Arc<sandbox::Sandbox>,
-    task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     command_executor: Arc<dyn executor::CommandExecutor>,
     mutex_registry: Arc<CommandMutexRegistry>,
     scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
@@ -1916,7 +1999,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         monitor,
         shell_pool,
         sandbox,
-        task_handles,
         command_executor,
         mutex_registry,
         scope_grant_notifier,
@@ -1965,7 +2047,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         Err(()) => {
             handle_cancellation(&monitor, &op_id).await;
             audit_complete(audit::Outcome::Cancelled, None).await;
-            task_handles.lock().await.remove(&op_id);
             return;
         }
     };
@@ -1981,6 +2062,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     if cancellation_token.is_cancelled() {
         tracing::info!("Operation {} was cancelled before execution started", op_id);
+        drop(lease.take());
         handle_cancellation(&monitor, &op_id).await;
         audit_complete(audit::Outcome::Cancelled, None).await;
         return;
@@ -2002,9 +2084,9 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         Ok(permit) => permit,
         Err(err) => {
             drop(lease.take());
+            // Published Failed, so audited Failed: the two views of one end.
             fail_operation_with_error(&monitor, &op_id, err).await;
-            audit_complete(audit::Outcome::TimedOut, None).await;
-            task_handles.lock().await.remove(&op_id);
+            audit_complete(audit::Outcome::Failed, None).await;
             return;
         }
     };
@@ -2029,7 +2111,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
             drop(lease.take());
             fail_operation_with_error(&monitor, &op_id, err_msg).await;
             audit_complete(audit::Outcome::Failed, None).await;
-            task_handles.lock().await.remove(&op_id);
             return;
         }
     };
@@ -2106,8 +2187,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // Normally already released inside, just before the terminal transition.
     drop(lease);
     audit_complete(outcome, exit_code).await;
-
-    task_handles.lock().await.remove(&op_id);
 }
 
 /// The shell command line of a `run_terminal_command`-style call (`command`
@@ -2624,7 +2703,7 @@ async fn run_session_operation(
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
-) -> (audit::Outcome, Option<i32>) {
+) -> Finished {
     let mut spill_writer = spill::SpillWriter::create(op_id).await;
     let mut collected = BoundedLineCollector::default();
 
@@ -2659,14 +2738,7 @@ async fn run_session_operation(
                 // the child kills the shell and its children.
                 sessions.remove_session(session_id).await;
                 spill_writer.finish().await;
-                monitor
-                    .update_status(
-                        op_id,
-                        OperationStatus::Cancelled,
-                        Some(Value::String("Operation was cancelled".to_string())),
-                    )
-                    .await;
-                return (audit::Outcome::Cancelled, None);
+                return Finished::cancelled();
             }
 
             line = line_rx.recv() => {
@@ -2693,19 +2765,16 @@ async fn run_session_operation(
     }
     spill_writer.finish().await;
 
-    finalize_session_result(exec_result, &collected, session_id, op_id, monitor).await
+    finalize_session_result(exec_result, &collected, session_id, op_id)
 }
 
-/// Turn the terminal result of a session-protocol command into the final
-/// monitor status update and the `(outcome, exit_code)` pair the caller
-/// reports to the audit log.
-async fn finalize_session_result(
+/// How a session-protocol command ended, from its terminal result.
+fn finalize_session_result(
     exec_result: anyhow::Result<i32>,
     collected: &BoundedLineCollector,
     session_id: &str,
     op_id: &str,
-    monitor: &Arc<OperationMonitor>,
-) -> (audit::Outcome, Option<i32>) {
+) -> Finished {
     match exec_result {
         Ok(exit_code) => {
             let final_output = json!({
@@ -2718,29 +2787,10 @@ async fn finalize_session_result(
                 "stdout_truncated_bytes": collected.dropped_bytes(),
                 "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
             });
-            // Monitor status and audit outcome are two views of one verdict —
-            // decided together so they cannot drift apart.
-            let (status, outcome) = if exit_code == 0 {
-                (OperationStatus::Completed, audit::Outcome::Completed)
-            } else {
-                (OperationStatus::Failed, audit::Outcome::Failed)
-            };
-            monitor
-                .update_status(op_id, status, Some(final_output))
-                .await;
-            (outcome, Some(exit_code))
+            Finished::exited(Some(exit_code), final_output)
         }
-        Err(e) => {
-            let (status, outcome) = if e.to_string().contains("timed out") {
-                (OperationStatus::TimedOut, audit::Outcome::TimedOut)
-            } else {
-                (OperationStatus::Failed, audit::Outcome::Failed)
-            };
-            monitor
-                .update_status(op_id, status, Some(Value::String(e.to_string())))
-                .await;
-            (outcome, None)
-        }
+        Err(e) if e.to_string().contains("timed out") => Finished::timed_out(e.to_string()),
+        Err(e) => Finished::failed(e.to_string()),
     }
 }
 
@@ -3907,6 +3957,41 @@ mod tests {
                 .unwrap(),
         );
         (Adapter::new(monitor, shell_pool, sandbox).unwrap(), td)
+    }
+
+    /// A command cancelled after it was registered but before it started
+    /// leaves no task handle behind: every other way an async task ends removes
+    /// its own, and this one did not, so the handle lived until shutdown.
+    #[tokio::test]
+    async fn a_command_cancelled_before_it_starts_leaves_no_task_behind() {
+        use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let id = adapter
+            .execute_async_in_dir_with_options(
+                "echo_tool",
+                "echo",
+                td.path().to_str().unwrap(),
+                AsyncExecOptions {
+                    id: None,
+                    args: None,
+                    timeout: None,
+                    subcommand_config: None,
+                    log_monitor_config: None,
+                },
+            )
+            .await
+            .expect("dispatch");
+        // On this single-threaded test runtime the operation's task has not run
+        // yet: it starts already cancelled.
+        assert!(adapter.monitor.cancel_operation(&id).await);
+        let deadline = tokio::time::Instant::now() + TestTimeouts::get(TimeoutCategory::Quick);
+        while !adapter.task_handles.lock().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cancelled operation's task handle is still registered"
+            );
+            tokio::time::sleep(TestTimeouts::poll_interval() / 10).await;
+        }
     }
 
     fn shell_args(command: &str) -> Map<String, serde_json::Value> {

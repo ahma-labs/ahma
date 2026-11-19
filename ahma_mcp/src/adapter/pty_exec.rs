@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use anyhow::Result;
-use serde_json::Value;
 
-use crate::operation_monitor::{OperationMonitor, OperationStatus};
+use super::Finished;
+use crate::operation_monitor::OperationMonitor;
 use crate::sandbox::Sandbox;
 
 /// Returns `true` when a pseudo-terminal can be allocated in this process.
@@ -61,12 +61,9 @@ pub fn pty_available() -> bool {
 
 /// Run `command_str` under a PTY through the standard operation lifecycle.
 ///
-/// Mirrors `execute_with_streaming`: emits output lines via the monitor,
-/// spills the complete output, and ends with exactly one terminal status
-/// transition (Completed/Failed/Cancelled/TimedOut).
-///
-/// Returns how it ended so the caller can close the audit log's `tool_call` with
-/// exactly one matching `tool_complete`.
+/// Mirrors `execute_with_streaming`: emits output lines via the monitor and
+/// spills the complete output. Returns how it ended without publishing it:
+/// the caller releases the workspace first, then publishes (SPEC R2.7.1).
 #[cfg_attr(windows, allow(unused_variables))]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_pty_operation(
@@ -79,22 +76,15 @@ pub(super) async fn run_pty_operation(
     monitor: &Arc<OperationMonitor>,
     ssh_auth_sock: Option<&Path>,
     keep_leftovers: bool,
-) -> (crate::adapter::audit::Outcome, Option<i32>) {
+) -> Finished {
     #[cfg(windows)]
     {
-        let _ = ssh_auth_sock;
-        monitor
-            .update_status(
-                op_id,
-                OperationStatus::Failed,
-                Some(Value::String(
-                    "pty: true is not yet supported on Windows (ConPTY integration pending). \
-                     Run the command without the pty parameter."
-                        .to_string(),
-                )),
-            )
-            .await;
-        (crate::adapter::audit::Outcome::Failed, None)
+        let _ = (ssh_auth_sock, monitor, op_id);
+        Finished::failed(
+            "pty: true is not yet supported on Windows (ConPTY integration pending). \
+             Run the command without the pty parameter."
+                .to_string(),
+        )
     }
 
     #[cfg(unix)]
@@ -367,9 +357,7 @@ mod unix {
         monitor: &Arc<OperationMonitor>,
         ssh_auth_sock: Option<&Path>,
         keep_leftovers: bool,
-    ) -> (crate::adapter::audit::Outcome, Option<i32>) {
-        use crate::adapter::audit::Outcome;
-
+    ) -> Finished {
         let start_time = Instant::now();
 
         let (mut killer, mut line_rx, mut exit_rx) = match setup_pty(
@@ -380,16 +368,7 @@ mod unix {
             keep_leftovers,
         ) {
             Ok(parts) => parts,
-            Err(e) => {
-                monitor
-                    .update_status(
-                        op_id,
-                        OperationStatus::Failed,
-                        Some(Value::String(format!("Failed to start PTY command: {e}"))),
-                    )
-                    .await;
-                return (Outcome::Failed, None);
-            }
+            Err(e) => return Finished::failed(format!("Failed to start PTY command: {e}")),
         };
 
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
@@ -404,14 +383,7 @@ mod unix {
                     tracing::info!("PTY operation {} cancelled", op_id);
                     killer.kill();
                     spill_writer.finish().await;
-                    monitor
-                        .update_status(
-                            op_id,
-                            OperationStatus::Cancelled,
-                            Some(Value::String("Operation was cancelled".to_string())),
-                        )
-                        .await;
-                    return (Outcome::Cancelled, None);
+                    return Finished::cancelled();
                 }
 
                 _ = tokio::time::sleep_until(deadline) => {
@@ -419,16 +391,9 @@ mod unix {
                     killer.kill();
                     spill_writer.finish().await;
                     let duration_ms = start_time.elapsed().as_millis() as u64;
-                    monitor
-                        .update_status(
-                            op_id,
-                            OperationStatus::TimedOut,
-                            Some(Value::String(format!(
-                                "Operation timed out after {duration_ms}ms (exceeded timeout limit)"
-                            ))),
-                        )
-                        .await;
-                    return (Outcome::TimedOut, None);
+                    return Finished::timed_out(format!(
+                        "Operation timed out after {duration_ms}ms (exceeded timeout limit)"
+                    ));
                 }
 
                 line = line_rx.recv() => {
@@ -482,7 +447,6 @@ mod unix {
         }
 
         let exit_code = exit_status.unwrap_or(-1);
-        let success = exit_code == 0;
         let final_output = json!({
             "stdout": collected.rendered_output(),
             // A PTY merges stderr into the terminal stream by construction.
@@ -493,21 +457,7 @@ mod unix {
             "stdout_truncated_bytes": collected.dropped_bytes(),
             "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
         });
-        let status = if success {
-            OperationStatus::Completed
-        } else {
-            OperationStatus::Failed
-        };
-        monitor
-            .update_status(op_id, status, Some(final_output))
-            .await;
-
-        let outcome = if success {
-            Outcome::Completed
-        } else {
-            Outcome::Failed
-        };
-        (outcome, exit_status)
+        Finished::exited(exit_status, final_output)
     }
 }
 
@@ -617,6 +567,8 @@ mod tests {
                 None,
                 keep,
             )
+            .await
+            .publish(&monitor, op_id)
             .await;
             let op = monitor
                 .check_completion_history_pub(op_id)
@@ -695,6 +647,8 @@ mod tests {
             None,
             false,
         )
+        .await
+        .publish(&monitor, op_id)
         .await;
 
         let op = monitor
@@ -750,6 +704,8 @@ mod tests {
             Some(&broker),
             false,
         )
+        .await
+        .publish(&monitor, op_id)
         .await;
 
         let op = monitor
@@ -802,6 +758,8 @@ mod tests {
             None,
             false,
         )
+        .await
+        .publish(&monitor, op_id)
         .await;
 
         let op = monitor
@@ -849,6 +807,8 @@ mod tests {
             None,
             false,
         )
+        .await
+        .publish(&monitor, op_id)
         .await;
 
         let op = monitor
@@ -893,6 +853,8 @@ mod tests {
             None,
             false,
         )
+        .await
+        .publish(&monitor, op_id)
         .await;
 
         let op = monitor
@@ -940,6 +902,8 @@ mod tests {
             None,
             false,
         )
+        .await
+        .publish(&monitor, op_id)
         .await;
 
         let op = monitor
