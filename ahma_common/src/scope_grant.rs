@@ -961,7 +961,13 @@ fn auto_execution_warning(path: &Path, home: Option<&Path>) -> Option<String> {
     None
 }
 
-fn resolve_worktree_main_repo(dir: &Path, git_file: &Path) -> Option<PathBuf> {
+/// The main repository of the worktree at `dir`, whose `.git` file is
+/// `git_file`: the one pointer shape git writes, `<main>/.git/worktrees/<name>`,
+/// names `<main>`. Any other pointer names nothing. The `.git` file lies in the
+/// workspace, where anything can write it, so a pointer to an arbitrary folder
+/// must not make that folder's ancestor pass for the workspace's own
+/// repository (a grant of it would then look like no widening).
+pub fn resolve_worktree_main_repo(dir: &Path, git_file: &Path) -> Option<PathBuf> {
     if !git_file.is_file() {
         return None;
     }
@@ -977,7 +983,12 @@ fn resolve_worktree_main_repo(dir: &Path, git_file: &Path) -> Option<PathBuf> {
         gitdir_path.to_path_buf()
     };
     let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
-    let main = canon_gitdir.parent()?.parent()?.parent()?;
+    let worktrees = canon_gitdir.parent()?;
+    let dot_git = worktrees.parent()?;
+    if worktrees.file_name()? != "worktrees" || dot_git.file_name()? != ".git" {
+        return None;
+    }
+    let main = dot_git.parent()?;
     Some(dunce::canonicalize(main).unwrap_or_else(|_| main.to_path_buf()))
 }
 
@@ -1637,6 +1648,43 @@ mod answer_settles_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worktree's `.git` file points at `<main>/.git/worktrees/<name>`, and
+    /// only a pointer of that shape names a main repository. The file lies in
+    /// the workspace, so anything can write it: a pointer to an arbitrary
+    /// folder must not make that folder's ancestor count as the workspace's
+    /// own repository, which would let a grant of it pass as no widening.
+    #[test]
+    fn only_a_worktree_shaped_pointer_names_a_main_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let real = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&real).unwrap();
+        // A worktree kept inside its main repository's folder.
+        let wt = main.join("worktrees-here/wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", real.display())).unwrap();
+        assert!(
+            is_enclosing_git_repo(&wt, &main),
+            "a real worktree's main repository"
+        );
+
+        // A crafted pointer: three levels up from it is `root`, an ancestor of
+        // everything here, and not a repository the workspace belongs to.
+        let crafted = root.path().join("a/b/c");
+        std::fs::create_dir_all(&crafted).unwrap();
+        let evil = root.path().join("evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(
+            evil.join(".git"),
+            format!("gitdir: {}\n", crafted.display()),
+        )
+        .unwrap();
+        assert!(
+            !is_enclosing_git_repo(&evil, root.path()),
+            "a pointer that is not <repo>/.git/worktrees/<name> names no main repository"
+        );
+    }
 
     mod other_repository_tests {
         use super::*;

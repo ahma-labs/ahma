@@ -3021,36 +3021,9 @@ fn apply_stop_process(name: &str, pid: u32) -> anyhow::Result<String> {
     ))
 }
 
-/// Whether this process runs inside a macOS Seatbelt sandbox, asked of the
-/// kernel (`sandbox_check(getpid(), NULL, …)`). A daemon restarted from a
-/// confined process inherits the confinement, which is the very fault being
-/// repaired, so [`Fix::RestartDaemon`] refuses in that case.
-#[cfg(target_os = "macos")]
-fn this_process_is_confined() -> bool {
-    const SANDBOX_CHECK_NO_REPORT: std::ffi::c_int = 0x0002;
-    unsafe extern "C" {
-        fn sandbox_check(
-            pid: std::ffi::c_int,
-            operation: *const std::ffi::c_char,
-            type_: std::ffi::c_int,
-            ...
-        ) -> std::ffi::c_int;
-    }
-    // SAFETY: a NULL operation asks only whether the pid is sandboxed at all.
-    let rc = unsafe {
-        sandbox_check(
-            std::process::id() as std::ffi::c_int,
-            std::ptr::null(),
-            SANDBOX_CHECK_NO_REPORT,
-        )
-    };
-    rc == 1
-}
-
-#[cfg(not(target_os = "macos"))]
-fn this_process_is_confined() -> bool {
-    false
-}
+// A daemon restarted from a confined process inherits the confinement, which
+// is the very fault being repaired, so `Fix::RestartDaemon` refuses in that case.
+use crate::seatbelt::this_process_is_confined;
 
 /// Stop and start a `--stop-server`/`--start-server` style daemon (sccache's
 /// protocol; the only one ahma restarts on its own).
