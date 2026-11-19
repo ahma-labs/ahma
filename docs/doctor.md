@@ -59,6 +59,7 @@ Example report:
 | A build helper (sccache, a Gradle or Kotlin daemon) left running inside a sandbox, by shape: confined, orphaned, your own executable | warn | restart it (`--stop-server` / `--start-server`), refused if the doctor is itself sandboxed |
 | How grant prompts are being answered: median time-to-decision, share under three seconds, advisor followed | info / warn | none — a habit, not a file |
 | A session started in a subfolder of a git checkout whose root `.claude/settings.json` carries ahma's shell hook (Claude Code reads that file only from the folder a session starts in, so the hook never ran) | warn | none — start the session at the git root, or `ahma hooks install` for a user-level hook |
+| A session started in a folder that holds git checkouts (one or two folders below) whose own `.claude` settings declare hooks: Claude Code loads none of them there | info; warn when ahma's shell hook is among them and your own settings carry none | none — start the session in the checkout it works on, or `ahma hooks install` |
 | Sandbox profiles in effect and the GPU capability (`[sandbox] allow_gpu`) are shown on every scope surface | info | none |
 
 Every applied fix is written through the same strict read-modify-write the
