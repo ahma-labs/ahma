@@ -840,10 +840,8 @@ fn write_declined(
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
     // Write beside it and rename, so a reader never sees half a file.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(store)?)
-        .with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))?;
+    ahma_common::fs_atomic::write(&path, serde_json::to_string_pretty(store)?)
+        .with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
 }
 

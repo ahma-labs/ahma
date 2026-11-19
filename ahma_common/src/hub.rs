@@ -1023,28 +1023,7 @@ impl std::fmt::Debug for HubToken {
 /// previous server's token or this one's and never a partial file. What the hub
 /// and an operator-started `serve unix|http` (SPEC R-HUB.14) both use.
 pub async fn publish_token(path: &Path, token: &HubToken) -> std::io::Result<()> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let _ = tokio::fs::remove_file(&tmp).await;
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let written = async {
-        let mut file = options.open(&tmp).await?;
-        file.write_all(token.as_str().as_bytes()).await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(&tmp, path).await
-    }
-    .await;
-    if written.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    written
+    crate::fs_atomic::write_with_mode_async(path, token.as_str().as_bytes().to_vec(), 0o600).await
 }
 
 /// Where an operator-started `ahma serve http` on `port` publishes its token

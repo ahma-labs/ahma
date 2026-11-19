@@ -736,13 +736,11 @@ impl WorkspaceQueue {
         for program in programs {
             *counts.entry(program).or_default() += 1;
         }
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         let written = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| serde_json::to_string(&counts).map_err(std::io::Error::other))
-            .and_then(|text| std::fs::write(&tmp, text))
-            .and_then(|()| std::fs::rename(&tmp, &path));
+            .and_then(|text| ahma_common::fs_atomic::write(&path, text));
         if let Err(e) = written {
             tracing::debug!("could not remember a held edit in {}: {e}", path.display());
         }
@@ -825,10 +823,7 @@ impl WorkspaceQueue {
 /// file, then renamed over the record — so a reader never sees half a JSON
 /// document and mistakes a held workspace for an anonymous holder.
 async fn publish_holder(path: &Path, json: String) {
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if tokio::fs::write(&tmp, json).await.is_ok() && tokio::fs::rename(&tmp, path).await.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
+    let _ = ahma_common::fs_atomic::write_async(path, json.into_bytes()).await;
 }
 
 /// A place in a workspace's line. Dropping it (cancelled before it ran) gives

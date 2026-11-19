@@ -98,16 +98,14 @@ pub fn launcher_script(ahma: &Path) -> String {
 pub fn write_launcher(dir: &Path, ahma: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let file = dir.join("ahma-askpass");
-    let tmp = dir.join("ahma-askpass.tmp");
-    std::fs::write(&tmp, launcher_script(ahma))
-        .with_context(|| format!("write {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
     }
-    std::fs::rename(&tmp, &file).with_context(|| format!("rename to {}", file.display()))?;
+    // Owner-only and executable from the moment it exists.
+    ahma_common::fs_atomic::write_with_mode(&file, launcher_script(ahma), 0o700)
+        .with_context(|| format!("write {}", file.display()))?;
     Ok(file)
 }
 
