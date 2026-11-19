@@ -1,3 +1,4 @@
+use super::WorkspaceAccess;
 use anyhow::Result;
 use parking_lot::RwLock;
 use std::path::Path;
@@ -550,18 +551,8 @@ impl Sandbox {
         if self.mode == SandboxMode::Test {
             return Ok(None);
         }
-        let scopes = self.scopes().to_vec();
-        // R-NET: when the guarded egress proxy is active, confine the child's
-        // outbound TCP to the proxy port (Landlock ≥ 6.7). `None` leaves network
-        // unrestricted (restriction off / advisory tier).
-        let connect_tcp_port = self.egress_proxy_addr.read().map(|addr| addr.port());
-        let fd = super::landlock::landlock_ruleset_fd(
-            &scopes,
-            &self.read_scopes(),
-            self.is_no_temp_files(),
-            self.package_cache_write(),
-            connect_tcp_port,
-        )?;
+        let fd =
+            super::landlock::landlock_ruleset_fd(&self.kernel_policy(WorkspaceAccess::ReadWrite))?;
         if fd.is_none() {
             tracing::warn!(
                 "Landlock unavailable on this kernel — child process spawned without \
@@ -603,6 +594,23 @@ impl Sandbox {
         mounts
     }
 
+    /// What the kernel lets a command at `access` reach: the one place the
+    /// rules live. A read-only command never writes temp (Landlock rules are
+    /// additive, so a writable `/tmp` would make a workspace under `/tmp`
+    /// writable again) or a package cache. With the egress proxy active,
+    /// outbound TCP goes to its port only (R-NET, Landlock 6.7+).
+    pub fn kernel_policy(&self, access: WorkspaceAccess) -> super::KernelPolicy {
+        let writable = access.is_writable();
+        super::KernelPolicy {
+            workspace: self.scopes().to_vec(),
+            access,
+            read_only: self.read_scopes(),
+            temp_writable: writable && !self.is_no_temp_files(),
+            package_cache_write: writable && self.package_cache_write(),
+            connect_tcp_port: self.egress_proxy_addr.read().map(|addr| addr.port()),
+        }
+    }
+
     /// Whether this sandbox can spawn a command the **kernel** forbids from
     /// writing the workspace (SPEC R2.7.4): Linux with Landlock, macOS when
     /// ahma is not itself nested inside another Seatbelt profile. Never in
@@ -618,10 +626,15 @@ impl Sandbox {
         {
             static LANDLOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *LANDLOCK.get_or_init(|| {
-                matches!(
-                    super::landlock::landlock_read_only_ruleset_fd(&[], &[], true, None),
-                    Ok(Some(_))
-                )
+                let probe = super::KernelPolicy {
+                    workspace: Vec::new(),
+                    access: WorkspaceAccess::ReadOnly,
+                    read_only: Vec::new(),
+                    temp_writable: false,
+                    package_cache_write: false,
+                    connect_tcp_port: None,
+                };
+                matches!(super::landlock::landlock_ruleset_fd(&probe), Ok(Some(_)))
             })
         }
         #[cfg(target_os = "macos")]
@@ -653,15 +666,8 @@ impl Sandbox {
         }
         #[cfg(target_os = "linux")]
         {
-            let scopes = self.scopes().to_vec();
-            let connect_tcp_port = self.egress_proxy_addr.read().map(|addr| addr.port());
-            // No temp-dir writes: Landlock rules are additive, so a writable
-            // `/tmp` would make any workspace *under* `/tmp` writable again.
-            let Some(fd) = super::landlock::landlock_read_only_ruleset_fd(
-                &scopes,
-                &self.read_scopes(),
-                true,
-                connect_tcp_port,
+            let Some(fd) = super::landlock::landlock_ruleset_fd(
+                &self.kernel_policy(WorkspaceAccess::ReadOnly),
             )?
             else {
                 anyhow::bail!("Landlock unavailable: read-only execution is not enforceable");
@@ -682,8 +688,11 @@ impl Sandbox {
         {
             let mut full_command = vec![program.to_string()];
             full_command.extend(args.iter().cloned());
-            let (sandbox_program, sandbox_args) =
-                self.build_macos_sandbox_command_with(&full_command, working_dir, false)?;
+            let (sandbox_program, sandbox_args) = self.build_macos_sandbox_command_with(
+                &full_command,
+                working_dir,
+                WorkspaceAccess::ReadOnly,
+            )?;
             let mut cmd = self.base_command(&sandbox_program, &sandbox_args, working_dir);
             cmd.env("GIT_OPTIONAL_LOCKS", "0");
             Ok(cmd)
@@ -760,6 +769,30 @@ mod tests {
             set.get("NO_PROXY").and_then(|v| v.as_deref()),
             Some("127.0.0.1,::1,localhost")
         );
+    }
+
+    /// The one place the kernel policy is decided: a read-only command never
+    /// writes temp or a package cache, whatever the sandbox allows an ordinary
+    /// command, and both reach the same workspace at their own access.
+    #[test]
+    fn a_read_only_policy_writes_neither_temp_nor_a_package_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .with_package_cache_write(true);
+        let rw = sandbox.kernel_policy(WorkspaceAccess::ReadWrite);
+        assert_eq!(rw.access, WorkspaceAccess::ReadWrite);
+        assert!(rw.temp_writable && rw.package_cache_write, "{rw:?}");
+        let ro = sandbox.kernel_policy(WorkspaceAccess::ReadOnly);
+        assert_eq!(ro.access, WorkspaceAccess::ReadOnly);
+        assert!(!ro.temp_writable && !ro.package_cache_write, "{ro:?}");
+        assert_eq!(ro.workspace, rw.workspace);
     }
 
     fn make_test_sandbox(scope: &std::path::Path) -> Sandbox {

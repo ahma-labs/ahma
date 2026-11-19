@@ -889,10 +889,7 @@ fn apply_platform_sandbox_enforcement(
         if policy.mode == sandbox::SandboxMode::Strict
             && !cfg.defer_sandbox
             && let Err(e) = sandbox::enforce_landlock_sandbox(
-                &sandbox.scopes(),
-                &sandbox.read_scopes(),
-                sandbox.is_no_temp_files(),
-                sandbox.package_cache_write(),
+                &sandbox.kernel_policy(sandbox::WorkspaceAccess::ReadWrite),
             )
         {
             tracing::error!("Failed to enforce Landlock sandbox: {}", e);

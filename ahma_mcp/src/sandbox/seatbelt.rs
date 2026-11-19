@@ -1,3 +1,4 @@
+use super::WorkspaceAccess;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -15,11 +16,11 @@ use super::core::Sandbox;
 const XCRUN_CACHE_RULE: &str =
     "(allow file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db[^/]*$\"))\n";
 
-/// Read access to `path`, plus write access when `writable` (the read-only
-/// lane passes `false`, SPEC R2.7.4).
-fn macos_path_rules(path: &Path, writable: bool) -> String {
+/// Read access to `path`, plus write access when `access` is read-write (the
+/// read-only lane is not, SPEC R2.7.4).
+fn macos_path_rules(path: &Path, access: WorkspaceAccess) -> String {
     let mut rules = format!("(allow file-read* (subpath \"{}\"))\n", path.display());
-    if writable {
+    if access.is_writable() {
         rules.push_str(&format!(
             "(allow file-write* (subpath \"{}\"))\n",
             path.display()
@@ -34,18 +35,18 @@ impl Sandbox {
         command: &[String],
         working_dir: &Path,
     ) -> Result<(String, Vec<String>)> {
-        self.build_macos_sandbox_command_with(command, working_dir, true)
+        self.build_macos_sandbox_command_with(command, working_dir, WorkspaceAccess::ReadWrite)
     }
 
     /// [`Self::build_macos_sandbox_command`] with the workspace's write access
-    /// chosen: `writable = false` is the read-only lane (SPEC R2.7.4).
+    /// chosen: [`WorkspaceAccess::ReadOnly`] is the read-only lane (SPEC R2.7.4).
     pub(super) fn build_macos_sandbox_command_with(
         &self,
         command: &[String],
         working_dir: &Path,
-        writable: bool,
+        access: WorkspaceAccess,
     ) -> Result<(String, Vec<String>)> {
-        let profile = self.generate_seatbelt_profile_with(working_dir, writable);
+        let profile = self.generate_seatbelt_profile_with(working_dir, access);
 
         let mut args = vec!["-p".to_string(), profile];
         args.extend(command.iter().cloned());
@@ -63,19 +64,24 @@ impl Sandbox {
     /// Expose the read-only-lane profile for test inspection (SPEC R2.7.4).
     #[doc(hidden)]
     pub fn generate_read_only_seatbelt_profile_test(&self, working_dir: &Path) -> String {
-        self.generate_seatbelt_profile_with(working_dir, false)
+        self.generate_seatbelt_profile_with(working_dir, WorkspaceAccess::ReadOnly)
     }
 
     fn generate_seatbelt_profile(&self, working_dir: &Path) -> String {
-        self.generate_seatbelt_profile_with(working_dir, true)
+        self.generate_seatbelt_profile_with(working_dir, WorkspaceAccess::ReadWrite)
     }
 
-    fn generate_seatbelt_profile_with(&self, working_dir: &Path, writable: bool) -> String {
+    fn generate_seatbelt_profile_with(
+        &self,
+        working_dir: &Path,
+        access: WorkspaceAccess,
+    ) -> String {
+        let writable = access.is_writable();
         let wd_str = working_dir.to_string_lossy();
-        let scope_rules = self.get_macos_scope_rules(writable);
+        let scope_rules = self.get_macos_scope_rules(access);
         let read_scopes_rules = self.get_macos_read_scopes_rules();
         let git_resolution_roots = self.git_resolution_roots(working_dir);
-        let git_dir_rules = self.get_macos_git_dir_rules(&git_resolution_roots, writable);
+        let git_dir_rules = self.get_macos_git_dir_rules(&git_resolution_roots, access);
         let working_dir_write = if writable {
             format!("(allow file-write* (subpath \"{wd_str}\"))\n")
         } else {
@@ -195,7 +201,7 @@ impl Sandbox {
     /// private-key regex, container sockets, `<git_dir>/hooks` — has to outrank
     /// them. `git_dir_allow_rules_come_before_credential_denies` asserts the byte
     /// offsets.
-    fn get_macos_git_dir_rules(&self, roots: &[PathBuf], writable: bool) -> String {
+    fn get_macos_git_dir_rules(&self, roots: &[PathBuf], access: WorkspaceAccess) -> String {
         let scopes = self.scopes.read().to_vec();
         let grants = super::exec_config::grantable_git_dirs(roots, &scopes);
 
@@ -204,21 +210,27 @@ impl Sandbox {
 
         let mut rules = String::new();
         for grant in grants.granted.iter().filter(|g| g.needs_rule()) {
+            // Says what is granted: a read-only command only reads it.
+            let (granted, consequence) = if access.is_writable() {
+                ("read/write", "Git operations in this worktree write there.")
+            } else {
+                ("read-only", "This command may read it, not write it.")
+            };
             tracing::warn!(
-                "sandbox: granting read/write to git storage outside the workspace scope: {} \
-                 (verified: {:?}). Git operations in this worktree write there.",
+                "sandbox: granting {granted} access to git storage outside the workspace scope: {} \
+                 (verified: {:?}). {consequence}",
                 grant.path.display(),
                 grant.basis
             );
-            rules.push_str(&macos_path_rules(&grant.path, writable));
+            rules.push_str(&macos_path_rules(&grant.path, access));
         }
         rules
     }
 
-    fn get_macos_scope_rules(&self, writable: bool) -> String {
+    fn get_macos_scope_rules(&self, access: WorkspaceAccess) -> String {
         let mut rules = String::new();
         for scope in self.scopes.read().iter() {
-            rules.push_str(&macos_path_rules(scope, writable));
+            rules.push_str(&macos_path_rules(scope, access));
         }
         rules
     }

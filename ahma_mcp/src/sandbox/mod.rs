@@ -112,8 +112,7 @@ pub use grant_channel::{LoggingGrantNotifier, ScopeGrantNotifier};
 pub use host_detect::{HostSandbox, OUTER_SANDBOX_PID_ENV, detect_host_sandbox};
 #[cfg(target_os = "linux")]
 pub use landlock::{
-    apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_read_only_ruleset_fd,
-    landlock_ruleset_fd,
+    apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,
 };
 pub use launch_services::launch_services_denial_note;
 pub use permission_broker::{
@@ -132,7 +131,7 @@ pub use signals::{set_signal_other_processes, signal_denial_note, signal_other_p
 pub use ssh_agent::{
     SshAgentMode, set_ssh_agent_mode, set_upstream_agent, ssh_agent_mode, upstream_agent,
 };
-pub use types::{SandboxMode, ScopesGuard};
+pub use types::{KernelPolicy, SandboxMode, ScopesGuard, WorkspaceAccess};
 
 /// The directories the kernel sandbox lets every command write for temp
 /// files, unless `--no-temp-files`: `/tmp` under Landlock, `/private/tmp` and
