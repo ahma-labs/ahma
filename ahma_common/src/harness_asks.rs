@@ -1428,7 +1428,9 @@ pub fn load_all(dir: &Path, now: u64) -> Vec<WorkspaceAsks> {
 
 /// Whether a grant in `granted` already lets a command in `workspace` reach
 /// `path` with `access` (SPEC R-PERM.10(c)): the test the hook and the TUI
-/// both apply before asking.
+/// both apply before asking. Which grants apply to the workspace is the
+/// sandbox's own rule (`scope_grant::grant_applies`), so nothing the sandbox
+/// would allow is asked about.
 pub fn grant_covers(
     granted: &[PersistentScope],
     workspace: &Path,
@@ -1439,14 +1441,12 @@ pub fn grant_covers(
     // `/tmp` is `/private/tmp`) must meet the grant of its real folder.
     let canonical = crate::scope_grant::canonicalize_best_effort;
     let path = canonical(path);
-    let workspace = canonical(workspace);
+    let scopes = [canonical(workspace)];
     granted.iter().any(|g| {
-        let applies = g
-            .workspace
-            .as_deref()
-            .is_none_or(|w| workspace.starts_with(canonical(w)));
         let root = canonical(&crate::config::expand_home(&g.path));
-        applies && (g.access.is_write() || !access.is_write()) && path.starts_with(&root)
+        crate::scope_grant::grant_applies(g.workspace.as_deref(), &scopes)
+            && (g.access.is_write() || !access.is_write())
+            && path.starts_with(&root)
     })
 }
 
@@ -2323,6 +2323,54 @@ mod tests {
             p,
             ScopeAccess::Rw
         ));
+    }
+
+    /// "Does a grant already cover this?" has one answer: the one the sandbox
+    /// enforces (`scope_grant::grant_applies`). The hook and the TUI asked by a
+    /// narrower rule, so a grant made for a folder inside the workspace, or
+    /// for the repository that holds a worktree, was enforced yet asked about.
+    #[test]
+    fn a_grant_covers_exactly_what_the_sandbox_applies() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sub = repo.join("crates/core");
+        let elsewhere = root.path().join("other");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let target = root.path().join("cache");
+        std::fs::create_dir_all(&target).unwrap();
+        let grant = |workspace: &Path| PersistentScope {
+            path: target.clone(),
+            access: ScopeAccess::Rw,
+            workspace: Some(workspace.to_path_buf()),
+            granted_by: Some("cli".into()),
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        };
+        for (granted_for, session) in [
+            (&repo, &repo),
+            (&repo, &sub),
+            (&sub, &repo),
+            (&elsewhere, &repo),
+        ] {
+            let applies =
+                crate::scope_grant::grant_applies(Some(granted_for), std::slice::from_ref(session));
+            let covers = grant_covers(
+                &[grant(granted_for)],
+                session,
+                &target.join("lock"),
+                ScopeAccess::Rw,
+            );
+            assert_eq!(
+                covers,
+                applies,
+                "grant for {} seen from {}",
+                granted_for.display(),
+                session.display()
+            );
+        }
     }
 
     #[test]
