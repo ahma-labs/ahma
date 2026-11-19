@@ -296,6 +296,90 @@ async fn test_async_sequence_tool_execution() -> Result<()> {
     Ok(())
 }
 
+/// An asynchronous sequence's steps run in the directory the caller named. They
+/// were started with `"."` (the server's own working directory), while the
+/// real directory went into the step's arguments, where the preparer treats
+/// `working_directory` as reserved and drops it.
+///
+/// Unix only: the step needs a program that prints its working directory, and
+/// on Windows that is a shell builtin, not a program a tool can name.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_async_sequence_steps_run_in_the_callers_directory() -> Result<()> {
+    init_test_logging();
+    let temp_dir = setup_sequence_tool_config().await?;
+    let tools_dir = temp_dir.path().join(".ahma");
+    let here = temp_dir.path().join("here");
+    fs::create_dir_all(&here).await?;
+    let here = std::fs::canonicalize(&here)?;
+    fs::write(
+        tools_dir.join("pwd_sequence.json"),
+        r#"{
+    "name": "pwd_sequence",
+    "description": "An asynchronous sequence that prints where it runs",
+    "command": "sequence",
+    "timeout_seconds": 30,
+    "synchronous": false,
+    "enabled": true,
+    "step_delay_ms": 0,
+    "sequence": [
+        {"tool": "pwd_tool", "subcommand": "default", "description": "where am I"}
+    ]
+}"#,
+    )
+    .await?;
+
+    let mcp = create_in_process_mcp_from_dir(&tools_dir).await?;
+    let started = mcp
+        .client
+        .call_tool(
+            CallToolRequestParams::new(Cow::Borrowed("pwd_sequence")).with_arguments(
+                json!({"working_directory": here.to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    let started_text: String = started
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect();
+    let id = started_text
+        .split(|c: char| c.is_whitespace() || c == '`' || c == ',' || c == ')')
+        .find(|w| w.starts_with("op_"))
+        .unwrap_or_else(|| panic!("the step started: {started_text}"))
+        .to_string();
+
+    let awaited = mcp
+        .client
+        .call_tool(
+            CallToolRequestParams::new(Cow::Borrowed("await"))
+                .with_arguments(json!({"id": id}).as_object().unwrap().clone()),
+        )
+        .await?;
+    let output: String = awaited
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect();
+    // The await result is a summary line, then the operation as JSON.
+    let operation: serde_json::Value = output
+        .find('{')
+        .and_then(|at| serde_json::from_str(&output[at..]).ok())
+        .unwrap_or_else(|| panic!("the await result carries the operation: {output}"));
+    assert_eq!(
+        operation["result"]["stdout"].as_str().map(str::trim),
+        Some(here.to_string_lossy().as_ref()),
+        "the step ran in {}: {output}",
+        here.display()
+    );
+
+    mcp.client.cancel().await?;
+    Ok(())
+}
+
 // ============================================================================
 // Subcommand Sequence Tests
 // ============================================================================

@@ -280,6 +280,10 @@ async fn handle_sequence_tool_sync(
 struct ResolvedStep {
     /// Name registered with the adapter and used for the operation id.
     tool_name: String,
+    /// Where the step runs: the directory the sequence was called for. A
+    /// required field, so no step can fall back to the server's own working
+    /// directory (an async step used to run in `"."`).
+    working_dir: String,
     args: Option<Map<String, Value>>,
     subcommand_config: SubcommandConfig,
     command_parts: Vec<String>,
@@ -324,7 +328,7 @@ async fn run_async_sequence(
             .execute_async_in_dir_with_options(
                 &resolved.tool_name,
                 &resolved.command_parts.join(" "),
-                ".",
+                &resolved.working_dir,
                 crate::adapter::AsyncExecOptions {
                     id: Some(id),
                     args: resolved.args,
@@ -420,11 +424,7 @@ async fn handle_sequence_tool_async(
         Some(&working_directory),
         wait,
         |step| {
-            let mut merged_args = merge_step_arguments(&parent_args, &step.args);
-            merged_args.insert(
-                "working_directory".to_string(),
-                Value::String(working_directory.clone()),
-            );
+            let merged_args = merge_step_arguments(&parent_args, &step.args);
 
             let step_tool_config = get_tool_config(configs, &step.tool)?;
             let (subcommand_config, command_parts) =
@@ -432,6 +432,7 @@ async fn handle_sequence_tool_async(
 
             Ok(ResolvedStep {
                 tool_name: step.tool.clone(),
+                working_dir: working_directory.clone(),
                 args: Some(merged_args),
                 subcommand_config: subcommand_config.clone(),
                 command_parts,
@@ -454,6 +455,7 @@ pub async fn handle_subcommand_sequence(
     wait: Option<SequenceWait<'_>>,
 ) -> Result<CallToolResult, McpError> {
     let sequence = subcommand_config.sequence.as_ref().unwrap(); // Safe due to prior check
+    let working_directory = extract_working_directory(adapter, &params);
     let step_delay_ms = subcommand_config
         .step_delay_ms
         .or(config.step_delay_ms)
@@ -485,6 +487,7 @@ pub async fn handle_subcommand_sequence(
 
             Ok(ResolvedStep {
                 tool_name: config.name.clone(),
+                working_dir: working_directory.clone(),
                 args: params.arguments.clone(),
                 subcommand_config: step_config.clone(),
                 command_parts,
