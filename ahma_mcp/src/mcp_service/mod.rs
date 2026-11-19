@@ -2270,7 +2270,7 @@ impl AhmaMcpService {
                 .update_status(&op_id_clone, OperationStatus::InProgress, None)
                 .await;
 
-            crate::livelog::run_file_monitor_pipeline(
+            let outcome = crate::livelog::run_file_monitor_pipeline(
                 &op_id_clone,
                 safe_path,
                 detection_prompt,
@@ -2280,10 +2280,7 @@ impl AhmaMcpService {
                 llm_service_clone,
             )
             .await;
-
-            monitor_clone
-                .update_status(&op_id_clone, OperationStatus::Completed, None)
-                .await;
+            crate::livelog::finish_monitoring(&monitor_clone, &op_id_clone, outcome).await;
         });
 
         Ok(handlers::common::text_result(format!(

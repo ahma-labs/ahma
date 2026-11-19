@@ -473,6 +473,54 @@ async fn test_livelog_handler_llm_http_error_graceful() {
     );
 }
 
+/// A livelog whose source never started did no monitoring at all. It used to be
+/// reported `Completed`, which an agent reads as "watched, nothing found"; it
+/// ends `Failed`, and the result says why.
+#[tokio::test]
+async fn test_livelog_handler_source_that_never_starts_fails_with_its_reason() {
+    init_test_logging();
+
+    let server = MockServer::start().await;
+    let temp_dir = tempdir().unwrap();
+    let sandbox = test_sandbox(temp_dir.path());
+    let monitor = test_monitor();
+
+    let config = make_tool_config(
+        "test-livelog",
+        make_livelog_config("ahma-test-no-such-program-xyz", Vec::new(), &server.uri()),
+    );
+
+    let op_id = handle_livelog_start(
+        "test-op-no-source".to_string(),
+        &config,
+        &serde_json::Map::new(),
+        monitor.clone(),
+        sandbox,
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
+    )
+    .await
+    .expect("handle_livelog_start should succeed");
+
+    assert!(
+        wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await,
+        "operation '{op_id}' should reach a terminal state within the timeout"
+    );
+    let op = monitor
+        .wait_for_operation(&op_id)
+        .await
+        .expect("finished operation should be in history");
+    assert_eq!(op.state, OperationStatus::Failed, "{op:?}");
+    let reason = op
+        .result
+        .as_ref()
+        .and_then(|r| r.as_str())
+        .unwrap_or_default();
+    assert!(
+        reason.contains("ahma-test-no-such-program-xyz"),
+        "the result names the source that did not start: {reason:?}"
+    );
+}
+
 /// Missing `livelog` config block returns an error — the operation is never registered.
 #[tokio::test]
 async fn test_livelog_handler_missing_livelog_block_returns_error() {

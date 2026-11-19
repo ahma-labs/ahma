@@ -335,13 +335,11 @@ pub(crate) fn render_completed_operation(op: &Operation) -> String {
     use crate::operation_monitor::OperationStatus;
 
     let body = match op.state {
-        OperationStatus::Cancelled | OperationStatus::TimedOut => op
-            .result
-            .as_ref()
-            .and_then(|v| v.get("reason"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Operation was cancelled or timed out")
-            .to_string(),
+        OperationStatus::Cancelled | OperationStatus::TimedOut => {
+            crate::operation_monitor::ended_reason(op.result.as_ref())
+                .unwrap_or("Operation was cancelled or timed out")
+                .to_string()
+        }
         _ => extract_output_from_result(&op.result),
     };
 

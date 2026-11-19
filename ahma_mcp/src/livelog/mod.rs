@@ -154,15 +154,18 @@ fn spawn_source_process(
     runtime: &LivelogRuntime,
     sandbox: &Arc<Sandbox>,
     working_dir: &std::path::Path,
-) -> Option<ProcessGroupGuard> {
-    let mut cmd =
-        match sandbox.create_command(&config.source_command, &runtime.source_args, working_dir) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                warn!("livelog[{}]: failed to create command: {}", op_id, e);
-                return None;
-            }
-        };
+) -> Result<ProcessGroupGuard, NotStarted> {
+    let mut cmd = sandbox
+        .create_command(&config.source_command, &runtime.source_args, working_dir)
+        .map_err(|e| {
+            NotStarted::logged(
+                op_id,
+                format!(
+                    "could not build the command for `{}`: {e}",
+                    config.source_command
+                ),
+            )
+        })?;
     apply_env(&mut cmd, &runtime.env);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -171,15 +174,57 @@ fn spawn_source_process(
         // interesting processes are grandchildren. `kill_on_drop` would signal
         // only the direct child and leave them streaming; the guard sends
         // `kill(-pgid)`, and `create_command` already made this a group leader.
-        Ok(child) => Some(ProcessGroupGuard::new(child)),
-        Err(e) => {
-            warn!("livelog[{}]: failed to spawn source process: {}", op_id, e);
-            None
-        }
+        Ok(child) => Ok(ProcessGroupGuard::new(child)),
+        Err(e) => Err(NotStarted::logged(
+            op_id,
+            format!("could not start `{}`: {e}", config.source_command),
+        )),
     }
 }
 
+/// Why a monitoring pipeline never started watching. The operation it belongs
+/// to then failed with this reason; it did not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotStarted(pub String);
+
+impl NotStarted {
+    /// The reason, also logged against the operation.
+    fn logged(op_id: &str, reason: String) -> Self {
+        warn!("monitor[{op_id}]: {reason}");
+        Self(reason)
+    }
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How a monitoring operation ends: `Completed` when it watched until it was
+/// stopped or its source ended, `Failed` with the reason when it never started.
+pub async fn finish_monitoring(
+    monitor: &OperationMonitor,
+    op_id: &str,
+    outcome: Result<(), NotStarted>,
+) {
+    use crate::operation_monitor::OperationStatus;
+    let (status, result) = match outcome {
+        Ok(()) => (OperationStatus::Completed, None),
+        Err(NotStarted(reason)) => (
+            OperationStatus::Failed,
+            Some(serde_json::Value::String(format!(
+                "monitoring never started: {reason}"
+            ))),
+        ),
+    };
+    monitor.update_status(op_id, status, result).await;
+}
+
 /// Run the live-log pipeline until cancelled or the source process exits.
+///
+/// `Err` when it never started watching (no LLM provider, no source process):
+/// the operation then failed, it did not complete. (SPEC R9.5)
 ///
 /// # Arguments
 ///
@@ -199,17 +244,11 @@ pub async fn run_livelog_pipeline(
     cancellation_token: CancellationToken,
     monitor: Arc<OperationMonitor>,
     llm_service: Arc<crate::llm_service::DefaultLlmCompletionService>,
-) {
-    let provider = match config.llm_provider.resolve() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "livelog[{}]: failed to resolve LLM provider config: {}",
-                op_id, e
-            );
-            return;
-        }
-    };
+) -> Result<(), NotStarted> {
+    let provider = config
+        .llm_provider
+        .resolve()
+        .map_err(|e| NotStarted::logged(op_id, format!("the LLM provider is not usable: {e}")))?;
 
     // Compile the optional pre-filter once. An invalid pattern is non-fatal:
     // log it and let every line through rather than aborting monitoring.
@@ -217,9 +256,7 @@ pub async fn run_livelog_pipeline(
 
     run_clear_command_if_requested(op_id, config, runtime, sandbox, working_dir).await;
 
-    let Some(mut child) = spawn_source_process(op_id, config, runtime, sandbox, working_dir) else {
-        return;
-    };
+    let mut child = spawn_source_process(op_id, config, runtime, sandbox, working_dir)?;
 
     info!(
         "livelog[{}]: source process started ({} {:?})",
@@ -320,6 +357,7 @@ pub async fn run_livelog_pipeline(
 
     let _ = child.child_mut().wait().await;
     info!("livelog[{}]: pipeline finished", op_id);
+    Ok(())
 }
 
 /// Immutable per-pipeline configuration threaded into [`maybe_analyze`].
@@ -509,38 +547,20 @@ async fn process_new_bytes(
 async fn open_file_and_seek_to_end(
     op_id: &str,
     file_path: &std::path::Path,
-) -> Option<(tokio::fs::File, u64)> {
-    let mut file = match tokio::fs::File::open(file_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(
-                "file_monitor[{}]: failed to open file {:?}: {}",
-                op_id, file_path, e
-            );
-            return None;
-        }
-    };
-
-    let pos = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(e) => {
-            warn!(
-                "file_monitor[{}]: failed to read metadata for {:?}: {}",
-                op_id, file_path, e
-            );
-            return None;
-        }
-    };
-
-    if let Err(e) = file.seek(std::io::SeekFrom::Start(pos)).await {
-        warn!(
-            "file_monitor[{}]: failed to seek file {:?}: {}",
-            op_id, file_path, e
-        );
-        return None;
-    }
-
-    Some((file, pos))
+) -> Result<(tokio::fs::File, u64), NotStarted> {
+    let shown = file_path.display();
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .map_err(|e| NotStarted::logged(op_id, format!("could not open {shown}: {e}")))?;
+    let pos = file
+        .metadata()
+        .await
+        .map_err(|e| NotStarted::logged(op_id, format!("could not read the size of {shown}: {e}")))?
+        .len();
+    file.seek(std::io::SeekFrom::Start(pos))
+        .await
+        .map_err(|e| NotStarted::logged(op_id, format!("could not seek in {shown}: {e}")))?;
+    Ok((file, pos))
 }
 
 /// Fold freshly-read lines into the analysis chunk, flushing it (and
@@ -637,17 +657,10 @@ pub async fn run_file_monitor_pipeline(
     cancellation_token: CancellationToken,
     monitor: Arc<OperationMonitor>,
     llm_service: Arc<crate::llm_service::DefaultLlmCompletionService>,
-) {
-    let provider = match llm_provider.resolve() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "file_monitor[{}]: failed to resolve LLM provider config: {}",
-                op_id, e
-            );
-            return;
-        }
-    };
+) -> Result<(), NotStarted> {
+    let provider = llm_provider
+        .resolve()
+        .map_err(|e| NotStarted::logged(op_id, format!("the LLM provider is not usable: {e}")))?;
 
     info!(
         "file_monitor[{}]: starting file monitor on {:?}",
@@ -655,9 +668,7 @@ pub async fn run_file_monitor_pipeline(
     );
 
     // Open the file and seek to the end
-    let Some((mut file, mut pos)) = open_file_and_seek_to_end(op_id, &file_path).await else {
-        return;
-    };
+    let (mut file, mut pos) = open_file_and_seek_to_end(op_id, &file_path).await?;
 
     let chunk_max_lines = 50;
     let chunk_max_duration = Duration::from_secs(30);
@@ -728,6 +739,7 @@ pub async fn run_file_monitor_pipeline(
     }
 
     info!("file_monitor[{}]: pipeline finished", op_id);
+    Ok(())
 }
 
 // ===========================================================================

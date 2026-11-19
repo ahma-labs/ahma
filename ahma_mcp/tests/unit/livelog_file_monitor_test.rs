@@ -101,7 +101,7 @@ async fn test_file_monitor_llm_resolve_error_exits_early() {
     };
 
     let cancel = CancellationToken::new();
-    run_file_monitor_pipeline(
+    let outcome = run_file_monitor_pipeline(
         "op-llm-err",
         log_path,
         "detect errors".to_string(),
@@ -111,6 +111,8 @@ async fn test_file_monitor_llm_resolve_error_exits_early() {
         Arc::new(DefaultLlmCompletionService),
     )
     .await;
+    let reason = outcome.expect_err("an unusable provider never starts watching");
+    assert!(reason.0.contains("LLM provider"), "{reason}");
 
     // No alert should be recorded because the pipeline returned before the loop.
     assert!(
@@ -130,9 +132,9 @@ async fn test_file_monitor_file_not_found_exits_early() {
     register_op(&monitor, "op-no-file").await;
 
     let cancel = CancellationToken::new();
-    run_file_monitor_pipeline(
+    let outcome = run_file_monitor_pipeline(
         "op-no-file",
-        nonexistent,
+        nonexistent.clone(),
         "detect errors".to_string(),
         valid_provider("http://localhost:1234"),
         cancel,
@@ -140,6 +142,11 @@ async fn test_file_monitor_file_not_found_exits_early() {
         Arc::new(DefaultLlmCompletionService),
     )
     .await;
+    let reason = outcome.expect_err("a missing file never starts watching");
+    assert!(
+        reason.0.contains(&nonexistent.display().to_string()),
+        "the reason names the file: {reason}"
+    );
 
     assert!(
         alerts_for(&monitor, "op-no-file").await.is_empty(),
@@ -175,7 +182,8 @@ async fn test_file_monitor_pre_cancelled_token_completes_setup_then_exits() {
         monitor.clone(),
         Arc::new(DefaultLlmCompletionService),
     )
-    .await;
+    .await
+    .expect("a monitor stopped before its first read still started");
     let elapsed = start.elapsed();
 
     // Should finish almost instantly (no sleeps, exits at first cancellation check).
@@ -227,7 +235,7 @@ async fn test_file_monitor_file_growth_triggers_llm_and_records_alert() {
     let server_uri = server.uri();
 
     tokio::spawn(async move {
-        run_file_monitor_pipeline(
+        let _ = run_file_monitor_pipeline(
             "op-grow",
             log_path_bg,
             "look for crashes".to_string(),
@@ -323,7 +331,7 @@ async fn test_file_monitor_clean_llm_response_no_alert() {
     let server_uri = server.uri();
 
     tokio::spawn(async move {
-        run_file_monitor_pipeline(
+        let _ = run_file_monitor_pipeline(
             "op-clean",
             log_path_bg,
             "look for crashes".to_string(),
@@ -404,7 +412,7 @@ async fn test_file_monitor_llm_http_error_no_panic_no_alert() {
     let server_uri = server.uri();
 
     tokio::spawn(async move {
-        run_file_monitor_pipeline(
+        let _ = run_file_monitor_pipeline(
             "op-llm-500",
             log_path_bg,
             "look for crashes".to_string(),
