@@ -29,12 +29,24 @@ pub const SPAWN_DEPTH_ENV: &str = "AHMA_SPAWN_DEPTH";
 /// configuration — it only ever *skips a wait* for a lease an ancestor holds.
 pub const HELD_WORKSPACE_LEASE_ENV: &str = "AHMA_HELD_WORKSPACE_LEASE";
 
+/// Environment variable naming the sandboxed command ("run") a process was
+/// started by (SPEC R-PROC.5). Descendants inherit it wherever they move, so
+/// what a command leaves running can be found and ended when it ends. An
+/// internal supervision marker, not configuration.
+pub const SANDBOX_RUN_ENV: &str = "AHMA_SANDBOX_RUN";
+
 /// Markers that describe the *spawning* process tree and must never reach the
 /// detached per-user hub, which outlives that tree: `AHMA_SERVER_CHILD`
-/// would make it believe it is a session worker, and an inherited lease would
+/// would make it believe it is a session worker, an inherited lease would
 /// make it — and every session worker it spawns — skip the workspace lock for
-/// that workspace for the rest of its life (SPEC R2.7.7).
-pub const NOT_INHERITED_BY_HUB: &[&str] = &["AHMA_SERVER_CHILD", HELD_WORKSPACE_LEASE_ENV];
+/// that workspace for the rest of its life (SPEC R2.7.7), and an inherited run
+/// stamp would have it ended with the command that happened to start it
+/// (SPEC R-PROC.5).
+pub const NOT_INHERITED_BY_HUB: &[&str] = &[
+    "AHMA_SERVER_CHILD",
+    HELD_WORKSPACE_LEASE_ENV,
+    SANDBOX_RUN_ENV,
+];
 
 /// Maximum tolerated spawn depth before a process refuses to start.
 ///

@@ -127,7 +127,7 @@ impl ProbePlan {
                 );
             }
         };
-        let mut guard = ProcessGroupGuard::new(child);
+        let mut guard = ProcessGroupGuard::of(&command, child);
 
         // Read both pipes concurrently with the wait, not after it: a probe that
         // fills a pipe buffer would otherwise deadlock against its own timeout.

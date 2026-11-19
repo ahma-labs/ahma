@@ -174,7 +174,7 @@ fn spawn_source_process(
         // interesting processes are grandchildren. `kill_on_drop` would signal
         // only the direct child and leave them streaming; the guard sends
         // `kill(-pgid)`, and `create_command` already made this a group leader.
-        Ok(child) => Ok(ProcessGroupGuard::new(child)),
+        Ok(child) => Ok(ProcessGroupGuard::of(&cmd, child)),
         Err(e) => Err(NotStarted::logged(
             op_id,
             format!("could not start `{}`: {e}", config.source_command),

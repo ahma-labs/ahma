@@ -204,11 +204,39 @@ pub async fn kill_process_tree(child: &mut tokio::process::Child) -> bool {
 #[derive(Debug)]
 pub struct ProcessGroupGuard {
     child: Option<tokio::process::Child>,
+    /// The run `child` is, until what it left running has been ended
+    /// (SPEC R-PROC.5).
+    run: Option<crate::sandbox::leftovers::Run>,
 }
 
 impl ProcessGroupGuard {
     pub fn new(child: tokio::process::Child) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            run: None,
+        }
+    }
+
+    /// Own, besides the child's process group, whatever `cmd`'s run leaves
+    /// running after leaving that group (SPEC R-PROC.5): ended by
+    /// [`Self::end_leftovers`], or when the guard drops.
+    pub fn of(cmd: &tokio::process::Command, child: tokio::process::Child) -> Self {
+        Self {
+            run: crate::sandbox::leftovers::Run::of(cmd, child.id()),
+            child: Some(child),
+        }
+    }
+
+    /// End what the command left running, once it has itself ended, and return
+    /// it for the command's result. Later calls, and the drop, find nothing.
+    pub async fn end_leftovers(&mut self) -> Vec<crate::sandbox::leftovers::Leftover> {
+        let Some(run) = self.run.take() else {
+            return Vec::new();
+        };
+        // The process table is read through a synchronous API.
+        tokio::task::spawn_blocking(move || crate::sandbox::leftovers::end(&run))
+            .await
+            .unwrap_or_default()
     }
 
     pub fn child_mut(&mut self) -> &mut tokio::process::Child {
@@ -220,7 +248,12 @@ impl ProcessGroupGuard {
     }
 
     /// Disarm the guard and return the inner child once reaped or completed.
+    /// Nothing is signalled afterwards, leftovers included: a caller that
+    /// wants them ended calls [`Self::end_leftovers`] first, once the command
+    /// is known to have ended. (A guard disarmed after a failed status check
+    /// may hold a command that is still running.)
     pub fn disarm(mut self) -> Option<tokio::process::Child> {
+        self.run = None;
         self.child.take()
     }
 }
@@ -233,6 +266,23 @@ impl Drop for ProcessGroupGuard {
                 signal_process_group_kill(pid as i32);
             }
             let _ = child.start_kill();
+        }
+        // A command stopped by its time limit, a cancel or an error leaves
+        // nothing running either; nobody is left to tell, so it is logged.
+        // Inline, not on the blocking pool: a process about to exit (a hooked
+        // command's `run-shell`) would not wait for a task it only spawned.
+        // Killed at once, with no grace: this may be a runtime worker thread.
+        let leftovers = self
+            .run
+            .take()
+            .map(|run| crate::sandbox::leftovers::end_at_once(&run))
+            .unwrap_or_default();
+        for leftover in leftovers {
+            tracing::info!(
+                "stopped {} (pid {}), left running by a command that ended (SPEC R-PROC.5)",
+                leftover.name,
+                leftover.pid
+            );
         }
     }
 }

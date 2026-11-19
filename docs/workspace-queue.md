@@ -226,7 +226,9 @@ the session that started it. An agent sees the same report in the `status` tool,
   started above the checkout; a pipe, a redirection to a file or anything else chained to it
   does not. An entry names a program or a program and its first words: `scripts/audition`
   covers every subcommand, `scripts/audition ask` only that one. `settings set` replaces the
-  whole list, so name every entry you want to keep. A repository's own settings file cannot
+  whole list, so name every entry you want to keep. A process a declared command starts may
+  stay running after it; any other command's is stopped when it ends
+  ([security-sandbox.md](security-sandbox.md#helpers-left-running-inside-a-sandbox-sccache-gradle-and-kotlin-daemons)). A repository's own settings file cannot
   declare one. Otherwise `cancel` the
   holder the queued result names.
 

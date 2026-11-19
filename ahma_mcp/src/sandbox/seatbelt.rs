@@ -134,7 +134,7 @@ impl Sandbox {
 (allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
 (allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
 {exec_config_deny_rules}{network_rules}{socket_connect_denies}{agent_connect_denies}{hub_denies}(allow mach-lookup)
-{pasteboard_denies}(allow ipc-posix-shm*)
+{run_rule}{pasteboard_denies}(allow ipc-posix-shm*)
 {broker_rules}"#,
             working_dir = wd_str,
             working_dir_write = working_dir_write,
@@ -155,6 +155,8 @@ impl Sandbox {
             agent_connect_denies = agent_connect_denies,
             broker_rules = broker_rules(),
             pasteboard_denies = pasteboard_denies(),
+            // The mark this run's processes are found by when it ends (SPEC R-PROC.5).
+            run_rule = super::leftovers::seatbelt_rule(&tag),
         );
 
         tracing::debug!("Generated macOS Sandbox (Seatbelt) profile:\n{}", profile);

@@ -341,6 +341,10 @@ impl Sandbox {
         cmd.env_remove("AHMA_SERVER_CHILD")
             .env_remove(ahma_common::process_guard::SPAWN_DEPTH_ENV);
 
+        // Stamp the child as one run, so what it leaves running can be ended
+        // with it (SPEC R-PROC.5).
+        super::leftovers::stamp(&mut cmd);
+
         // Stamp the child with *which* ahma sandboxed it (SPEC R7.6). A nested
         // ahma inside this command — the test suite, or an `ahma serve` run
         // through `run_terminal_command` — reads it to name the outer sandbox
