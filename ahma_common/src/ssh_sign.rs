@@ -133,11 +133,7 @@ pub fn persist(settings_file: &Path, grant: SshSignGrant, surface: &str) -> Resu
                 settings_file.display()
             )
         })?;
-    let tier = if grant.expires_at.is_some() {
-        crate::permissions::GrantTier::Lease
-    } else {
-        crate::permissions::GrantTier::Always
-    };
+    let tier = crate::permissions::GrantTier::for_expiry(grant.expires_at);
     let subject = format!("{} for {}", grant.key, grant.destination);
     let list = &mut settings.sandbox.ssh_sign;
     list.retain(|g| {

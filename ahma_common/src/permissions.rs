@@ -160,6 +160,16 @@ pub enum GrantTier {
 }
 
 impl GrantTier {
+    /// The tier of a saved grant: a lease when it has an end
+    /// (SPEC R-PERM.2.3), else for good. One answer for every kind of record.
+    pub fn for_expiry(expires_at: Option<u64>) -> Self {
+        if expires_at.is_some() {
+            GrantTier::Lease
+        } else {
+            GrantTier::Always
+        }
+    }
+
     /// Stable lowercase label used in the CLI, the audit log, and prompts.
     pub fn label(self) -> &'static str {
         match self {
@@ -221,7 +231,7 @@ fn fs_scope_record(s: &crate::config::PersistentScope) -> GrantRecord {
         kind: GrantKind::FsScope,
         subject: s.path.display().to_string(),
         access: Some(s.access.short().to_string()),
-        tier: GrantTier::Always,
+        tier: GrantTier::for_expiry(s.expires_at),
         granted_by: s.granted_by.clone(),
         granted_at: s.granted_at.clone(),
         surface: None,
@@ -241,11 +251,7 @@ fn ssh_sign_record(g: &crate::ssh_sign::SshSignGrant) -> GrantRecord {
         kind: GrantKind::SshSign,
         subject: format!("{} for {}", g.key, g.destination),
         access: None,
-        tier: if g.expires_at.is_some() {
-            GrantTier::Lease
-        } else {
-            GrantTier::Always
-        },
+        tier: GrantTier::for_expiry(g.expires_at),
         granted_by: g.granted_by.clone(),
         granted_at: Some(crate::config::fmt_utc_datetime(g.granted_at)),
         surface: None,
@@ -1409,6 +1415,27 @@ mod tests {
 
     fn key(p: &str) -> PathBuf {
         PathBuf::from(p)
+    }
+
+    /// A folder grant with an end (`ahma sandbox grant --lease`) is listed as
+    /// a lease, as a signing grant with an end already was. The folder record
+    /// copied the end but always said `always`.
+    #[test]
+    fn a_leased_folder_grant_is_listed_as_a_lease() {
+        let scope = |expires_at| crate::config::PersistentScope {
+            path: key("/repo/data"),
+            access: ScopeAccess::Ro,
+            workspace: Some(key("/repo")),
+            granted_by: Some("cli".into()),
+            granted_at: None,
+            note: None,
+            expires_at,
+        };
+        assert_eq!(
+            fs_scope_record(&scope(Some(4_000_000_000))).tier,
+            GrantTier::Lease
+        );
+        assert_eq!(fs_scope_record(&scope(None)).tier, GrantTier::Always);
     }
 
     #[test]
