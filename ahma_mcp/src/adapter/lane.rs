@@ -711,6 +711,12 @@ pub fn classify_shell_command(command: &str) -> Lane {
 /// exactly one plain command — no list, pipe, redirection or substitution, so
 /// nothing can ride along without the lease — starting with the entry's
 /// command as whole words.
+///
+/// How the command is reached does not change which command it is: any number
+/// of leading `cd <dir>` steps may come first, and the program may be named by
+/// a longer path that ends in the entry's (`./scripts/audition`,
+/// `/repo/scripts/audition` for `scripts/audition`). A session started above
+/// its checkout can write the line no other way.
 pub fn long_running_entry<'a>(
     command: &str,
     entries: &'a [ahma_common::config::LongRunningCommand],
@@ -723,21 +729,35 @@ pub fn long_running_entry<'a>(
         return None;
     }
     let line = parse_line(&lifted)?;
-    let [seg] = line.segs.as_slice() else {
-        return None;
-    };
     if !line.writes.is_empty() {
         return None;
     }
-    let joined = seg.join(" ");
+    let (seg, leading) = line.segs.split_last()?;
+    if !leading.iter().all(|s| s.len() == 2 && s[0] == "cd") {
+        return None;
+    }
     entries.iter().find(|e| {
-        let want = e.command.trim();
-        !want.is_empty()
-            && (joined == want
-                || joined
-                    .strip_prefix(want)
-                    .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+        let want: Vec<&str> = e.command.split_whitespace().collect();
+        let Some((program, args)) = want.split_first() else {
+            return false;
+        };
+        seg.len() >= want.len()
+            && same_program(&seg[0], program)
+            && seg[1..want.len()]
+                .iter()
+                .map(String::as_str)
+                .eq(args.iter().copied())
     })
+}
+
+/// Whether `written` names the program `declared`: the same words, or a longer
+/// path whose last components are `declared`'s (`./x/run` and `/repo/x/run`
+/// for `x/run`; never `ax/run`).
+fn same_program(written: &str, declared: &str) -> bool {
+    written == declared
+        || written
+            .strip_suffix(declared)
+            .is_some_and(|before| before.ends_with('/') || before.ends_with('\\'))
 }
 
 /// Why a command line takes its turn in the workspace queue, in words an agent
@@ -768,8 +788,19 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     let mut reading = Reading::default();
     for seg in &line.segs {
         if read_one_segment(seg, &mut reading).is_none() {
+            // The project's own program is the one case with a way out, and
+            // only a human may take it (SPEC R2.7.10): say what to ask for.
+            let way_out = project_program(seg, site.cwd)
+                .map(|program| {
+                    format!(
+                        ". If it never writes this workspace, a human can let it skip the \
+                         queue: add `{{command='{program}'}}` to `tools.long_running` (`ahma \
+                         settings explain tools.long_running` says how)"
+                    )
+                })
+                .unwrap_or_default();
             return format!(
-                "`{}` may write (it is not a command ahma knows only reads)",
+                "`{}` may write (it is not a command ahma knows only reads){way_out}",
                 segment_head(seg)
             );
         }
@@ -816,6 +847,27 @@ fn unparsed_construct(command: &str) -> Option<char> {
         i += 1;
     }
     None
+}
+
+/// The program a segment runs, when it is the project's own: named by a
+/// relative path (`scripts/x`, `./scripts/x`) or by a path under `cwd`, as a
+/// `[tools] long_running` entry would name it. `None` for a bare name (a
+/// program on `PATH`), a path elsewhere, or one the shell would expand.
+fn project_program(seg: &Segment, cwd: &Path) -> Option<String> {
+    let words: Vec<&String> = seg
+        .iter()
+        .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+        .collect();
+    let program = words.get(wrapper_len(&words))?.as_str();
+    if program.contains(['$', '`', '~', '*', '?', '\'']) {
+        return None;
+    }
+    let relative = match Path::new(program).strip_prefix(cwd) {
+        Ok(under) => under.to_string_lossy().into_owned(),
+        Err(_) if Path::new(program).is_absolute() => return None,
+        Err(_) => program.trim_start_matches("./").to_string(),
+    };
+    relative.contains(['/', '\\']).then_some(relative)
 }
 
 /// A segment's command, as an agent would name it: its program and first
@@ -2899,6 +2951,34 @@ mod queue_reason_tests {
         assert!(nested.contains("another sandbox"), "{nested}");
     }
 
+    /// SPEC R2.7.4 (field case 2026-11-18): `scripts/audition unread`, which
+    /// writes one file outside the workspace, waited 20 minutes behind the
+    /// agent's own test run. The notice said why and not what to do, so the
+    /// agent never learned the project's own program can be declared. A line
+    /// held for a project program names the way out; a system program or a
+    /// construct ahma cannot read has none to name.
+    #[test]
+    fn a_line_held_for_a_project_program_names_the_way_out() {
+        for cmd in [
+            "scripts/audition unread",
+            "cd /Volumes/T7/github/neubit4 && scripts/audition unread 2>&1 | tail -30",
+            "./scripts/audition ask r1",
+        ] {
+            let reason = why(cmd, true);
+            assert!(reason.contains("scripts/audition"), "{cmd}: {reason}");
+            assert!(
+                reason.contains("{command='scripts/audition'}"),
+                "{cmd}: {reason}"
+            );
+            assert!(reason.contains("tools.long_running"), "{cmd}: {reason}");
+            assert!(reason.contains("a human"), "{cmd}: {reason}");
+        }
+        for cmd in ["cargo fmt", "git commit -m x", "somebinary --flag"] {
+            let reason = why(cmd, true);
+            assert!(!reason.contains("long_running"), "{cmd}: {reason}");
+        }
+    }
+
     /// SPEC R2.7.10: a declared long-running command matches only as a whole
     /// line of its own, never a line that chains something after it.
     #[test]
@@ -2922,7 +3002,48 @@ mod queue_reason_tests {
             "scripts/audition ask | tee log",
             "scripts/audition ask > log",
             "scripts/audition ask $(touch f)",
-            "cd x && scripts/audition ask",
+        ] {
+            assert!(long_running_entry(cmd, &entries).is_none(), "{cmd}");
+        }
+    }
+
+    /// SPEC R2.7.10 (field case 2026-11-18): a session started in the folder above its
+    /// checkout sends every line as `cd <checkout> && scripts/audition ask …`, and another
+    /// names the script by its full path. Neither matched the declared `scripts/audition`, so
+    /// the day-long wait held the workspace and every build queued behind it. A leading `cd`
+    /// and the path the program is reached by change where the command runs, not which
+    /// command it is.
+    #[test]
+    fn a_long_running_entry_matches_however_the_program_is_reached() {
+        use ahma_common::config::LongRunningCommand;
+        let entries = vec![LongRunningCommand {
+            command: "scripts/audition".into(),
+            timeout_secs: Some(86400),
+        }];
+        for cmd in [
+            "scripts/audition unread",
+            "./scripts/audition unread",
+            "/Volumes/T7/github/neubit4/scripts/audition ask 'auditions/r 1'",
+            "neubit4/scripts/audition ask r1",
+            "cd /Volumes/T7/github/neubit4 && scripts/audition ask r1",
+            "cd /Volumes/T7/github && cd neubit4 && ./scripts/audition ask r1 2>&1",
+        ] {
+            assert_eq!(
+                long_running_entry(cmd, &entries).and_then(|e| e.timeout_secs),
+                Some(86400),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            // Another program whose name only ends the same way.
+            "myscripts/audition ask",
+            "scripts/audition-hook unread",
+            // Something else rides along: before it, after it, or in the `cd`.
+            "cd x && cargo fmt && scripts/audition ask",
+            "cd x && scripts/audition ask && cargo fmt",
+            "cd $(touch f) && scripts/audition ask",
+            "cd x y && scripts/audition ask",
+            "cd x",
         ] {
             assert!(long_running_entry(cmd, &entries).is_none(), "{cmd}");
         }

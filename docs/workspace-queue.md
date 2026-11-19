@@ -45,7 +45,9 @@ status()                                     → ── Finished since your last
   another sandbox (macOS refuses to nest Seatbelt profiles), there is no read-only lane at
   all, so every command takes its turn. A waiting command says which:
   `NOT started — `git status` is waiting for the workspace; op `op_12` (`cargo nextest run`,
-  41s) holds it. Queued because …`.
+  41s) holds it. Queued because …`. When the cause is one of the project's own programs
+  (`scripts/audition unread`), the reason also names the way out: a human adds
+  `{command='scripts/audition'}` to `tools.long_running` (see Limits, below).
 - **Watching CI does not hold the workspace.** `gh run watch`, `gh pr checks --watch` and
   `tail -f` read until their subject ends, which can be most of an hour. They take no lease:
   read-only where the kernel enforces that lane, `service` where it does not. The whole line
@@ -218,7 +220,13 @@ the session that started it. An agent sees the same report in the `status` tool,
   `make serve`), declare it in your own `~/.ahma/settings.toml`:
   `ahma settings set tools.long_running "[{command='scripts/audition ask', timeout_secs=14400}]"`.
   It then runs without the lease and with that timeout, as long as the line is exactly that
-  one command. A repository's own settings file cannot declare one. Otherwise `cancel` the
+  one command. Leading `cd <dir> &&` steps and a longer path to the same program
+  (`./scripts/audition`, `/repo/scripts/audition`) still match, so it works from a session
+  started above the checkout; a pipe, a redirection to a file or anything else chained to it
+  does not. An entry names a program or a program and its first words: `scripts/audition`
+  covers every subcommand, `scripts/audition ask` only that one. `settings set` replaces the
+  whole list, so name every entry you want to keep. A repository's own settings file cannot
+  declare one. Otherwise `cancel` the
   holder the queued result names.
 
 ## See also
