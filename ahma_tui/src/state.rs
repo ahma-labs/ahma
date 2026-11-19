@@ -2607,6 +2607,40 @@ impl AppState {
     }
 }
 
+/// An overlay that takes keys before the chat does. [`OVERLAYS_TOP_FIRST`]
+/// orders them: the order they are drawn in (bottom first) and the order
+/// keys are offered to them (top first) are one list, so the overlay a key
+/// reaches is always the one on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    /// A doctor fix waiting for `y` (SPEC R-DOCTOR.2).
+    DoctorConfirm,
+    /// Whether to trust this folder.
+    Trust,
+    /// A filesystem grant question (SPEC R-PERM.3.10).
+    ScopeGrant,
+    /// A web egress question.
+    WebApproval,
+    /// The guided setup view.
+    Setup,
+    /// The settings panel.
+    Settings,
+    /// Help, a picker, the intro, a detail view ([`ModalState`]).
+    Modal,
+}
+
+/// Every [`Overlay`], topmost first. Security questions sit over everything
+/// else; the trust and doctor questions over the grant questions.
+pub const OVERLAYS_TOP_FIRST: [Overlay; 7] = [
+    Overlay::DoctorConfirm,
+    Overlay::Trust,
+    Overlay::ScopeGrant,
+    Overlay::WebApproval,
+    Overlay::Setup,
+    Overlay::Settings,
+    Overlay::Modal,
+];
+
 impl AppState {
     // ── Modal accessors ──
     //
@@ -2778,6 +2812,24 @@ impl AppState {
     }
 
     /// True when the help screen is open.
+    /// Whether `overlay` is open.
+    pub fn is_open(&self, overlay: Overlay) -> bool {
+        match overlay {
+            Overlay::DoctorConfirm => self.doctor_confirm.is_some(),
+            Overlay::Trust => self.trust_prompt.is_some(),
+            Overlay::ScopeGrant => self.scope_grant.is_some(),
+            Overlay::WebApproval => self.web_approval.is_some(),
+            Overlay::Setup => self.setup_view.open,
+            Overlay::Settings => self.settings_editor.open,
+            Overlay::Modal => !matches!(self.modal, ModalState::None),
+        }
+    }
+
+    /// The open overlay drawn on top, which is the one keys reach first.
+    pub fn top_overlay(&self) -> Option<Overlay> {
+        OVERLAYS_TOP_FIRST.into_iter().find(|o| self.is_open(*o))
+    }
+
     pub fn is_help_open(&self) -> bool {
         matches!(self.modal, ModalState::Help)
     }

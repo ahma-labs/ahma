@@ -36,9 +36,37 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     draw_chat_layout(frame, state, theme);
 
-    // Overlays drawn on top of whichever layout is active. At most one user
-    // overlay is open (SPEC R23).
+    // Overlays drawn on top of whichever layout is active, bottom first, in the
+    // order keys reach them top first (`state::OVERLAYS_TOP_FIRST`): the one on
+    // screen is the one a key answers. At most one user modal is open (SPEC R23).
     let full = frame.area();
+    for overlay in crate::state::OVERLAYS_TOP_FIRST.into_iter().rev() {
+        if state.is_open(overlay) {
+            draw_overlay(frame, state, theme, full, overlay);
+        }
+    }
+}
+
+fn draw_overlay(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    full: Rect,
+    overlay: crate::state::Overlay,
+) {
+    use crate::state::Overlay;
+    match overlay {
+        Overlay::Modal => draw_modal(frame, state, theme, full),
+        Overlay::Settings => draw_settings_panel(frame, state, theme, full),
+        Overlay::Setup => draw_setup_view(frame, state, theme, full),
+        Overlay::WebApproval => draw_web_approval_modal(frame, state, theme, full),
+        Overlay::ScopeGrant => draw_scope_grant_modal(frame, state, theme, full),
+        Overlay::Trust => draw_trust_modal(frame, state, theme, full),
+        Overlay::DoctorConfirm => draw_doctor_confirm(frame, state, theme, full),
+    }
+}
+
+fn draw_modal(frame: &mut Frame, state: &AppState, theme: &Theme, full: Rect) {
     match &state.modal {
         crate::state::ModalState::None => {}
         crate::state::ModalState::Help => draw_help(frame, state, theme, full),
@@ -61,29 +89,6 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         crate::state::ModalState::LogLineDetail(detail) => {
             draw_log_line_detail(frame, state, detail, theme, full)
         }
-    }
-    if state.settings_editor.open {
-        draw_settings_panel(frame, state, theme, full);
-    }
-    if state.setup_view.open {
-        draw_setup_view(frame, state, theme, full);
-    }
-    // Grant questions are security decisions, drawn over every other overlay.
-    // With both open, the one on top must be the one the keys answer: the
-    // scope question takes keys first (`handle_scope_grant_key` runs before
-    // `handle_web_approval_key`), so it is drawn last. Drawn the other way,
-    // `s` on the visible web question granted the hidden filesystem one.
-    if state.web_approval.is_some() {
-        draw_web_approval_modal(frame, state, theme, full);
-    }
-    if state.scope_grant.is_some() {
-        draw_scope_grant_modal(frame, state, theme, full);
-    }
-    if state.trust_prompt.is_some() {
-        draw_trust_modal(frame, state, theme, full);
-    }
-    if state.doctor_confirm.is_some() {
-        draw_doctor_confirm(frame, state, theme, full);
     }
 }
 
@@ -5152,15 +5157,15 @@ pub(crate) fn shorten_llm_label(label: &str) -> String {
 }
 
 pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
+    shorten_path_under(path, max_chars, &std::env::var("HOME").unwrap_or_default())
+}
+
+/// [`shorten_path`] with the home directory given.
+fn shorten_path_under(path: &str, max_chars: usize, home: &str) -> String {
     if path.chars().count() <= max_chars {
         return path.to_string();
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let shortened = if !home.is_empty() && path.starts_with(&home) {
-        format!("~{}", &path[home.len()..])
-    } else {
-        path.to_string()
-    };
+    let shortened = crate::task_tree::home_relative(path, home).unwrap_or_else(|| path.to_string());
     let char_count = shortened.chars().count();
     if char_count <= max_chars {
         return shortened;
@@ -5503,6 +5508,24 @@ mod native_terminal_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Home is replaced by `~` only at a folder boundary: `/Users/paulx` is not
+    /// under `/Users/paul`, and was shown as `~x/…`.
+    #[test]
+    fn home_is_shortened_only_at_a_folder_boundary() {
+        let home = "/Users/paul";
+        let long = "/Users/paul/github/ahma/ahma_tui/src";
+        assert_eq!(
+            shorten_path_under(long, 30, home),
+            "~/github/ahma/ahma_tui/src"
+        );
+        // Long enough to be shortened, and not under home.
+        let other = "/Users/paulx/github/ahma/ahma_tui/src";
+        let shown = shorten_path_under(other, 30, home);
+        assert!(!shown.starts_with('~'), "{shown}");
+        assert!(shown.ends_with("ahma_tui/src"), "{shown}");
+        assert_eq!(shorten_path_under("/Users/paul", 5, home), "~");
+    }
+
     use super::*;
     use ratatui::text::{Line, Span};
 

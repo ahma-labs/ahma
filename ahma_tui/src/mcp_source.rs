@@ -157,6 +157,30 @@ pub enum McpSourceCommand {
 
 /// Spawn the background task.  The task runs until the channel is closed or
 /// the server stays unreachable for an extended period.
+/// The TUI's MCP session with the bridge. The only way to forget it is
+/// [`Self::end`], which also tells the bridge, so no path can abandon a session
+/// the bridge still counts: a health hiccup used to drop it here only, and
+/// repeated hiccups piled up sessions against the bridge's cap.
+#[derive(Default)]
+struct BridgeSession(Option<StreamableHttpMcpClient>);
+
+impl BridgeSession {
+    fn get(&self) -> Option<&StreamableHttpMcpClient> {
+        self.0.as_ref()
+    }
+
+    fn set(&mut self, session: StreamableHttpMcpClient) {
+        self.0 = Some(session);
+    }
+
+    /// End the session: best-effort DELETE to the bridge, then forget it.
+    async fn end(&mut self) {
+        if let Some(session) = self.0.take() {
+            session.delete_session(Duration::from_secs(2)).await;
+        }
+    }
+}
+
 pub fn spawn_mcp_source(
     connection: ResolvedConnection,
     tx: mpsc::Sender<SourceEvent>,
@@ -209,7 +233,7 @@ async fn mcp_source_task(
 
     let mut prev_healthy = false;
     let mut prev_status_ok = true;
-    let mut mcp_state: Option<StreamableHttpMcpClient> = None;
+    let mut mcp_state = BridgeSession::default();
 
     // Backoff state for MCP session init failures.  After each consecutive
     // failure the wait grows (1 s → 3 s → 8 s → 20 s → 60 s cap) to avoid
@@ -238,7 +262,7 @@ async fn mcp_source_task(
                     }
                     Some(McpSourceCommand::RefreshLogs) => {
                         if prev_healthy
-                            && let Some(ref session) = mcp_state
+                            && let Some(session) = mcp_state.get()
                             && let Ok(files) = call_logs_list(session).await
                         {
                             send(&tx, SourceEvent::LogFilesUpdated { files }).await;
@@ -254,9 +278,7 @@ async fn mcp_source_task(
                         // decrements active_sessions immediately rather than waiting for the
                         // 5-second SSE-drop grace period, allowing the auto-spawned bridge to
                         // idle-exit promptly once no client is connected.
-                        if let Some(ref session) = mcp_state {
-                            session.delete_session(Duration::from_secs(2)).await;
-                        }
+                        mcp_state.end().await;
                         break;
                     }
                 }
@@ -288,7 +310,11 @@ async fn mcp_source_task(
                     })).await;
                     // Reset MCP session on disconnect; reset backoff on reconnect.
                     if !healthy {
-                        mcp_state = None;
+                        // Told to the bridge as well, not only forgotten here: a
+                        // health hiccup with the bridge still up otherwise left
+                        // the session alive there, one more on its cap.
+                        mcp_state.end().await;
+                        send(&tx, SourceEvent::SessionId { id: String::new() }).await;
                         prev_status_ok = true;
                         send(&tx, SourceEvent::SandboxStatus { status: crate::state::SandboxAuthority::Unknown }).await;
                     } else {
@@ -303,7 +329,7 @@ async fn mcp_source_task(
                 if !prev_healthy { continue; }
 
                 // Ensure we have an MCP session, with exponential backoff after failures.
-                if mcp_state.is_none() {
+                if mcp_state.get().is_none() {
                     if tokio::time::Instant::now() < next_init_attempt {
                         // Still in backoff window — skip this tick.
                         continue;
@@ -316,7 +342,7 @@ async fn mcp_source_task(
                             if let Ok(tools) = call_tools_list(&session).await {
                                 send(&tx, SourceEvent::ToolsListUpdated { tools }).await;
                             }
-                            mcp_state = Some(session);
+                            mcp_state.set(session);
                         }
                         Err(e) => {
                             send(&tx, SourceEvent::SandboxStatus { status: crate::state::SandboxAuthority::Failed }).await;
@@ -330,7 +356,7 @@ async fn mcp_source_task(
                 }
 
                 // Call status to get current operations
-                if let Some(ref session) = mcp_state {
+                if let Some(session) = mcp_state.get() {
                     match call_status(&request_base_url, session).await {
                         Ok(StatusPoll::Ready(ops)) => {
                             prev_status_ok = true;
@@ -357,8 +383,7 @@ async fn mcp_source_task(
                             // while it stays alive server-side, and repeated hiccups can pile
                             // up enough orphaned sessions to blow through the server's
                             // concurrent-session cap.
-                            session.delete_session(Duration::from_secs(2)).await;
-                            mcp_state = None;
+                            mcp_state.end().await;
                             // Same backoff as init failures — a run of status hiccups
                             // must not re-init every 3-10s and keep growing the pile.
                             init_fail_count = init_fail_count.saturating_add(1);
@@ -373,7 +398,7 @@ async fn mcp_source_task(
 
             _ = logs_tick.tick() => {
                 if !prev_healthy { continue; }
-                if let Some(ref session) = mcp_state {
+                if let Some(session) = mcp_state.get() {
                     // 1. Poll logs list
                     let files = match call_logs_list(session).await {
                         Ok(f) => {
@@ -1144,6 +1169,41 @@ mod tests {
         let ops = parse_operations(&val);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].id, "ok");
+    }
+
+    /// Ending the TUI's session tells the bridge (a DELETE carrying the
+    /// session id), and leaves nothing to end twice. Every teardown path goes
+    /// through it, a health hiccup included.
+    #[tokio::test]
+    async fn ending_the_session_tells_the_bridge_once() {
+        use std::sync::{Arc, Mutex};
+        let deleted: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = deleted.clone();
+        let router = Router::new().route(
+            "/mcp",
+            axum::routing::delete(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let id = headers
+                        .get("mcp-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    seen.lock().unwrap().push(id);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let (base, handle) = spawn_test_server(router).await;
+        let mut session = BridgeSession::default();
+        session.set(test_session(&base));
+        session.end().await;
+        assert!(session.get().is_none(), "forgotten here");
+        session.end().await;
+        let deleted = deleted.lock().unwrap().clone();
+        assert_eq!(deleted.len(), 1, "told to the bridge once: {deleted:?}");
+        assert!(!deleted[0].is_empty(), "with its id");
+        handle.abort();
     }
 
     #[tokio::test]
