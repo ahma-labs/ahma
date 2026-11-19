@@ -1344,6 +1344,9 @@ fn summary_text_from_value(result: &serde_json::Value) -> String {
         .and_then(|v| v.as_str())
     {
         err_obj.to_string()
+    } else if let Some(reason) = crate::operation_monitor::ended_reason(Some(result)) {
+        // A timed-out, cancelled or failed operation: its reason, not raw JSON.
+        reason.to_string()
     } else {
         serde_json::to_string(result).unwrap_or_default()
     }
@@ -1745,6 +1748,19 @@ mod tests {
     fn summary_from_value_nested_error_message() {
         let v = json!({ "error": { "message": "nested error" } });
         assert_eq!(summary_from_value(&v), Some("nested error".into()));
+    }
+
+    /// An ended operation's summary is its reason, in either layout an ender
+    /// stores it, never the raw JSON of the result.
+    #[test]
+    fn summary_from_value_of_an_ending_is_its_reason() {
+        for v in [
+            json!({ "timed_out": true, "reason": "past its limit" }),
+            json!({ "cancelled": true, "reason": "past its limit" }),
+            json!("past its limit"),
+        ] {
+            assert_eq!(summary_from_value(&v), Some("past its limit".into()), "{v}");
+        }
     }
 
     #[test]

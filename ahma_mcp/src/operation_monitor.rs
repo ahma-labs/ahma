@@ -45,6 +45,105 @@ pub(crate) const MAX_COMPLETION_HISTORY: usize = 1000;
 /// inherit it.
 pub const DEFAULT_WAIT_FOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// What a command produced, as its operation's result. One type for every
+/// execution path: the fields a path does not have are left out, so each
+/// path's result keeps exactly the shape it always had.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    /// The process's exit code; `None` when it ended without one (a signal),
+    /// written as `-1`.
+    #[serde(serialize_with = "exit_code_or_minus_one")]
+    pub exit_code: Option<i32>,
+    /// Ran in a pseudo-terminal: one merged stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty: Option<bool>,
+    /// Ran in this persistent shell session: one merged stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub stdout_truncated_lines: usize,
+    /// For a command with its own stderr stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_truncated_lines: Option<usize>,
+    pub stdout_truncated_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_truncated_bytes: Option<usize>,
+    /// The complete output on disk, when the inline output was truncated.
+    pub output_file: String,
+    /// Files other writers changed while it ran (SPEC R2.7.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_during_run: Option<Value>,
+    /// Trust-handoff writes it made (SPEC R6.1.7), and the alert naming them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_writes: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_alert: Option<String>,
+}
+
+fn exit_code_or_minus_one<S: serde::Serializer>(
+    code: &Option<i32>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_i32(code.unwrap_or(-1))
+}
+
+/// How an operation ended. Its state, its result and its audit outcome are all
+/// read from this one value ([`OperationMonitor::finish`]), so they cannot
+/// disagree, and each kind of ending has one result layout.
+#[derive(Debug, Clone)]
+#[must_use = "an ending does nothing until it is finished on the monitor"]
+pub enum Terminal {
+    /// An operation that is not a command (a log monitor) ran to its end.
+    Done(Option<Value>),
+    /// The command exited: `Completed` for exit 0, else `Failed`.
+    Exited(Box<CommandOutput>),
+    /// It did not run to an exit of its own; the reason, as a string.
+    Failed(String),
+    /// A time limit ended it: `{"timed_out": true, "reason": …}`.
+    TimedOut(String),
+    /// It was cancelled: `{"cancelled": true, "reason": …}`.
+    Cancelled(String),
+}
+
+impl Terminal {
+    /// The state this ending leaves the operation in.
+    pub fn status(&self) -> OperationStatus {
+        match self {
+            Self::Done(_) => OperationStatus::Completed,
+            Self::Exited(output) if output.exit_code == Some(0) => OperationStatus::Completed,
+            Self::Exited(_) | Self::Failed(_) => OperationStatus::Failed,
+            Self::TimedOut(_) => OperationStatus::TimedOut,
+            Self::Cancelled(_) => OperationStatus::Cancelled,
+        }
+    }
+
+    /// The command's exit code, when it exited with one.
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Exited(output) => output.exit_code,
+            _ => None,
+        }
+    }
+
+    /// The operation's result: the one place each ending's layout is decided.
+    pub fn into_result(self) -> Option<Value> {
+        match self {
+            Self::Done(result) => result,
+            Self::Exited(output) => serde_json::to_value(*output).ok(),
+            Self::Failed(reason) => Some(Value::String(reason)),
+            Self::TimedOut(reason) => Some(serde_json::json!({
+                "timed_out": true,
+                "reason": reason
+            })),
+            Self::Cancelled(reason) => Some(serde_json::json!({
+                "cancelled": true,
+                "reason": reason
+            })),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Represents the current state of an operation
 pub enum OperationStatus {
@@ -412,11 +511,10 @@ impl MonitorConfig {
 
 /// Build a structured JSON cancellation result for debugging/LLM visibility.
 fn build_cancellation_result(reason: Option<String>) -> Value {
-    let reason_str = reason.unwrap_or_else(|| "Cancelled by user".to_string());
-    serde_json::json!({
-        "cancelled": true,
-        "reason": reason_str
-    })
+    let reason = reason.unwrap_or_else(|| "Cancelled by user".to_string());
+    Terminal::Cancelled(reason)
+        .into_result()
+        .unwrap_or(Value::Null)
 }
 
 /// Operation monitor that tracks and manages cargo operations
@@ -751,10 +849,7 @@ impl OperationMonitor {
         tracing::warn!("Timing out operation: {} - {}", id, reason);
 
         op.cancellation_token.cancel();
-        op.result = Some(serde_json::json!({
-            "timed_out": true,
-            "reason": reason
-        }));
+        op.result = Terminal::TimedOut(reason).into_result();
 
         let timed_out_op = ops.remove(id);
         drop(ops);
@@ -794,7 +889,20 @@ impl OperationMonitor {
         self.events.emit(terminal_event_for(&op));
     }
 
+    /// End operation `id` the way `terminal` says (SPEC R2.6). Returns whether
+    /// this call ended it: the first terminal writer wins, so a later one is
+    /// ignored (the monitor's own deadline, a cancel and the executor can race).
+    pub async fn finish(&self, id: &str, terminal: Terminal) -> bool {
+        let status = terminal.status();
+        self.transition(id, status, terminal.into_result()).await
+    }
+
     pub async fn update_status(&self, id: &str, status: OperationStatus, result: Option<Value>) {
+        self.transition(id, status, result).await;
+    }
+
+    /// Move `id` to `status` with `result`; whether it moved.
+    async fn transition(&self, id: &str, status: OperationStatus, result: Option<Value>) -> bool {
         let mut ops = self.operations.write().await;
         let mut operation_to_move = None;
         let mut updated_op = None;
@@ -812,7 +920,7 @@ impl OperationMonitor {
                     id,
                     op.state
                 );
-                return;
+                return false;
             }
 
             tracing::debug!("Updating operation {} from {:?} to {:?}", id, from, status);
@@ -830,6 +938,7 @@ impl OperationMonitor {
 
         drop(ops);
 
+        let moved = operation_to_move.is_some() || updated_op.is_some();
         if let Some(op) = operation_to_move {
             tracing::debug!("Moving operation {} to completion history.", id);
             self.move_to_history_and_notify(id, Some(op)).await;
@@ -840,6 +949,7 @@ impl OperationMonitor {
                 percent: None,
             });
         }
+        moved
     }
 
     /// Cancel an operation by ID with an optional reason string.

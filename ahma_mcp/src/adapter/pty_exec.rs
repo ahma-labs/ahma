@@ -20,8 +20,10 @@ use std::sync::Arc;
 #[cfg(unix)]
 use anyhow::Result;
 
-use super::Finished;
+#[cfg(test)]
+use super::PublishEnding;
 use crate::operation_monitor::OperationMonitor;
+use crate::operation_monitor::Terminal;
 use crate::sandbox::Sandbox;
 
 /// Returns `true` when a pseudo-terminal can be allocated in this process.
@@ -76,11 +78,11 @@ pub(super) async fn run_pty_operation(
     monitor: &Arc<OperationMonitor>,
     ssh_auth_sock: Option<&Path>,
     keep_leftovers: bool,
-) -> Finished {
+) -> Terminal {
     #[cfg(windows)]
     {
         let _ = (ssh_auth_sock, monitor, op_id);
-        Finished::failed(
+        Terminal::Failed(
             "pty: true is not yet supported on Windows (ConPTY integration pending). \
              Run the command without the pty parameter."
                 .to_string(),
@@ -107,7 +109,6 @@ mod unix {
     use super::*;
     use crate::adapter::spill;
     use crate::shell_pool::platform_shell_program;
-    use serde_json::json;
     use std::io::{BufRead, BufReader, Read};
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -357,7 +358,7 @@ mod unix {
         monitor: &Arc<OperationMonitor>,
         ssh_auth_sock: Option<&Path>,
         keep_leftovers: bool,
-    ) -> Finished {
+    ) -> Terminal {
         let start_time = Instant::now();
 
         let (mut killer, mut line_rx, mut exit_rx) = match setup_pty(
@@ -368,7 +369,7 @@ mod unix {
             keep_leftovers,
         ) {
             Ok(parts) => parts,
-            Err(e) => return Finished::failed(format!("Failed to start PTY command: {e}")),
+            Err(e) => return Terminal::Failed(format!("Failed to start PTY command: {e}")),
         };
 
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
@@ -383,7 +384,7 @@ mod unix {
                     tracing::info!("PTY operation {} cancelled", op_id);
                     killer.kill();
                     spill_writer.finish().await;
-                    return Finished::cancelled();
+                    return Terminal::Cancelled("Operation was cancelled".to_string());
                 }
 
                 _ = tokio::time::sleep_until(deadline) => {
@@ -391,7 +392,7 @@ mod unix {
                     killer.kill();
                     spill_writer.finish().await;
                     let duration_ms = start_time.elapsed().as_millis() as u64;
-                    return Finished::timed_out(format!(
+                    return Terminal::TimedOut(format!(
                         "Operation timed out after {duration_ms}ms (exceeded timeout limit)"
                     ));
                 }
@@ -446,18 +447,11 @@ mod unix {
             monitor.append_alert(op_id, line).await;
         }
 
-        let exit_code = exit_status.unwrap_or(-1);
-        let final_output = json!({
-            "stdout": collected.rendered_output(),
-            // A PTY merges stderr into the terminal stream by construction.
-            "stderr": "",
-            "exit_code": exit_code,
-            "pty": true,
-            "stdout_truncated_lines": collected.dropped_lines(),
-            "stdout_truncated_bytes": collected.dropped_bytes(),
-            "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
-        });
-        Finished::exited(exit_status, final_output)
+        // A PTY merges stderr into the terminal stream by construction.
+        Terminal::Exited(Box::new(crate::operation_monitor::CommandOutput {
+            pty: Some(true),
+            ..collected.merged_output(exit_status, op_id)
+        }))
     }
 }
 
@@ -863,7 +857,8 @@ mod tests {
             .expect("operation should be in completion history");
         assert_eq!(op.state, OperationStatus::TimedOut);
         let result = op.result.expect("timed-out op carries a result payload");
-        let msg = result.as_str().unwrap_or_default();
+        assert_eq!(result["timed_out"], true, "{result}");
+        let msg = crate::operation_monitor::ended_reason(Some(&result)).unwrap_or_default();
         assert!(
             msg.contains("timed out"),
             "expected a timeout message, got: {msg:?}"
