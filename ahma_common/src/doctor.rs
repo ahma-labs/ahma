@@ -352,6 +352,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
     check_grant_tools_auto_allowed(input.home_dir.as_deref(), &input.workspace, &mut findings);
     check_hook_coverage(input.home_dir.as_deref(), &mut findings);
     check_subfolder_hooks(input.home_dir.as_deref(), &input.workspace, &mut findings);
+    check_hooks_below(input.home_dir.as_deref(), &input.workspace, &mut findings);
     check_old_sccache_dir(&input.workspace, &mut findings);
     if let Some(probe) = &input.git_auth {
         let default_settings;
@@ -607,6 +608,149 @@ fn check_subfolder_hooks(home: Option<&Path>, workspace: &Path, out: &mut Vec<Fi
             root_file.display(),
             workspace.display(),
             root.display()
+        ),
+        fix: None,
+    });
+}
+
+/// The hook events (`Stop`, `PreToolUse`, …) a Claude Code settings file
+/// declares at least one hook for, sorted. Empty when it has none or cannot
+/// be read.
+fn declared_hook_events(path: &Path) -> Vec<String> {
+    let Some(settings) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return Vec::new();
+    };
+    let mut events: Vec<String> = settings
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, hooks)| hooks.as_array().is_some_and(|a| !a.is_empty()))
+        .map(|(event, _)| event.clone())
+        .collect();
+    events.sort();
+    events
+}
+
+/// The hook events `folder`'s own Claude Code settings files declare.
+fn project_hook_events(folder: &Path) -> Vec<String> {
+    let mut events: Vec<String> = [SHARED_SETTINGS, LOCAL_SETTINGS]
+        .iter()
+        .flat_map(|name| declared_hook_events(&folder.join(".claude").join(name)))
+        .collect();
+    events.sort();
+    events.dedup();
+    events
+}
+
+/// How many folders [`checkouts_below`] looks at before it stops.
+const MAX_FOLDERS_BELOW: usize = 400;
+
+/// The git checkouts one or two folders below `folder`, in name order. Hidden
+/// folders are skipped and at most [`MAX_FOLDERS_BELOW`] folders are looked
+/// at, so a doctor run in a home directory stays quick.
+fn checkouts_below(folder: &Path) -> Vec<PathBuf> {
+    let children = |dir: &Path| -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
+            })
+            .collect();
+        dirs.sort();
+        dirs
+    };
+    let mut looked_at = 0;
+    let mut found = Vec::new();
+    for child in children(folder) {
+        if looked_at >= MAX_FOLDERS_BELOW {
+            break;
+        }
+        looked_at += 1;
+        if child.join(".git").exists() {
+            found.push(child);
+            continue;
+        }
+        for grandchild in children(&child) {
+            if looked_at >= MAX_FOLDERS_BELOW {
+                break;
+            }
+            looked_at += 1;
+            if grandchild.join(".git").exists() {
+                found.push(grandchild);
+            }
+        }
+    }
+    found
+}
+
+/// SPEC R-DOCTOR.10, from the other side: a session started in a folder that
+/// *holds* checkouts loads none of their project hooks either. Reported when
+/// this folder is in no git checkout, declares no hooks of its own, and a
+/// checkout one or two folders below does. A warning when a hook missed this
+/// way is ahma's own shell hook and the user's settings carry none, since
+/// commands in that checkout then run without the sandbox; otherwise
+/// information, because the project's own hooks are the project's business.
+fn check_hooks_below(home: Option<&Path>, workspace: &Path, out: &mut Vec<Finding>) {
+    // Home kept in git (a dotfiles repository) puts every folder under it
+    // "inside a checkout": that one is no project, as in R-PERM.11.
+    let in_a_checkout = git_root_of(workspace).is_some_and(|root| Some(root.as_path()) != home);
+    if in_a_checkout || !project_hook_events(workspace).is_empty() {
+        return;
+    }
+    let user_has_ahma_hook = home
+        .map(|h| h.join(".claude").join("settings.json"))
+        .is_some_and(|p| matches!(hook_file_coverage(&p), Some((true, _))));
+    let mut declared = Vec::new();
+    let mut unsandboxed = Vec::new();
+    for checkout in checkouts_below(workspace) {
+        let events = project_hook_events(&checkout);
+        if events.is_empty() {
+            continue;
+        }
+        let ahma_hook = ahma_hook_file(&checkout, SHARED_SETTINGS).is_some()
+            || ahma_hook_file(&checkout, LOCAL_SETTINGS).is_some();
+        if ahma_hook && !user_has_ahma_hook {
+            unsandboxed.push(checkout.display().to_string());
+        }
+        declared.push(format!("  {} ({})", checkout.display(), events.join(", ")));
+    }
+    if declared.is_empty() {
+        return;
+    }
+    let sandbox = if unsandboxed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Among them is ahma's shell hook, and your own ~/.claude/settings.json has none, \
+             so a session started here runs shell commands in {} without ahma's sandbox. Run \
+             `ahma hooks install` for a user-level hook that applies everywhere.",
+            unsandboxed.join(", ")
+        )
+    };
+    out.push(Finding {
+        level: if unsandboxed.is_empty() {
+            Level::Info
+        } else {
+            Level::Warn
+        },
+        title: "Hooks of the checkouts below are not loaded by a session started here".into(),
+        detail: format!(
+            "This folder ({}) is not a git checkout, and these checkouts below it declare \
+             Claude Code hooks in their own .claude settings:\n{}\nClaude Code reads a \
+             project's hooks only from the folder a session is started in, so a session \
+             started here runs none of them. Start the session in the checkout it works \
+             on.{sandbox} (SPEC R-DOCTOR.10)",
+            workspace.display(),
+            declared.join("\n"),
         ),
         fix: None,
     });
@@ -2129,6 +2273,100 @@ mod hook_and_grant_tool_tests {
                 .iter()
                 .any(|f| f.title.contains("hooks are not loaded from this folder"))
         );
+    }
+
+    const PROJECT_HOOK: &str = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"scripts/audition-hook unread"}]}]}}"#;
+
+    /// A folder of checkouts: `neubit4/` and `alt/neubit4/` below `dir`.
+    fn folder_of_checkouts(dir: &Path) -> (PathBuf, PathBuf) {
+        let near = dir.join("neubit4");
+        let far = dir.join("alt").join("neubit4");
+        std::fs::create_dir_all(near.join(".git")).unwrap();
+        std::fs::create_dir_all(far.join(".git")).unwrap();
+        (near, far)
+    }
+
+    fn above_finding(findings: &[Finding]) -> Option<&Finding> {
+        findings
+            .iter()
+            .find(|f| f.title.contains("not loaded by a session started here"))
+    }
+
+    /// R-DOCTOR.10 (field case 2026-11-18): a session started in the folder
+    /// that holds the checkouts loads none of their hooks either. A project's
+    /// own hook (one that wakes the agent when its owner answers) silently
+    /// never ran; ahma's sandbox was unaffected, since the user's own settings
+    /// carry its hook, so this is information.
+    #[test]
+    fn doctor_reports_a_session_started_above_checkouts_that_declare_hooks() {
+        let home = tempfile::tempdir().unwrap();
+        write_project_settings(home.path(), "settings.json", AHMA_HOOK);
+        let parent = tempfile::tempdir().unwrap();
+        let (near, far) = folder_of_checkouts(parent.path());
+        write_project_settings(&near, "settings.json", PROJECT_HOOK);
+        write_project_settings(&far, "settings.json", PROJECT_HOOK);
+
+        let findings = run(&input(home.path(), parent.path()));
+        let f = above_finding(&findings).expect("checkouts below with hooks are reported");
+        assert_eq!(f.level, Level::Info);
+        for checkout in [&near, &far] {
+            assert!(
+                f.detail.contains(&checkout.display().to_string()),
+                "names each checkout to start the session in: {}",
+                f.detail
+            );
+        }
+        assert!(
+            f.detail.contains("Stop"),
+            "names the hook events: {}",
+            f.detail
+        );
+    }
+
+    /// When a checkout's hook is ahma's own shell hook and the user's settings
+    /// carry none, a session started above runs that checkout's commands
+    /// outside ahma's sandbox: a warning, with the user-level install.
+    #[test]
+    fn a_session_above_a_checkout_that_misses_ahmas_hook_is_a_warning() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let (near, _far) = folder_of_checkouts(parent.path());
+        write_project_settings(&near, "settings.json", AHMA_HOOK);
+
+        let findings = run(&input(home.path(), parent.path()));
+        let f = above_finding(&findings).expect("reported");
+        assert_eq!(f.level, Level::Warn);
+        assert!(f.detail.contains("without ahma's sandbox"), "{}", f.detail);
+        assert!(f.detail.contains("ahma hooks install"), "{}", f.detail);
+    }
+
+    /// A home directory kept in git (dotfiles) is an ancestor `.git` of every
+    /// folder under it, and is no project: the check still runs below it.
+    #[test]
+    fn a_home_kept_in_git_does_not_hide_the_checkouts_below() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        let parent = home.path().join("github");
+        std::fs::create_dir_all(&parent).unwrap();
+        let (near, _far) = folder_of_checkouts(&parent);
+        write_project_settings(&near, "settings.json", PROJECT_HOOK);
+        assert!(above_finding(&run(&input(home.path(), &parent))).is_some());
+    }
+
+    #[test]
+    fn nothing_is_said_above_checkouts_without_hooks_or_inside_a_checkout() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let (near, _far) = folder_of_checkouts(parent.path());
+        // No hooks declared anywhere: nothing to miss.
+        write_project_settings(&near, "settings.json", r#"{"permissions":{"allow":[]}}"#);
+        assert!(above_finding(&run(&input(home.path(), parent.path()))).is_none());
+        // Inside a checkout the folder's own file is what Claude Code loads.
+        write_project_settings(&near, "settings.json", PROJECT_HOOK);
+        assert!(above_finding(&run(&input(home.path(), &near))).is_none());
+        // The launch folder's own settings file may carry the hooks instead.
+        write_project_settings(parent.path(), "settings.json", PROJECT_HOOK);
+        assert!(above_finding(&run(&input(home.path(), parent.path()))).is_none());
     }
 }
 

@@ -146,18 +146,36 @@ pub(super) fn next_ask(
     .flatten()
 }
 
-/// The question to put before `command` runs in `cwd` when it works in another repository (SPEC
-/// R-PERM.11): the repository, the workspace, and the token a yes carries. `None` when the command
-/// names no other repository, or the human already said yes to it this session, or a human
-/// granted this workspace that repository (a deliberate setup is never asked about). A repository
-/// under a hidden folder (`~/.cargo`, `~/.gradle`) is a tool's cache, not a project, and asks
-/// nothing. Read or write: the point is to ask while the human is still at the keyboard.
-pub(super) fn next_repo_ask(
+/// What happens before a command that names another repository (SPEC R-PERM.11).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RepoStep {
+    /// It works there: ask the human, with the token a yes carries.
+    Ask {
+        repo: PathBuf,
+        workspace: PathBuf,
+        token: String,
+    },
+    /// It only looks there: it runs, and [`repo_read_note`] says so once a session.
+    Read { repo: PathBuf, workspace: PathBuf },
+}
+
+/// What to do before `command` runs in `cwd` when it names another repository (SPEC R-PERM.11).
+/// `None` when the command names no other repository, or the human already said yes to it this
+/// session, or a human granted this workspace that repository (a deliberate setup is never asked
+/// about). A repository under a hidden folder (`~/.cargo`, `~/.gradle`) is a tool's cache, not a
+/// project, and asks nothing.
+///
+/// A command that moves into the repository (`cd`, `-C`) or may write asks, while the human is
+/// still at the keyboard. A line that can only look ([`crate::adapter::lane::only_looks`]: every
+/// program a plain reader, none able to write or run another program through its arguments),
+/// naming the repository as a plain argument, is a lookup and not work there:
+/// [`RepoStep::Read`].
+pub(super) fn next_repo_step(
     cwd: &Path,
     session_id: &str,
     command: &str,
     persistent: &[PersistentScope],
-) -> Option<(PathBuf, PathBuf, String)> {
+) -> Option<RepoStep> {
     use ahma_common::scope_grant::{GRANTED_BY_HARNESS_DIALOG, grant_applies, other_repository};
     let dir = harness_asks::default_dir()?;
     let workspace = workspace_for(cwd);
@@ -185,20 +203,55 @@ pub(super) fn next_repo_ask(
             })
     };
     let asks = harness_asks::load(&dir, &workspace, now);
-    let repo = harness_asks::command_paths(command, cwd, home.as_deref())
+    let named: Vec<(PathBuf, bool)> = harness_asks::command_folders(command, cwd, home.as_deref())
         .into_iter()
-        .filter_map(|p| {
-            let existing = p.ancestors().find(|a| a.exists())?;
-            other_repository(existing, &workspace, home.as_deref())
+        .filter_map(|f| {
+            let existing = f.path.ancestors().find(|a| a.exists())?;
+            let repo = other_repository(existing, &workspace, home.as_deref())?;
+            Some((repo, f.entered))
         })
-        .find(|repo| {
+        .filter(|(repo, _)| {
             !hidden(repo)
                 && !granted_by_a_human(repo)
                 && !harness_asks::repo_acknowledged(&asks, session_id, repo)
-        })?;
-    let token =
-        harness_asks::mark_repo_asked(&dir, &workspace, session_id, &repo, command, now).ok()?;
-    Some((repo, workspace, token))
+        })
+        .collect();
+    let only_reads = crate::adapter::lane::only_looks(command);
+    let works_there = named
+        .iter()
+        .find(|(_, entered)| *entered || !only_reads)
+        .map(|(repo, _)| repo.clone());
+    if let Some(repo) = works_there {
+        let token =
+            harness_asks::mark_repo_asked(&dir, &workspace, session_id, &repo, command, now)
+                .ok()?;
+        return Some(RepoStep::Ask {
+            repo,
+            workspace,
+            token,
+        });
+    }
+    let (repo, _) = named.into_iter().next()?;
+    Some(RepoStep::Read { repo, workspace })
+}
+
+/// The one line said before the first plain read of another repository in a harness session
+/// (SPEC R-PERM.11), `None` every later time: the read runs either way, and a note on every
+/// command would be the noise the dialog was.
+pub(super) fn repo_read_note(repo: &Path, workspace: &Path, session_id: &str) -> Option<String> {
+    let dir = harness_asks::default_dir()?;
+    let now = ahma_common::session_grants::now_secs();
+    let first = harness_asks::note_repo_read(&dir, workspace, session_id, repo, now).ok()?;
+    let home = ahma_common::config::ahma_home_dir();
+    first.then(|| {
+        format!(
+            "ahma: this command reads {repo}, a different repository from this session's {ws}. \
+             Plain reads there are not asked about. A `cd` into it, or a command that may write, \
+             asks the human first.",
+            repo = display_path(repo, home.as_deref()),
+            ws = display_path(workspace, home.as_deref()),
+        )
+    })
 }
 
 /// The dialog text before a command that works in another repository (SPEC R-PERM.11): a few
@@ -1066,7 +1119,7 @@ mod tests {
             note: None,
             expires_at: None,
         });
-        let cmd = format!("ls {}", elsewhere.display());
+        let cmd = format!("cd {} && ls", elsewhere.display());
         assert!(matches!(
             decide_with(&cmd, &granted),
             HooksDecision::AllowRewrite { .. }
@@ -1075,6 +1128,101 @@ mod tests {
             matches!(token_of(decide(&cmd)), (_, _)),
             "ungranted, it asks"
         );
+    }
+
+    /// SPEC R-PERM.11 (field case 2026-11-18): a session in `~/github/neubit4` ran
+    /// `ls /Volumes/T7/github/neubit4/analysis_results/…`, a lookup in another checkout, and the
+    /// owner was stopped by a dialog for it in every session. A line ahma can prove only reads,
+    /// and that names the other repository as a plain argument, asks nothing: it runs, and the
+    /// first one of a session carries one line saying so. Moving in (`cd`, `-C`) or a command
+    /// that may write still asks.
+    #[test]
+    fn a_plain_read_of_another_repository_runs_with_a_note_instead_of_a_dialog() {
+        use super::super::{
+            HookEnvironment, HookPlatform, HookScope, HooksDecision, HooksExecArgs,
+            ask_first_if_refused_before, compute_exec_decision_internal,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("home-neubit4");
+        let other = tmp.path().join("t7-neubit4");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join("analysis_results")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let other = dunce::canonicalize(&other).unwrap();
+        let env = HookEnvironment {
+            home_dir: tmp.path().join("home"),
+            project_root: ws.clone(),
+            current_exe: PathBuf::from("/usr/local/bin/ahma"),
+        };
+        let args = HooksExecArgs {
+            platform: HookPlatform::Claude,
+            scope: HookScope::Project,
+            managed_id: super::super::MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
+        };
+        let cfg = crate::shell::cli::AppConfig::default();
+        let decide = |command: &str| {
+            let input = serde_json::json!({
+                "session_id": "session-reads",
+                "cwd": ws.display().to_string(),
+                "tool_input": { "command": command }
+            });
+            let d = compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+            ask_first_if_refused_before(d, &input, &args, &env, &cfg)
+        };
+        let note_of = |d: HooksDecision| match d {
+            HooksDecision::AllowRewrite { disclosure, .. } => disclosure,
+            _ => panic!("a plain read runs without a dialog"),
+        };
+
+        let data = other.join("analysis_results");
+        // A Windows path is written with `\`, which the classifier does not read as a plain
+        // word, so a lookup there still asks: the relaxation is for lines ahma can read.
+        if cfg!(not(windows)) {
+            let note = note_of(decide(&format!("ls {}", data.display())))
+                .expect("the first plain read of a session says where it reads");
+            assert!(note.contains(&other.display().to_string()), "{note}");
+            assert!(note.contains("different repository"), "{note}");
+            assert!(note.contains("not asked about"), "{note}");
+            assert!(
+                note_of(decide(&format!("grep -rn x {} | head -3", data.display()))).is_none(),
+                "said once per session, not on every command"
+            );
+        }
+
+        // Moving in is what a task typed into the wrong terminal does: still a dialog,
+        // also when the `cd` sits behind an assignment or a keyword, or goes where a
+        // variable says.
+        for moves_in in [
+            format!("cd {} && ls", other.display()),
+            format!("git -C {} status", other.display()),
+            format!("X=1 cd {} && git status", other.display()),
+            format!("if cd {}; then git status; fi", other.display()),
+            format!("for r in {}; do cd $r && git log -1; done", other.display()),
+        ] {
+            assert!(
+                matches!(decide(&moves_in), HooksDecision::AskGrant { .. }),
+                "{moves_in}"
+            );
+        }
+        // So is anything that may write or run a program, wherever it does: a copy, and a
+        // reader whose own arguments can write a file or name a program to run.
+        let d = data.display();
+        for may_write in [
+            format!("cp {d}/a.json ."),
+            format!("sort -o {d}/a.json {d}/a.json"),
+            format!("sed -Ei s/a/b/ {d}/a.json"),
+            format!("uniq a.json {d}/b.json"),
+            format!("env -i {d}/release.sh"),
+            format!("awk -f {d}/x.awk {d}/a.json"),
+            format!("LD_PRELOAD=x ls {d}"),
+            format!("ls {d} > {d}/listing"),
+        ] {
+            assert!(
+                matches!(decide(&may_write), HooksDecision::AskGrant { .. }),
+                "{may_write}"
+            );
+        }
     }
 
     /// SPEC R-PERM.11 (field case 2026-11-15): two clones of one remote

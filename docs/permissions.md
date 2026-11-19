@@ -87,9 +87,16 @@ saved grant on a path where nothing exists (SPEC R-PERM.10.3). **No** runs nothi
 ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).
 
 **Another repository is different** (SPEC R-PERM.11). A command that works in a git
-repository other than the session's own — `cd ../other-repo && …`, `git -C`, an absolute
-path into it — asks first, read or write, because the usual reason is a task typed into
-the wrong terminal. **No** stops that command (the next one there asks again); **Yes** lets
+repository other than the session's own asks first, because the usual reason is a task
+typed into the wrong terminal: one that moves into it (`cd ../other-repo && …`, `git -C`),
+read or write, and one that names a path in it and may write (`cp /other-repo/a .`). A
+command that only looks there — `ls /other-repo/data`, `grep -r x /other-repo/src | head`,
+every program a plain reader and the repository a plain argument — runs without a
+question; the first one of a session says so in one line. "Only looks" is strict: a
+program that could write or run another program through its own arguments still asks
+(`sed`, `awk`, `sort -o`, `env <program>`, anything under `NAME=value`), so does a `cd`
+behind a keyword or to a variable (`if cd …`, `cd $dir`), and so does a Windows path
+written with backslashes. **No** stops that command (the next one there asks again); **Yes** lets
 the session keep working there and grants nothing. The prompt names both repositories by
 path (two clones of one remote count as two repositories) and ends with the command that
 stops the asking for routine reads, which you type once:

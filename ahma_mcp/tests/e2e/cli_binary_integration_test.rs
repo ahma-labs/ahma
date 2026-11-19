@@ -1142,8 +1142,18 @@ mod settings_set_tests {
         );
         assert!(out.status.success(), "{out:?}");
         let stdout = String::from_utf8_lossy(&out.stdout);
+        // R-CFG10.8: the values, then what the change means and how to undo it.
         assert!(
-            stdout.contains("tools.timeout_secs: 1800 -> 90000"),
+            stdout.contains("tools.timeout_secs changed in")
+                && stdout.contains("  was: 1800\n  now: 90000\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Where it applies: only an ahma started with `--settings-path"),
+            "a file named with --path reaches nothing else: {stdout}"
+        );
+        assert!(
+            stdout.contains("To undo: ahma settings unset --path"),
             "{stdout}"
         );
         let text = std::fs::read_to_string(&file).unwrap();

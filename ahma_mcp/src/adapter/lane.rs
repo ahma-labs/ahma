@@ -707,10 +707,33 @@ pub fn classify_shell_command(command: &str) -> Lane {
     }
 }
 
+/// Whether `command` can only look (SPEC R-PERM.11): the read-only verdict of
+/// [`classify_shell_command`], and no program in it could write a file or run
+/// another program through its own arguments or under an assignment
+/// (`writes_through_args`: `sort -o`, `sed`, `awk`, `env <program>`,
+/// `LD_PRELOAD=… ls`). The read-only lane may admit those because the kernel
+/// refuses the write there; a line let past a question has no such net.
+pub fn only_looks(command: &str) -> bool {
+    matches!(
+        read_line(command),
+        Some((line, reading))
+            if line.writes.is_empty()
+                && reading.tee_files.is_empty()
+                && reading.syncs.is_none()
+                && !reading.writes_through_args
+    )
+}
+
 /// The `[tools] long_running` entry `command` is (SPEC R2.7.10): a line that is
 /// exactly one plain command — no list, pipe, redirection or substitution, so
 /// nothing can ride along without the lease — starting with the entry's
 /// command as whole words.
+///
+/// How the command is reached does not change which command it is: any number
+/// of leading `cd <dir>` steps may come first, and the program may be named by
+/// a longer path that ends in the entry's (`./scripts/audition`,
+/// `/repo/scripts/audition` for `scripts/audition`). A session started above
+/// its checkout can write the line no other way.
 pub fn long_running_entry<'a>(
     command: &str,
     entries: &'a [ahma_common::config::LongRunningCommand],
@@ -723,21 +746,38 @@ pub fn long_running_entry<'a>(
         return None;
     }
     let line = parse_line(&lifted)?;
-    let [seg] = line.segs.as_slice() else {
-        return None;
-    };
     if !line.writes.is_empty() {
         return None;
     }
-    let joined = seg.join(" ");
+    let (seg, leading) = line.segs.split_last()?;
+    if !leading.iter().all(|s| s.len() == 2 && s[0] == "cd") {
+        return None;
+    }
     entries.iter().find(|e| {
-        let want = e.command.trim();
-        !want.is_empty()
-            && (joined == want
-                || joined
-                    .strip_prefix(want)
-                    .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+        let want: Vec<&str> = e.command.split_whitespace().collect();
+        let Some((program, args)) = want.split_first() else {
+            return false;
+        };
+        seg.len() >= want.len()
+            && same_program(&seg[0], program)
+            && seg[1..want.len()]
+                .iter()
+                .map(String::as_str)
+                .eq(args.iter().copied())
     })
+}
+
+/// Whether `written` names the program `declared`: the same words, or a longer
+/// path whose last components are `declared`'s (`./x/run` and `/repo/x/run`
+/// for `x/run`; never `ax/run`).
+fn same_program(written: &str, declared: &str) -> bool {
+    // `X=/scripts/audition cargo build` runs `cargo`: an assignment is never
+    // the program, however its value ends.
+    !is_assignment(written)
+        && (written == declared
+            || written
+                .strip_suffix(declared)
+                .is_some_and(|before| before.ends_with('/') || before.ends_with('\\')))
 }
 
 /// Why a command line takes its turn in the workspace queue, in words an agent
@@ -768,8 +808,32 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     let mut reading = Reading::default();
     for seg in &line.segs {
         if read_one_segment(seg, &mut reading).is_none() {
+            // The project's own program is the one case with a way out, and
+            // only a human may take it (SPEC R2.7.10): say what to ask for.
+            let way_out = project_program(seg, site.cwd)
+                .filter(|program| !program.contains(char::is_whitespace))
+                .map(|program| {
+                    // The entry matches the command only as a line of its own
+                    // (R2.7.10): advice this line could never use would be
+                    // given again on every retry.
+                    let entry = [ahma_common::config::LongRunningCommand {
+                        command: program.clone(),
+                        timeout_secs: None,
+                    }];
+                    let alone = if long_running_entry(command, &entry).is_some() {
+                        ""
+                    } else {
+                        ", when it is run by itself, with nothing piped or chained to it"
+                    };
+                    format!(
+                        ". If it never writes this workspace, a human can let it skip the \
+                         queue{alone}: add `{{command='{program}'}}` to `tools.long_running` \
+                         (`ahma settings explain tools.long_running` says how)"
+                    )
+                })
+                .unwrap_or_default();
             return format!(
-                "`{}` may write (it is not a command ahma knows only reads)",
+                "`{}` may write (it is not a command ahma knows only reads){way_out}",
                 segment_head(seg)
             );
         }
@@ -816,6 +880,27 @@ fn unparsed_construct(command: &str) -> Option<char> {
         i += 1;
     }
     None
+}
+
+/// The program a segment runs, when it is the project's own: named by a
+/// relative path (`scripts/x`, `./scripts/x`) or by a path under `cwd`, as a
+/// `[tools] long_running` entry would name it. `None` for a bare name (a
+/// program on `PATH`), a path elsewhere, or one the shell would expand.
+fn project_program(seg: &Segment, cwd: &Path) -> Option<String> {
+    let words: Vec<&String> = seg
+        .iter()
+        .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+        .collect();
+    let program = words.get(wrapper_len(&words))?.as_str();
+    if program.contains(['$', '`', '~', '*', '?', '\'']) {
+        return None;
+    }
+    let relative = match Path::new(program).strip_prefix(cwd) {
+        Ok(under) => under.to_string_lossy().into_owned(),
+        Err(_) if Path::new(program).is_absolute() => return None,
+        Err(_) => program.trim_start_matches("./").to_string(),
+    };
+    relative.contains(['/', '\\']).then_some(relative)
 }
 
 /// A segment's command, as an agent would name it: its program and first
@@ -2899,6 +2984,50 @@ mod queue_reason_tests {
         assert!(nested.contains("another sandbox"), "{nested}");
     }
 
+    /// SPEC R2.7.4 (field case 2026-11-18): `scripts/audition unread`, which
+    /// writes one file outside the workspace, waited 20 minutes behind the
+    /// agent's own test run. The notice said why and not what to do, so the
+    /// agent never learned the project's own program can be declared. A line
+    /// held for a project program names the way out; a system program or a
+    /// construct ahma cannot read has none to name.
+    #[test]
+    fn a_line_held_for_a_project_program_names_the_way_out() {
+        for cmd in [
+            "scripts/audition unread",
+            "cd /Volumes/T7/github/neubit4 && scripts/audition unread 2>&1 | tail -30",
+            "./scripts/audition ask r1",
+        ] {
+            let reason = why(cmd, true);
+            assert!(reason.contains("scripts/audition"), "{cmd}: {reason}");
+            assert!(
+                reason.contains("{command='scripts/audition'}"),
+                "{cmd}: {reason}"
+            );
+            assert!(reason.contains("tools.long_running"), "{cmd}: {reason}");
+            assert!(reason.contains("a human"), "{cmd}: {reason}");
+        }
+        // The entry only matches the command run by itself (R2.7.10). Advice
+        // that the line as written could never use would be given again on
+        // every retry, so a line with something piped or chained says so.
+        let alone = why("cd /repo && scripts/audition unread", true);
+        assert!(!alone.contains("by itself"), "{alone}");
+        for cmd in [
+            "cd /repo && scripts/audition unread 2>&1 | tail -30",
+            "scripts/audition unread && cargo fmt",
+            "scripts/audition unread > out.txt",
+        ] {
+            let reason = why(cmd, true);
+            assert!(
+                reason.contains("run by itself, with nothing piped or chained"),
+                "{cmd}: {reason}"
+            );
+        }
+        for cmd in ["cargo fmt", "git commit -m x", "somebinary --flag"] {
+            let reason = why(cmd, true);
+            assert!(!reason.contains("long_running"), "{cmd}: {reason}");
+        }
+    }
+
     /// SPEC R2.7.10: a declared long-running command matches only as a whole
     /// line of its own, never a line that chains something after it.
     #[test]
@@ -2922,9 +3051,93 @@ mod queue_reason_tests {
             "scripts/audition ask | tee log",
             "scripts/audition ask > log",
             "scripts/audition ask $(touch f)",
-            "cd x && scripts/audition ask",
         ] {
             assert!(long_running_entry(cmd, &entries).is_none(), "{cmd}");
+        }
+    }
+
+    /// SPEC R2.7.10 (field case 2026-11-18): a session started in the folder above its
+    /// checkout sends every line as `cd <checkout> && scripts/audition ask …`, and another
+    /// names the script by its full path. Neither matched the declared `scripts/audition`, so
+    /// the day-long wait held the workspace and every build queued behind it. A leading `cd`
+    /// and the path the program is reached by change where the command runs, not which
+    /// command it is.
+    #[test]
+    fn a_long_running_entry_matches_however_the_program_is_reached() {
+        use ahma_common::config::LongRunningCommand;
+        let entries = vec![LongRunningCommand {
+            command: "scripts/audition".into(),
+            timeout_secs: Some(86400),
+        }];
+        for cmd in [
+            "scripts/audition unread",
+            "./scripts/audition unread",
+            "/Volumes/T7/github/neubit4/scripts/audition ask 'auditions/r 1'",
+            "neubit4/scripts/audition ask r1",
+            "cd /Volumes/T7/github/neubit4 && scripts/audition ask r1",
+            "cd /Volumes/T7/github && cd neubit4 && ./scripts/audition ask r1 2>&1",
+        ] {
+            assert_eq!(
+                long_running_entry(cmd, &entries).and_then(|e| e.timeout_secs),
+                Some(86400),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            // Another program whose name only ends the same way.
+            "myscripts/audition ask",
+            "scripts/audition-hook unread",
+            // Something else rides along: before it, after it, or in the `cd`.
+            "cd x && cargo fmt && scripts/audition ask",
+            "cd x && scripts/audition ask && cargo fmt",
+            "cd $(touch f) && scripts/audition ask",
+            "cd x y && scripts/audition ask",
+            "cd x",
+            // An assignment whose value only ends like the entry: the program
+            // is the word after it, and that is not the declared one.
+            "X=/scripts/audition cargo build --release",
+            "cd x && X=/scripts/audition rm -rf target",
+            "X=1 scripts/audition ask",
+        ] {
+            assert!(long_running_entry(cmd, &entries).is_none(), "{cmd}");
+        }
+        let serve = vec![LongRunningCommand {
+            command: "make serve".into(),
+            timeout_secs: None,
+        }];
+        assert!(long_running_entry("X=/make serve", &serve).is_none());
+    }
+
+    /// SPEC R-PERM.11: "only looks" is narrower than the read-only lane. The
+    /// lane may admit a program that could write through its own arguments,
+    /// because the kernel refuses the write there; a line that is let past a
+    /// question has no such net, so it must be unable to write or to run
+    /// another program at all.
+    #[test]
+    fn only_looks_refuses_what_could_write_or_run_a_program() {
+        for cmd in [
+            "ls /other/repo/data",
+            "grep -rn x /other/repo/src | head -3",
+            "cat /other/repo/a.json | jq .name",
+            "git log -1 --oneline",
+            "cd sub && ls /other/repo",
+        ] {
+            assert!(only_looks(cmd), "{cmd}");
+        }
+        for cmd in [
+            "sort -o /other/repo/f /other/repo/f",
+            "sed -Ei s/a/b/ /other/repo/Cargo.toml",
+            "uniq a /other/repo/b",
+            "env -i /other/repo/scripts/release.sh",
+            "awk -f /other/repo/x.awk /other/repo/data",
+            "LD_PRELOAD=/other/repo/x.so ls /other/repo",
+            "ls /other/repo > /other/repo/listing",
+            "ls /other/repo | tee /other/repo/listing",
+            "cp /other/repo/a .",
+            "/other/repo/scripts/release.sh",
+            "ls $(touch /other/repo/f)",
+        ] {
+            assert!(!only_looks(cmd), "{cmd}");
         }
     }
 }

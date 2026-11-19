@@ -333,6 +333,24 @@ impl ShellSplitter {
 /// command that works in another repository; what it misses is asked about at the first
 /// refusal, as before.
 pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    command_folders(command, cwd, home)
+        .into_iter()
+        .map(|f| f.path)
+        .collect()
+}
+
+/// One folder a shell line names ([`command_folders`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedFolder {
+    pub path: PathBuf,
+    /// The line moves into it (`cd <dir>`, `-C <dir>`) and runs from there, where a plain
+    /// argument (`ls <dir>`) only looks at it. Moving in is what a task typed into the wrong
+    /// terminal does first (SPEC R-PERM.11).
+    pub entered: bool,
+}
+
+/// [`command_paths`], with how each folder is named: moved into, or passed as an argument.
+pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<NamedFolder> {
     let expand = |word: &str, base: &Path| -> Option<PathBuf> {
         if word.is_empty() || word.contains(['$', '`', '*', '?', '[']) {
             return None;
@@ -346,8 +364,20 @@ pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Path
         };
         Some(path)
     };
+    // A word that only frames the command after it: a loop or conditional keyword, or a
+    // `NAME=value` assignment. `if cd /repo; then …` and `X=1 cd /repo` move in all the same.
+    let frames = |word: &str| {
+        matches!(
+            word,
+            "until" | "while" | "if" | "elif" | "then" | "else" | "do" | "!" | "time"
+        ) || word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
     let mut paths = Vec::new();
     let mut here = cwd.to_path_buf();
+    // A `cd` whose target cannot be read (`cd $r`, `cd -`) may go to any folder the line names.
+    let mut moves_somewhere_unread = false;
     #[cfg(windows)]
     let segments = literal_segments(command);
     #[cfg(not(windows))]
@@ -356,26 +386,51 @@ pub fn command_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Path
         let mut words = segment.iter().map(String::as_str).peekable();
         let mut first = true;
         while let Some(word) = words.next() {
+            if first && frames(word) {
+                continue;
+            }
             if first && word == "cd" {
-                if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
-                    here = target.clone();
-                    paths.push(target);
+                match words.next() {
+                    Some(t) if t != "-" => match expand(t, &here) {
+                        Some(target) => {
+                            here = target.clone();
+                            paths.push(NamedFolder {
+                                path: target,
+                                entered: true,
+                            });
+                        }
+                        None => moves_somewhere_unread = true,
+                    },
+                    Some(_) => moves_somewhere_unread = true,
+                    // `cd` alone goes home, which is no repository (R-PERM.11).
+                    None => {}
                 }
                 break;
             }
             first = false;
             if word == "-C" {
-                if let Some(target) = words.next().and_then(|t| expand(t, &here)) {
-                    paths.push(target);
+                if let Some(path) = words.next().and_then(|t| expand(t, &here)) {
+                    paths.push(NamedFolder {
+                        path,
+                        entered: true,
+                    });
                 }
             } else if (word.starts_with('/')
                 || Path::new(word).is_absolute()
                 || word == "~"
                 || word.starts_with("~/"))
-                && let Some(p) = expand(word, &here)
+                && let Some(path) = expand(word, &here)
             {
-                paths.push(p);
+                paths.push(NamedFolder {
+                    path,
+                    entered: false,
+                });
             }
+        }
+    }
+    if moves_somewhere_unread {
+        for folder in &mut paths {
+            folder.entered = true;
         }
     }
     paths
@@ -936,6 +991,36 @@ pub struct WorkspaceAsks {
     /// The yeses to them, per harness session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos_acknowledged: Vec<RepoAck>,
+    /// Other repositories a plain read was let through with a one-line note, per harness
+    /// session, so the note is said once (SPEC R-PERM.11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_noted: Vec<RepoAck>,
+}
+
+/// Record that a plain read of `repo` from this workspace was noted in `session_id`. `true` the
+/// first time: the note is said once per harness session, never on every command.
+pub fn note_repo_read(
+    dir: &Path,
+    workspace: &Path,
+    session_id: &str,
+    repo: &Path,
+    now: u64,
+) -> Result<bool> {
+    update(dir, workspace, now, |asks| {
+        if asks
+            .repos_noted
+            .iter()
+            .any(|a| a.session_id == session_id && a.repo == repo)
+        {
+            return false;
+        }
+        asks.repos_noted.push(RepoAck {
+            session_id: session_id.to_string(),
+            repo: repo.to_path_buf(),
+            at: now,
+        });
+        true
+    })
 }
 
 /// Whether the human said yes, in `session_id`, to this workspace working in `repo`.
@@ -1232,6 +1317,8 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
     asks.repos_asked
         .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
     asks.repos_acknowledged
+        .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
+    asks.repos_noted
         .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
 }
 
@@ -1659,6 +1746,26 @@ mod tests {
         );
         assert!(p("cargo build && ls src").is_empty());
         assert!(p("ls $HOME/x /w/*/y `pwd`").is_empty());
+        // Moving into a folder is told apart from looking at it (SPEC R-PERM.11).
+        let entered = |c: &str| -> Vec<bool> {
+            command_folders(c, cwd, home)
+                .iter()
+                .map(|f| f.entered)
+                .collect()
+        };
+        assert_eq!(entered("cd /w/neubit4 && ls /w/other"), [true, false]);
+        assert_eq!(entered("git -C /w/neubit4 status"), [true]);
+        assert_eq!(entered("ls /w/neubit4/rust ~/notes"), [false, false]);
+        // A `cd` behind an assignment or a shell keyword moves in all the same.
+        assert_eq!(entered("X=1 cd /w/neubit4 && git status"), [true]);
+        assert_eq!(entered("if cd /w/neubit4; then git status; fi"), [true]);
+        assert_eq!(entered("ls /w/other; ! cd /w/neubit4"), [false, true]);
+        // A `cd` whose target cannot be read may go to any folder the line names.
+        assert_eq!(
+            entered("for r in /w/a /w/b; do cd $r && git log -1; done"),
+            [true, true]
+        );
+        assert_eq!(entered("ls /w/other && cd - && git status"), [true]);
         // A heredoc is a POSIX shell's; on Windows the line is split literally.
         #[cfg(not(windows))]
         assert!(
