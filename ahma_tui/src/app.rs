@@ -2396,22 +2396,26 @@ fn handle_intro_key(key: crossterm::event::KeyEvent, state: &mut crate::state::A
     true
 }
 
-/// Offer `key` to every overlay and editor that takes keys, topmost first: the
-/// order matches `ui::draw`, so the overlay a key reaches is the one on screen.
-/// The trust and doctor questions are drawn over grant questions; grant
-/// questions are drawn over help, settings and every other modal (SPEC
+/// Offer `key` to every overlay that takes keys, topmost first, in the order
+/// `ui::draw` stacks them (`state::OVERLAYS_TOP_FIRST`), so the overlay a key
+/// reaches is the one on screen: grant questions over help and settings (SPEC
 /// R-PERM.3.10), so Esc denies a grant instead of closing help beneath it.
+/// Then the inline tool approval, then the chat input.
 fn handle_overlay_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
-    handle_trust_key(key, state)
-        || handle_doctor_confirm_key(key, state)
-        || handle_scope_grant_key(key, state)
-        || handle_web_approval_key(key, state)
-        || handle_settings_key(key, state)
-        || handle_setup_key(key, state)
-        || handle_help_key(key, state)
-        || handle_picker_key(key, state)
-        || handle_intro_key(key, state)
-        || handle_approval_key(key, state)
+    use crate::state::{OVERLAYS_TOP_FIRST, Overlay};
+    OVERLAYS_TOP_FIRST.into_iter().any(|overlay| match overlay {
+        Overlay::DoctorConfirm => handle_doctor_confirm_key(key, state),
+        Overlay::Trust => handle_trust_key(key, state),
+        Overlay::ScopeGrant => handle_scope_grant_key(key, state),
+        Overlay::WebApproval => handle_web_approval_key(key, state),
+        Overlay::Setup => handle_setup_key(key, state),
+        Overlay::Settings => handle_settings_key(key, state),
+        Overlay::Modal => {
+            handle_help_key(key, state)
+                || handle_picker_key(key, state)
+                || handle_intro_key(key, state)
+        }
+    }) || handle_approval_key(key, state)
         || handle_chat_input_key(key, state)
 }
 
@@ -9084,6 +9088,33 @@ mod tests {
         assert!(super::handle_overlay_key(esc, &mut state));
         assert!(state.web_approval.is_none(), "Esc denied the web question");
         assert!(state.settings_editor.open);
+    }
+
+    /// With the trust question and a doctor fix both open, the key answers the
+    /// one drawn on top. The doctor's question was drawn over the trust one
+    /// while the trust one took the keys first, so a `y` meant for the visible
+    /// fix trusted the folder underneath. Drawing and key order now read one
+    /// list (`state::OVERLAYS_TOP_FIRST`).
+    #[test]
+    fn the_question_on_top_is_the_one_a_key_answers() {
+        use crate::state::{AppState, Overlay};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.trust_prompt = Some("/work/repo".to_string());
+        state.doctor_confirm = Some(ahma_common::doctor::Fix::RemoveMissingScopes(Vec::new()));
+        assert_eq!(state.top_overlay(), Some(Overlay::DoctorConfirm));
+        assert!(super::handle_overlay_key(esc, &mut state));
+        assert!(
+            state.doctor_confirm.is_none(),
+            "Esc answered the visible fix"
+        );
+        assert!(
+            state.trust_prompt.is_some(),
+            "the trust question underneath is untouched"
+        );
+        assert_eq!(state.top_overlay(), Some(Overlay::Trust));
     }
 
     /// The mouse wheel scrolls an open grant question's body, wherever the

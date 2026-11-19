@@ -432,20 +432,25 @@ pub(crate) fn display_label(info: &InstanceInfo) -> String {
 
 /// Shorten a scope path for the header line: home-relative (`~/...`) when possible,
 /// preserving meaningful workspace paths unless they exceed the column budget.
+/// `path` with `home` written as `~`, when `path` is `home` or lies under it.
+/// Compared at a folder boundary: `/Users/paulx` is not under `/Users/paul`.
+/// `None` when it is not under home, or no home is known.
+pub(crate) fn home_relative(path: &str, home: &str) -> Option<String> {
+    let home = home.trim_end_matches(['/', '\\']);
+    if home.is_empty() {
+        return None;
+    }
+    let rest = path.strip_prefix(home)?;
+    (rest.is_empty() || rest.starts_with(['/', '\\'])).then(|| format!("~{rest}"))
+}
+
 pub(crate) fn short_path(p: &str) -> String {
     if p.is_empty() {
         return String::new();
     }
     let normalized = p.replace('\\', "/");
     let home = std::env::var("HOME").unwrap_or_default().replace('\\', "/");
-    let home_trimmed = home.trim_end_matches('/');
-    let path = if !home_trimmed.is_empty()
-        && (normalized == home_trimmed || normalized.starts_with(&format!("{}/", home_trimmed)))
-    {
-        format!("~{}", &normalized[home_trimmed.len()..])
-    } else {
-        normalized
-    };
+    let path = home_relative(&normalized, &home).unwrap_or(normalized);
 
     if path.chars().count() <= 40 {
         return path;
