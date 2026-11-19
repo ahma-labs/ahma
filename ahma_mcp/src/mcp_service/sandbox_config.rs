@@ -228,10 +228,10 @@ impl AhmaMcpService {
             // this process: keep the hub's token first (SPEC R-HUB.13.2).
             ahma_common::hub::preload_hub_token(&ahma_common::hub::default_socket_path());
             if let Err(e) = crate::sandbox::enforce_landlock_sandbox(
-                &self.adapter.sandbox().scopes(),
-                &self.adapter.sandbox().read_scopes(),
-                self.adapter.sandbox().is_no_temp_files(),
-                self.adapter.sandbox().package_cache_write(),
+                &self
+                    .adapter
+                    .sandbox()
+                    .kernel_policy(crate::sandbox::WorkspaceAccess::ReadWrite),
             ) {
                 tracing::error!(
                     "FATAL: Failed to enforce Landlock sandbox: {}. \

@@ -1,41 +1,15 @@
 use anyhow::Result;
-use std::path::PathBuf;
 
-/// Build the Landlock ruleset for the given scopes without applying it.
+/// Build the Landlock ruleset for `policy` without applying it.
 ///
 /// Shared by [`enforce_landlock_sandbox`] (process-level, `restrict_self`) and
 /// [`landlock_ruleset_fd`] (spawn-time, applied in the child via `pre_exec`).
+/// A read-only workspace (`policy.access`) is granted **read and execute
+/// only**, its git storage too: the kernel half of the read-only lane (SPEC
+/// R2.7.4). Everything outside the workspace (system paths, toolchain
+/// profiles, temp) is granted as the policy says.
 #[cfg(target_os = "linux")]
-fn build_landlock_ruleset(
-    scopes: &[PathBuf],
-    read_scopes: &[PathBuf],
-    no_temp_files: bool,
-    package_cache_write: bool,
-    connect_tcp_port: Option<u16>,
-) -> Result<landlock::RulesetCreated> {
-    build_landlock_ruleset_with(
-        scopes,
-        read_scopes,
-        no_temp_files,
-        package_cache_write,
-        connect_tcp_port,
-        true,
-    )
-}
-
-/// [`build_landlock_ruleset`] with the scope access chosen: `scopes_writable =
-/// false` grants the workspace scopes (and their git storage) **read and
-/// execute only** — the kernel half of the read-only lane (SPEC R2.7.4).
-/// Everything outside the workspace (system paths, toolchain profiles, temp)
-/// is granted exactly as for an ordinary command.
-fn build_landlock_ruleset_with(
-    scopes: &[PathBuf],
-    read_scopes: &[PathBuf],
-    no_temp_files: bool,
-    package_cache_write: bool,
-    connect_tcp_port: Option<u16>,
-    scopes_writable: bool,
-) -> Result<landlock::RulesetCreated> {
+fn build_landlock_ruleset(policy: &super::KernelPolicy) -> Result<landlock::RulesetCreated> {
     use anyhow::Context;
     use landlock::{
         ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -62,7 +36,7 @@ fn build_landlock_ruleset_with(
     // confined to the egress proxy port. Best-effort by default: on kernels < 6.7
     // (Landlock ABI < V4) this access is silently dropped and only the filesystem
     // rules enforce, so older kernels degrade to the advisory tier without error.
-    if connect_tcp_port.is_some() {
+    if policy.connect_tcp_port.is_some() {
         builder = builder
             .handle_access(AccessNet::ConnectTcp)
             .context("Failed to handle Landlock TCP-connect access")?;
@@ -87,23 +61,24 @@ fn build_landlock_ruleset_with(
     // this ruleset can carve out (the opt-in `sandbox::deny_tier` namespace
     // holds it with a read-only mount instead). Refusing unverified dirs is
     // what bounds it.
-    let mut all_scopes = scopes.to_vec();
+    let scopes = &policy.workspace;
+    let mut all_scopes = scopes.clone();
     let grants = super::exec_config::grantable_git_dirs(scopes, scopes);
     super::exec_config::report_refusals(&grants.refused);
+    let (scope_access, granted) = if policy.access.is_writable() {
+        (access_all, "read/write")
+    } else {
+        (access_read, "read-only")
+    };
     for git_dir in grants.rule_paths() {
         if !all_scopes.contains(&git_dir) {
             tracing::warn!(
-                "sandbox: granting read/write to git storage outside the workspace scope: {}",
+                "sandbox: granting {granted} access to git storage outside the workspace scope: {}",
                 git_dir.display()
             );
             all_scopes.push(git_dir);
         }
     }
-    let scope_access = if scopes_writable {
-        access_all
-    } else {
-        access_read
-    };
     for scope in &all_scopes {
         ruleset = ruleset
             .add_rule(PathBeneath::new(
@@ -114,7 +89,7 @@ fn build_landlock_ruleset_with(
     }
 
     // Add explicit read_scopes target files (for --livelog)
-    for read_scope in read_scopes {
+    for read_scope in &policy.read_only {
         if let Ok(fd) = PathFd::new(read_scope) {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(fd, access_read))
@@ -123,10 +98,15 @@ fn build_landlock_ruleset_with(
     }
 
     add_landlock_system_rules(&mut ruleset, access_read)?;
-    add_landlock_profile_rules(&mut ruleset, access_read, access_all, package_cache_write)?;
+    add_landlock_profile_rules(
+        &mut ruleset,
+        access_read,
+        access_all,
+        policy.package_cache_write,
+    )?;
     add_landlock_client_config_rules(&mut ruleset, access_read)?;
 
-    if !no_temp_files {
+    if policy.temp_writable {
         add_landlock_temp_rules(&mut ruleset, access_all)?;
     }
 
@@ -136,7 +116,7 @@ fn build_landlock_ruleset_with(
     // `HTTP_PROXY` cannot reach the internet directly. Port-only (Landlock cannot
     // filter by address) and TCP-only — see the README network limits. A no-op on
     // kernels where the access was dropped above.
-    if let Some(port) = connect_tcp_port {
+    if let Some(port) = policy.connect_tcp_port {
         ruleset = ruleset
             .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
             .context("Failed to add Landlock TCP-connect rule for the egress proxy")?;
@@ -155,26 +135,19 @@ fn build_landlock_ruleset_with(
 /// enforcement in [`landlock_ruleset_fd`] / [`apply_landlock_ruleset_in_child`];
 /// this process-level call is defense-in-depth for the server itself.
 #[cfg(target_os = "linux")]
-pub fn enforce_landlock_sandbox(
-    scopes: &[PathBuf],
-    read_scopes: &[PathBuf],
-    no_temp_files: bool,
-    package_cache_write: bool,
-) -> Result<()> {
+pub fn enforce_landlock_sandbox(policy: &super::KernelPolicy) -> Result<()> {
     use anyhow::Context;
 
     tracing::info!("Enforcing Landlock sandbox (process level)");
+    let scopes = &policy.workspace;
 
     // The server process itself keeps full network: it *runs* the egress proxy,
     // which must connect out to real destinations. The TCP-connect restriction is
     // applied only to spawned children (see `landlock_ruleset_fd`).
-    let ruleset = build_landlock_ruleset(
-        scopes,
-        read_scopes,
-        no_temp_files,
-        package_cache_write,
-        None,
-    )?;
+    let ruleset = build_landlock_ruleset(&super::KernelPolicy {
+        connect_tcp_port: None,
+        ..policy.clone()
+    })?;
 
     // SPEC R6.1.7: a child inherits the Landlock domain of the thread that
     // forks it, and a task inside a domain may not mount — so restricting this
@@ -225,8 +198,8 @@ pub fn enforce_landlock_sandbox(
     Ok(())
 }
 
-/// Build a Landlock ruleset for the given scopes and return its file
-/// descriptor, for spawn-time enforcement in a child process.
+/// Build the Landlock ruleset for `policy` and return its file descriptor,
+/// for spawn-time enforcement in a child process.
 ///
 /// Because `landlock_restrict_self(2)` only restricts the calling thread,
 /// process-level enforcement from inside an async runtime does not cover
@@ -240,42 +213,8 @@ pub fn enforce_landlock_sandbox(
 /// ruleset creation yields no fd). Strict-mode server startup independently
 /// fails closed via `check_sandbox_prerequisites`.
 #[cfg(target_os = "linux")]
-pub fn landlock_ruleset_fd(
-    scopes: &[PathBuf],
-    read_scopes: &[PathBuf],
-    no_temp_files: bool,
-    package_cache_write: bool,
-    connect_tcp_port: Option<u16>,
-) -> Result<Option<std::os::fd::OwnedFd>> {
-    let ruleset = build_landlock_ruleset(
-        scopes,
-        read_scopes,
-        no_temp_files,
-        package_cache_write,
-        connect_tcp_port,
-    )?;
-    Ok(ruleset.into())
-}
-
-/// Like [`landlock_ruleset_fd`], but the workspace scopes are read-only: the
-/// ruleset for a read-lane command (SPEC R2.7.4). Package-cache writes are
-/// never granted here.
-#[cfg(target_os = "linux")]
-pub fn landlock_read_only_ruleset_fd(
-    scopes: &[PathBuf],
-    read_scopes: &[PathBuf],
-    no_temp_files: bool,
-    connect_tcp_port: Option<u16>,
-) -> Result<Option<std::os::fd::OwnedFd>> {
-    let ruleset = build_landlock_ruleset_with(
-        scopes,
-        read_scopes,
-        no_temp_files,
-        false,
-        connect_tcp_port,
-        false,
-    )?;
-    Ok(ruleset.into())
+pub fn landlock_ruleset_fd(policy: &super::KernelPolicy) -> Result<Option<std::os::fd::OwnedFd>> {
+    Ok(build_landlock_ruleset(policy)?.into())
 }
 
 /// Apply a previously built Landlock ruleset fd to the current (child) process.
@@ -428,12 +367,7 @@ fn add_landlock_temp_rules(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn enforce_landlock_sandbox(
-    _scopes: &[PathBuf],
-    _read_scopes: &[PathBuf],
-    _no_temp_files: bool,
-    _package_cache_write: bool,
-) -> Result<()> {
+pub fn enforce_landlock_sandbox(_policy: &super::KernelPolicy) -> Result<()> {
     Ok(())
 }
 
@@ -452,11 +386,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let scopes = vec![dir.path().to_path_buf()];
         // Some(port): the R-NET child restriction path.
-        landlock_ruleset_fd(&scopes, &[], true, false, Some(34567))
-            .expect("ruleset with a connect-tcp restriction must build");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: scopes.clone(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: false,
+            package_cache_write: false,
+            connect_tcp_port: Some(34567),
+        })
+        .expect("ruleset with a connect-tcp restriction must build");
         // None: the unrestricted path must keep working too.
-        landlock_ruleset_fd(&scopes, &[], true, false, None)
-            .expect("unrestricted ruleset must build");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: scopes.clone(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: false,
+            package_cache_write: false,
+            connect_tcp_port: None,
+        })
+        .expect("unrestricted ruleset must build");
     }
 
     /// The `scopes` loop in `build_landlock_ruleset` must handle both the
@@ -466,15 +414,29 @@ mod tests {
     fn ruleset_fd_builds_with_multiple_and_empty_scopes() {
         // Empty scopes: the `for scope in scopes` loop body never runs, but
         // construction must still succeed (system/home rules are unaffected).
-        landlock_ruleset_fd(&[], &[], true, false, None)
-            .expect("empty scopes must still build a valid ruleset");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: Vec::new(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: false,
+            package_cache_write: false,
+            connect_tcp_port: None,
+        })
+        .expect("empty scopes must still build a valid ruleset");
 
         // Multiple scopes: exercise more than one loop iteration.
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
         let scopes = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
-        landlock_ruleset_fd(&scopes, &[], true, false, None)
-            .expect("multiple scopes must build a valid ruleset");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: scopes.clone(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: false,
+            package_cache_write: false,
+            connect_tcp_port: None,
+        })
+        .expect("multiple scopes must build a valid ruleset");
     }
 
     /// Explicit `read_scopes` (used by `--livelog`) must get a read-only
@@ -493,8 +455,15 @@ mod tests {
         // rather than erroring the whole ruleset build.
         let read_scopes = vec![readable_dir.path().to_path_buf(), missing_path];
 
-        landlock_ruleset_fd(&scopes, &read_scopes, true, false, None)
-            .expect("ruleset with a valid + missing read scope must still build");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: scopes.clone(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: read_scopes.clone(),
+            temp_writable: false,
+            package_cache_write: false,
+            connect_tcp_port: None,
+        })
+        .expect("ruleset with a valid + missing read scope must still build");
     }
 
     /// When `no_temp_files` is false, `add_landlock_temp_rules` must run and
@@ -507,8 +476,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let scopes = vec![dir.path().to_path_buf()];
 
-        landlock_ruleset_fd(&scopes, &[], false, false, None)
-            .expect("ruleset with temp files enabled must build");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: scopes.clone(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: true,
+            package_cache_write: false,
+            connect_tcp_port: None,
+        })
+        .expect("ruleset with temp files enabled must build");
     }
 
     /// Serialize tests in this module that mutate process-wide `HOME` /
@@ -559,8 +535,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let scopes = vec![dir.path().to_path_buf()];
 
-        landlock_ruleset_fd(&scopes, &[], true, true, None)
-            .expect("ruleset with package_cache_write=true must build");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: scopes.clone(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: false,
+            package_cache_write: true,
+            connect_tcp_port: None,
+        })
+        .expect("ruleset with package_cache_write=true must build");
 
         // `pre_create_package_cache_paths` must have created the writable
         // dirs/files so the Landlock `PathFd::new()` calls could succeed.
@@ -591,8 +574,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let scopes = vec![dir.path().to_path_buf()];
 
-        landlock_ruleset_fd(&scopes, &[], true, false, None)
-            .expect("ruleset must build when HOME has toolchain dirs present");
+        landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: scopes.clone(),
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: false,
+            package_cache_write: false,
+            connect_tcp_port: None,
+        })
+        .expect("ruleset must build when HOME has toolchain dirs present");
     }
 
     /// Passing an invalid ruleset fd must fail, not silently succeed.

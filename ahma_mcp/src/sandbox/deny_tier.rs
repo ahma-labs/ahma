@@ -963,9 +963,15 @@ mod tests {
             let _mode = ModeGuard::set(LinuxDenyTier::Namespace);
             let sandbox = strict_sandbox(ws.path());
             let scope = dunce::canonicalize(ws.path()).unwrap();
-            let Some(fd) =
-                crate::sandbox::landlock_ruleset_fd(&[scope], &[], false, false, None).unwrap()
-            else {
+            let Some(fd) = crate::sandbox::landlock_ruleset_fd(&crate::sandbox::KernelPolicy {
+                workspace: vec![scope],
+                access: crate::sandbox::WorkspaceAccess::ReadWrite,
+                read_only: Vec::new(),
+                temp_writable: true,
+                package_cache_write: false,
+                connect_tcp_port: None,
+            })
+            .unwrap() else {
                 eprintln!("Skipping test: Landlock unavailable on this kernel");
                 return;
             };
