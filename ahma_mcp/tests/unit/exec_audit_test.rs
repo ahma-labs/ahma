@@ -281,6 +281,73 @@ async fn the_synchronous_path_records_a_failed_command() {
     assert_eq!(complete["success"], false);
 }
 
+/// A command that gave up waiting for its `tools.mutex_groups` gate is
+/// published `Failed`, so its audit record says `failed`: the operation's
+/// state and its audit record are two views of one end. The record used to
+/// say `timed_out` while the operation said `Failed`.
+#[tokio::test]
+async fn a_mutex_gate_that_gives_up_is_audited_as_the_operation_ended() {
+    use ahma_mcp::adapter::mutex_groups::CommandMutexRegistry;
+    use ahma_mcp::operation_monitor::OperationStatus;
+    let (_dir, scope) = scope_dir();
+    let locks = tempfile::tempdir().expect("lock dir");
+    let group = ahma_common::config::MutexGroupConfig {
+        name: "echo".to_string(),
+        prefixes: vec!["echo".to_string()],
+        max_wait_secs: 0,
+    };
+    let registry = Arc::new(CommandMutexRegistry::from_config_with_lock_dir(
+        std::slice::from_ref(&group),
+        Some(locks.path().to_path_buf()),
+    ));
+    audit_log_path();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+    )));
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![scope.to_path_buf(), std::env::temp_dir()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .expect("test sandbox"),
+    );
+    let adapter = Adapter::new_with_registry(
+        monitor.clone(),
+        Arc::new(ShellPoolManager::new(ShellPoolConfig::default())),
+        sandbox,
+        registry.clone(),
+    )
+    .expect("adapter");
+    // Another echo holds the group in this workspace.
+    let _held = registry
+        .acquire(&group, &adapter.workspace_key_for(&scope))
+        .await
+        .expect("the group is free");
+
+    let op_id = dispatch_echo_with_args(&adapter, &scope, vec![json!("hi")]).await;
+    let op = monitor
+        .wait_for_operation(&op_id)
+        .await
+        .expect("the operation ends");
+    assert_eq!(op.state, OperationStatus::Failed, "{:?}", op.result);
+    assert!(
+        wait_until(|events| events
+            .iter()
+            .any(|e| e["operation_id"] == op_id.as_str() && e["type"] == "tool_complete"))
+        .await,
+        "the end is recorded"
+    );
+    let complete = events_for(&op_id)
+        .await
+        .into_iter()
+        .find(|e| e["type"] == "tool_complete")
+        .expect("tool_complete");
+    assert_eq!(complete["outcome"], "failed", "{complete}");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Redaction
 // ─────────────────────────────────────────────────────────────────────────────

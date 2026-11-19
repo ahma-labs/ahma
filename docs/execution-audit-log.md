@@ -99,8 +99,10 @@ Written on every terminal path: exit, failure, timeout, cancellation.
 }
 ```
 
-`outcome` is one of `completed`, `failed`, `timed_out`, `cancelled`. `exit_code`
-is absent when the process was killed rather than allowed to exit.
+`outcome` is one of `completed`, `failed`, `timed_out`, `cancelled`, and is always the
+state the operation itself ended in: a command that gave up waiting for its
+`tools.mutex_groups` gate ended `Failed`, so it is `failed` here. `exit_code` is absent
+when the process was killed rather than allowed to exit.
 
 ### `trust_handoff_disclosure`
 
