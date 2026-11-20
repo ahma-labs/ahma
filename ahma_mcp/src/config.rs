@@ -515,6 +515,48 @@ pub struct SubcommandConfig {
     pub concurrency: Option<crate::adapter::workspace_queue::Lane>,
 }
 
+/// The JSON type of an MTDF option or argument: the one reading of its `type`
+/// text, for the tool schema a client is given, the argument processor and
+/// `ahma tool validate` alike. The text itself stays as written in the tool
+/// file, which is what [`CommandOption::option_type`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionType {
+    String,
+    Boolean,
+    Integer,
+    Number,
+    Array,
+}
+
+impl OptionType {
+    /// The canonical spellings, the ones `ahma tool validate` accepts.
+    pub const CANONICAL: [&'static str; 5] = ["string", "boolean", "integer", "number", "array"];
+
+    /// How a tool's `type` text is read: a canonical spelling, the shorthands
+    /// `bool` and `int`, and anything else as a string (which loads, and which
+    /// `ahma tool validate` flags).
+    pub fn read(spelling: &str) -> Self {
+        match spelling {
+            "boolean" | "bool" => Self::Boolean,
+            "integer" | "int" => Self::Integer,
+            "number" => Self::Number,
+            "array" => Self::Array,
+            _ => Self::String,
+        }
+    }
+
+    /// The JSON Schema `type`.
+    pub fn as_json(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Boolean => "boolean",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::Array => "array",
+        }
+    }
+}
+
 /// Configuration for a single command-line option.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -536,6 +578,13 @@ pub struct CommandOption {
     pub file_flag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+}
+
+impl CommandOption {
+    /// The option's type, read once for every surface ([`OptionType::read`]).
+    pub fn kind(&self) -> OptionType {
+        OptionType::read(&self.option_type)
+    }
 }
 
 /// Schema details for array items.
