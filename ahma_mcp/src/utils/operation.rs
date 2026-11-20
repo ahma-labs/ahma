@@ -69,6 +69,21 @@ pub fn id_generation(id: &str) -> Option<&str> {
     tagged.then_some(generation)
 }
 
+/// The next number from this process's one operation counter. Every source of
+/// operation ids draws from it: the adapter, the tool service and the
+/// sequence runner each kept a counter of their own, and two of them could
+/// issue the same `op_<generation>_<n>_<details>` for the same command.
+pub fn next_operation_number() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A new operation id for `tool_name` running `command`: the one way an id is
+/// minted ([`next_operation_number`]).
+pub fn mint_id(tool_name: &str, command: &str) -> String {
+    generate_id_with_details(next_operation_number(), tool_name, command)
+}
+
 /// Formats a descriptive operation ID from this process's [`generation`], the
 /// monotonically increasing counter value, the tool name and the command string.
 pub fn generate_id_with_details(counter_val: u64, tool_name: &str, command: &str) -> String {

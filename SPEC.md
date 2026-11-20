@@ -524,7 +524,7 @@ drops work — and it is built so that no crash, kill or power loss can leave it
 ### R3: Performance
 
 - **R3.1**: Command dispatch **must** stay low-latency via direct sandboxed spawns; the budget is enforced by the `latency_guard_test` benchmarks.
-- **R3.2**: Persistent shell sessions (opt-in via `session_id`) are tracked per session and automatically cleaned up on shutdown.
+- **R3.2**: Persistent shell sessions (opt-in via `session_id`) are tracked per session and automatically cleaned up on shutdown. A call **must** ask for a session or a terminal (`pty: true`), not both: a terminal inside a session is not supported, so such a call is refused with the reason (`ShellRunner::from_args`), rather than run in the session without the terminal it asked for.
 
 ### R4: JSON Schema Validation
 

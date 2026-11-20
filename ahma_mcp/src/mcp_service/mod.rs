@@ -68,10 +68,7 @@ use rmcp::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 use tracing;
 use tracing::Instrument as _;
 
@@ -85,8 +82,6 @@ use crate::{
     operation_monitor::Operation,
 };
 use serde_json::Value;
-
-pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How long a `tools/call` waits for an in-flight sandbox configuration to
 /// settle before proceeding anyway (SPEC R5.1.2).
@@ -2471,9 +2466,7 @@ impl AhmaMcpService {
         context: RequestContext<RoleServer>,
         execution_mode: crate::adapter::ExecutionMode,
     ) -> Result<CallToolResult, McpError> {
-        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id =
-            crate::utils::operation::generate_id_with_details(counter_val, tool_name, base_command);
+        let id = crate::utils::operation::mint_id(tool_name, base_command);
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
 
@@ -2612,7 +2605,10 @@ impl AhmaMcpService {
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let params_map = params.arguments.clone().unwrap_or_default();
-        let op_id = format!("livelog_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        let op_id = format!(
+            "livelog_{}",
+            crate::utils::operation::next_operation_number()
+        );
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         self.register_progress_if_requested(
