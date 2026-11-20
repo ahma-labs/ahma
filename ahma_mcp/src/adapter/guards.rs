@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use super::{PublishEnding, audit, finish_handoff_watch, workspace_queue};
-use crate::operation_monitor::OperationMonitor;
+use crate::operation_monitor::{OperationMonitor, Terminal};
 use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch};
 
 /// What a running command holds until it has ended: its place in the
@@ -84,7 +84,11 @@ impl RunGuards {
     /// trail, before the workspace is handed on, so another command's writes
     /// cannot be counted as this one's. The workspace is then free before
     /// anyone can observe the operation as ended (SPEC R2.7.1).
-    pub(super) async fn end(self, monitor: &OperationMonitor, ending: impl PublishEnding) {
+    ///
+    /// A run that stopped because its token was signalled ends `Cancelled`;
+    /// when a cancel or the watchdog asked for that, the ending they asked for
+    /// is published instead, with its own reason and kind.
+    pub(super) async fn end(self, monitor: &OperationMonitor, ending: Terminal) {
         let Self {
             op_id,
             subject,
@@ -109,6 +113,10 @@ impl RunGuards {
         #[cfg(unix)]
         drop(broker);
         drop(lease);
+        let ending = match ending {
+            Terminal::Cancelled(_) => monitor.take_stop_request(&op_id).await.unwrap_or(ending),
+            other => other,
+        };
         let (outcome, exit_code) = ending.publish(monitor, &op_id).await;
         audit::record_tool_complete(
             &op_id,

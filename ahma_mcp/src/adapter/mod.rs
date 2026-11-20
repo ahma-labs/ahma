@@ -608,6 +608,8 @@ impl Adapter {
         op_id: &str,
         task: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
+        // The task ends the operation, so a cancel asks it to (SPEC R2.7.1).
+        self.monitor.ends_by_task(op_id).await;
         let handles = self.task_handles.clone();
         let id = op_id.to_string();
         let mut registered = self.task_handles.lock().await;
@@ -623,16 +625,15 @@ impl Adapter {
     pub async fn shutdown(&self) {
         tracing::info!("Adapter shutdown initiated: cancelling operations and aborting tasks");
 
-        // 1) Cancel all known operations tracked by this adapter (best-effort)
+        // 1) Cancel all known operations tracked by this adapter (best-effort),
+        //    together: each cancel waits for its task to end the operation.
         {
-            let handles = self.task_handles.lock().await;
-            for op_id in handles.keys() {
-                let reason = Some("Adapter shutdown".to_string());
-                let _ = self
-                    .monitor
-                    .cancel_operation_with_reason(op_id, reason)
-                    .await;
-            }
+            let ids: Vec<String> = self.task_handles.lock().await.keys().cloned().collect();
+            futures::future::join_all(ids.iter().map(|op_id| {
+                self.monitor
+                    .cancel_operation_with_reason(op_id, Some("Adapter shutdown".to_string()))
+            }))
+            .await;
         }
 
         // 2) Drain handles then give each task a grace period before aborting
