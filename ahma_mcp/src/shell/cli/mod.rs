@@ -2176,8 +2176,8 @@ pub enum SandboxCommand {
         /// Record what asked for this scope (e.g. a tool name), for auditing.
         #[arg(long = "by", value_name = "WHO")]
         by: Option<String>,
-        /// Free-form note explaining why this scope exists.
-        #[arg(long = "note", value_name = "TEXT")]
+        /// Free-form note explaining why this scope exists. Not with `--session`, which writes nothing down.
+        #[arg(long = "note", value_name = "TEXT", conflicts_with = "session")]
         note: Option<String>,
         /// Grant it as a lease that stops applying after this long (`30m`, `8h`, `7d`, `2w`): the right tier for anything outside the project you need for a task, not forever. `ahma sandbox list` shows when it ends and `ahma sandbox renew` extends it.
         #[arg(long = "for", value_name = "DURATION", conflicts_with = "session")]
@@ -5518,6 +5518,30 @@ mod tests {
                 "{key} is not recorded: {recorded:?}"
             );
         }
+    }
+
+    /// A session grant records no note (it is never written down), so asking
+    /// for one is refused rather than silently dropped.
+    #[test]
+    fn a_session_grant_with_a_note_is_refused() {
+        let err = Cli::try_parse_from([
+            "ahma",
+            "sandbox",
+            "grant",
+            "/tmp/x",
+            "--session",
+            "--note",
+            "why",
+        ])
+        .expect_err("--session --note is refused");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{err}"
+        );
+        assert!(
+            Cli::try_parse_from(["ahma", "sandbox", "grant", "/tmp/x", "--note", "why"]).is_ok()
+        );
     }
 
     #[test]

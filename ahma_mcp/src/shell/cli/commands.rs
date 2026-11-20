@@ -742,6 +742,9 @@ fn run_sandbox_grant(file: &std::path::Path, req: GrantRequest) -> Result<()> {
         }
         GrantLifetime::Persistent { lease_secs } => lease_secs,
     };
+    // One instant for what is stored and what is printed: computing it twice
+    // could show an end a second off the one saved.
+    let expires_at = lease_secs.map(|secs| ahma_common::config::unix_now() + secs);
 
     let outcome = ahma_common::scope_grant::persist_grant(
         file,
@@ -754,7 +757,7 @@ fn run_sandbox_grant(file: &std::path::Path, req: GrantRequest) -> Result<()> {
             surface: "cli",
             live_scopes: &live_scopes,
             workspace: workspace.as_deref(),
-            expires_at: lease_secs.map(|secs| ahma_common::config::unix_now() + secs),
+            expires_at,
         },
     )?;
 
@@ -776,7 +779,7 @@ fn run_sandbox_grant(file: &std::path::Path, req: GrantRequest) -> Result<()> {
         Some(ws) => println!("Bound to workspace: {}", ws.display()),
         None => println!("GLOBAL: applies to every workspace on this machine."),
     }
-    if let Some(line) = lease_line(lease_secs.map(|s| ahma_common::config::unix_now() + s)) {
+    if let Some(line) = lease_line(expires_at) {
         println!("{line}");
     }
     println!("Recorded in: {}", file.display());
