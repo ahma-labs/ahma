@@ -377,6 +377,8 @@ mod unix {
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
         let mut collected = crate::adapter::BoundedLineCollector::default();
         let deadline = tokio::time::Instant::now() + limit;
+        // Warned once at 80% of the limit, as a piped command is (SPEC R2.6.6).
+        let mut near_limit = crate::adapter::time_limit::NearLimit::starting_now(limit);
 
         let exit_status: Option<i32> = loop {
             tokio::select! {
@@ -389,14 +391,16 @@ mod unix {
                     return Terminal::Cancelled("Operation was cancelled".to_string());
                 }
 
+                _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
+                    monitor.append_alert(op_id, near_limit.alert()).await;
+                }
+
                 _ = tokio::time::sleep_until(deadline) => {
                     tracing::warn!("PTY operation {} timed out", op_id);
                     killer.kill();
                     spill_writer.finish().await;
-                    let duration_ms = start_time.elapsed().as_millis() as u64;
-                    return Terminal::TimedOut(format!(
-                        "Operation timed out after {duration_ms}ms (exceeded timeout limit)"
-                    ));
+                    // Says how to raise the limit, as the piped path does (SPEC R2.6.6).
+                    return crate::adapter::timed_out(start_time.elapsed().as_millis() as u64);
                 }
 
                 line = line_rx.recv() => {

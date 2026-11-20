@@ -48,6 +48,41 @@ pub(crate) fn near_limit(limit_secs: u64) -> String {
     )
 }
 
+/// The once-only near-limit warning (SPEC R2.6.6) of one running command,
+/// shared by the piped, PTY and session loops so none of them can lose it.
+pub(crate) struct NearLimit {
+    at: tokio::time::Instant,
+    limit_secs: u64,
+    warned: bool,
+}
+
+impl NearLimit {
+    /// Warn at 80% of `limit`, measured from now.
+    pub(crate) fn starting_now(limit: std::time::Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + limit.mul_f64(0.8),
+            limit_secs: limit.as_millis().div_ceil(1000) as u64,
+            warned: false,
+        }
+    }
+
+    /// When to warn.
+    pub(crate) fn at(&self) -> tokio::time::Instant {
+        self.at
+    }
+
+    /// Not warned yet: the `select!` arm's precondition.
+    pub(crate) fn pending(&self) -> bool {
+        !self.warned
+    }
+
+    /// The alert, and the warning is spent.
+    pub(crate) fn alert(&mut self) -> String {
+        self.warned = true;
+        near_limit(self.limit_secs)
+    }
+}
+
 /// Where the limit lives and how to raise it.
 pub(crate) fn how_to_raise(limit_secs: u64) -> String {
     format!(

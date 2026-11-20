@@ -2567,6 +2567,9 @@ async fn run_session_operation(
 ) -> Terminal {
     let mut spill_writer = spill::SpillWriter::create(op_id).await;
     let mut collected = BoundedLineCollector::default();
+    // Warned once at 80% of the limit, as a piped command is (SPEC R2.6.6).
+    // The session enforces the limit itself (`ShellSession::execute_streaming`).
+    let mut near_limit = time_limit::NearLimit::starting_now(timeout);
 
     // The session protocol streams lines through a sync callback; forward
     // them over a channel so the async side can append/spill as they arrive.
@@ -2600,6 +2603,10 @@ async fn run_session_operation(
                 sessions.remove_session(session_id).await;
                 spill_writer.finish().await;
                 return Terminal::Cancelled("Operation was cancelled".to_string());
+            }
+
+            _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
+                monitor.append_alert(op_id, near_limit.alert()).await;
             }
 
             line = line_rx.recv() => {
@@ -2644,8 +2651,9 @@ fn finalize_session_result(
             session_id: Some(session_id.to_string()),
             ..collected.merged_output(exit_code, op_id)
         })),
-        Err(e @ crate::shell_session::SessionError::TimedOut(_)) => {
-            Terminal::TimedOut(e.to_string())
+        // Says how to raise the limit, as the piped path does (SPEC R2.6.6).
+        Err(crate::shell_session::SessionError::TimedOut(limit)) => {
+            timed_out(limit.as_millis() as u64)
         }
         Err(e) => Terminal::Failed(e.to_string()),
     }
@@ -2728,8 +2736,7 @@ async fn execute_with_streaming(
     let timeout_deadline = tokio::time::Instant::now() + limit;
     // Warn once at 80% of the limit (SPEC R2.6.6), so a healthy job near it
     // is not stopped without notice.
-    let near_limit_at = tokio::time::Instant::now() + limit.mul_f64(0.8);
-    let mut warned_near_limit = false;
+    let mut near_limit = time_limit::NearLimit::starting_now(limit);
 
     let mut still_running_interval = tokio::time::interval(Duration::from_secs(10));
     still_running_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2779,11 +2786,8 @@ async fn execute_with_streaming(
                 return;
             }
 
-            _ = tokio::time::sleep_until(near_limit_at), if !warned_near_limit => {
-                warned_near_limit = true;
-                op_monitor
-                    .append_alert(op_id, time_limit::near_limit(limit.as_millis().div_ceil(1000) as u64))
-                    .await;
+            _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
+                op_monitor.append_alert(op_id, near_limit.alert()).await;
             }
 
             // Timeout
