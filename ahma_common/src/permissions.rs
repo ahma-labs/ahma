@@ -1366,8 +1366,8 @@ pub fn setting_audit_entry(
     surface: &str,
     file: &str,
     key: &str,
-    before: &str,
-    after: &str,
+    before: Option<&str>,
+    after: Option<&str>,
 ) -> AuditEntry {
     fn shown(key: &str, value: &str) -> String {
         const LIMIT: usize = 160;
@@ -1379,11 +1379,11 @@ pub fn setting_audit_entry(
             value.to_string()
         }
     }
-    let action = if after == "(unset)" {
-        AuditAction::Revoke
-    } else {
-        AuditAction::Grant
+    let action = match after {
+        None => AuditAction::Revoke,
+        Some(_) => AuditAction::Grant,
     };
+    let text = |v: Option<&str>| v.unwrap_or(crate::config::UNSET_TEXT).to_string();
     audit_entry(
         at,
         action,
@@ -1391,8 +1391,8 @@ pub fn setting_audit_entry(
         key,
         Some(format!(
             "{file}: {} -> {}",
-            shown(key, before),
-            shown(key, after)
+            shown(key, &text(before)),
+            shown(key, &text(after))
         )),
         GrantTier::Always,
         Some(surface.to_string()),
@@ -1437,8 +1437,8 @@ mod tests {
             "cli",
             "project",
             "tools.timeout_secs",
-            "1800",
-            "3600",
+            Some("1800"),
+            Some("3600"),
         );
         assert_eq!(e.kind, GrantKind::Setting);
         assert_eq!(e.action, AuditAction::Grant);
@@ -1455,8 +1455,8 @@ mod tests {
             "tui",
             "user",
             "tools.context_length",
-            "8192",
-            "(unset)",
+            Some("8192"),
+            None,
         );
         assert_eq!(unset.action, AuditAction::Revoke);
 
@@ -1465,8 +1465,8 @@ mod tests {
             "cli",
             "user",
             "auth.require_token",
-            "\"hunter2\"",
-            "\"s3cret\"",
+            Some("\"hunter2\""),
+            Some("\"s3cret\""),
         );
         let line = serde_json::to_string(&secret).unwrap();
         assert!(
@@ -1475,7 +1475,7 @@ mod tests {
         );
 
         let long = "x".repeat(500);
-        let cut = setting_audit_entry("t", "cli", "user", "instance.label", "a", &long);
+        let cut = setting_audit_entry("t", "cli", "user", "instance.label", Some("a"), Some(&long));
         assert!(cut.access.unwrap().chars().count() < 200);
 
         assert!(!GrantKind::Setting.is_persisted());

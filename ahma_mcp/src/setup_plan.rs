@@ -502,10 +502,11 @@ fn validate_set(
         risk: setting_risk(key),
         preview: format!(
             "{key}: {} -> {} ({scope} settings)",
-            preview.edit.before, preview.edit.after
+            preview.edit.before_text(),
+            preview.edit.after_text()
         ),
-        undo: undo_command(file, key, &preview.edit.before),
-        already: preview.edit.before == preview.edit.after,
+        undo: undo_command(file, key, preview.edit.before.as_deref()),
+        already: !preview.edit.changed(),
     })
 }
 
@@ -716,17 +717,21 @@ fn write_setting(
 ) -> Result<String> {
     let path = env.file(file).map_err(|r| anyhow::anyhow!("{r}"))?;
     let edit = AhmaSettings::set_in_file_as(file, path, key, raw)?;
-    if edit.before != edit.after {
+    if edit.changed() {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
             now,
             surface,
             file.label(),
             key,
-            &edit.before,
-            &edit.after,
+            edit.before.as_deref(),
+            edit.after.as_deref(),
         ));
     }
-    Ok(format!("{key}: {} -> {}", edit.before, edit.after))
+    Ok(format!(
+        "{key}: {} -> {}",
+        edit.before_text(),
+        edit.after_text()
+    ))
 }
 
 /// Turn a detector's finding into a proposal.
