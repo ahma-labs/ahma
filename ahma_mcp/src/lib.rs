@@ -52,7 +52,7 @@
 //!     // 1. Operation tracking, the default command timeout, and the sandbox
 //!     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(300))));
 //!     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-//!     let sandbox = Arc::new(Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, false)?);
+//!     let sandbox = Arc::new(Sandbox::new(Vec::new(), SandboxMode::Strict, Default::default())?);
 //!
 //!     // 2. Create the execution adapter (with default cargo mutex group)
 //!     let mutex_groups = ahma_common::config::default_mutex_groups();

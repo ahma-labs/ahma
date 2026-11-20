@@ -1072,9 +1072,7 @@ mod tests {
         let sandbox = Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("sandbox must build")
         .with_explicit_scopes(explicit)

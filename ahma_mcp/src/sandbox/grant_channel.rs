@@ -1064,9 +1064,7 @@ mod tests {
         super::super::Sandbox::new(
             vec![scope.to_path_buf()],
             super::super::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
     }

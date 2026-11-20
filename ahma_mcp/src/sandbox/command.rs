@@ -780,9 +780,7 @@ mod tests {
         let sandbox = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_package_cache_write(true);
@@ -799,9 +797,7 @@ mod tests {
         Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
     }
@@ -1245,9 +1241,7 @@ mod tests {
         let sandbox = Sandbox::new(
             vec![td.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let result = sandbox.create_command("echo", &["hi".to_string()], td.path());

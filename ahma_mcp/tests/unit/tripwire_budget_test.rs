@@ -394,7 +394,7 @@ async fn a_session_with_a_build_edits_and_an_escape_stays_within_its_tripwire_bu
 
     // Strict, so `validate_path` really refuses (Test mode skips it). Nothing
     // is spawned on this server: every call is refused before it runs.
-    let sandbox = Sandbox::new(vec![ws.clone()], SandboxMode::Strict, false, false, false)?;
+    let sandbox = Sandbox::new(vec![ws.clone()], SandboxMode::Strict, Default::default())?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
     let client = RecordingClient::new("claude-code").with_elicitation(Some("deny"));

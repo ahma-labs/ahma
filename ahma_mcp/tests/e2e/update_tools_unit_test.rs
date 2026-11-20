@@ -30,9 +30,7 @@ async fn make_service(initial_configs: HashMap<String, ToolConfig>) -> AhmaMcpSe
         Sandbox::new(
             vec![std::env::temp_dir()],
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

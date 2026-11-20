@@ -203,9 +203,7 @@ async fn test_service_with_configs() {
         Sandbox::new(
             vec![_temp.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

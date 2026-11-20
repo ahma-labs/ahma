@@ -16,9 +16,7 @@ fn adapter_in(dir: &std::path::Path, monitor: Arc<OperationMonitor>) -> Arc<Adap
         Sandbox::new(
             vec![dir.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

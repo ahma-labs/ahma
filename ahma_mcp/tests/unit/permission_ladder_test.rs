@@ -60,9 +60,7 @@ fn test_sandbox(scope: &Path) -> Sandbox {
     Sandbox::new(
         vec![scope.to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap()
 }

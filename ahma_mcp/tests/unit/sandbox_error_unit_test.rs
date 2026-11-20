@@ -202,9 +202,7 @@ fn test_validate_path_triggers_format_scopes_multiple_scopes() {
     let sandbox = Sandbox::new(
         vec![scope1.path().to_path_buf(), scope2.path().to_path_buf()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 

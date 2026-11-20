@@ -1158,9 +1158,7 @@ mod tests {
         sandbox::Sandbox::new(
             vec![scope.to_path_buf()],
             sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
     }
@@ -1178,9 +1176,7 @@ mod tests {
         let sb = sandbox::Sandbox::new(
             vec![tmp.path().to_path_buf()],
             sandbox::SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let name = sandbox_mode_name(&sb);

@@ -861,9 +861,7 @@ mod tests {
             Sandbox::new(
                 vec![ws.to_path_buf()],
                 SandboxMode::Strict,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap()
         }

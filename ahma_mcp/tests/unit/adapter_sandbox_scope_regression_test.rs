@@ -18,9 +18,7 @@ async fn adapter_uses_global_sandbox_scope_not_adapter_root_path() {
         Sandbox::new(
             vec![temp_dir.path().to_path_buf()],
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -83,9 +81,7 @@ async fn adapter_sync_denial_on_symlinked_target_returns_runtime_denial() {
         Sandbox::new(
             vec![ws_canon.clone()],
             ahma_mcp::sandbox::SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -175,9 +171,7 @@ async fn adapter_sync_refused_setuid_exec_is_a_note_not_a_grant() {
         Sandbox::new(
             vec![ws_canon.clone()],
             ahma_mcp::sandbox::SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

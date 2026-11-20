@@ -53,6 +53,7 @@ pub mod hostname;
 pub mod http_retry;
 pub mod hub;
 pub mod hub_history;
+pub mod jsonl;
 pub mod keepalive;
 pub mod local_socket;
 pub mod local_tls;

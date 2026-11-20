@@ -999,13 +999,12 @@ impl Adapter {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let child = match cmd.spawn() {
-            Ok(child) => child,
+        let mut guard = match ProcessGroupGuard::spawn(&mut cmd) {
+            Ok(guard) => guard,
             Err(e) => {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
         };
-        let mut guard = ProcessGroupGuard::of(&cmd, child);
 
         // Read stdout/stderr concurrently with `wait()` (not after `wait()`
         // returns) so a chatty child can't fill the pipe buffer and deadlock —
@@ -1583,14 +1582,17 @@ impl Adapter {
         );
 
         let task = async move {
-            let mut guards = guards::RunGuards::new(&op_id_task, &tool_task);
-            // Held until the PTY process is gone.
-            match wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await {
-                Ok(lease) => guards.hold_lease(lease),
-                Err(()) => return guards.end(&monitor, cancelled()).await,
-            }
-            // Running from here, not while it waited its turn (SPEC R2.7.1).
-            monitor.start(&op_id_task).await;
+            let Some(mut guards) = guards::RunGuards::begin(
+                &monitor,
+                &op_id_task,
+                &tool_task,
+                ticket,
+                &cancellation_token,
+            )
+            .await
+            else {
+                return;
+            };
             if watch_handoff {
                 guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
             }
@@ -1691,14 +1693,17 @@ impl Adapter {
         );
 
         let task = async move {
-            let mut guards = guards::RunGuards::new(&op_id_task, &tool_task);
-            // Held until the session command is done.
-            match wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await {
-                Ok(lease) => guards.hold_lease(lease),
-                Err(()) => return guards.end(&monitor, cancelled()).await,
-            }
-            // Running from here, not while it waited its turn (SPEC R2.7.1).
-            monitor.start(&op_id_task).await;
+            let Some(mut guards) = guards::RunGuards::begin(
+                &monitor,
+                &op_id_task,
+                &tool_task,
+                ticket,
+                &cancellation_token,
+            )
+            .await
+            else {
+                return;
+            };
             if watch_handoff {
                 guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
             }
@@ -1938,32 +1943,20 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     // Timed from the moment the task starts, so queueing behind a command mutex
     // group is visible in the audit record rather than silently excluded.
-    let mut guards = guards::RunGuards::new(&op_id, &command);
-
     // ── Workspace write queue (SPEC R2.7) ──────────────────────────────────
     // Wait for every exclusive operation that arrived earlier in this
     // workspace — in this process or any other — before starting. The lease is
     // held until the operation ends, i.e. until the process tree is gone.
-    match wait_for_lease(ticket, &monitor, &op_id, &cancellation_token).await {
-        Ok(lease) => guards.hold_lease(lease),
-        Err(()) => {
-            guards.end(&monitor, cancelled()).await;
-            return;
-        }
-    }
-
-    monitor.start(&op_id).await;
+    let Some(mut guards) =
+        guards::RunGuards::begin(&monitor, &op_id, &command, ticket, &cancellation_token).await
+    else {
+        return;
+    };
 
     // Lifecycle events (Started / terminal) are emitted by the OperationMonitor
     // at each state transition — the single emission point for the unified
     // event stream (SPEC R15).  MCP progress notifications are pushed by the
     // `progress_push` forwarder subscribed to that stream.
-
-    if cancellation_token.is_cancelled() {
-        tracing::info!("Operation {} was cancelled before execution started", op_id);
-        guards.end(&monitor, cancelled()).await;
-        return;
-    }
 
     // ── Command mutex group gate ────────────────────────────────────────────────────
     // Serialise commands in the same mutex group within the same working
@@ -2703,8 +2696,8 @@ async fn execute_with_streaming(
     proc_cmd.stdout(std::process::Stdio::piped());
     proc_cmd.stderr(std::process::Stdio::piped());
 
-    let child = match proc_cmd.spawn() {
-        Ok(child) => child,
+    let mut guard = match ProcessGroupGuard::spawn(proc_cmd) {
+        Ok(guard) => guard,
         Err(e) => {
             guards
                 .end(
@@ -2715,7 +2708,6 @@ async fn execute_with_streaming(
             return;
         }
     };
-    let mut guard = ProcessGroupGuard::of(proc_cmd, child);
 
     let stdout = guard.child_mut().stdout.take().expect("stdout piped");
     let stderr = guard.child_mut().stderr.take().expect("stderr piped");
@@ -3740,9 +3732,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -3759,7 +3749,7 @@ mod tests {
         ));
         let td = tempfile::tempdir().unwrap();
         let sandbox = Arc::new(
-            crate::sandbox::Sandbox::new(vec![td.path().to_path_buf()], mode, false, false, false)
+            crate::sandbox::Sandbox::new(vec![td.path().to_path_buf()], mode, Default::default())
                 .unwrap(),
         );
         (Adapter::new(monitor, shell_pool, sandbox).unwrap(), td)
@@ -4166,9 +4156,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![ws.clone(), other.clone(), scratch.clone()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4364,9 +4352,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4389,9 +4375,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4414,9 +4398,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );

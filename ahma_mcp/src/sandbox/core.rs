@@ -625,15 +625,28 @@ impl std::fmt::Debug for Sandbox {
     }
 }
 
+/// The optional parts of a [`Sandbox`], each off unless asked for. Named
+/// where three positional `bool`s were passed, `false, false, false` at almost
+/// every call, so a swap was invisible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SandboxOptions {
+    /// `--no-temp-files`: no temp directory is writable.
+    pub no_temp_files: bool,
+    /// Live log monitoring: the targets of `<scope>/.ahma/logs/*.log` links
+    /// become read-only scopes.
+    pub livelog: bool,
+    /// `--tmp`: the system temp directory is a scope (SPEC R5.2.5).
+    pub tmp_access: bool,
+}
+
 impl Sandbox {
     /// Create a new Sandbox with the given scopes.
-    pub fn new(
-        scopes: Vec<PathBuf>,
-        mode: SandboxMode,
-        no_temp_files: bool,
-        livelog: bool,
-        tmp_access: bool,
-    ) -> Result<Self> {
+    pub fn new(scopes: Vec<PathBuf>, mode: SandboxMode, options: SandboxOptions) -> Result<Self> {
+        let SandboxOptions {
+            no_temp_files,
+            livelog,
+            tmp_access,
+        } = options;
         let canonicalized = scopes::canonicalize_scopes(
             scopes,
             mode,
@@ -1656,9 +1669,7 @@ mod persistent_scope_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_scopes(
@@ -1716,9 +1727,7 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -1761,9 +1770,7 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![allowed.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         // Simulate "no roots/list client" — the condition the old auto-add keyed on.
@@ -1782,9 +1789,7 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let text = sb.scope_text(ScopeSource::Container);
@@ -1801,9 +1806,10 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            true,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
         )
         .unwrap();
         assert!(sb.is_tmp_access(), "the request is recorded");
@@ -1835,7 +1841,15 @@ mod scope_view_tests {
     #[test]
     fn tmp_requested_is_not_in_scope_after_commit() {
         let ws = workspace_outside_temp();
-        let sb = Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, true).unwrap();
+        let sb = Sandbox::new(
+            Vec::new(),
+            SandboxMode::Strict,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             sb.commit_scopes(vec![ws.clone()]).unwrap(),
             ScopeCommit::Applied
@@ -1864,7 +1878,15 @@ mod scope_view_tests {
     #[test]
     fn tmp_live_grant_brings_temp_into_scope() {
         let ws = workspace_outside_temp();
-        let sb = Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, true).unwrap();
+        let sb = Sandbox::new(
+            Vec::new(),
+            SandboxMode::Strict,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
+        )
+        .unwrap();
         let _ = sb.commit_scopes(vec![ws]).unwrap();
         let temp = Sandbox::canonical_temp_dir().unwrap();
 
@@ -1884,7 +1906,15 @@ mod scope_view_tests {
     /// The question is asked at most once a session, whichever path asks.
     #[test]
     fn the_tmp_question_is_claimed_once() {
-        let sb = Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, true).unwrap();
+        let sb = Sandbox::new(
+            Vec::new(),
+            SandboxMode::Strict,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
+        )
+        .unwrap();
         assert!(!sb.tmp_consent_settled());
         assert!(sb.claim_tmp_consent());
         assert!(!sb.claim_tmp_consent(), "a second claim must not ask again");
@@ -1910,9 +1940,7 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![ws_canon.clone()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -1940,9 +1968,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let home = ahma_common::config::ahma_home_dir().expect("home dir");
@@ -1990,9 +2016,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_records(vec![
@@ -2040,9 +2064,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_ledger_source(file.clone(), Arc::new(move || Some(source.lock().clone())));
@@ -2106,9 +2128,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_records(vec![
@@ -2147,9 +2167,7 @@ mod once_grant_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         sb.add_once_grant(cache.path(), ScopeAccess::Rw).unwrap();

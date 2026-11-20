@@ -1,5 +1,6 @@
 //! What a running command holds until it has ended, and the one way to end it.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{PublishEnding, audit, finish_handoff_watch, workspace_queue};
@@ -29,21 +30,43 @@ pub(super) struct RunGuards {
 }
 
 impl RunGuards {
-    pub(super) fn new(op_id: &str, subject: &str) -> Self {
-        Self {
+    /// Start a run, the one way for every async path: wait for its turn in
+    /// the workspace queue (SPEC R2.7.1), then mark it running, not before.
+    /// `None` when it was cancelled first, while queued or as its turn came;
+    /// it has then been ended. `subject` is what the handoff watch's findings
+    /// name.
+    pub(super) async fn begin(
+        monitor: &Arc<OperationMonitor>,
+        op_id: &str,
+        subject: &str,
+        ticket: Option<workspace_queue::Ticket>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<Self> {
+        let mut guards = Self {
             op_id: op_id.to_string(),
             subject: subject.to_string(),
+            // From the task's start, so time spent queued is in the audit record.
             started: Instant::now(),
             lease: None,
             handoff: None,
             #[cfg(unix)]
             broker: None,
+        };
+        match super::wait_for_lease(ticket, monitor, op_id, cancel).await {
+            // Held until the operation ends: until its process tree is gone.
+            Ok(lease) => guards.lease = lease,
+            Err(()) => {
+                guards.end(monitor, super::cancelled()).await;
+                return None;
+            }
         }
-    }
-
-    /// Hold the workspace (SPEC R2.7.1) until the operation ends.
-    pub(super) fn hold_lease(&mut self, lease: Option<workspace_queue::Lease>) {
-        self.lease = lease;
+        monitor.start(op_id).await;
+        if cancel.is_cancelled() {
+            tracing::info!("Operation {op_id} was cancelled before execution started");
+            guards.end(monitor, super::cancelled()).await;
+            return None;
+        }
+        Some(guards)
     }
 
     pub(super) fn lease(&self) -> Option<&workspace_queue::Lease> {
@@ -85,9 +108,10 @@ impl RunGuards {
     /// cannot be counted as this one's. The workspace is then free before
     /// anyone can observe the operation as ended (SPEC R2.7.1).
     ///
-    /// A run that stopped because its token was signalled ends `Cancelled`;
-    /// when a cancel or the watchdog asked for that, the ending they asked for
-    /// is published instead, with its own reason and kind.
+    /// When a cancel or the watchdog asked the run to stop (SPEC R13.3), the
+    /// ending they asked for is published, with its own reason and kind,
+    /// whatever ending the run reached: one that had just exited on its own
+    /// still ends cancelled, as when the monitor ended it itself.
     pub(super) async fn end(self, monitor: &OperationMonitor, ending: Terminal) {
         let Self {
             op_id,
@@ -113,10 +137,7 @@ impl RunGuards {
         #[cfg(unix)]
         drop(broker);
         drop(lease);
-        let ending = match ending {
-            Terminal::Cancelled(_) => monitor.take_stop_request(&op_id).await.unwrap_or(ending),
-            other => other,
-        };
+        let ending = monitor.take_stop_request(&op_id).await.unwrap_or(ending);
         let (outcome, exit_code) = ending.publish(monitor, &op_id).await;
         audit::record_tool_complete(
             &op_id,
@@ -125,5 +146,58 @@ impl RunGuards {
             exit_code,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operation_monitor::{MonitorConfig, Operation, OperationStatus};
+    use std::time::Duration;
+
+    /// A cancel that arrives while the command is ending on its own still ends
+    /// it cancelled, as when the monitor ended the operation itself: the stop a
+    /// person asked for wins over whatever ending the run then reached. Only a
+    /// run that saw its token signalled used to take the request, so a run
+    /// that had just exited published its own ending and the cancel reported
+    /// failure (seen on Windows CI).
+    #[tokio::test]
+    async fn a_stop_asked_for_wins_over_the_ending_the_run_reached() {
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(60),
+        )));
+        let token = monitor
+            .register(Operation::new("op".into(), "t".into(), "d".into(), None))
+            .await;
+        monitor.ends_by_task("op").await;
+        let guards = RunGuards::begin(&monitor, "op", "t", None, &token)
+            .await
+            .expect("not cancelled yet");
+
+        let cancel = {
+            let monitor = monitor.clone();
+            tokio::spawn(async move {
+                monitor
+                    .cancel_operation_with_reason("op", Some("stopped".into()))
+                    .await
+            })
+        };
+        crate::test_utils::assertions::assert_eventually(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            ahma_common::timeouts::TestTimeouts::poll_interval(),
+            "the cancel is recorded",
+            || async { token.is_cancelled() },
+        )
+        .await;
+
+        // The run had already exited on its own and reports that.
+        guards
+            .end(&monitor, Terminal::Failed("exit code 1".into()))
+            .await;
+
+        assert!(cancel.await.unwrap(), "the cancel reports it cancelled");
+        let op = monitor.wait_for_operation("op").await.unwrap();
+        assert_eq!(op.state, OperationStatus::Cancelled);
+        assert!(op.result.unwrap().to_string().contains("stopped"));
     }
 }

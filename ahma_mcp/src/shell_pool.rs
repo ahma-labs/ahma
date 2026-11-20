@@ -210,21 +210,22 @@ pub struct ProcessGroupGuard {
 }
 
 impl ProcessGroupGuard {
-    pub fn new(child: tokio::process::Child) -> Self {
-        Self {
-            child: Some(child),
-            run: None,
-        }
-    }
-
-    /// Own, besides the child's process group, whatever `cmd`'s run leaves
-    /// running after leaving that group (SPEC R-PROC.5): ended by
+    /// Spawn `cmd` and guard what it starts: the one way to get a guard. It
+    /// makes the child a process-group leader itself (Unix), so a guard can
+    /// never hold a child whose `kill(-pid)` would signal nothing; that used to
+    /// rest on every caller having built `cmd` with `.process_group(0)`.
+    ///
+    /// Besides the child's process group, the guard owns whatever `cmd`'s run
+    /// leaves running after leaving that group (SPEC R-PROC.5): ended by
     /// [`Self::end_leftovers`], or when the guard drops.
-    pub fn of(cmd: &tokio::process::Command, child: tokio::process::Child) -> Self {
-        Self {
+    pub fn spawn(cmd: &mut tokio::process::Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        Ok(Self {
             run: crate::sandbox::leftovers::Run::of(cmd, child.id()),
             child: Some(child),
-        }
+        })
     }
 
     /// End what the command left running, once it has itself ended, and return
@@ -409,6 +410,8 @@ mod tests {
     /// Regression: when ProcessGroupGuard is dropped (e.g. on async cancellation
     /// or signal handling), it must immediately kill the entire process group,
     /// preventing orphaned grandchildren like `cargo nextest` from staying alive.
+    /// The command does not make itself a group leader here: the guard's own
+    /// `spawn` must, or `kill(-pid)` would signal nothing.
     #[cfg(unix)]
     #[tokio::test]
     async fn process_group_guard_kills_grandchildren_on_drop() {
@@ -421,10 +424,8 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .process_group(0);
-        let child = cmd.spawn().expect("spawn sh");
-        let guard = ProcessGroupGuard::new(child);
+            .kill_on_drop(true);
+        let guard = ProcessGroupGuard::spawn(&mut cmd).expect("spawn sh");
 
         // Wait for the grandchild pid to be recorded.
         let mut gpid = None;

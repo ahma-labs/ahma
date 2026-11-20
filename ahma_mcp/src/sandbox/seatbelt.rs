@@ -745,9 +745,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -790,9 +788,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let p = sb.generate_seatbelt_profile_test(dir.path());
@@ -851,9 +847,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let temp = sb.get_macos_temp_rules(&[PathBuf::from("/Volumes/T7/github/neubit4")]);
@@ -875,9 +869,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let p = sb.generate_read_only_seatbelt_profile_test(dir.path());
@@ -902,9 +894,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let p = sb.generate_seatbelt_profile_test(dir.path());
@@ -935,9 +925,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -972,9 +960,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -1006,9 +992,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -1035,7 +1019,7 @@ mod tests {
         let root = dunce::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
 
-        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, Default::default()).unwrap();
         let profile = sb.generate_seatbelt_profile_test(&root);
 
         let workspace_allow = profile
@@ -1088,7 +1072,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dunce::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
-        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, Default::default()).unwrap();
 
         let hooks_deny = format!(
             "(deny file-write* (subpath \"{}\"))",
@@ -1158,9 +1142,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let profile = sb.generate_seatbelt_profile_test(dir.path());
@@ -1225,9 +1207,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let upstream = dir.path().join("agent.sock");
@@ -1293,9 +1273,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![root.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let p = sb.generate_seatbelt_profile_test(root.path());
@@ -1474,9 +1452,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let profile = sb.generate_seatbelt_profile_test(dir.path());
@@ -1525,9 +1501,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -1580,7 +1554,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (wt, wt_meta, shared_git) = worktree_fixture(tmp.path());
 
-        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, Default::default()).unwrap();
         let profile = sb.generate_seatbelt_profile_test(&wt);
 
         let canonical_shared = dunce::canonicalize(&shared_git).unwrap();
@@ -1644,7 +1618,7 @@ mod tests {
         std::fs::write(victim.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(sub.join(".git"), format!("gitdir: {}\n", victim.display())).unwrap();
 
-        let sb = Sandbox::new(vec![ws.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let sb = Sandbox::new(vec![ws.clone()], SandboxMode::Test, Default::default()).unwrap();
         let profile = sb.generate_seatbelt_profile_test(&ws);
         let canonical = dunce::canonicalize(&victim).unwrap();
         std::fs::remove_dir_all(&victim).ok();
@@ -1687,7 +1661,7 @@ mod tests {
         let secret = tmp.path().join("secret");
         std::fs::create_dir_all(&secret).unwrap();
         set_credential_read_denies(vec![secret.clone()]);
-        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, Default::default()).unwrap();
         let profile = sb.generate_seatbelt_profile_test(&wt);
         set_credential_read_denies(Vec::new());
 
@@ -1721,7 +1695,7 @@ mod tests {
         let subdir = wt.join("crate_a");
         std::fs::create_dir_all(&subdir).unwrap();
 
-        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let sb = Sandbox::new(vec![wt.clone()], SandboxMode::Test, Default::default()).unwrap();
         let canonical_shared = dunce::canonicalize(&shared_git).unwrap();
         let allow = format!(
             "(allow file-write* (subpath \"{}\"))",
@@ -1756,7 +1730,7 @@ mod tests {
         let root = dunce::canonicalize(tmp.path()).unwrap();
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
 
-        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, Default::default()).unwrap();
         let profile = sb.generate_seatbelt_profile_test(&root);
 
         assert!(

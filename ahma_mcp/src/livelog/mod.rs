@@ -169,12 +169,12 @@ fn spawn_source_process(
     apply_env(&mut cmd, &runtime.env);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    match cmd.spawn() {
+    match ProcessGroupGuard::spawn(&mut cmd) {
         // A log source is typically a pipeline (`adb logcat | grep …`), so the
         // interesting processes are grandchildren. `kill_on_drop` would signal
         // only the direct child and leave them streaming; the guard sends
-        // `kill(-pgid)`, and `create_command` already made this a group leader.
-        Ok(child) => Ok(ProcessGroupGuard::of(&cmd, child)),
+        // `kill(-pgid)` to the group it made the child lead.
+        Ok(guard) => Ok(guard),
         Err(e) => Err(NotStarted::logged(
             op_id,
             format!("could not start `{}`: {e}", config.source_command),

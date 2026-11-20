@@ -1307,18 +1307,10 @@ pub fn audit_path() -> Option<PathBuf> {
 /// Append-only and one JSON object per line, so a corrupt or truncated tail
 /// costs at most the last record and the file can be tailed while ahma runs.
 pub fn append_audit_at(path: &Path, entry: &AuditEntry) -> std::io::Result<()> {
-    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut line = serde_json::to_string(entry)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    line.push('\n');
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    f.write_all(line.as_bytes())
+    crate::jsonl::append_blocking(path, entry)
 }
 
 /// Append to the real audit log, swallowing (but logging) failures.

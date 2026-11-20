@@ -6312,8 +6312,7 @@ fn append_profile_transcript(state: &crate::state::AppState) {
         // the blocking pool; best-effort, as before.
         let profile = profile.clone();
         tokio::task::spawn_blocking(move || {
-            let _ =
-                crate::agent_config::append_transcript_entry(&cwd, &profile, &payload.to_string());
+            let _ = crate::agent_config::append_transcript_entry(&cwd, &profile, &payload);
         });
     }
 }
