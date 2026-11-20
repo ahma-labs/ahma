@@ -29,8 +29,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt as _;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AuditEvent
@@ -168,16 +166,7 @@ impl AuditWriter {
             trace_id: None,
             kind,
         };
-        let mut line = serde_json::to_string(&event)?;
-        line.push('\n');
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await?;
+        ahma_common::jsonl::append(&self.path, &event).await?;
         Ok(())
     }
 

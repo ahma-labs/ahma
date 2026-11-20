@@ -61,7 +61,11 @@ pub fn delete_profile(cwd: &Path, name: &str) -> Result<bool> {
     Ok(removed)
 }
 
-pub fn append_transcript_entry(cwd: &Path, profile_name: &str, line_json: &str) -> Result<()> {
+pub fn append_transcript_entry(
+    cwd: &Path,
+    profile_name: &str,
+    entry: &serde_json::Value,
+) -> Result<()> {
     let dir = transcripts_dir(cwd, profile_name);
     if !dir.exists() {
         std::fs::create_dir_all(&dir)
@@ -73,13 +77,10 @@ pub fn append_transcript_entry(cwd: &Path, profile_name: &str, line_json: &str) 
         ignore_self(&dir);
     }
     let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y-%m-%d")));
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
-    writeln!(file, "{line_json}").with_context(|| format!("Failed to append {}", path.display()))
+    // One write per line (`jsonl`): `writeln!` handed the line and its
+    // newline to the file separately.
+    ahma_common::jsonl::append_blocking(&path, entry)
+        .with_context(|| format!("Failed to append {}", path.display()))
 }
 
 fn profiles_path(cwd: &Path) -> PathBuf {
@@ -248,11 +249,19 @@ mod tests {
         let convo_dir = tmp.path().join(".ahma").join("conversations").join("agent");
         assert!(!convo_dir.exists());
 
-        append_transcript_entry(tmp.path(), "agent", r#"{"role":"user","text":"hi"}"#)
-            .expect("first append should succeed");
+        append_transcript_entry(
+            tmp.path(),
+            "agent",
+            &serde_json::json!({"role": "user", "text": "hi"}),
+        )
+        .expect("first append should succeed");
         // Second call hits the `dir.exists()` true branch.
-        append_transcript_entry(tmp.path(), "agent", r#"{"role":"assistant","text":"yo"}"#)
-            .expect("second append should succeed");
+        append_transcript_entry(
+            tmp.path(),
+            "agent",
+            &serde_json::json!({"role": "assistant", "text": "yo"}),
+        )
+        .expect("second append should succeed");
 
         assert!(convo_dir.exists(), "conversations dir should be created");
 
@@ -277,8 +286,12 @@ mod tests {
     #[test]
     fn transcript_dir_ignores_itself() {
         let tmp = tempdir().unwrap();
-        append_transcript_entry(tmp.path(), "agent", r#"{"role":"user","text":"hi"}"#)
-            .expect("append should succeed");
+        append_transcript_entry(
+            tmp.path(),
+            "agent",
+            &serde_json::json!({"role": "user", "text": "hi"}),
+        )
+        .expect("append should succeed");
 
         let marker = tmp
             .path()
