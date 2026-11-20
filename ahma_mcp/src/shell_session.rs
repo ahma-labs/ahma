@@ -61,13 +61,13 @@ impl ShellSession {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
 
-        let child = cmd.spawn().context("failed to spawn session shell")?;
+        let mut child =
+            ProcessGroupGuard::spawn(&mut cmd).context("failed to spawn session shell")?;
         // A session shell is long-lived and runs whatever the agent asks of it,
         // so it is the worst place to orphan a tree: `sh → cargo → rustc` all
         // outlive a bare `kill_on_drop`, which signals only the direct child.
         // `create_command` already made it a process-group leader.
         // What the session leaves running ends with it (SPEC R-PROC.5).
-        let mut child = ProcessGroupGuard::of(&cmd, child);
         let stdin = child
             .child_mut()
             .stdin
