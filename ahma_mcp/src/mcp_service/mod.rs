@@ -698,23 +698,10 @@ impl AhmaMcpService {
         audit_log_path: &Path,
         payload: serde_json::Value,
     ) -> Result<(), anyhow::Error> {
-        use tokio::fs::OpenOptions;
-        use tokio::io::AsyncWriteExt as _;
-
         if let Some(parent) = audit_log_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-
-        let mut line = serde_json::to_string(&payload)?;
-        line.push('\n');
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(audit_log_path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await?;
+        ahma_common::jsonl::append(audit_log_path, &payload).await?;
         Ok(())
     }
 
