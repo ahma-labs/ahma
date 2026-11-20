@@ -8,7 +8,8 @@ use crate::operation_monitor::{OperationMonitor, Terminal};
 use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch};
 
 /// What a running command holds until it has ended: its place in the
-/// workspace queue (SPEC R2.7.1), the deny-tier watch (R6.1.7) and its SSH key
+/// workspace queue (SPEC R2.7.1), its mutex group gate (R2.7.2), the
+/// deny-tier watch (R6.1.7) and its SSH key
 /// broker (R-CRED.1).
 ///
 /// [`RunGuards::end`] is the one way to end the operation, and it takes the
@@ -24,6 +25,9 @@ pub(super) struct RunGuards {
     /// From the task's start, so time spent queued is in the audit record.
     started: Instant,
     lease: Option<workspace_queue::Lease>,
+    /// The command's `tools.mutex_groups` gate (SPEC R2.7.2), taken after the
+    /// lease and handed on with it.
+    mutex: Option<super::mutex_groups::MutexGroupGuard>,
     handoff: Option<HandoffWatch>,
     #[cfg(unix)]
     broker: Option<crate::credentials::ssh_agent::host::BrokerLease>,
@@ -48,6 +52,7 @@ impl RunGuards {
             // From the task's start, so time spent queued is in the audit record.
             started: Instant::now(),
             lease: None,
+            mutex: None,
             handoff: None,
             #[cfg(unix)]
             broker: None,
@@ -71,6 +76,31 @@ impl RunGuards {
 
     pub(super) fn lease(&self) -> Option<&workspace_queue::Lease> {
         self.lease.as_ref()
+    }
+
+    /// Wait for the command's `tools.mutex_groups` gate (SPEC R2.7.2), after
+    /// the lease, and hold it until the operation ends: the one way every
+    /// async path takes it. `None` when the wait gave up; the operation has
+    /// then been ended `Failed`, as for any other failure to start.
+    pub(super) async fn gate(
+        mut self,
+        monitor: &Arc<OperationMonitor>,
+        registry: &super::CommandMutexRegistry,
+        command_line: &str,
+        workspace: &std::path::Path,
+    ) -> Option<Self> {
+        match super::acquire_mutex_gate(registry, monitor, &self.op_id, command_line, workspace)
+            .await
+        {
+            Ok(permit) => {
+                self.mutex = permit;
+                Some(self)
+            }
+            Err(why) => {
+                self.end(monitor, super::failed(why)).await;
+                None
+            }
+        }
     }
 
     /// Watch the deny tier (SPEC R6.1.7) from now until the operation ends.
@@ -118,6 +148,7 @@ impl RunGuards {
             subject,
             started,
             lease,
+            mutex,
             handoff,
             #[cfg(unix)]
             broker,
@@ -136,6 +167,8 @@ impl RunGuards {
         }
         #[cfg(unix)]
         drop(broker);
+        // The gate was taken after the lease: handed on first.
+        drop(mutex);
         drop(lease);
         let ending = monitor.take_stop_request(&op_id).await.unwrap_or(ending);
         let (outcome, exit_code) = ending.publish(monitor, &op_id).await;

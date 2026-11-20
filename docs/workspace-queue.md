@@ -196,7 +196,7 @@ the session that started it. An agent sees the same report in the `status` tool,
 | `workspace_queue` | `true` | `false` lets writers overlap again (the pre-R2.7 behaviour); only sensible with `execution_mode = "sync"` |
 | `edit_guard` | `true` | ahma's own file tools refuse edits while a command that may rewrite sources runs; also gates the edit guard installed by `ahma hooks install --edit-guard` |
 | `source_readers` | `[]` | This project's own wrappers that only read sources (`["scripts/heavy"]`): edits proceed while one runs |
-| `mutex_groups` | `cargo` | Extra per-workspace serialisation for tools that contend on a shared directory, matched on the command line you wrote |
+| `mutex_groups` | `cargo` | Extra per-workspace serialisation for tools that contend on a shared directory, matched on the command line you wrote, for piped, PTY and session commands alike |
 
 ## Limits
 
