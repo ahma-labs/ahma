@@ -313,7 +313,9 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   tools), PTY and persistent-session commands. On every path an operation is shown running
   only once it holds its turn, and gives the lease up before its end is published, so a
   caller woken by that end never finds the workspace still held by it. On the async, PTY and
-  session paths `adapter::guards::RunGuards::end` is the one way an operation ends, and takes
+  session paths `adapter::guards::RunGuards::begin` is the one way an operation starts (it waits its
+  turn, then marks the operation running, and ends it at once if it was cancelled first), and
+  `RunGuards::end` is the one way it ends, and takes
   what the run holds by value: it tells the SSH broker's refusals, compares the deny tier
   (R6.1.7) while the workspace is still held, so another command's writes are not counted as
   this one's, hands the workspace on, then publishes the ending and audits it. A cancel or a watchdog

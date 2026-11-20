@@ -1,5 +1,6 @@
 //! What a running command holds until it has ended, and the one way to end it.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{PublishEnding, audit, finish_handoff_watch, workspace_queue};
@@ -29,21 +30,43 @@ pub(super) struct RunGuards {
 }
 
 impl RunGuards {
-    pub(super) fn new(op_id: &str, subject: &str) -> Self {
-        Self {
+    /// Start a run, the one way for every async path: wait for its turn in
+    /// the workspace queue (SPEC R2.7.1), then mark it running, not before.
+    /// `None` when it was cancelled first, while queued or as its turn came;
+    /// it has then been ended. `subject` is what the handoff watch's findings
+    /// name.
+    pub(super) async fn begin(
+        monitor: &Arc<OperationMonitor>,
+        op_id: &str,
+        subject: &str,
+        ticket: Option<workspace_queue::Ticket>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<Self> {
+        let mut guards = Self {
             op_id: op_id.to_string(),
             subject: subject.to_string(),
+            // From the task's start, so time spent queued is in the audit record.
             started: Instant::now(),
             lease: None,
             handoff: None,
             #[cfg(unix)]
             broker: None,
+        };
+        match super::wait_for_lease(ticket, monitor, op_id, cancel).await {
+            // Held until the operation ends: until its process tree is gone.
+            Ok(lease) => guards.lease = lease,
+            Err(()) => {
+                guards.end(monitor, super::cancelled()).await;
+                return None;
+            }
         }
-    }
-
-    /// Hold the workspace (SPEC R2.7.1) until the operation ends.
-    pub(super) fn hold_lease(&mut self, lease: Option<workspace_queue::Lease>) {
-        self.lease = lease;
+        monitor.start(op_id).await;
+        if cancel.is_cancelled() {
+            tracing::info!("Operation {op_id} was cancelled before execution started");
+            guards.end(monitor, super::cancelled()).await;
+            return None;
+        }
+        Some(guards)
     }
 
     pub(super) fn lease(&self) -> Option<&workspace_queue::Lease> {
