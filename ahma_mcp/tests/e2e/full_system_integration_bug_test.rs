@@ -43,9 +43,7 @@ mod tests {
             Sandbox::new(
                 vec![std::env::current_dir().unwrap()],
                 SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -129,9 +127,7 @@ mod tests {
             Sandbox::new(
                 vec![std::env::current_dir().unwrap()],
                 SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );

@@ -138,7 +138,7 @@ async fn setup_custom_mcp(
     fetcher: MockWebPageFetcher,
 ) -> Result<CustomInProcessMcp> {
     let mode = SandboxMode::Test;
-    let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, false, false, false)?;
+    let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, Default::default())?;
 
     let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(30));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));

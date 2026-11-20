@@ -79,9 +79,7 @@ fn adapter(root: &Path, mode: HandoffWatchMode) -> (Adapter, Arc<OperationMonito
         Sandbox::new(
             vec![root.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("test sandbox"),
     );

@@ -49,9 +49,7 @@ async fn test_mcp_cancellation_does_not_trigger_canceled_canceled_message() {
         Sandbox::new(
             scopes,
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

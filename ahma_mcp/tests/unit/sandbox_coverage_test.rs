@@ -29,7 +29,7 @@ fn test_validate_path_basic() {
     let root = tmp_dir.path().to_path_buf();
 
     let sandbox =
-        Sandbox::new(vec![root.clone()], SandboxMode::Strict, false, false, false).unwrap();
+        Sandbox::new(vec![root.clone()], SandboxMode::Strict, Default::default()).unwrap();
 
     // Allowed path
     let file_path = root.join("test.txt");
@@ -57,8 +57,15 @@ fn test_validate_path_no_temp_files_violation() {
     let root = tmp_dir.path().to_path_buf();
 
     // Enable no_temp_files
-    let _sandbox =
-        Sandbox::new(vec![root.clone()], SandboxMode::Strict, true, false, false).unwrap();
+    let _sandbox = Sandbox::new(
+        vec![root.clone()],
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions {
+            no_temp_files: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
 
     // Even if the system temp dir is in scope (unlikely but if added), it should be blocked by HighSecurityViolation logic
     // But logic says: if scopes.iter().any... THEN check high security.
@@ -70,9 +77,10 @@ fn test_validate_path_no_temp_files_violation() {
         let sandbox_lax = Sandbox::new(
             vec![tmp_root.clone()],
             SandboxMode::Strict,
-            true,
-            false,
-            false,
+            ahma_mcp::sandbox::SandboxOptions {
+                no_temp_files: true,
+                ..ahma_mcp::sandbox::SandboxOptions::default()
+            },
         )
         .unwrap();
 
@@ -97,7 +105,7 @@ fn test_validate_path_symlink_traversal() {
     let tmp_dir = TempDir::new().unwrap();
     let root = tmp_dir.path().to_path_buf();
     let sandbox =
-        Sandbox::new(vec![root.clone()], SandboxMode::Strict, false, false, false).unwrap();
+        Sandbox::new(vec![root.clone()], SandboxMode::Strict, Default::default()).unwrap();
 
     let safe_dir = root.join("safe");
     std::fs::create_dir(&safe_dir).unwrap();
@@ -137,9 +145,7 @@ fn test_sandbox_test_mode_bypass() {
     let sandbox = Sandbox::new(
         vec![td.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 
@@ -171,9 +177,7 @@ fn test_sandbox_auto_scoping() {
     let sandbox = Sandbox::new(
         vec![fake_scope.clone()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 

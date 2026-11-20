@@ -3734,9 +3734,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -3753,7 +3751,7 @@ mod tests {
         ));
         let td = tempfile::tempdir().unwrap();
         let sandbox = Arc::new(
-            crate::sandbox::Sandbox::new(vec![td.path().to_path_buf()], mode, false, false, false)
+            crate::sandbox::Sandbox::new(vec![td.path().to_path_buf()], mode, Default::default())
                 .unwrap(),
         );
         (Adapter::new(monitor, shell_pool, sandbox).unwrap(), td)
@@ -4160,9 +4158,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![ws.clone(), other.clone(), scratch.clone()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4358,9 +4354,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4383,9 +4377,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4408,9 +4400,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );

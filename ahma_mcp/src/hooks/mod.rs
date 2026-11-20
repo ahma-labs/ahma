@@ -4197,9 +4197,7 @@ mod tests {
         let sandbox = crate::sandbox::Sandbox::new(
             vec![workspace.path().to_path_buf()],
             crate::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_scopes(vec![cache.path().to_path_buf()], vec![]);

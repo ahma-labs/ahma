@@ -400,7 +400,7 @@ mod tests {
     /// Create a `SandboxMode::Test` sandbox scoped to `scope`.
     fn make_test_sandbox(scope: std::path::PathBuf) -> Arc<Sandbox> {
         Arc::new(
-            Sandbox::new(vec![scope], SandboxMode::Test, false, false, false)
+            Sandbox::new(vec![scope], SandboxMode::Test, Default::default())
                 .expect("test sandbox creation should never fail"),
         )
     }

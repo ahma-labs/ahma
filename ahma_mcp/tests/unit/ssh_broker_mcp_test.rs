@@ -48,9 +48,7 @@ async fn a_refused_signature_is_an_alert_on_the_running_operation() {
         Sandbox::new(
             vec![ws.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

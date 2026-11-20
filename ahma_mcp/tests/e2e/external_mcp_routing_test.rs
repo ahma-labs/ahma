@@ -24,7 +24,7 @@ async fn create_test_mcp() -> anyhow::Result<InProcessMcp> {
     let mode = SandboxMode::Test;
 
     // Construct sandbox with explicit_scopes = true to skip roots/list config reload race
-    let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, false, false, false)?
+    let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, Default::default())?
         .with_explicit_scopes(true);
 
     sandbox.set_roots_received(true);

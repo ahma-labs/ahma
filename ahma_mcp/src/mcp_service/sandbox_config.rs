@@ -1015,9 +1015,7 @@ mod tests {
             Sandbox::new(
                 vec![scope_dir.to_path_buf()],
                 SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );

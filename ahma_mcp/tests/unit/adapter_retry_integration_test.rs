@@ -27,9 +27,7 @@ fn create_test_adapter_with_retry_and_root(
         Sandbox::new(
             scopes,
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -53,9 +51,7 @@ fn create_test_adapter_with_retry(retry_config: Option<RetryConfig>) -> ahma_mcp
         Sandbox::new(
             vec![std::env::temp_dir()],
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

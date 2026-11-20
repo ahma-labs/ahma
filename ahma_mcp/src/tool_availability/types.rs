@@ -366,9 +366,7 @@ mod probe_exit_tests {
         let sandbox = Sandbox::new(
             vec![temp.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         for codes in [vec![0], vec![0, 1], vec![-1, 0, 1]] {
@@ -414,9 +412,7 @@ mod tests {
         let sandbox = Sandbox::new(
             vec![temp.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 

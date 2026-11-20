@@ -501,9 +501,7 @@ mod tests {
         let sandbox = Sandbox::new(
             vec![dir.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("sandbox construction");
         sandbox.set_roots_received(true);
