@@ -2193,11 +2193,33 @@ pub struct SettingsPreview {
 }
 
 /// One setting changed by [`AhmaSettings::set_in_file`]: its value before and
-/// after, as TOML (`"(unset)"` for an optional key with no value).
+/// after, as TOML text, `None` for an optional key with no value. Code
+/// matches on `None`; only what a person reads says `(unset)`, so no
+/// comparison depends on that spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsEdit {
-    pub before: String,
-    pub after: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+/// How an unset value reads to a person.
+pub const UNSET_TEXT: &str = "(unset)";
+
+impl SettingsEdit {
+    /// Whether the value changed.
+    pub fn changed(&self) -> bool {
+        self.before != self.after
+    }
+
+    /// The value before, as a person reads it.
+    pub fn before_text(&self) -> &str {
+        self.before.as_deref().unwrap_or(UNSET_TEXT)
+    }
+
+    /// The value after, as a person reads it.
+    pub fn after_text(&self) -> &str {
+        self.after.as_deref().unwrap_or(UNSET_TEXT)
+    }
 }
 
 /// Top-level user settings loaded from `~/.ahma/settings.toml`.
@@ -2487,7 +2509,12 @@ impl AhmaSettings {
         if let Some(before) = before {
             for (key, was, now) in setting_changes(&before, &after) {
                 crate::permissions::append_audit(&crate::permissions::setting_audit_entry(
-                    at, surface, "user", &key, &was, &now,
+                    at,
+                    surface,
+                    "user",
+                    &key,
+                    was.as_deref(),
+                    now.as_deref(),
                 ));
             }
         }
@@ -3195,12 +3222,12 @@ impl AhmaSettings {
         })
     }
 
-    /// The TOML text of `table.field` in `settings`, or `(unset)`.
-    fn value_text(settings: &Self, table: &str, field: &str) -> String {
+    /// The TOML text of `table.field` in `settings`, or `None` when unset.
+    fn value_text(settings: &Self, table: &str, field: &str) -> Option<String> {
         toml::Value::try_from(settings)
             .ok()
             .and_then(|v| v.get(table)?.get(field).cloned())
-            .map_or_else(|| "(unset)".to_string(), |v| v.to_string())
+            .map(|v| v.to_string())
     }
 
     /// Every check [`set_in_file`](Self::set_in_file) makes, and the file it
@@ -3666,7 +3693,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 pub fn setting_changes(
     before: &AhmaSettings,
     after: &AhmaSettings,
-) -> Vec<(String, String, String)> {
+) -> Vec<(String, Option<String>, Option<String>)> {
     let tables = |s: &AhmaSettings| -> toml::Table {
         match toml::Value::try_from(s) {
             Ok(toml::Value::Table(t)) => t,
@@ -3685,8 +3712,7 @@ pub fn setting_changes(
             if ledger_key_command(table, key).is_some() {
                 continue;
             }
-            let render =
-                |t: &toml::Table| t.get(key).map_or("(unset)".to_string(), |v| v.to_string());
+            let render = |t: &toml::Table| t.get(key).map(|v| v.to_string());
             let (was, now) = (render(was), render(now));
             if was != now {
                 out.push((format!("{table}.{key}"), was, now));
@@ -3873,8 +3899,9 @@ impl SettingsReach {
     }
 }
 
-/// `ahma settings set`/`unset` for `key`, the way a human would undo to `before`.
-pub fn undo_command(file: SettingsFile, key: &str, before: &str) -> String {
+/// `ahma settings set`/`unset` for `key`, the way a human would undo to
+/// `before` (`None`: it was unset).
+pub fn undo_command(file: SettingsFile, key: &str, before: Option<&str>) -> String {
     let flag = if file == SettingsFile::Project {
         " --project"
     } else {
@@ -3883,14 +3910,16 @@ pub fn undo_command(file: SettingsFile, key: &str, before: &str) -> String {
     undo_with_flag(flag, key, before)
 }
 
-fn undo_with_flag(flag: &str, key: &str, before: &str) -> String {
+fn undo_with_flag(flag: &str, key: &str, before: Option<&str>) -> String {
     // Back to the default is `unset`, which also leaves the file tidy.
-    let is_default = setting_docs()
-        .iter()
-        .any(|d| d.dotted() == key && d.default == before);
-    if before == "(unset)" || is_default {
-        format!("ahma settings unset{flag} {key}")
-    } else if before.contains('\'') {
+    let Some(before) = before.filter(|before| {
+        !setting_docs()
+            .iter()
+            .any(|d| d.dotted() == key && d.default == *before)
+    }) else {
+        return format!("ahma settings unset{flag} {key}");
+    };
+    if before.contains('\'') {
         format!(
             "ahma settings set{flag} {key} \"{}\"",
             before.replace('"', "\\\"")
@@ -3924,17 +3953,18 @@ pub fn describe_setting_change(
 ) -> String {
     use std::fmt::Write as _;
 
-    let changed = edit.before != edit.after;
+    let changed = edit.changed();
     let file = path.display();
     let mut out = if changed {
         format!(
             "{key} changed in {file}\n  was: {}\n  now: {}\n\n",
-            edit.before, edit.after
+            edit.before_text(),
+            edit.after_text()
         )
     } else {
         format!(
             "{key} is already {} in {file}. Nothing changed.\n\n",
-            edit.after
+            edit.after_text()
         )
     };
     let doc = setting_docs().iter().find(|d| d.dotted() == key);
@@ -3946,7 +3976,10 @@ pub fn describe_setting_change(
     if !changed {
         return out;
     }
-    if let (Some(before), Some(after)) = (list_entries(&edit.before), list_entries(&edit.after)) {
+    if let (Some(before), Some(after)) = (
+        edit.before.as_deref().and_then(list_entries),
+        edit.after.as_deref().and_then(list_entries),
+    ) {
         let gone: Vec<String> = before
             .iter()
             .filter(|entry| !after.contains(entry))
@@ -3964,7 +3997,7 @@ pub fn describe_setting_change(
     let _ = writeln!(
         out,
         "To undo: {}",
-        undo_with_flag(&reach.flag(path), key, &edit.before)
+        undo_with_flag(&reach.flag(path), key, edit.before.as_deref())
     );
     out
 }
@@ -4470,7 +4503,7 @@ mod tests {
         let edit =
             AhmaSettings::set_in_file(&path, "tools.source_readers", Some("['scripts/t.sh']"))
                 .unwrap();
-        assert_eq!(edit.after, "[\"scripts/t.sh\"]");
+        assert_eq!(edit.after.as_deref(), Some("[\"scripts/t.sh\"]"));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("this repository's ahma settings"), "{text}");
         assert!(!text.contains("Ahma user settings"), "{text}");
@@ -4575,14 +4608,14 @@ mod tests {
             .iter()
             .find(|(k, _, _)| k == "tools.context_length")
             .unwrap();
-        assert_eq!((ctx.1.as_str(), ctx.2.as_str()), ("(unset)", "8192"));
+        assert_eq!((ctx.1.as_deref(), ctx.2.as_deref()), (None, Some("8192")));
         // And back again: the reverse change is reported as an unset.
         let back = setting_changes(&after, &before);
         let ctx = back
             .iter()
             .find(|(k, _, _)| k == "tools.context_length")
             .unwrap();
-        assert_eq!(ctx.2, "(unset)");
+        assert_eq!(ctx.2, None);
         assert!(setting_changes(&before, &before).is_empty());
     }
 
@@ -5421,8 +5454,8 @@ timeout_secs = 600
         std::fs::write(&path, AhmaSettings::default().render_documented()).unwrap();
 
         let edit = AhmaSettings::set_in_file(&path, "tools.timeout_secs", Some("90000")).unwrap();
-        assert_eq!(edit.before, "1800");
-        assert_eq!(edit.after, "90000");
+        assert_eq!(edit.before.as_deref(), Some("1800"));
+        assert_eq!(edit.after.as_deref(), Some("90000"));
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             text.matches("\n[tools]").count(),
@@ -5443,7 +5476,11 @@ timeout_secs = 600
         assert_eq!(text.matches("\n[tools]").count(), 1, "{text}");
 
         let edit = AhmaSettings::set_in_file(&path, "tools.timeout_secs", None).unwrap();
-        assert_eq!(edit.after, "1800", "unset returns the default");
+        assert_eq!(
+            edit.after.as_deref(),
+            Some("1800"),
+            "unset returns the default"
+        );
         assert_eq!(
             AhmaSettings::load_from_checked(&path).unwrap(),
             AhmaSettings::default()
@@ -5451,7 +5488,7 @@ timeout_secs = 600
 
         // A string value needs no TOML quoting on the command line.
         let edit = AhmaSettings::set_in_file(&path, "logging.target", Some("stderr")).unwrap();
-        assert_eq!(edit.after, "\"stderr\"");
+        assert_eq!(edit.after.as_deref(), Some("\"stderr\""));
     }
 
     /// R-CFG10.2: what `set` refuses, it refuses before writing anything.
@@ -6549,8 +6586,8 @@ mod project_settings_tests {
         let old = r#"{ command = "coach_eval run", timeout_secs = 14400 }"#;
         let new = r#"{ command = "scripts/audition", timeout_secs = 86400 }"#;
         let edit = SettingsEdit {
-            before: format!("[{old}]"),
-            after: format!("[{new}]"),
+            before: Some(format!("[{old}]")),
+            after: Some(format!("[{new}]")),
         };
         let text = describe_setting_change(
             "tools.long_running",
@@ -6598,8 +6635,8 @@ mod project_settings_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.toml");
         let edit = SettingsEdit {
-            before: "1800".into(),
-            after: "90000".into(),
+            before: Some("1800".into()),
+            after: Some("90000".into()),
         };
         let project = describe_setting_change(
             "tools.timeout_secs",
@@ -6673,13 +6710,28 @@ mod project_settings_tests {
 
     /// Setting a key to the value it has changes nothing, and says so, but
     /// still says where that value applies.
+    /// Undo is decided by whether the value was set, not by its text: an
+    /// unset value is undone by `unset`, any set one by `set`, even one whose
+    /// text reads like the word for unset.
+    #[test]
+    fn undo_is_decided_by_whether_the_value_was_set() {
+        assert_eq!(
+            undo_command(SettingsFile::User, "tools.context_length", None),
+            "ahma settings unset tools.context_length"
+        );
+        assert_eq!(
+            undo_command(SettingsFile::Project, "instance.label", Some("(unset)")),
+            "ahma settings set --project instance.label '(unset)'"
+        );
+    }
+
     #[test]
     fn an_unchanged_setting_says_nothing_changed() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.toml");
         let edit = SettingsEdit {
-            before: "90000".into(),
-            after: "90000".into(),
+            before: Some("90000".into()),
+            after: Some("90000".into()),
         };
         let text = describe_setting_change(
             "tools.timeout_secs",
