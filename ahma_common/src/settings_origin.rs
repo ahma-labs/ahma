@@ -214,12 +214,12 @@ pub struct StartupLine {
 /// Keys whose value is never logged. None of today's rows hold a secret (the
 /// bearer token is configured by *path*), but a row added later might, and a
 /// startup log is a file that outlives the process.
-const SECRET_KEYS: &[&str] = &["auth.require_token"];
+pub(crate) const SECRET_KEYS: &[&str] = &["auth.require_token"];
 
 /// Keys that only a CLI flag can set (SPEC R-CFG2.3). A file value parses but
 /// never takes effect, and `parse_sandbox_settings` already warns that it was
 /// ignored, so reporting it here as a deviation would claim the opposite.
-const CLI_ONLY_KEYS: &[&str] = &["sandbox.disable"];
+pub(crate) const CLI_ONLY_KEYS: &[&str] = &["sandbox.disable"];
 
 /// The trust tier of a dotted key, via the one classification (R-CFG2.1).
 fn dotted_tier(dotted: &str) -> Option<SettingsTier> {
