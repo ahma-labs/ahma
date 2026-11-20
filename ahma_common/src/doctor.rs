@@ -44,10 +44,40 @@ impl Level {
     }
 }
 
+/// Which check a finding comes from. Code and tests match on this, never on
+/// the title, which is prose for a person and is reworded freely. One check
+/// can report several states (the hub is running, or not); its `level` and
+/// title tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FindingId {
+    NoHome,
+    Settings,
+    MissingGrants,
+    RefusedGrants,
+    GlobalGrants,
+    OtherRepositoryWrites,
+    MissingApprovals,
+    Trust,
+    Hub,
+    GrantToolsAutoApproved,
+    NativeEditsUnconfined,
+    HooksSandbox,
+    HooksNotLoaded,
+    CheckoutHooksNotLoaded,
+    AntigravityPermissions,
+    LogSize,
+    LogWarnings,
+    OldSccacheCache,
+    GitAuth,
+    ConfinedDaemon,
+    GrantPromptPace,
+}
+
 /// One thing the doctor noticed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub level: Level,
+    pub id: FindingId,
     pub title: String,
     pub detail: String,
     pub fix: Option<Fix>,
@@ -459,6 +489,7 @@ fn check_grant_tools_auto_allowed(home: Option<&Path>, workspace: &Path, out: &m
     }
     out.push(Finding {
         level: Level::Warn,
+        id: FindingId::GrantToolsAutoApproved,
         title: "A harness auto-approves ahma's grant tools".into(),
         detail: format!(
             "`sandbox_grant` / `network_grant` only *request* a wider scope; the human decides. \
@@ -514,6 +545,7 @@ fn check_hook_coverage(home: Option<&Path>, out: &mut Vec<Finding>) {
     if !unguarded.is_empty() {
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::NativeEditsUnconfined,
             title: "Native file edits are not confined in some clients".into(),
             detail: format!(
                 "{} route shell commands through ahma's sandbox but have no edit guard, so the \
@@ -527,6 +559,7 @@ fn check_hook_coverage(home: Option<&Path>, out: &mut Vec<Finding>) {
     if !covered.is_empty() || !unguarded.is_empty() {
         out.push(Finding {
             level: Level::Info,
+            id: FindingId::HooksSandbox,
             title: "Terminal hooks apply ahma's own sandbox".into(),
             detail: format!(
                 "Shell hook + edit guard: {}. ahma never defers to a client on an environment \
@@ -598,6 +631,7 @@ fn check_subfolder_hooks(home: Option<&Path>, workspace: &Path, out: &mut Vec<Fi
     }
     out.push(Finding {
         level: Level::Warn,
+        id: FindingId::HooksNotLoaded,
         title: "Claude Code hooks are not loaded from this folder".into(),
         detail: format!(
             "{} declares ahma's shell hook, but Claude Code reads project hooks only from the \
@@ -742,6 +776,7 @@ fn check_hooks_below(home: Option<&Path>, workspace: &Path, out: &mut Vec<Findin
         } else {
             Level::Warn
         },
+        id: FindingId::CheckoutHooksNotLoaded,
         title: "Hooks of the checkouts below are not loaded by a session started here".into(),
         detail: format!(
             "This folder ({}) is not a git checkout, and these checkouts below it declare \
@@ -760,6 +795,7 @@ fn check_settings(input: &DoctorInput, out: &mut Vec<Finding>) -> Option<AhmaSet
     let Some(file) = &input.settings_file else {
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::NoHome,
             title: "No home directory".into(),
             detail: "ahma cannot find ~/.ahma, so nothing it is told to remember is kept.".into(),
             fix: None,
@@ -770,6 +806,7 @@ fn check_settings(input: &DoctorInput, out: &mut Vec<Finding>) -> Option<AhmaSet
         Ok(settings) => {
             out.push(Finding {
                 level: Level::Ok,
+                id: FindingId::Settings,
                 title: "Settings file reads cleanly".into(),
                 detail: file.display().to_string(),
                 fix: None,
@@ -779,6 +816,7 @@ fn check_settings(input: &DoctorInput, out: &mut Vec<Finding>) -> Option<AhmaSet
         Err(e) => {
             out.push(Finding {
                 level: Level::Problem,
+                id: FindingId::Settings,
                 title: "Settings file does not parse".into(),
                 detail: format!(
                     "{e}. ahma refuses to start servers with it (fail-closed) and will not \
@@ -805,6 +843,7 @@ fn check_missing_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
     }
     out.push(Finding {
         level: Level::Warn,
+        id: FindingId::MissingGrants,
         title: "Granted folders that no longer exist".into(),
         detail: format!(
             "{} — every ahma session tries to add these to its sandbox and logs a warning. \
@@ -835,6 +874,7 @@ fn check_refused_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
     }
     out.push(Finding {
         level: Level::Warn,
+        id: FindingId::RefusedGrants,
         title: "Saved grants that ahma refuses and never applies".into(),
         detail: format!(
             "Every session skips these and logs a warning. {}",
@@ -859,6 +899,7 @@ fn check_global_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
     }
     out.push(Finding {
         level: Level::Warn,
+        id: FindingId::GlobalGrants,
         title: "Some granted folders apply to every workspace".into(),
         detail: format!(
             "These grants have no workspace, so an agent in any project can use them: {}. \
@@ -911,6 +952,7 @@ fn check_cross_repo_grants(settings: &AhmaSettings, home: Option<&Path>, out: &m
     if !unconfirmed.is_empty() {
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::OtherRepositoryWrites,
             title: "A dialog let a workspace write another repository".into(),
             detail: unconfirmed_lines.join(" "),
             fix: Some(Fix::RevokeScopes(unconfirmed)),
@@ -919,6 +961,7 @@ fn check_cross_repo_grants(settings: &AhmaSettings, home: Option<&Path>, out: &m
     if !confirmed.is_empty() {
         out.push(Finding {
             level: Level::Info,
+            id: FindingId::OtherRepositoryWrites,
             title: "Workspaces that may write other repositories".into(),
             detail: format!("Granted by you: {}.", confirmed.join("; ")),
             fix: None,
@@ -939,6 +982,7 @@ fn check_missing_workspaces(settings: &AhmaSettings, out: &mut Vec<Finding>) {
     }
     out.push(Finding {
         level: Level::Info,
+        id: FindingId::MissingApprovals,
         title: "Approvals for folders that no longer exist".into(),
         detail: join_paths(&missing),
         fix: Some(Fix::ForgetMissingWorkspaces(missing)),
@@ -977,6 +1021,7 @@ fn check_trust(settings: &AhmaSettings, workspace: &Path, out: &mut Vec<Finding>
     };
     out.push(Finding {
         level: Level::Info,
+        id: FindingId::Trust,
         title: title.into(),
         detail,
         fix: None,
@@ -1072,6 +1117,7 @@ fn check_hub(input: &DoctorInput, out: &mut Vec<Finding>) {
             version: Some(theirs),
         } if *theirs == ours => Finding {
             level: Level::Ok,
+            id: FindingId::Hub,
             title: "Hub is running this build".into(),
             detail: format!("ahma {theirs}"),
             fix: None,
@@ -1080,6 +1126,7 @@ fn check_hub(input: &DoctorInput, out: &mut Vec<Finding>) {
             version: Some(theirs),
         } => Finding {
             level: Level::Warn,
+            id: FindingId::Hub,
             title: "Hub is a different build".into(),
             detail: format!(
                 "The hub is ahma {theirs}, this is {ours}. Behaviour follows the hub \
@@ -1090,18 +1137,21 @@ fn check_hub(input: &DoctorInput, out: &mut Vec<Finding>) {
         },
         HubStatus::Running { version: None } => Finding {
             level: Level::Info,
+            id: FindingId::Hub,
             title: "Hub is running".into(),
             detail: "It did not say which build it is.".into(),
             fix: None,
         },
         HubStatus::NotRunning => Finding {
             level: Level::Info,
+            id: FindingId::Hub,
             title: "Hub is not running".into(),
             detail: "It starts by itself when needed.".into(),
             fix: None,
         },
         HubStatus::Unreachable => Finding {
             level: Level::Info,
+            id: FindingId::Hub,
             title: "Hub is out of reach".into(),
             detail: "This process may not connect to the hub's socket. Inside a sandbox \
                      that is deliberate: a command cannot reach the hub (R-HUB.13). Run \
@@ -1377,6 +1427,7 @@ fn check_antigravity_permissions(
     if !has_warnings && !missing_clean {
         out.push(Finding {
             level: Level::Ok,
+            id: FindingId::AntigravityPermissions,
             title: "Antigravity command permissions are clean".into(),
             detail: "Clean prefix grants are active in ~/.gemini config files; no bloated or malformed entries found.".into(),
             fix: None,
@@ -1397,6 +1448,7 @@ fn check_antigravity_permissions(
         } else {
             Level::Info
         },
+        id: FindingId::AntigravityPermissions,
         title: "Antigravity permission grants need cleanup".into(),
         detail,
         fix: Some(Fix::RepairAntigravityPermissions {
@@ -1440,6 +1492,7 @@ fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
     if total > LARGE {
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::LogSize,
             title: "Logs are large".into(),
             detail: format!(
                 "{} MB in {}. Old files can be deleted safely.",
@@ -1457,6 +1510,7 @@ fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
     if top.is_empty() {
         out.push(Finding {
             level: Level::Ok,
+            id: FindingId::LogWarnings,
             title: "No warnings in the latest log".into(),
             detail: newest.display().to_string(),
             fix: None,
@@ -1466,6 +1520,7 @@ fn check_logs(workspace: &Path, out: &mut Vec<Finding>) {
     let lines: Vec<String> = top.iter().map(|(msg, n)| format!("{n}× {msg}")).collect();
     out.push(Finding {
         level: Level::Info,
+        id: FindingId::LogWarnings,
         title: "Most repeated warnings in the latest log".into(),
         detail: format!("{}\n{}", newest.display(), lines.join("\n")),
         fix: None,
@@ -1611,7 +1666,7 @@ mod tests {
         let report = render(&findings);
         let warn = findings
             .iter()
-            .find(|f| f.level == Level::Warn && f.title.contains("another repository"))
+            .find(|f| f.level == Level::Warn && f.id == FindingId::OtherRepositoryWrites)
             .unwrap_or_else(|| panic!("{report}"));
         assert!(warn.detail.contains("neubit4"), "{report}");
         assert!(!warn.detail.contains("tools"), "{report}");
@@ -1629,7 +1684,7 @@ mod tests {
         );
         let info = findings
             .iter()
-            .find(|f| f.level == Level::Info && f.title.contains("other repositories"))
+            .find(|f| f.level == Level::Info && f.id == FindingId::OtherRepositoryWrites)
             .unwrap_or_else(|| panic!("{report}"));
         assert!(
             info.detail.contains("tools") && info.fix.is_none(),
@@ -1880,7 +1935,7 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
         assert!(
             findings_after
                 .iter()
-                .any(|f| f.title == "Antigravity command permissions are clean")
+                .any(|f| f.id == FindingId::AntigravityPermissions && f.level == Level::Ok)
         );
         assert!(fixes(&findings_after).is_empty());
     }
@@ -1894,7 +1949,7 @@ pid=4 2026-09-23T05:18:51Z  INFO ahma: fine
         input.hub = hub;
         run(&input)
             .into_iter()
-            .find(|f| f.title.starts_with("Hub"))
+            .find(|f| f.id == FindingId::Hub)
             .expect("the hub always gets a finding")
     }
 
@@ -2020,6 +2075,7 @@ fn check_old_sccache_dir(workspace: &Path, out: &mut Vec<Finding>) {
     }
     out.push(Finding {
         level: Level::Info,
+        id: FindingId::OldSccacheCache,
         title: "An old sccache cache can be deleted".to_string(),
         detail: format!(
             "One thing to do, if you want the space back: `rm -rf {}`. ahma's sccache profile \
@@ -2041,12 +2097,12 @@ mod hook_and_grant_tool_tests {
         let home = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let none = run(&input(home.path(), ws.path()));
-        assert!(!none.iter().any(|f| f.title.contains("sccache cache")));
+        assert!(!none.iter().any(|f| f.id == FindingId::OldSccacheCache));
         std::fs::create_dir_all(ws.path().join("target").join("sccache")).unwrap();
         let found = run(&input(home.path(), ws.path()));
         let f = found
             .iter()
-            .find(|f| f.title.contains("old sccache cache"))
+            .find(|f| f.id == FindingId::OldSccacheCache)
             .expect("reported");
         assert_eq!(f.level, Level::Info);
         assert!(f.detail.contains("rm -rf"), "{}", f.detail);
@@ -2082,7 +2138,7 @@ mod hook_and_grant_tool_tests {
         let findings = run(&input(home.path(), ws.path()));
         let f = findings
             .iter()
-            .find(|f| f.title.contains("auto-approves ahma's grant tools"))
+            .find(|f| f.id == FindingId::GrantToolsAutoApproved)
             .expect("the auto-allowed grant tool must be reported");
         assert_eq!(f.level, Level::Warn);
         assert!(f.detail.contains("mcp(Ahma/sandbox_grant)"), "{}", f.detail);
@@ -2097,7 +2153,7 @@ mod hook_and_grant_tool_tests {
         assert!(
             !findings
                 .iter()
-                .any(|f| f.title.contains("auto-approves ahma's grant tools"))
+                .any(|f| f.id == FindingId::GrantToolsAutoApproved)
         );
     }
 
@@ -2115,12 +2171,12 @@ mod hook_and_grant_tool_tests {
         let findings = run(&input(home.path(), ws.path()));
         let f = findings
             .iter()
-            .find(|f| f.title.contains("Native file edits are not confined"))
+            .find(|f| f.id == FindingId::NativeEditsUnconfined)
             .expect("a guard-less shell hook must be reported");
         assert!(f.detail.contains("Claude Code"), "{}", f.detail);
         let info = findings
             .iter()
-            .find(|f| f.title.contains("Terminal hooks apply ahma's own sandbox"))
+            .find(|f| f.id == FindingId::HooksSandbox)
             .expect("the enforcement model is stated");
         assert!(
             info.detail.contains("Bash sandbox is off"),
@@ -2138,7 +2194,7 @@ mod hook_and_grant_tool_tests {
         assert!(
             !findings
                 .iter()
-                .any(|f| f.title.contains("Native file edits are not confined"))
+                .any(|f| f.id == FindingId::NativeEditsUnconfined)
         );
     }
 
@@ -2172,7 +2228,7 @@ mod hook_and_grant_tool_tests {
         let findings = run(&input(home.path(), &sub));
         let f = findings
             .iter()
-            .find(|f| f.title.contains("hooks are not loaded from this folder"))
+            .find(|f| f.id == FindingId::HooksNotLoaded)
             .expect("a subfolder session that misses the root's hooks is reported");
         assert_eq!(f.level, Level::Warn);
         assert!(f.detail.contains("settings.json"), "{}", f.detail);
@@ -2195,11 +2251,7 @@ mod hook_and_grant_tool_tests {
         write_project_settings(&root, "settings.json", AHMA_HOOK);
         write_project_settings(&root, "settings.local.json", AHMA_HOOK);
         let findings = run(&input(home.path(), &sub));
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.title.contains("hooks are not loaded from this folder"))
-        );
+        assert!(!findings.iter().any(|f| f.id == FindingId::HooksNotLoaded));
     }
 
     #[test]
@@ -2209,11 +2261,7 @@ mod hook_and_grant_tool_tests {
         let (root, _sub) = checkout_with_subfolder(repo.path());
         write_project_settings(&root, "settings.json", AHMA_HOOK);
         let findings = run(&input(home.path(), &root));
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.title.contains("hooks are not loaded from this folder"))
-        );
+        assert!(!findings.iter().any(|f| f.id == FindingId::HooksNotLoaded));
     }
 
     #[test]
@@ -2224,11 +2272,7 @@ mod hook_and_grant_tool_tests {
         write_project_settings(&root, "settings.json", AHMA_HOOK);
         write_project_settings(&sub, "settings.json", AHMA_HOOK);
         let findings = run(&input(home.path(), &sub));
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.title.contains("hooks are not loaded from this folder"))
-        );
+        assert!(!findings.iter().any(|f| f.id == FindingId::HooksNotLoaded));
     }
 
     #[test]
@@ -2239,11 +2283,7 @@ mod hook_and_grant_tool_tests {
         write_project_settings(&root, "settings.json", AHMA_HOOK);
         write_project_settings(home.path(), "settings.json", AHMA_HOOK);
         let findings = run(&input(home.path(), &sub));
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.title.contains("hooks are not loaded from this folder"))
-        );
+        assert!(!findings.iter().any(|f| f.id == FindingId::HooksNotLoaded));
     }
 
     #[test]
@@ -2253,11 +2293,7 @@ mod hook_and_grant_tool_tests {
         let (root, sub) = checkout_with_subfolder(repo.path());
         write_project_settings(&root, "settings.json", r#"{"permissions":{"allow":[]}}"#);
         let findings = run(&input(home.path(), &sub));
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.title.contains("hooks are not loaded from this folder"))
-        );
+        assert!(!findings.iter().any(|f| f.id == FindingId::HooksNotLoaded));
     }
 
     #[test]
@@ -2268,11 +2304,7 @@ mod hook_and_grant_tool_tests {
         std::fs::create_dir_all(&sub).unwrap();
         write_project_settings(dir.path(), "settings.json", AHMA_HOOK);
         let findings = run(&input(home.path(), &sub));
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.title.contains("hooks are not loaded from this folder"))
-        );
+        assert!(!findings.iter().any(|f| f.id == FindingId::HooksNotLoaded));
     }
 
     const PROJECT_HOOK: &str = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"scripts/audition-hook unread"}]}]}}"#;
@@ -2289,7 +2321,7 @@ mod hook_and_grant_tool_tests {
     fn above_finding(findings: &[Finding]) -> Option<&Finding> {
         findings
             .iter()
-            .find(|f| f.title.contains("not loaded by a session started here"))
+            .find(|f| f.id == FindingId::CheckoutHooksNotLoaded)
     }
 
     /// R-DOCTOR.10 (field case 2026-11-18): a session started in the folder
@@ -2721,6 +2753,7 @@ fn check_git_ssh_auth(probe: &GitAuthProbe, keys_present: bool, out: &mut Vec<Fi
         Some(0) => {
             out.push(Finding {
                 level: Level::Warn,
+                id: FindingId::GitAuth,
                 title: "Git over SSH fails inside the sandbox: the SSH agent holds no key".into(),
                 detail: format!(
                     "One thing to do: run `{add_cmd}` in a terminal on the host.\n\n\
@@ -2734,6 +2767,7 @@ fn check_git_ssh_auth(probe: &GitAuthProbe, keys_present: bool, out: &mut Vec<Fi
         None => {
             out.push(Finding {
                 level: Level::Warn,
+                id: FindingId::GitAuth,
                 title: "Git over SSH fails inside the sandbox: no SSH agent answered".into(),
                 detail: format!(
                     "One thing to do: start an agent and load your key — `eval \"$(ssh-agent \
@@ -2757,6 +2791,7 @@ fn check_git_https_auth(
     if keychain_helper && !settings.sandbox.allow_keychain {
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::GitAuth,
             title: "Git over HTTPS fails inside the sandbox: the keychain helper is blocked".into(),
             detail: "One thing to do: set `allow_keychain = true` under `[sandbox]` in \
                      ~/.ahma/settings.toml (or remove the key; the default is on).\n\nYour \
@@ -2777,6 +2812,7 @@ fn check_git_https_auth(
     if gh_helper && gh_denied {
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::GitAuth,
             title: "Git over HTTPS fails inside the sandbox: the `gh` helper cannot read its token"
                 .into(),
             detail:
@@ -2832,6 +2868,7 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
         };
         out.push(Finding {
             level: Level::Info,
+            id: FindingId::GitAuth,
             title: "Git has no way to authenticate from inside the sandbox".into(),
             detail: format!(
                 "One thing to do: create an SSH key on the host with `ssh-keygen -t ed25519` and \
@@ -2855,6 +2892,7 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
         let ssh = git_ssh_summary(probe, keys_present);
         out.push(Finding {
             level: Level::Info,
+            id: FindingId::GitAuth,
             title: "Git can authenticate from inside the sandbox".into(),
             detail: format!(
                 "Nothing more to do. {https}; {ssh}. Sandboxed commands sign through the agent \
@@ -2987,6 +3025,7 @@ fn check_confined_daemons(daemons: &[ConfinedDaemon], out: &mut Vec<Finding>) {
             .unwrap_or_default();
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::ConfinedDaemon,
             title: format!(
                 "The {} process (pid {}) is running inside a sandbox",
                 d.name, d.pid
@@ -3103,6 +3142,7 @@ fn check_decision_habits(entries: &[crate::permissions::AuditEntry], out: &mut V
     if median_ms < REFLEX_SECS * 1_000 {
         out.push(Finding {
             level: Level::Warn,
+            id: FindingId::GrantPromptPace,
             title: "Grant prompts are being answered faster than they can be read".into(),
             detail: format!(
                 "Nothing to run; something to notice. {habits} A prompt answered in under \
@@ -3115,6 +3155,7 @@ fn check_decision_habits(entries: &[crate::permissions::AuditEntry], out: &mut V
     } else {
         out.push(Finding {
             level: Level::Info,
+            id: FindingId::GrantPromptPace,
             title: "Grant prompts are being read".into(),
             detail: format!("Nothing more to do. {habits}"),
             fix: None,
