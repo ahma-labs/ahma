@@ -316,7 +316,8 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   session paths `adapter::guards::RunGuards::end` is the one way an operation ends, and takes
   what the run holds by value: it tells the SSH broker's refusals, compares the deny tier
   (R6.1.7) while the workspace is still held, so another command's writes are not counted as
-  this one's, hands the workspace on, then publishes the ending and audits it.
+  this one's, hands the workspace on, then publishes the ending and audits it. A cancel or a watchdog
+  timeout asks the task rather than ending the operation under it (R13.3).
   The synchronous path has no operation to show
   as queued, so it **must** announce a wait once (a terminal hook writes it to stderr, where
   the harness shows it) and, if its turn does not come within the command's own timeout,
@@ -2058,6 +2059,16 @@ These are per-call arguments of the MCP request, never forwarded to the command 
 
 - **R13.1**: Distinguish MCP protocol cancellations from process cancellations.
 - **R13.2**: Only cancel actual background operations, not synchronous MCP tool calls (`await`, `status`, `cancel`).
+- **R13.3**: **A stop asks the task that runs the operation; the task ends it.** A cancel (the
+  `cancel` tool, the TUI, shutdown) or a watchdog timeout of an operation that a task runs
+  (`OperationMonitor::ends_by_task`: the async, PTY and session paths) **must not** end the
+  operation under its task. It records the ending it wants, with its reason, and signals the
+  task, which kills the process tree, hands the workspace on and then publishes that ending
+  (R2.7.1). Ending first and signalling second published `Cancelled` while the workspace was
+  still held, so a caller woken by the cancel found it busy. A cancel waits for the ending (so
+  "cancelled" means ended) and reports whether the operation ended cancelled; the watchdog does
+  not wait. A task that has not ended the operation 5 s after being asked has it ended for it,
+  so a stuck task cannot keep an operation alive. An operation no task runs is ended at once.
 
 ### 8.5 Concurrency Architecture Principles
 

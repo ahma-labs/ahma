@@ -203,11 +203,18 @@ async fn silent_and_cpu_idle_operation_is_still_reaped() {
 
     monitor.check_timeouts().await;
 
+    // The watchdog asks the operation's task to stop, and the task ends it once
+    // its process tree is gone and the workspace handed on (SPEC R2.7.1).
+    let ended = tokio::time::timeout(
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+        monitor.wait_for_operation(&id),
+    )
+    .await
+    .expect("the watchdog's stop ends the operation")
+    .expect("the operation is known");
     assert_eq!(
-        state_of(&monitor, &id).await,
-        Some(OperationStatus::TimedOut),
+        ended.state,
+        OperationStatus::TimedOut,
         "a silent operation whose process tree burned no CPU must still be reaped"
     );
-
-    let _ = monitor.cancel_operation(&id).await;
 }

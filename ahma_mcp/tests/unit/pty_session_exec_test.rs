@@ -284,11 +284,16 @@ async fn session_echo_round_trip() {
 fn queued_adapter(
     scope: &std::path::Path,
 ) -> (Arc<Adapter>, Arc<OperationMonitor>, std::path::PathBuf) {
+    queued_adapter_with(scope, MonitorConfig::with_timeout(Duration::from_secs(60)))
+}
+
+fn queued_adapter_with(
+    scope: &std::path::Path,
+    config: MonitorConfig,
+) -> (Arc<Adapter>, Arc<OperationMonitor>, std::path::PathBuf) {
     use ahma_mcp::adapter::workspace_queue::WorkspaceQueue;
     use ahma_mcp::sandbox::handoff_watch::HandoffWatchMode;
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(60),
-    )));
+    let monitor = Arc::new(OperationMonitor::new(config));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let sandbox = Arc::new(
         Sandbox::new(
@@ -437,5 +442,84 @@ async fn a_piped_command_hands_the_workspace_on_however_it_ends() {
     assert!(
         matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
         "a command stopped at its limit still holds the workspace"
+    );
+
+    let cancelled = start("sleep 60", 30).await;
+    ahma_mcp::test_utils::assertions::assert_eventually(
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+        ahma_common::timeouts::TestTimeouts::poll_interval(),
+        "the command is running",
+        || async {
+            monitor
+                .get_operation(&cancelled)
+                .await
+                .is_some_and(|op| op.state == OperationStatus::InProgress)
+        },
+    )
+    .await;
+    assert!(
+        monitor
+            .cancel_operation_with_reason(&cancelled, Some("stopped by the test".into()))
+            .await
+    );
+    let op = wait_done(&monitor, &cancelled).await;
+    assert_eq!(op.state, OperationStatus::Cancelled);
+    assert!(
+        op.result
+            .as_ref()
+            .is_some_and(|r| r.to_string().contains("stopped by the test")),
+        "the cancel's own reason is the result: {:?}",
+        op.result
+    );
+    assert!(
+        matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+        "a cancelled command still holds the workspace"
+    );
+}
+
+/// The monitor's watchdog stops a silent command the same way: the workspace
+/// is free once the command is observed timed out, and the result names the
+/// watchdog's reason. The watchdog published the ending first and signalled
+/// the task second, like `cancel_operation`.
+#[tokio::test]
+async fn a_command_the_watchdog_stops_hands_the_workspace_on_first() {
+    use ahma_mcp::adapter::workspace_queue::LeaseProbe;
+    use ahma_mcp::operation_monitor::OperationStatus;
+    let temp = tempdir().unwrap();
+    let config = MonitorConfig::with_timeout(Duration::from_secs(60))
+        .with_idle_timeout(Some(Duration::from_secs(1)));
+    let (adapter, monitor, key) = queued_adapter_with(temp.path(), config);
+    let id = adapter
+        .execute_async_in_dir(
+            "run_terminal_command",
+            "sleep 60",
+            None,
+            temp.path().to_str().unwrap(),
+            Some(30),
+        )
+        .await
+        .expect("piped command starts");
+    ahma_mcp::test_utils::assertions::assert_eventually(
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+        ahma_common::timeouts::TestTimeouts::poll_interval(),
+        "the watchdog stops the silent command",
+        || async {
+            monitor.check_timeouts().await;
+            monitor.get_operation(&id).await.is_none()
+        },
+    )
+    .await;
+    let op = wait_done(&monitor, &id).await;
+    assert_eq!(op.state, OperationStatus::TimedOut);
+    assert!(
+        matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+        "a command the watchdog stopped still holds the workspace"
+    );
+    assert!(
+        op.result
+            .as_ref()
+            .is_some_and(|r| r.to_string().contains("no output")),
+        "the watchdog's reason is the result: {:?}",
+        op.result
     );
 }
