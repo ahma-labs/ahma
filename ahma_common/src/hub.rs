@@ -154,7 +154,8 @@ pub struct InstanceInfo {
     /// Random UUID assigned by the hub at registration time.
     pub id: String,
     pub pid: u32,
-    /// "stdio", "http", or "unix"
+    /// `"stdio"` (an MCP session worker), `"hook"` (a hooked command), or
+    /// `"tui"` (`ahma tui`'s own reporter).
     pub mode: String,
     /// Sandbox scope / workspace root, e.g. `/home/user/project`.
     pub scope: String,

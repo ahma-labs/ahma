@@ -211,7 +211,8 @@ pub struct GrantRecord {
     /// When it was granted (`YYYY-MM-DD`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<String>,
-    /// Which surface the answer came from (`cli`, `tui`, `harness:cursor`, …).
+    /// Which surface the answer came from (`cli`, `tui`, `web`, `desktop`,
+    /// `harness`, `mcp:<tool>`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
     /// Free-form human note.
@@ -373,7 +374,8 @@ pub struct ToolApproval {
     /// Who approved (`user`), retained for provenance in `permissions list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_by: Option<String>,
-    /// The surface the approval was given at (`tui`, `cli`, `harness:<client>`).
+    /// The surface the approval was given at (`tui`, `web`, `desktop`, `cli`,
+    /// `harness`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
 }

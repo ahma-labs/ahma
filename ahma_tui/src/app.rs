@@ -2869,7 +2869,7 @@ pub(crate) fn resolve_scope_grant(
     // A question read from the terminal-hook records has no instance behind
     // it: the TUI applies the answer itself (SPEC R-PERM.10(e)).
     if let Some(ask) = &gate.harness {
-        let (level, message) = match crate::harness_asks::answer(ask, decision) {
+        let (level, message) = match crate::harness_asks::answer(ask, decision, state.surface) {
             Ok(line) => (
                 if decision.within_offer(gate.reason) == GrantDecision::Deny {
                     LogLevel::Warn

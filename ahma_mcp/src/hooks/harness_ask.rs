@@ -602,7 +602,7 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
         q.access,
         Some(&workspace),
         owner,
-        "harness dialog",
+        ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG,
     );
     let verb = if q.access.is_write() { "write" } else { "read" };
     Some(Approval {
@@ -739,7 +739,7 @@ fn apply_ssh_approval(asked: &harness_asks::AskedSsh, workspace: &Path, now: u64
             workspace: workspace.to_path_buf(),
             granted_at: now,
             expires_at: None,
-            granted_by: Some("harness dialog".into()),
+            granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string()),
             owner_pid: Some(owner),
         };
         ahma_common::ssh_sign::record_session(&dir, &grant).ok()
@@ -753,7 +753,9 @@ fn apply_ssh_approval(asked: &harness_asks::AskedSsh, workspace: &Path, now: u64
                 format!("{} for {}", r.key, r.destination),
                 None,
                 ahma_common::permissions::GrantTier::Session,
-                Some("harness dialog".into()),
+                // The surface, as every other harness-dialog record has it;
+                // "harness dialog" is the grant's maker (`granted_by`).
+                Some("harness".into()),
             ));
             format!(
                 "ahma: approved — commands in this workspace may sign with {} for {} for this \

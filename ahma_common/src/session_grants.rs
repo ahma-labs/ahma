@@ -42,7 +42,7 @@ pub struct SessionGrant {
     pub owner_pid: u32,
     /// Unix seconds when it was approved.
     pub granted_at: u64,
-    /// The surface or tool that asked (`"tui"`, `"harness"`, `"cli"`, a tool name).
+    /// Who made it (`"tui"`, `"web"`, `"cli"`, `"harness dialog"`, a tool name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_by: Option<String>,
 }

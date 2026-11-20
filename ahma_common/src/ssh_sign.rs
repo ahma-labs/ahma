@@ -43,7 +43,7 @@ pub struct SshSignGrant {
     /// When it lapses (a lease), Unix seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
-    /// The surface that asked (`"harness dialog"`, `"tui"`, `"cli"`).
+    /// Who made it (`"harness dialog"`, `"tui"`, `"cli"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_by: Option<String>,
     /// For the session tier, the process whose life bounds it.
