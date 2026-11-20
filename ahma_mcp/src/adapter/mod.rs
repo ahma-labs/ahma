@@ -45,6 +45,7 @@
 
 pub mod audit;
 pub mod executor;
+mod guards;
 pub mod lane;
 pub mod mutex_groups;
 mod preparer;
@@ -1593,38 +1594,29 @@ impl Adapter {
         );
 
         let task = async move {
-            let started = Instant::now();
+            let mut guards = guards::RunGuards::new(&op_id_task, &tool_task);
             // Held until the PTY process is gone.
-            let Ok(lease) =
-                wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await
-            else {
-                handle_cancellation(&monitor, &op_id_task).await;
-                audit::record_tool_complete(
-                    &op_id_task,
-                    audit::Outcome::Cancelled,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                )
-                .await;
-                return;
-            };
+            match wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await {
+                Ok(lease) => guards.hold_lease(lease),
+                Err(()) => return guards.end(&monitor, cancelled()).await,
+            }
             // Running from here, not while it waited its turn (SPEC R2.7.1).
             monitor.start(&op_id_task).await;
-            let handoff = if watch_handoff {
-                Some(begin_handoff_watch(&sandbox, &safe_wd).await)
-            } else {
-                None
-            };
+            if watch_handoff {
+                guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
+            }
             // Its SSH key broker (SPEC R-CRED.1), as for any other command: a
             // refused signature is an alert on this operation (R-CRED.10). Held
             // until the PTY process is gone.
             #[cfg(unix)]
-            let broker = credential_brokers
-                .as_ref()
-                .and_then(|f| f.lease_for_command(&safe_wd, Some(&command_str)))
-                .inspect(|broker| alert_broker_refusals(broker, &monitor, &op_id_task));
+            guards.hold_broker(
+                credential_brokers
+                    .as_ref()
+                    .and_then(|f| f.lease_for_command(&safe_wd, Some(&command_str)))
+                    .inspect(|broker| alert_broker_refusals(broker, &monitor, &op_id_task)),
+            );
             #[cfg(unix)]
-            let broker_socket = broker.as_ref().map(|b| b.socket().to_path_buf());
+            let broker_socket = guards.broker().map(|b| b.socket().to_path_buf());
             #[cfg(not(unix))]
             let broker_socket: Option<std::path::PathBuf> = None;
             let finished = pty_exec::run_pty_operation(
@@ -1639,30 +1631,9 @@ impl Adapter {
                 keep_leftovers,
             )
             .await;
-            #[cfg(unix)]
-            if let Some(broker) = broker.as_ref() {
-                for refusal in broker_refusal_lines(broker) {
-                    monitor.append_alert_unique(&op_id_task, refusal).await;
-                }
-            }
-            // The PTY path publishes its own result, so a deny-tier write here
-            // reaches the log and the audit trail, not the result text.
-            if let Some(watch) = handoff {
-                let _ = finish_handoff_watch(watch, &op_id_task, &tool_task).await;
-            }
-            #[cfg(unix)]
-            drop(broker);
-            // Hand the workspace on before anyone can observe this operation
-            // as finished (SPEC R2.7.1).
-            drop(lease);
-            let (outcome, exit_code) = finished.publish(&monitor, &op_id_task).await;
-            audit::record_tool_complete(
-                &op_id_task,
-                outcome,
-                started.elapsed().as_millis() as u64,
-                exit_code,
-            )
-            .await;
+            // A deny-tier write reaches the log and the audit trail, not the
+            // result text.
+            guards.end(&monitor, finished).await;
         };
         self.spawn_operation_task(&op_id, task).await;
 
@@ -1736,28 +1707,17 @@ impl Adapter {
         );
 
         let task = async move {
-            let started = Instant::now();
+            let mut guards = guards::RunGuards::new(&op_id_task, &tool_task);
             // Held until the session command is done.
-            let Ok(lease) =
-                wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await
-            else {
-                handle_cancellation(&monitor, &op_id_task).await;
-                audit::record_tool_complete(
-                    &op_id_task,
-                    audit::Outcome::Cancelled,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                )
-                .await;
-                return;
-            };
+            match wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await {
+                Ok(lease) => guards.hold_lease(lease),
+                Err(()) => return guards.end(&monitor, cancelled()).await,
+            }
             // Running from here, not while it waited its turn (SPEC R2.7.1).
             monitor.start(&op_id_task).await;
-            let handoff = if watch_handoff {
-                Some(begin_handoff_watch(&sandbox, &safe_wd).await)
-            } else {
-                None
-            };
+            if watch_handoff {
+                guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
+            }
             let finished = run_session_operation(
                 &sessions,
                 &sandbox,
@@ -1771,20 +1731,7 @@ impl Adapter {
             )
             .await;
             // As for PTY: a deny-tier write reaches the log and the audit trail.
-            if let Some(watch) = handoff {
-                let _ = finish_handoff_watch(watch, &op_id_task, &tool_task).await;
-            }
-            // Hand the workspace on before anyone can observe this operation
-            // as finished (SPEC R2.7.1).
-            drop(lease);
-            let (outcome, exit_code) = finished.publish(&monitor, &op_id_task).await;
-            audit::record_tool_complete(
-                &op_id_task,
-                outcome,
-                started.elapsed().as_millis() as u64,
-                exit_code,
-            )
-            .await;
+            guards.end(&monitor, finished).await;
         };
         self.spawn_operation_task(&op_id, task).await;
 
@@ -2005,25 +1952,13 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     // Timed from the moment the task starts, so queueing behind a command mutex
     // group is visible in the audit record rather than silently excluded.
-    let task_start = Instant::now();
-    let audit_complete = |outcome: audit::Outcome, exit_code: Option<i32>| {
-        let op_id = op_id.clone();
-        async move {
-            audit::record_tool_complete(
-                &op_id,
-                outcome,
-                task_start.elapsed().as_millis() as u64,
-                exit_code,
-            )
-            .await;
-        }
-    };
+    let mut guards = guards::RunGuards::new(&op_id, &command);
 
     let cancellation_token = match monitor.get_operation(&op_id).await {
         Some(operation) => operation.cancellation_token.clone(),
         None => {
-            tracing::error!("Could not find operation {} for cancellation token", op_id);
-            audit_complete(audit::Outcome::Failed, None).await;
+            let why = format!("Could not find operation {op_id} for cancellation token");
+            guards.end(&monitor, failed(why)).await;
             return;
         }
     };
@@ -2031,15 +1966,14 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // ── Workspace write queue (SPEC R2.7) ──────────────────────────────────
     // Wait for every exclusive operation that arrived earlier in this
     // workspace — in this process or any other — before starting. The lease is
-    // held until this function returns, i.e. until the process tree is gone.
-    let mut lease = match wait_for_lease(ticket, &monitor, &op_id, &cancellation_token).await {
-        Ok(lease) => lease,
+    // held until the operation ends, i.e. until the process tree is gone.
+    match wait_for_lease(ticket, &monitor, &op_id, &cancellation_token).await {
+        Ok(lease) => guards.hold_lease(lease),
         Err(()) => {
-            handle_cancellation(&monitor, &op_id).await;
-            audit_complete(audit::Outcome::Cancelled, None).await;
+            guards.end(&monitor, cancelled()).await;
             return;
         }
-    };
+    }
 
     monitor.start(&op_id).await;
 
@@ -2050,9 +1984,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     if cancellation_token.is_cancelled() {
         tracing::info!("Operation {} was cancelled before execution started", op_id);
-        drop(lease.take());
-        handle_cancellation(&monitor, &op_id).await;
-        audit_complete(audit::Outcome::Cancelled, None).await;
+        guards.end(&monitor, cancelled()).await;
         return;
     }
 
@@ -2071,10 +2003,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     {
         Ok(permit) => permit,
         Err(err) => {
-            drop(lease.take());
-            // Published Failed, so audited Failed: the two views of one end.
-            fail_operation_with_error(&monitor, &op_id, err).await;
-            audit_complete(audit::Outcome::Failed, None).await;
+            guards.end(&monitor, failed(err)).await;
             return;
         }
     };
@@ -2095,15 +2024,13 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     let mut proc_cmd = match built {
         Ok(cmd) => cmd,
         Err(e) => {
-            let err_msg = format!("Failed to create sandboxed command: {}", e);
-            drop(lease.take());
-            fail_operation_with_error(&monitor, &op_id, err_msg).await;
-            audit_complete(audit::Outcome::Failed, None).await;
+            let why = format!("Failed to create sandboxed command: {}", e);
+            guards.end(&monitor, failed(why)).await;
             return;
         }
     };
 
-    stamp_lease(&mut proc_cmd, lease.as_ref());
+    stamp_lease(&mut proc_cmd, guards.lease());
     if keep_leftovers {
         sandbox::leftovers::keep(&mut proc_cmd);
     }
@@ -2111,13 +2038,15 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // alert on this operation while it still runs (R-CRED.10). Held until the
     // command has finished.
     #[cfg(unix)]
-    let broker = credential_brokers
-        .as_ref()
-        .and_then(|f| f.lease_for_command(&wd_path, Some(&display_command)))
-        .inspect(|broker| {
-            proc_cmd.env("SSH_AUTH_SOCK", broker.socket());
-            alert_broker_refusals(broker, &monitor, &op_id);
-        });
+    guards.hold_broker(
+        credential_brokers
+            .as_ref()
+            .and_then(|f| f.lease_for_command(&wd_path, Some(&display_command)))
+            .inspect(|broker| {
+                proc_cmd.env("SSH_AUTH_SOCK", broker.socket());
+                alert_broker_refusals(broker, &monitor, &op_id);
+            }),
+    );
     // The tag the kernel's records of this operation's denials carry
     // (SPEC R-DENY.1), for the failure path to read them back.
     if let Some(tag) = sandbox::kernel_denials::tag_of(proc_cmd.as_std().get_args()) {
@@ -2133,18 +2062,16 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     // SPEC R6.1.7: the "before" inventory of the deny tier, taken as late as
     // possible — after the queue and the mutex gate, just before the spawn.
-    let mut handoff = if watch_handoff {
-        Some(begin_handoff_watch(&sandbox, &wd_path).await)
-    } else {
-        None
-    };
+    if watch_handoff {
+        guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &wd_path).await));
+    }
 
     // Single execution path: stream stdout/stderr line-by-line for every
     // operation (SPEC R15.2).  Lines flow through the OperationMonitor, which
     // appends to the tail buffer and emits `OutputLine` on the unified event
     // stream — so the TUI and hub subscribers see output as it is produced.
     // Log-monitor alerting only runs when a config was provided.
-    let (outcome, exit_code) = execute_with_streaming(
+    execute_with_streaming(
         &mut proc_cmd,
         limit,
         log_monitor_config,
@@ -2157,22 +2084,9 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         &command,
         &wd_path,
         drift.as_ref(),
-        &mut handoff,
-        &mut lease,
-        #[cfg(unix)]
-        broker.as_ref(),
+        guards,
     )
     .await;
-    // Normally compared inside, where the alert can lead the result. Still
-    // here only when the run ended another way — timeout, cancellation, spawn
-    // failure — and its result is already published: a partial run can still
-    // have written a hook, so the log and the audit trail hear about it.
-    if let Some(watch) = handoff.take() {
-        let _ = finish_handoff_watch(watch, &op_id, &command).await;
-    }
-    // Normally already released inside, just before the terminal transition.
-    drop(lease);
-    audit_complete(outcome, exit_code).await;
 }
 
 /// The shell command line of a `run_terminal_command`-style call (`command`
@@ -2628,13 +2542,10 @@ async fn acquire_mutex_gate(
     }
 }
 
-async fn fail_operation_with_error(
-    monitor: &Arc<OperationMonitor>,
-    op_id: &str,
-    error_message: String,
-) {
-    tracing::error!("{}", error_message);
-    monitor.finish(op_id, Terminal::Failed(error_message)).await;
+/// The ending of an operation that failed before it produced an exit status.
+fn failed(why: String) -> Terminal {
+    tracing::error!("{}", why);
+    Terminal::Failed(why)
 }
 
 /// Give a task a 250 ms grace period then abort it if still running,
@@ -2770,19 +2681,13 @@ fn finalize_session_result(
     }
 }
 
-async fn cancel_operation_timed_out(
-    monitor: &Arc<OperationMonitor>,
-    op_id: &str,
-    duration_ms: u64,
-) {
-    let timeout_reason = format!(
+/// The ending of a command stopped at its time limit, saying how to raise it.
+fn timed_out(duration_ms: u64) -> Terminal {
+    Terminal::TimedOut(format!(
         "Operation timed out after {}ms (exceeded timeout limit). {}",
         duration_ms,
         time_limit::how_to_raise(duration_ms.div_ceil(1000))
-    );
-    monitor
-        .finish(op_id, Terminal::TimedOut(timeout_reason))
-        .await;
+    ))
 }
 
 /// Execute a command with line-by-line streaming and optional log monitoring.
@@ -2795,9 +2700,9 @@ async fn cancel_operation_timed_out(
 /// through a `LogMonitor` which checks for error/warning patterns and emits
 /// `Alert` events.
 ///
-/// Returns how the operation ended and, where one exists, its exit code — the
-/// caller turns that into the single `tool_complete` audit event that pairs with
-/// the `tool_call` written before the task was spawned.
+/// Ends the operation through `guards`, which also writes the single
+/// `tool_complete` audit event that pairs with the `tool_call` written before
+/// the task was spawned.
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_streaming(
     proc_cmd: &mut tokio::process::Command,
@@ -2812,10 +2717,8 @@ async fn execute_with_streaming(
     tool: &str,
     working_dir: &Path,
     drift: Option<&DriftProbe>,
-    handoff: &mut Option<HandoffWatch>,
-    lease: &mut Option<workspace_queue::Lease>,
-    #[cfg(unix)] broker: Option<&crate::credentials::ssh_agent::host::BrokerLease>,
-) -> (audit::Outcome, Option<i32>) {
+    guards: guards::RunGuards,
+) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Ensure stdin/stdout/stderr are strictly isolated (should already be set by sandbox)
@@ -2826,10 +2729,13 @@ async fn execute_with_streaming(
     let child = match proc_cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            drop(lease.take());
-            fail_operation_with_error(op_monitor, op_id, format!("Failed to spawn process: {}", e))
+            guards
+                .end(
+                    op_monitor,
+                    failed(format!("Failed to spawn process: {}", e)),
+                )
                 .await;
-            return (audit::Outcome::Failed, None);
+            return;
         }
     };
     let mut guard = ProcessGroupGuard::of(proc_cmd, child);
@@ -2900,9 +2806,8 @@ async fn execute_with_streaming(
                     tracing::warn!("Operation {} cancelled but its process did not reap cleanly", op_id);
                 }
                 spill.finish().await;
-                drop(lease.take());
-                handle_cancellation(op_monitor, op_id).await;
-                return (audit::Outcome::Cancelled, None);
+                guards.end(op_monitor, cancelled()).await;
+                return;
             }
 
             _ = tokio::time::sleep_until(near_limit_at), if !warned_near_limit => {
@@ -2920,9 +2825,8 @@ async fn execute_with_streaming(
                 }
                 spill.finish().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
-                drop(lease.take());
-                cancel_operation_timed_out(op_monitor, op_id, duration_ms).await;
-                return (audit::Outcome::TimedOut, None);
+                guards.end(op_monitor, timed_out(duration_ms)).await;
+                return;
             }
 
             _ = still_running_interval.tick() => {
@@ -3052,10 +2956,7 @@ async fn execute_with_streaming(
         tool,
         working_dir,
         drift,
-        handoff,
-        lease,
-        #[cfg(unix)]
-        broker,
+        guards,
     )
     .await
 }
@@ -3325,10 +3226,8 @@ async fn finalize_streaming_operation(
     tool: &str,
     working_dir: &Path,
     drift: Option<&DriftProbe>,
-    handoff: &mut Option<HandoffWatch>,
-    lease: &mut Option<workspace_queue::Lease>,
-    #[cfg(unix)] broker: Option<&crate::credentials::ssh_agent::host::BrokerLease>,
-) -> (audit::Outcome, Option<i32>) {
+    mut guards: guards::RunGuards,
+) {
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
     tracing::debug!("Operation {} process exited after {}ms", op_id, duration_ms);
@@ -3368,10 +3267,7 @@ async fn finalize_streaming_operation(
     };
     // The process tree is gone: compare the deny tier with its inventory from
     // before the spawn (SPEC R6.1.7).
-    let handoff_report = match handoff.take() {
-        Some(watch) => finish_handoff_watch(watch, op_id, tool).await,
-        None => None,
-    };
+    let handoff_report = guards.take_handoff_report().await;
 
     let mut output = CommandOutput {
         stdout: stdout_str,
@@ -3397,39 +3293,17 @@ async fn finalize_streaming_operation(
         // the `Alert` event is what the hub and the TUI show.
         op_monitor.append_alert(op_id, alert).await;
     }
-    // What the SSH key broker refused this command, one line each (SPEC R-CRED.10):
-    // appended before the terminal transition so a waiter (or fast exit) observes it
-    // deterministically without racing the broker thread's background alert.
-    #[cfg(unix)]
-    if let Some(broker) = broker {
-        for refusal in broker_refusal_lines(broker) {
-            op_monitor.append_alert_unique(op_id, refusal).await;
-        }
-    }
-    // The process tree is gone and the drift probe has looked: hand the
-    // workspace on *before* anyone can observe this operation as finished, so
-    // a caller woken by the terminal transition never finds it still held
-    // (SPEC R2.7.1).
-    drop(lease.take());
-
-    // The terminal event emitted by this transition carries the result to all
-    // subscribers (MCP progress push, hub, TUI).
-    Terminal::Exited(Box::new(output))
-        .publish(op_monitor, op_id)
-        .await
+    // The process tree is gone and the drift probe has looked: the guards
+    // hand the workspace on, then publish. The terminal event carries the
+    // result to all subscribers (MCP progress push, hub, TUI).
+    guards
+        .end(op_monitor, Terminal::Exited(Box::new(output)))
+        .await;
 }
 
-/// Handle cancellation of an operation — shared logic for both execution paths.
-///
-/// The `Cancelled` event emitted by the status transition carries the reason
-/// to all subscribers.
-async fn handle_cancellation(monitor: &Arc<OperationMonitor>, op_id: &str) {
-    monitor
-        .finish(
-            op_id,
-            Terminal::Cancelled("Operation was cancelled".to_string()),
-        )
-        .await;
+/// The ending of an operation cancelled before or while it ran.
+fn cancelled() -> Terminal {
+    Terminal::Cancelled("Operation was cancelled".to_string())
 }
 
 /// Handle one result from a `next_line()` call inside the streaming select loop.

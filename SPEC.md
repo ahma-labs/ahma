@@ -312,8 +312,11 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   async path, the synchronous path (terminal hooks, CLI one-shots, `synchronous: true`
   tools), PTY and persistent-session commands. On every path an operation is shown running
   only once it holds its turn, and gives the lease up before its end is published, so a
-  caller woken by that end never finds the workspace still held by it (`adapter::Finished`:
-  a PTY or session runner returns how it ended, and its caller releases, then publishes).
+  caller woken by that end never finds the workspace still held by it. On the async, PTY and
+  session paths `adapter::guards::RunGuards::end` is the one way an operation ends, and takes
+  what the run holds by value: it tells the SSH broker's refusals, compares the deny tier
+  (R6.1.7) while the workspace is still held, so another command's writes are not counted as
+  this one's, hands the workspace on, then publishes the ending and audits it.
   The synchronous path has no operation to show
   as queued, so it **must** announce a wait once (a terminal hook writes it to stderr, where
   the harness shows it) and, if its turn does not come within the command's own timeout,

@@ -398,3 +398,44 @@ async fn a_queued_pty_or_session_command_is_pending_until_its_turn() {
         );
     }
 }
+
+/// A piped command hands the workspace on before anyone can observe it ended,
+/// whether it exited or was stopped at its time limit. Each ending released
+/// the lease by hand, one `drop(lease.take())` per branch.
+#[tokio::test]
+async fn a_piped_command_hands_the_workspace_on_however_it_ends() {
+    use ahma_mcp::adapter::workspace_queue::LeaseProbe;
+    use ahma_mcp::operation_monitor::OperationStatus;
+    let temp = tempdir().unwrap();
+    let (adapter, monitor, key) = queued_adapter(temp.path());
+    let wd = temp.path().to_str().unwrap();
+    let start = |command: &'static str, limit: u64| {
+        let adapter = adapter.clone();
+        async move {
+            adapter
+                .execute_async_in_dir("run_terminal_command", command, None, wd, Some(limit))
+                .await
+                .expect("piped command starts")
+        }
+    };
+
+    let exited = start("echo hi", 15).await;
+    assert_eq!(
+        wait_done(&monitor, &exited).await.state,
+        OperationStatus::Completed
+    );
+    assert!(
+        matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+        "an exited command still holds the workspace"
+    );
+
+    let timed_out = start("sleep 60", 1).await;
+    assert_eq!(
+        wait_done(&monitor, &timed_out).await.state,
+        OperationStatus::TimedOut
+    );
+    assert!(
+        matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+        "a command stopped at its limit still holds the workspace"
+    );
+}
