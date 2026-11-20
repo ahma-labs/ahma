@@ -475,7 +475,7 @@ async fn relay_forward_failure_to_client<S>(
 {
     let error = recovered.unwrap_or_else(|| {
         serde_json::json!({
-            "code": ahma_common::mcp_methods::JSONRPC_REQUEST_TIMEOUT,
+            "code": ahma_common::mcp_methods::RpcErrorCode::RequestTimeout,
             "message": GENERIC_FORWARD_FAILURE_MESSAGE,
         })
     });
@@ -594,7 +594,7 @@ fn reconnect_failed_detail(err: &anyhow::Error) -> serde_json::Value {
 /// The JSON-RPC error a request gets while the bridge is unreachable.
 fn bridge_unreachable_error() -> serde_json::Value {
     serde_json::json!({
-        "code": ahma_common::mcp_methods::JSONRPC_REQUEST_TIMEOUT,
+        "code": ahma_common::mcp_methods::RpcErrorCode::RequestTimeout,
         "message": BRIDGE_UNREACHABLE_MESSAGE,
     })
 }

@@ -190,21 +190,53 @@ pub const HEARTBEAT_METHOD: &str = "notifications/ahma/heartbeat";
 // recovers them from a rendered transport error), in a different crate. Spelled
 // as bare literals at both ends, a change on either side type-checks.
 
-/// `tools/call` arrived before the sandbox scope was locked — the client must
-/// complete the roots exchange first. Paired with HTTP 409; the pair is a SPEC
-/// RB.1.1 hard invariant and tests assert it directly.
-pub const JSONRPC_SANDBOX_NOT_READY: i32 = -32001;
+/// A JSON-RPC error code ahma writes or matches. Code that answers with an
+/// error names one of these; a bare `i32` literal no longer type-checks at the
+/// bridge's error helpers, so a mistyped code cannot reach the wire.
+/// Serializes as its number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcErrorCode {
+    /// JSON-RPC 2.0: the request is not a valid request object, or names no
+    /// session the bridge knows.
+    InvalidRequest,
+    /// JSON-RPC 2.0 Method Not Found.
+    MethodNotFound,
+    /// JSON-RPC 2.0: the method's parameters are invalid.
+    InvalidParams,
+    /// JSON-RPC 2.0: the server failed answering a valid request.
+    Internal,
+    /// Sandbox configuration failed, or the session is terminated: the
+    /// session will never become usable. Paired with HTTP 403.
+    SandboxFailed,
+    /// `tools/call` arrived before the sandbox scope was locked: the client
+    /// must complete the roots exchange first. Paired with HTTP 409; the pair
+    /// is a SPEC RB.1.1 hard invariant and tests assert it directly.
+    SandboxNotReady,
+    /// The request timed out waiting on the session subprocess or the client.
+    /// Paired with HTTP 504 (or 500 on the proxy's generic forward failure).
+    RequestTimeout,
+}
 
-/// The request timed out waiting on the session subprocess or the client.
-/// Paired with HTTP 504 (or 500 on the proxy's generic forward failure).
-pub const JSONRPC_REQUEST_TIMEOUT: i32 = -32002;
+impl RpcErrorCode {
+    /// The number on the wire.
+    pub const fn code(self) -> i32 {
+        match self {
+            Self::InvalidRequest => -32600,
+            Self::MethodNotFound => -32601,
+            Self::InvalidParams => -32602,
+            Self::Internal => -32603,
+            Self::SandboxFailed => -32000,
+            Self::SandboxNotReady => -32001,
+            Self::RequestTimeout => -32002,
+        }
+    }
+}
 
-/// Sandbox configuration failed, or the session is terminated — the session
-/// will never become usable. Paired with HTTP 403.
-pub const JSONRPC_SANDBOX_FAILED: i32 = -32000;
-
-/// Standard JSON-RPC 2.0 Method Not Found error code.
-pub const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
+impl Serialize for RpcErrorCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i32(self.code())
+    }
+}
 
 /// Deserialize a field to its `Default` when the value is missing **or**
 /// malformed, instead of failing the whole payload (lenient parsing — see the
@@ -434,6 +466,24 @@ impl PushChannelChangedParams {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The wire numbers are the contract with every client: a code may be
+    /// renamed, never renumbered.
+    #[test]
+    fn each_error_code_keeps_its_wire_number() {
+        for (code, number) in [
+            (RpcErrorCode::InvalidRequest, -32600),
+            (RpcErrorCode::MethodNotFound, -32601),
+            (RpcErrorCode::InvalidParams, -32602),
+            (RpcErrorCode::Internal, -32603),
+            (RpcErrorCode::SandboxFailed, -32000),
+            (RpcErrorCode::SandboxNotReady, -32001),
+            (RpcErrorCode::RequestTimeout, -32002),
+        ] {
+            assert_eq!(code.code(), number);
+            assert_eq!(json!({ "code": code }), json!({ "code": number }));
+        }
+    }
 
     fn wire(v: &impl Serialize) -> String {
         serde_json::to_string(v).unwrap()

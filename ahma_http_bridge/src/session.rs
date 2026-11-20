@@ -885,7 +885,10 @@ fn fail_pending_requests(
             let _ = sender.send(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.to_value(),
-                "error": { "code": -32603, "message": message }
+                "error": {
+                    "code": ahma_common::mcp_methods::RpcErrorCode::Internal,
+                    "message": message
+                }
             }));
         }
     }
