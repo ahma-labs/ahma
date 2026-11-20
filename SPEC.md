@@ -2066,7 +2066,8 @@ These are per-call arguments of the MCP request, never forwarded to the command 
   (`OperationMonitor::ends_by_task`: the async, PTY and session paths) **must not** end the
   operation under its task. It records the ending it wants, with its reason, and signals the
   task, which kills the process tree, hands the workspace on and then publishes that ending
-  (R2.7.1). Ending first and signalling second published `Cancelled` while the workspace was
+  (R2.7.1), whatever ending the run itself reached: a command that exited on its own just as the
+  cancel came still ends cancelled. Ending first and signalling second published `Cancelled` while the workspace was
   still held, so a caller woken by the cancel found it busy. A cancel waits for the ending (so
   "cancelled" means ended) and reports whether the operation ended cancelled; the watchdog does
   not wait. A task that has not ended the operation 5 s after being asked has it ended for it,
