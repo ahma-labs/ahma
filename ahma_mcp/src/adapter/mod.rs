@@ -76,20 +76,12 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn generate_id(tool_name: &str, command: &str) -> String {
-    let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    crate::utils::operation::generate_id_with_details(id, tool_name, command)
-}
+use crate::utils::operation::mint_id as generate_id;
 
 const MAX_STREAM_COLLECTED_LINES: usize = 5_000;
 const MAX_STREAM_COLLECTED_BYTES: usize = 1_000_000;
@@ -1472,7 +1464,7 @@ impl Adapter {
         let display_command = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| command.to_string());
-        self.monitor.add_operation(operation).await;
+        let cancellation_token = self.monitor.register(operation).await;
 
         // Durable provenance, written *before* the task is spawned. Doing it here
         // rather than inside the task is the point: nothing between this line and
@@ -1496,6 +1488,7 @@ impl Adapter {
 
         let run = run_async_operation(AsyncOperationRun {
             op_id,
+            cancellation_token,
             command,
             program: program_with_subcommand,
             args_vec,
@@ -1557,7 +1550,7 @@ impl Adapter {
         operation.cwd = Some(safe_wd.to_string_lossy().into_owned());
         operation.command = Some(command_str.to_string());
         operation.output_file = Some(spill::operation_spill_path(&op_id));
-        self.monitor.add_operation(operation).await;
+        let cancellation_token = self.monitor.register(operation).await;
 
         let audit_argv = [command_str.to_string()];
         audit::record_tool_call(
@@ -1569,11 +1562,6 @@ impl Adapter {
             &audit_argv,
         )
         .await;
-
-        let cancellation_token = match self.monitor.get_operation(&op_id).await {
-            Some(op) => op.cancellation_token.clone(),
-            None => anyhow::bail!("operation {op_id} vanished before start"),
-        };
 
         let limit = command_limit(&self.shell_pool, timeout);
         let monitor = self.monitor.clone();
@@ -1671,7 +1659,7 @@ impl Adapter {
         // observers (TUI task tree) render them as children of the session.
         .with_parent(format!("session:{session_id}"));
         operation.output_file = Some(spill::operation_spill_path(&op_id));
-        self.monitor.add_operation(operation).await;
+        let cancellation_token = self.monitor.register(operation).await;
 
         let audit_argv = [command_str.to_string()];
         audit::record_tool_call(
@@ -1683,11 +1671,6 @@ impl Adapter {
             &audit_argv,
         )
         .await;
-
-        let cancellation_token = match self.monitor.get_operation(&op_id).await {
-            Some(op) => op.cancellation_token.clone(),
-            None => anyhow::bail!("operation {op_id} vanished before start"),
-        };
 
         let timeout_duration = command_limit(&self.shell_pool, timeout);
         let monitor = self.monitor.clone();
@@ -1872,6 +1855,7 @@ fn command_limit(shell_pool: &ShellPoolManager, timeout_secs: Option<u64>) -> Du
 /// Context for a single background async operation task.
 struct AsyncOperationRun {
     op_id: String,
+    cancellation_token: tokio_util::sync::CancellationToken,
     command: String,
     program: String,
     args_vec: Vec<String>,
@@ -1927,6 +1911,7 @@ fn alert_broker_refusals(
 async fn run_async_operation(ctx: AsyncOperationRun) {
     let AsyncOperationRun {
         op_id,
+        cancellation_token,
         command,
         program,
         args_vec,
@@ -1953,15 +1938,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // Timed from the moment the task starts, so queueing behind a command mutex
     // group is visible in the audit record rather than silently excluded.
     let mut guards = guards::RunGuards::new(&op_id, &command);
-
-    let cancellation_token = match monitor.get_operation(&op_id).await {
-        Some(operation) => operation.cancellation_token.clone(),
-        None => {
-            let why = format!("Could not find operation {op_id} for cancellation token");
-            guards.end(&monitor, failed(why)).await;
-            return;
-        }
-    };
 
     // ── Workspace write queue (SPEC R2.7) ──────────────────────────────────
     // Wait for every exclusive operation that arrived earlier in this

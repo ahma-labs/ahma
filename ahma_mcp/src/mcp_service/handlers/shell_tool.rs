@@ -1,4 +1,3 @@
-use super::super::NEXT_ID;
 use super::common;
 use super::working_directory;
 use crate::AhmaMcpService;
@@ -11,7 +10,6 @@ use rmcp::{
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tracing;
 
 impl AhmaMcpService {
@@ -115,7 +113,7 @@ impl AhmaMcpService {
         properties.insert(
             "pty".to_string(),
             schema::boolean_property(
-                "Run the command attached to a pseudo-terminal (Unix only). Use for tools that require a TTY or change behaviour without one (colours, progress bars, interactive prompts). stdout and stderr are merged.",
+                "Run the command attached to a pseudo-terminal (Unix only). Use for tools that require a TTY or change behaviour without one (colours, progress bars, interactive prompts). stdout and stderr are merged. Cannot be combined with session_id.",
             ),
         );
         properties.insert(
@@ -242,18 +240,9 @@ impl AhmaMcpService {
         }
 
         // Dedicated execution paths: persistent shell session / PTY.
-        let session_id = common::opt_str(&args, "session_id");
-        let use_pty = args.get("pty").and_then(|v| v.as_bool()).unwrap_or(false);
-        if session_id.is_some() || use_pty {
+        if let Some(runner) = ShellRunner::from_args(&args)? {
             return self
-                .execute_shell_special(
-                    &command,
-                    working_directory,
-                    timeout,
-                    session_id.as_deref(),
-                    use_pty,
-                    &context,
-                )
+                .execute_shell_special(&command, working_directory, timeout, runner, &context)
                 .await;
         }
 
@@ -388,12 +377,7 @@ impl AhmaMcpService {
             .get("command")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id = crate::utils::operation::generate_id_with_details(
-            counter_val,
-            "run_terminal_command",
-            cmd_str,
-        );
+        let id = crate::utils::operation::mint_id("run_terminal_command", cmd_str);
         let started_at = std::time::Instant::now();
         self.emit_vault_tool_call(
             &id,
@@ -453,32 +437,25 @@ impl AhmaMcpService {
         }
     }
 
-    /// Execute `run_terminal_command` with a `session_id` and/or `pty: true`.
+    /// Execute `run_terminal_command` with a `session_id` or `pty: true`.
     ///
     /// Both paths run asynchronously through the standard operation lifecycle
     /// (operation id returned immediately; results via `await`/`status` and
-    /// the unified event stream).  When both are requested, the session wins:
-    /// PTY-in-session is not supported yet.
+    /// the unified event stream).
     async fn execute_shell_special(
         &self,
         command: &str,
         working_directory: &str,
         timeout: Option<u64>,
-        session_id: Option<&str>,
-        use_pty: bool,
+        runner: ShellRunner,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id = crate::utils::operation::generate_id_with_details(
-            counter_val,
-            "run_terminal_command",
-            command,
-        );
+        let id = crate::utils::operation::mint_id("run_terminal_command", command);
         self.emit_vault_tool_call(
             &id,
             "run_terminal_command",
             &VaultArgs::new(working_directory, command)
-                .special(session_id, use_pty)
+                .special(&runner)
                 .to_json(),
         )
         .await;
@@ -488,13 +465,8 @@ impl AhmaMcpService {
         self.register_progress_if_requested(&id, context.peer.clone(), progress_token, client_type)
             .await;
 
-        let started = match session_id {
-            Some(session) => {
-                if use_pty {
-                    tracing::warn!(
-                        "run_terminal_command: pty=true ignored — PTY inside a session is not supported"
-                    );
-                }
+        let started = match &runner {
+            ShellRunner::Session(session) => {
                 self.adapter
                     .execute_session_async(
                         "run_terminal_command",
@@ -506,7 +478,7 @@ impl AhmaMcpService {
                     )
                     .await
             }
-            None => {
+            ShellRunner::Pty => {
                 self.adapter
                     .execute_pty_async(
                         "run_terminal_command",
@@ -560,12 +532,7 @@ impl AhmaMcpService {
             .get("command")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id = crate::utils::operation::generate_id_with_details(
-            counter_val,
-            "run_terminal_command",
-            cmd_str,
-        );
+        let id = crate::utils::operation::mint_id("run_terminal_command", cmd_str);
         let vault_args_summary = VaultArgs::new(working_directory, cmd_str).to_json();
 
         let progress_token = context.meta.get_progress_token();
@@ -597,6 +564,35 @@ impl AhmaMcpService {
     }
 }
 
+/// The dedicated runner a `run_terminal_command` call asked for: a terminal,
+/// or a persistent shell session. Read once from the arguments, so a call can
+/// ask for one or the other and nothing in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellRunner {
+    Pty,
+    Session(String),
+}
+
+impl ShellRunner {
+    /// `None` for a plain call. A call that asks for both is refused, saying
+    /// why: a PTY inside a session is not supported, and running it without
+    /// the PTY it asked for would leave the model thinking it had one.
+    fn from_args(args: &Map<String, Value>) -> Result<Option<Self>, McpError> {
+        let session_id = common::opt_str(args, "session_id");
+        let pty = args.get("pty").and_then(Value::as_bool).unwrap_or(false);
+        match (session_id, pty) {
+            (Some(_), true) => Err(common::mcp_invalid_params(
+                "`pty: true` and `session_id` cannot be combined: a terminal inside a persistent \
+                 session is not supported. Drop `pty` to keep the session's state between \
+                 calls, or drop `session_id` to get a terminal.",
+            )),
+            (Some(id), false) => Ok(Some(Self::Session(id))),
+            (None, true) => Ok(Some(Self::Pty)),
+            (None, false) => Ok(None),
+        }
+    }
+}
+
 /// The arguments a `run_terminal_command` call records in the task vault's
 /// audit log (`args_summary`), serialized rather than formatted: a command
 /// holds quotes and backslashes, and the line must stay JSON whatever it holds.
@@ -623,7 +619,11 @@ impl<'a> VaultArgs<'a> {
     }
 
     /// The fields a terminal or session call adds.
-    fn special(self, session_id: Option<&'a str>, pty: bool) -> Self {
+    fn special(self, runner: &'a ShellRunner) -> Self {
+        let (session_id, pty) = match runner {
+            ShellRunner::Session(id) => (Some(id.as_str()), false),
+            ShellRunner::Pty => (None, true),
+        };
         Self {
             session_id: Some(session_id),
             pty: Some(pty),
@@ -671,10 +671,11 @@ mod tests {
             .expect("a plain call is JSON");
         assert_eq!(plain, json!({"working_directory": dir, "command": command}));
 
-        for (session_id, pty) in [(Some("s1"), false), (None, true)] {
-            let text = VaultArgs::new(dir, command)
-                .special(session_id, pty)
-                .to_json();
+        for (runner, session_id, pty) in [
+            (super::ShellRunner::Session("s1".into()), Some("s1"), false),
+            (super::ShellRunner::Pty, None, true),
+        ] {
+            let text = VaultArgs::new(dir, command).special(&runner).to_json();
             let parsed: Value = serde_json::from_str(&text).expect("a session or PTY call is JSON");
             assert_eq!(
                 parsed,
@@ -1004,6 +1005,25 @@ mod tests {
         assert!(
             text.contains("hello_session") || text.contains("AHMA ID:"),
             "expected echoed output or an AHMA ID, got: {text:?}"
+        );
+    }
+
+    /// A call that asks for a PTY inside a session is refused and told why.
+    /// The session ran it and the PTY request was dropped with a line in the
+    /// server's log, so the model never learned it had no terminal.
+    #[tokio::test]
+    async fn a_pty_inside_a_session_is_refused_and_says_why() {
+        let err = call_run_terminal(json!({
+            "command": "echo hello_both",
+            "session_id": "unit-test-session",
+            "pty": true
+        }))
+        .await
+        .expect_err("asking for both is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("pty") && text.contains("session_id"),
+            "the refusal names both: {text}"
         );
     }
 

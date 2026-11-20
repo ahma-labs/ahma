@@ -582,6 +582,15 @@ impl OperationMonitor {
         &self.events
     }
 
+    /// Add a new operation, returning its cancellation token: what its task
+    /// watches, handed over here so nothing has to look the operation up again
+    /// (and handle it having vanished) just to get it.
+    pub async fn register(&self, operation: Operation) -> CancellationToken {
+        let token = operation.cancellation_token.clone();
+        self.add_operation(operation).await;
+        token
+    }
+
     pub async fn add_operation(&self, operation: Operation) {
         let mut ops = self.operations.write().await;
         tracing::info!(
