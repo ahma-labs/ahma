@@ -44,7 +44,8 @@ fn render_settings_origin(
     // Precedence order, highest first (R-CFG1.1): cli > project > user >
     // default — resolved by the same function the startup report uses.
     for o in resolve_origins(rows, &ctx.provenance_inputs(file_path, file_toml)) {
-        let _ = writeln!(out, "{:<45} = {}  # {}", o.key, o.value, o.source);
+        let value = ahma_common::settings_origin::shown_value(o.key, &o.value);
+        let _ = writeln!(out, "{:<45} = {}  # {}", o.key, value, o.source);
     }
     out
 }
@@ -162,7 +163,8 @@ fn print_settings_row(row: &SettingRow, section: &mut &str) {
     } else {
         "[default]"
     };
-    println!("{:<45} = {}  # {}", key, row.value, source);
+    let value = ahma_common::settings_origin::shown_value(row.key, &row.value);
+    println!("{:<45} = {}  # {}", key, value, source);
 }
 
 fn print_settings_file_footer(file_path: Option<&std::path::Path>) {
@@ -2751,6 +2753,26 @@ mod tests {
         let rows = setting_rows(&s, &d);
         let file_toml: toml::Value = toml::from_str(file_text).unwrap();
         (rows, file_toml, d)
+    }
+
+    /// A secret setting never reaches the report: the bearer token is a row
+    /// now that every setting is one (R-CFG5.1), and the report is printed to
+    /// a terminal and pasted into issues.
+    #[test]
+    fn the_origin_report_redacts_the_bearer_token() {
+        let (rows, file_toml, _) = origin_fixtures("[auth]\nrequire_token = \"hunter2\"\n");
+        let out = render_settings_origin(
+            &rows,
+            Some(std::path::Path::new("settings.toml")),
+            Some(&file_toml),
+            &SettingsOriginCtx::default(),
+        );
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("auth.require_token") && l.contains("<redacted>")),
+            "{out}"
+        );
     }
 
     #[test]
