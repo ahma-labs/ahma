@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{PersistentScope, ScopeAccess};
 use crate::scope_grant::{GrantRisk, classify_grant_risk, sensitive_dirs};
+use crate::shell_words::{self, Word};
 
 /// Refusals and questions older than this are forgotten: the session tier's
 /// own bound ([`crate::session_grants::MAX_AGE_SECS`]).
@@ -96,9 +97,6 @@ const NOT_THE_PROGRAM: &[&str] = &[
     "test", "[", "pwd", "sleep", "ls", "cat", "head", "tail", "grep", "wc", "which", "type",
 ];
 
-/// Words that run the program named after them.
-const RUNS_THE_NEXT: &[&str] = &["env", "time", "nice", "nohup", "exec", "command", "sudo"];
-
 /// The programs a shell command line runs, by file name, in order: the first
 /// word of each `&&`, `||`, `;`, `|` or `&` segment, past `VAR=value`
 /// assignments and wrappers such as `env` and `time`, skipping
@@ -128,202 +126,20 @@ pub fn command_programs(command: &str) -> Vec<String> {
 }
 
 /// The program word of each command a shell line runs, as written (quotes
-/// removed): past `VAR=value` assignments and wrappers that run the next
-/// word (`env`, `time`, `nohup`, `sudo`, …); heredoc bodies, strings and comments run nothing and
-/// give none. Unlike [`command_programs`] it keeps paths, variables and
-/// navigation words, for callers that judge the word itself.
+/// removed): past loop and conditional keywords, `VAR=value` assignments and
+/// wrappers that run the next word (`env`, `time`, `nohup`, `sudo`, `timeout`,
+/// …, with their options), in every segment and every `$(…)` or backtick
+/// substitution ([`shell_words::program_index`]). Heredoc bodies, strings and
+/// comments run nothing and give none. Unlike [`command_programs`] it keeps
+/// paths, variables and navigation words, for callers that judge the word itself.
 pub fn command_words(command: &str) -> Vec<String> {
-    shell_segments(command)
+    shell_words::segments(command)
         .into_iter()
-        .filter_map(|segment| {
-            segment.into_iter().find(|w| {
-                !((w.contains('=') && !w.starts_with('-'))
-                    || RUNS_THE_NEXT.contains(&w.as_str())
-                    || w.starts_with('-'))
-            })
+        .filter_map(|mut segment| {
+            let at = shell_words::program_index(&segment)?;
+            Some(segment.swap_remove(at).text)
         })
         .collect()
-}
-
-/// The words of each command a shell line runs, split at unquoted `&`, `|`,
-/// `;`, newlines and parentheses. Quotes are removed and keep their contents
-/// one word (`"/Applications/Google Chrome.app/…"`); heredoc bodies and
-/// comments are dropped, since they run nothing. Still a heuristic, not a
-/// shell: it only has to tell what runs from what is merely written down.
-fn shell_segments(command: &str) -> Vec<Vec<String>> {
-    let mut s = ShellSplitter::new(command);
-    while let Some(c) = s.peek(0) {
-        match c {
-            '\'' => s.single_quoted(),
-            '"' => s.double_quoted(),
-            '\\' if s.peek(1).is_some() => s.escaped(),
-            '#' if !s.in_word => s.comment(),
-            '<' if s.peek(1) == Some('<') && s.peek(2) != Some('<') => {
-                s.heredoc_operator();
-                continue; // already past the operator and its delimiter
-            }
-            '\n' => {
-                s.end_command();
-                s.skip_heredoc_bodies();
-            }
-            '&' | '|' | ';' | '(' | ')' => s.end_command(),
-            c if c.is_whitespace() => s.end_word(),
-            c => {
-                s.in_word = true;
-                s.word.push(c);
-            }
-        }
-        s.i += 1;
-    }
-    s.finish()
-}
-
-/// The state [`shell_segments`] walks along a command line.
-struct ShellSplitter {
-    chars: Vec<char>,
-    /// The next character to read.
-    i: usize,
-    segments: Vec<Vec<String>>,
-    word: String,
-    in_word: bool,
-    /// Heredocs announced on the current line: (closing word, strip tabs).
-    heredocs: Vec<(String, bool)>,
-}
-
-impl ShellSplitter {
-    fn new(command: &str) -> Self {
-        Self {
-            chars: command.chars().collect(),
-            i: 0,
-            segments: vec![Vec::new()],
-            word: String::new(),
-            in_word: false,
-            heredocs: Vec::new(),
-        }
-    }
-
-    fn peek(&self, offset: usize) -> Option<char> {
-        self.chars.get(self.i + offset).copied()
-    }
-
-    fn end_word(&mut self) {
-        if self.in_word {
-            let word = std::mem::take(&mut self.word);
-            self.segments.last_mut().expect("one segment").push(word);
-            self.in_word = false;
-        }
-    }
-
-    /// `&`, `|`, `;`, parentheses and newlines: the next word starts a new command.
-    fn end_command(&mut self) {
-        self.end_word();
-        self.segments.push(Vec::new());
-    }
-
-    fn finish(mut self) -> Vec<Vec<String>> {
-        self.end_word();
-        self.segments.retain(|s| !s.is_empty());
-        self.segments
-    }
-
-    /// At an opening quote: copy up to the closing one, which the caller steps past.
-    fn single_quoted(&mut self) {
-        self.in_word = true;
-        self.i += 1;
-        while let Some(c) = self.peek(0).filter(|c| *c != '\'') {
-            self.word.push(c);
-            self.i += 1;
-        }
-    }
-
-    /// Like [`Self::single_quoted`], but a backslash takes the next character literally.
-    fn double_quoted(&mut self) {
-        self.in_word = true;
-        self.i += 1;
-        while let Some(c) = self.peek(0).filter(|c| *c != '"') {
-            if c == '\\' && self.peek(1).is_some() {
-                self.i += 1;
-            }
-            self.word.push(self.chars[self.i]);
-            self.i += 1;
-        }
-    }
-
-    /// At a backslash with a character after it: that character is literal, and a
-    /// backslash-newline is a line continuation that adds nothing.
-    fn escaped(&mut self) {
-        self.in_word = true;
-        self.i += 1;
-        if self.chars[self.i] != '\n' {
-            self.word.push(self.chars[self.i]);
-        }
-    }
-
-    /// At a `#` that starts a word: stop on the last character before the newline.
-    fn comment(&mut self) {
-        while self.peek(1).is_some_and(|c| c != '\n') {
-            self.i += 1;
-        }
-    }
-
-    /// At `<<` (not `<<<`): read the closing word and remember it. Leaves `i` on the
-    /// character after the delimiter.
-    fn heredoc_operator(&mut self) {
-        self.end_word();
-        self.i += 2;
-        let strip_tabs = self.peek(0) == Some('-');
-        if strip_tabs {
-            self.i += 1;
-        }
-        while self.peek(0).is_some_and(|c| c == ' ' || c == '\t') {
-            self.i += 1;
-        }
-        let mut delimiter = String::new();
-        while let Some(d) = self.peek(0) {
-            if d.is_whitespace() || matches!(d, ';' | '&' | '|' | '(' | ')' | '<' | '>') {
-                break;
-            }
-            if !matches!(d, '\'' | '"' | '\\') {
-                delimiter.push(d);
-            }
-            self.i += 1;
-        }
-        if !delimiter.is_empty() {
-            self.heredocs.push((delimiter, strip_tabs));
-        }
-    }
-
-    /// At a newline: skip the bodies of the heredocs the line just ended announced.
-    fn skip_heredoc_bodies(&mut self) {
-        for (delimiter, strip_tabs) in std::mem::take(&mut self.heredocs) {
-            self.skip_heredoc_body(&delimiter, strip_tabs);
-        }
-    }
-
-    /// Leaves `i` on the newline that ends the closing line, or past the end.
-    fn skip_heredoc_body(&mut self, delimiter: &str, strip_tabs: bool) {
-        loop {
-            let start = self.i + 1;
-            if start >= self.chars.len() {
-                self.i = self.chars.len();
-                return;
-            }
-            let end = self.chars[start..]
-                .iter()
-                .position(|c| *c == '\n')
-                .map_or(self.chars.len(), |p| start + p);
-            let line: String = self.chars[start..end].iter().collect();
-            self.i = end;
-            let line = if strip_tabs {
-                line.trim_start_matches('\t')
-            } else {
-                line.as_str()
-            };
-            if line == delimiter {
-                return;
-            }
-        }
-    }
 }
 
 /// The folders a shell line names, resolved against `cwd`: every `cd` target (later segments
@@ -364,50 +180,41 @@ pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Na
         };
         Some(path)
     };
-    // A word that only frames the command after it: a loop or conditional keyword, or a
-    // `NAME=value` assignment. `if cd /repo; then …` and `X=1 cd /repo` move in all the same.
-    let frames = |word: &str| {
-        matches!(
-            word,
-            "until" | "while" | "if" | "elif" | "then" | "else" | "do" | "!" | "time"
-        ) || word.split_once('=').is_some_and(|(name, _)| {
-            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
-    };
     let mut paths = Vec::new();
     let mut here = cwd.to_path_buf();
     // A `cd` whose target cannot be read (`cd $r`, `cd -`) may go to any folder the line names.
     let mut moves_somewhere_unread = false;
     #[cfg(windows)]
-    let segments = literal_segments(command);
+    let segments = shell_words::split_literal(command);
     #[cfg(not(windows))]
-    let segments = shell_segments(command);
+    let segments = shell_words::segment_texts(command);
     for segment in segments {
-        let mut words = segment.iter().map(String::as_str).peekable();
-        let mut first = true;
+        // A `cd` is the program wherever it stands: behind an assignment, a loop or
+        // conditional keyword, a group or a wrapper (`X=1 cd /repo`,
+        // `if cd /repo; then …`, `{ cd /repo; …; }`, `time cd /repo`) it moves in all the same.
+        if let Some(at) = shell_words::program_index(&segment).filter(|&at| segment[at] == "cd") {
+            match segment.get(at + 1).map(String::as_str) {
+                Some(t) if t != "-" => match expand(t, &here) {
+                    Some(target) => {
+                        here = target.clone();
+                        paths.push(NamedFolder {
+                            path: target,
+                            entered: true,
+                        });
+                    }
+                    None => moves_somewhere_unread = true,
+                },
+                Some(_) => moves_somewhere_unread = true,
+                // `cd` alone goes home, which is no repository (R-PERM.11).
+                None => {}
+            }
+            continue;
+        }
+        let mut words = segment
+            .iter()
+            .map(String::as_str)
+            .skip_while(|w| shell_words::is_frame_or_group(w));
         while let Some(word) = words.next() {
-            if first && frames(word) {
-                continue;
-            }
-            if first && word == "cd" {
-                match words.next() {
-                    Some(t) if t != "-" => match expand(t, &here) {
-                        Some(target) => {
-                            here = target.clone();
-                            paths.push(NamedFolder {
-                                path: target,
-                                entered: true,
-                            });
-                        }
-                        None => moves_somewhere_unread = true,
-                    },
-                    Some(_) => moves_somewhere_unread = true,
-                    // `cd` alone goes home, which is no repository (R-PERM.11).
-                    None => {}
-                }
-                break;
-            }
-            first = false;
             if word == "-C" {
                 if let Some(path) = words.next().and_then(|t| expand(t, &here)) {
                     paths.push(NamedFolder {
@@ -436,164 +243,52 @@ pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Na
     paths
 }
 
-/// The words of each command a line runs, split at unquoted `&`, `|`, `;` and newlines, with
-/// quotes removed and a backslash kept as written: a Windows path (`cd C:\Users\me\repo`) is
-/// one word, where [`shell_segments`]' POSIX escapes would read `C:Usersmerepo`. Used for the
-/// folders a command names on Windows ([`command_paths`]).
-#[cfg_attr(not(windows), allow(dead_code))]
-fn literal_segments(command: &str) -> Vec<Vec<String>> {
-    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
-    let mut word = String::new();
-    let mut in_word = false;
-    let mut quote: Option<char> = None;
-    for c in command.chars() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), c) => word.push(c),
-            (None, '"' | '\'') => {
-                quote = Some(c);
-                in_word = true;
-            }
-            (None, '&' | '|' | ';' | '\n') => {
-                if in_word {
-                    segments
-                        .last_mut()
-                        .expect("one segment")
-                        .push(std::mem::take(&mut word));
-                    in_word = false;
-                }
-                segments.push(Vec::new());
-            }
-            (None, c) if c.is_whitespace() => {
-                if in_word {
-                    segments
-                        .last_mut()
-                        .expect("one segment")
-                        .push(std::mem::take(&mut word));
-                    in_word = false;
-                }
-            }
-            (None, c) => {
-                word.push(c);
-                in_word = true;
-            }
-        }
-    }
-    if in_word {
-        segments.last_mut().expect("one segment").push(word);
-    }
-    segments.retain(|s| !s.is_empty());
-    segments
+/// Where `sudo` runs in one segment: the program, or a wrapper on the way to it
+/// (`nohup sudo make`, `timeout 60 sudo x`), by [`shell_words::command_chain`].
+fn sudo_at(segment: &[Word]) -> Option<usize> {
+    let chain = shell_words::command_chain(segment);
+    chain
+        .wrappers
+        .into_iter()
+        .chain(chain.program)
+        .find(|&at| segment[at].text == "sudo" || segment[at].text.ends_with("/sudo"))
 }
 
-/// Words that run the next word of a segment, for [`runs_sudo`] and [`with_sudo_askpass`]: what
-/// [`RUNS_THE_NEXT`] lists, without `sudo` itself.
-const BEFORE_SUDO: &[&str] = &["env", "time", "nice", "nohup", "exec", "command"];
-
-/// Whether a shell line runs `sudo` as the program of any segment (past `VAR=value` assignments
-/// and wrappers such as `env`). `sudo` is setuid, so no sandbox can run it (SPEC R-ESCAPE.4);
-/// `echo sudo`, a heredoc body or a comment runs nothing of the kind.
+/// Whether a shell line runs `sudo` in any segment or substitution, past keywords,
+/// `VAR=value` assignments and wrappers (`sudo_at`). `sudo` is setuid, so no sandbox
+/// can run it (SPEC R-ESCAPE.4); `echo sudo`, a heredoc body or a comment runs nothing
+/// of the kind.
 pub fn runs_sudo(command: &str) -> bool {
-    shell_segments(command).iter().any(|segment| {
-        segment
-            .iter()
-            .find(|w| {
-                !((w.contains('=') && !w.starts_with('-'))
-                    || BEFORE_SUDO.contains(&w.as_str())
-                    || w.starts_with('-'))
-            })
-            .is_some_and(|w| w == "sudo" || w.ends_with("/sudo"))
-    })
+    shell_words::segments(command)
+        .iter()
+        .any(|segment| sudo_at(segment).is_some())
 }
 
-/// `command` with every `sudo` that starts a segment given `-A`, so it reads its password from
-/// `SUDO_ASKPASS` (SPEC R-ESCAPE.4 (b)): neither Claude Code's shell nor its `!` prefix has a
-/// terminal, so a plain `sudo` fails with "a terminal is required to read the password". Text is
-/// kept byte for byte otherwise; quoted text, a `sudo` that is an argument, and everything from a
-/// heredoc (`<<`) on are left alone. A `sudo` already given `-A` is not given another.
+/// `command` with every `sudo` that [`runs_sudo`] finds given `-A`, so it reads its
+/// password from `SUDO_ASKPASS` (SPEC R-ESCAPE.4 (b)): neither Claude Code's shell nor
+/// its `!` prefix has a terminal, so a plain `sudo` fails with "a terminal is required
+/// to read the password". Every other byte is kept: quoted text, a `sudo` that is an
+/// argument, and heredoc bodies are left alone. A `sudo` already given `-A` is not
+/// given another.
 pub fn with_sudo_askpass(command: &str) -> String {
-    let mut out = String::with_capacity(command.len() + 8);
-    let mut quote: Option<char> = None;
-    let mut at_start = true;
-    let mut i = 0;
-    while i < command.len() {
-        let rest = &command[i..];
-        let c = rest.chars().next().expect("i < command.len()");
-        if let Some(q) = quote {
-            i += copy_quoted_char(rest, c, q, &mut quote, &mut out);
-            continue;
-        }
-        if rest.starts_with("<<") {
-            out.push_str(rest);
-            break;
-        }
-        if at_start
-            && !(c.is_whitespace() && c != '\n')
-            && let Some(next_i) = try_consume_sudo_prefix(rest, i, &mut at_start, &mut out)
-        {
-            i = next_i;
-            continue;
-        }
-        match c {
-            '\'' | '"' => quote = Some(c),
-            ';' | '&' | '|' | '(' | '\n' => at_start = true,
-            _ => {}
-        }
-        out.push(c);
-        i += c.len_utf8();
+    let mut ends: Vec<usize> = shell_words::segments(command)
+        .iter()
+        .filter_map(|segment| {
+            let at = sudo_at(segment)?;
+            let asks = segment.get(at + 1).is_some_and(|w| w.text == "-A");
+            (!asks).then_some(segment[at].span.end)
+        })
+        .collect();
+    ends.sort_unstable();
+    let mut out = String::with_capacity(command.len() + 3 * ends.len());
+    let mut from = 0;
+    for end in ends {
+        out.push_str(&command[from..end]);
+        out.push_str(" -A");
+        from = end;
     }
+    out.push_str(&command[from..]);
     out
-}
-
-fn copy_quoted_char(
-    rest: &str,
-    c: char,
-    q: char,
-    quote: &mut Option<char>,
-    out: &mut String,
-) -> usize {
-    out.push(c);
-    let mut step = c.len_utf8();
-    if c == q {
-        *quote = None;
-    } else if c == '\\'
-        && q == '"'
-        && let Some(escaped) = rest[step..].chars().next()
-    {
-        out.push(escaped);
-        step += escaped.len_utf8();
-    }
-    step
-}
-
-fn try_consume_sudo_prefix(
-    rest: &str,
-    i: usize,
-    at_start: &mut bool,
-    out: &mut String,
-) -> Option<usize> {
-    let ends_word = |c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
-    let end_rel = rest.find(ends_word).unwrap_or(rest.len());
-    let word = &rest[..end_rel];
-    let assignment = word.contains('=') && !word.starts_with('-') && !word.contains(['"', '\'']);
-    if assignment || BEFORE_SUDO.contains(&word) {
-        out.push_str(word);
-        return Some(i + end_rel);
-    }
-    *at_start = false;
-    if word == "sudo" {
-        out.push_str("sudo");
-        let next = rest[end_rel..]
-            .trim_start_matches([' ', '\t'])
-            .split(char::is_whitespace)
-            .next()
-            .unwrap_or("");
-        if next != "-A" {
-            out.push_str(" -A");
-        }
-        return Some(i + end_rel);
-    }
-    None
 }
 
 /// The digest a command is recorded and matched under: of the command with
@@ -611,7 +306,7 @@ pub fn command_digest(command: &str) -> String {
 pub fn may_use_ssh_agent(command: &str) -> bool {
     let mut words = command
         .split_whitespace()
-        .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+        .skip_while(|w| shell_words::is_assignment(w));
     let Some(program) = words.next() else {
         return false;
     };
@@ -1701,26 +1396,6 @@ mod tests {
         );
     }
 
-    /// SPEC R-PERM.11: the folders a line names, for the question before a command that works in
-    /// another repository. The incident's first command was `cd /…/neubit4 && git fetch …`.
-    /// PR #259's Windows leg: `cd C:\Users\…\neubit4` named no folder, because the POSIX
-    /// splitter read each backslash as an escape.
-    #[test]
-    fn a_windows_path_stays_one_word() {
-        assert_eq!(
-            literal_segments(r#"cd C:\Users\me\neubit4 && git -C "C:\a b\x" status"#),
-            vec![
-                vec!["cd".to_string(), r"C:\Users\me\neubit4".to_string()],
-                vec![
-                    "git".to_string(),
-                    "-C".to_string(),
-                    r"C:\a b\x".to_string(),
-                    "status".to_string()
-                ]
-            ]
-        );
-    }
-
     #[test]
     fn the_folders_a_command_names_are_found() {
         let cwd = Path::new("/w/ahma");
@@ -2583,5 +2258,69 @@ mod tests {
             Path::new("/Users/me/Library/Caches"),
             "a shared folder itself is left to the climb, which never widens it"
         );
+    }
+
+    /// SPEC R-ESCAPE.4: a `sudo` behind a keyword, a group, a wrapper with options or
+    /// inside a substitution runs all the same, and the rewrite gives `-A` to exactly
+    /// the `sudo` that was found; a `sudo` the shell never runs is neither.
+    #[test]
+    fn sudo_is_found_and_rewritten_wherever_it_runs() {
+        for (line, rewritten) in [
+            ("if sudo true; then ls; fi", "if sudo -A true; then ls; fi"),
+            (
+                "while true; do sudo x; done",
+                "while true; do sudo -A x; done",
+            ),
+            ("{ sudo x; }", "{ sudo -A x; }"),
+            ("! sudo x", "! sudo -A x"),
+            ("timeout 60 sudo x", "timeout 60 sudo -A x"),
+            ("nice -n 5 sudo x", "nice -n 5 sudo -A x"),
+            ("time -p sudo x", "time -p sudo -A x"),
+            ("echo \"$(sudo x)\"", "echo \"$(sudo -A x)\""),
+            ("echo `sudo x`", "echo `sudo -A x`"),
+            ("\"sudo\" x", "\"sudo\" -A x"),
+            (
+                "cat <<EOF\nsudo body\nEOF\nsudo y",
+                "cat <<EOF\nsudo body\nEOF\nsudo -A y",
+            ),
+            ("cat <<< hi\nsudo rm x", "cat <<< hi\nsudo -A rm x"),
+            ("FOO=1 \\\n sudo x", "FOO=1 \\\n sudo -A x"),
+        ] {
+            assert!(runs_sudo(line), "{line:?}");
+            assert_eq!(with_sudo_askpass(line), rewritten, "{line:?}");
+        }
+        for line in ["a.b=c sudo x", "1X=y sudo z", "echo $(date) sudo"] {
+            assert!(!runs_sudo(line), "{line:?}");
+            assert_eq!(with_sudo_askpass(line), line, "{line:?}");
+        }
+    }
+
+    /// SPEC R-PERM.10.1: a loop or conditional names the programs inside it, never its
+    /// keywords (`for`/`do`/`done` recorded as programs matched every later loop), and a
+    /// wrapper's option value is never the program.
+    #[test]
+    fn keywords_and_wrapper_options_are_never_the_program() {
+        assert_eq!(command_programs("for f in a b; do make; done"), ["make"]);
+        assert_eq!(command_programs("if true; then cargo build; fi"), ["cargo"]);
+        assert_eq!(command_programs("{ xcodebuild build; }"), ["xcodebuild"]);
+        assert_eq!(command_programs("nice -n 10 make"), ["make"]);
+        assert_eq!(command_programs("sudo -u root make install"), ["make"]);
+        assert_eq!(command_programs("timeout 600 cargo nextest run"), ["cargo"]);
+        assert_eq!(command_programs("echo `swift build`"), ["swift"]);
+    }
+
+    /// SPEC R-PERM.11: a `cd` inside a group or behind a wrapper moves in.
+    #[test]
+    fn a_cd_in_a_group_or_behind_a_wrapper_moves_in() {
+        let cwd = Path::new("/w/ahma");
+        let entered = |c: &str| -> Vec<bool> {
+            command_folders(c, cwd, None)
+                .iter()
+                .map(|f| f.entered)
+                .collect()
+        };
+        assert_eq!(entered("{ cd /w/neubit4; make; }"), [true]);
+        assert_eq!(entered("time cd /w/neubit4 && ls"), [true]);
+        assert_eq!(entered("sudo ls /w/neubit4"), [false]);
     }
 }
