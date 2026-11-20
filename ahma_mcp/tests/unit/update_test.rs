@@ -1,18 +1,18 @@
 //! Integration tests for `ahma update`.
 
 use ahma_mcp::update::{
-    UpdateMode, build_cargo_install_command, classify_ref, default_install_dir,
+    Release, UpdateMode, build_cargo_install_command, classify_ref, default_install_dir,
 };
 use std::path::Path;
 
 #[test]
 fn test_classify_ref_branch_and_release() {
-    assert_eq!(classify_ref(None), UpdateMode::LatestRelease);
+    assert_eq!(classify_ref(None), UpdateMode::Release(Release::Latest));
     assert_eq!(
         classify_ref(Some("0.6.7")),
-        UpdateMode::TaggedRelease {
+        UpdateMode::Release(Release::Tagged {
             tag: "v0.6.7".to_string()
-        }
+        })
     );
     assert_eq!(
         classify_ref(Some("feature/update")),

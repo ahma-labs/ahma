@@ -9,21 +9,29 @@ static SEMVER_TAG: LazyLock<Regex> =
 /// How an `ahma update [ref]` request should be fulfilled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateMode {
-    /// Download the latest published GitHub release.
-    LatestRelease,
-    /// Download a specific semver release tag.
-    TaggedRelease { tag: String },
+    /// Download a published GitHub release.
+    Release(Release),
     /// Build and install from a Git branch or non-semver ref.
     GitRef { branch: String },
+}
+
+/// Which published release to download. Its own type, so the release path
+/// takes only what it can serve; it held an `unreachable!` for a Git ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    /// The latest published release.
+    Latest,
+    /// A specific semver release tag.
+    Tagged { tag: String },
 }
 
 /// Classify an optional ref argument.
 pub fn classify_ref(reference: Option<&str>) -> UpdateMode {
     match reference.map(str::trim).filter(|s| !s.is_empty()) {
-        None => UpdateMode::LatestRelease,
-        Some(r) if SEMVER_TAG.is_match(r) => UpdateMode::TaggedRelease {
+        None => UpdateMode::Release(Release::Latest),
+        Some(r) if SEMVER_TAG.is_match(r) => UpdateMode::Release(Release::Tagged {
             tag: normalize_release_tag(r),
-        },
+        }),
         Some(r) => UpdateMode::GitRef {
             branch: r.to_string(),
         },
@@ -50,22 +58,22 @@ mod tests {
 
     #[test]
     fn test_classify_none_is_latest() {
-        assert_eq!(classify_ref(None), UpdateMode::LatestRelease);
+        assert_eq!(classify_ref(None), UpdateMode::Release(Release::Latest));
     }
 
     #[test]
     fn test_classify_semver_tag() {
         assert_eq!(
             classify_ref(Some("0.6.7")),
-            UpdateMode::TaggedRelease {
+            UpdateMode::Release(Release::Tagged {
                 tag: "v0.6.7".to_string()
-            }
+            })
         );
         assert_eq!(
             classify_ref(Some("v0.6.7")),
-            UpdateMode::TaggedRelease {
+            UpdateMode::Release(Release::Tagged {
                 tag: "v0.6.7".to_string()
-            }
+            })
         );
     }
 

@@ -16,13 +16,13 @@ pub async fn install_release_asset(
     asset: &ReleaseAsset,
     platform: &Platform,
     install_dir: &Path,
-    dry_run: bool,
-    insecure_skip_verify: bool,
+    run: super::RunMode,
+    verification: super::Verification,
 ) -> Result<PathBuf> {
     let temp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
     let archive_path = temp_dir.path().join(&asset.asset_name);
 
-    if dry_run {
+    if run == super::RunMode::DryRun {
         println!("[dry-run] Would download {}", asset.download_url);
         println!("[dry-run] Would install to {}", install_dir.display());
         return Ok(install_dir.join(platform.binary_name()));
@@ -41,7 +41,7 @@ pub async fn install_release_asset(
 
     // Cryptographic verification: confirm the archive has a valid GitHub Build Provenance
     // Attestation (Sigstore SLSA Level 3) from the official ahma-labs/ahma pipeline.
-    if !insecure_skip_verify {
+    if verification == super::Verification::Required {
         verify::verify_artifact(&archive_path)
             .await
             .context("Release attestation verification failed; aborting install")?;
@@ -59,13 +59,12 @@ pub async fn install_release_asset(
 
     // Digests for the install receipt, taken before anything can change the bytes.
     // A receipt must never claim a verification that was skipped.
-    let verified = if insecure_skip_verify {
-        None
-    } else {
-        Some(receipt::VerifiedArtifact {
+    let verified = match verification {
+        super::Verification::Skipped => None,
+        super::Verification::Required => Some(receipt::VerifiedArtifact {
             name: asset.asset_name.clone(),
             sha256: file_sha256_hex(&archive_path).await?,
-        })
+        }),
     };
     let released_sha256 = file_sha256_hex(&extracted).await?;
 
@@ -1029,8 +1028,8 @@ mod tests {
             &asset,
             &platform,
             dir.path(),
-            true,  // dry_run — exits early, no network call
-            false, // insecure_skip_verify
+            crate::RunMode::DryRun, // exits early, no network call
+            crate::Verification::Required,
         )
         .await;
 
@@ -1240,8 +1239,8 @@ mod tests {
             &asset,
             &platform,
             install_dir.path(),
-            false, // not dry_run
-            true,  // insecure_skip_verify → skip Sigstore check
+            crate::RunMode::Apply,
+            crate::Verification::Skipped,
         )
         .await;
 
@@ -1297,8 +1296,8 @@ mod tests {
             &asset,
             &platform,
             install_dir.path(),
-            false,
-            true, // insecure_skip_verify
+            crate::RunMode::Apply,
+            crate::Verification::Skipped,
         )
         .await;
 
@@ -1347,8 +1346,8 @@ mod tests {
             &asset,
             &platform,
             install_dir.path(),
-            false,
-            true, // insecure_skip_verify
+            crate::RunMode::Apply,
+            crate::Verification::Skipped,
         )
         .await;
 
