@@ -746,17 +746,18 @@ fn apply_ssh_approval(asked: &harness_asks::AskedSsh, workspace: &Path, now: u64
     });
     match recorded {
         Some(_) => {
-            ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
-                ahma_common::config::fmt_utc_datetime(now),
-                ahma_common::permissions::AuditAction::Grant,
-                ahma_common::permissions::GrantKind::SshSign,
-                format!("{} for {}", r.key, r.destination),
-                None,
-                ahma_common::permissions::GrantTier::Session,
+            ahma_common::permissions::append_audit(
+                &ahma_common::permissions::AuditEntry::new(
+                    ahma_common::config::fmt_utc_datetime(now),
+                    ahma_common::permissions::AuditAction::Grant,
+                    ahma_common::permissions::GrantKind::SshSign,
+                    format!("{} for {}", r.key, r.destination),
+                    ahma_common::permissions::GrantTier::Session,
+                )
                 // The surface, as every other harness-dialog record has it;
                 // "harness dialog" is the grant's maker (`granted_by`).
-                Some("harness".into()),
-            ));
+                .with_surface("harness"),
+            );
             format!(
                 "ahma: approved — commands in this workspace may sign with {} for {} for this \
                  session.",

@@ -1525,15 +1525,17 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
     settings
         .save_to(settings_file)
         .with_context(|| format!("failed to write {}", settings_file.display()))?;
-    crate::permissions::append_audit(&crate::permissions::audit_entry(
-        grant.granted_at.unwrap_or_else(|| "unknown".to_string()),
-        crate::permissions::AuditAction::Grant,
-        crate::permissions::GrantKind::FsScope,
-        canonical.display().to_string(),
-        Some(if grant.access.is_write() { "rw" } else { "ro" }.to_string()),
-        crate::permissions::GrantTier::for_expiry(grant.expires_at),
-        Some(grant.surface.to_string()),
-    ));
+    crate::permissions::append_audit(
+        &crate::permissions::AuditEntry::new(
+            grant.granted_at.unwrap_or_else(|| "unknown".to_string()),
+            crate::permissions::AuditAction::Grant,
+            crate::permissions::GrantKind::FsScope,
+            canonical.display().to_string(),
+            crate::permissions::GrantTier::for_expiry(grant.expires_at),
+        )
+        .with_access(if grant.access.is_write() { "rw" } else { "ro" }.to_string())
+        .with_surface(grant.surface.to_string()),
+    );
     Ok(outcome)
 }
 

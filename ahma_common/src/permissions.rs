@@ -711,15 +711,17 @@ pub fn persist_log_target_as(
         );
     })?;
     if added {
-        append_audit(&audit_entry(
-            stamp,
-            AuditAction::Grant,
-            GrantKind::LogTarget,
-            target.display().to_string(),
-            Some("ro".to_string()),
-            GrantTier::Always,
-            Some(surface.to_string()),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                stamp,
+                AuditAction::Grant,
+                GrantKind::LogTarget,
+                target.display().to_string(),
+                GrantTier::Always,
+            )
+            .with_access("ro")
+            .with_surface(surface.to_string()),
+        );
     }
     Ok(added)
 }
@@ -1267,6 +1269,53 @@ pub struct AuditEntry {
 }
 
 impl AuditEntry {
+    /// An entry with no access, surface, request or advice attached; add them
+    /// with the `with_*` setters, so a value can never land in the wrong slot.
+    ///
+    /// `at` is supplied by the caller (stamp it with `chrono::Local::now()`), which
+    /// keeps this crate free of a date dependency — the same convention
+    /// [`crate::scope_grant::persist_grant`] follows for `granted_at`.
+    pub fn new(
+        at: impl Into<String>,
+        action: AuditAction,
+        kind: GrantKind,
+        subject: impl Into<String>,
+        tier: GrantTier,
+    ) -> Self {
+        Self {
+            at: at.into(),
+            action,
+            kind,
+            subject: subject.into(),
+            access: None,
+            tier,
+            surface: None,
+            request_id: None,
+            time_to_decision_ms: None,
+            risk: None,
+            advice: None,
+            advice_followed: None,
+        }
+    }
+
+    /// The access level granted or revoked (`rw`, `ro`, …).
+    pub fn with_access(mut self, access: impl Into<String>) -> Self {
+        self.access = Some(access.into());
+        self
+    }
+
+    /// [`Self::with_access`] for a caller that may have none.
+    pub fn with_access_opt(mut self, access: Option<impl Into<String>>) -> Self {
+        self.access = access.map(Into::into);
+        self
+    }
+
+    /// The surface the answer came from (`cli`, `tui`, `harness`, …).
+    pub fn with_surface(mut self, surface: impl Into<String>) -> Self {
+        self.surface = Some(surface.into());
+        self
+    }
+
     /// Attach the request this entry answered and how long it took.
     pub fn with_request(
         mut self,
@@ -1328,36 +1377,6 @@ pub fn append_audit(entry: &AuditEntry) {
     }
 }
 
-/// Build an [`AuditEntry`].
-///
-/// `at` is supplied by the caller (stamp it with `chrono::Local::now()`), which
-/// keeps this crate free of a date dependency — the same convention
-/// [`crate::scope_grant::persist_grant`] follows for `granted_at`.
-pub fn audit_entry(
-    at: impl Into<String>,
-    action: AuditAction,
-    kind: GrantKind,
-    subject: impl Into<String>,
-    access: Option<String>,
-    tier: GrantTier,
-    surface: Option<String>,
-) -> AuditEntry {
-    AuditEntry {
-        at: at.into(),
-        action,
-        kind,
-        subject: subject.into(),
-        access,
-        tier,
-        surface,
-        request_id: None,
-        time_to_decision_ms: None,
-        risk: None,
-        advice: None,
-        advice_followed: None,
-    }
-}
-
 /// The audit entry for one setting changed (SPEC R-CFG10.5): `subject` is the
 /// dotted key, `access` reads `<file>: <before> -> <after>` with a secret key's
 /// values redacted and long values cut, and `surface` is who changed it (`cli`,
@@ -1386,24 +1405,50 @@ pub fn setting_audit_entry(
         Some(_) => AuditAction::Grant,
     };
     let text = |v: Option<&str>| v.unwrap_or(crate::config::UNSET_TEXT).to_string();
-    audit_entry(
-        at,
-        action,
-        GrantKind::Setting,
-        key,
-        Some(format!(
+    AuditEntry::new(at, action, GrantKind::Setting, key, GrantTier::Always)
+        .with_access(format!(
             "{file}: {} -> {}",
             shown(key, &text(before)),
             shown(key, &text(after))
-        )),
-        GrantTier::Always,
-        Some(surface.to_string()),
-    )
+        ))
+        .with_surface(surface.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The audit log is read by `doctor`, the hub and humans with `jq`; the
+    /// builder must not change a byte of it (SPEC R-PERM.2).
+    #[test]
+    fn audit_entry_json_is_pinned() {
+        let full = AuditEntry::new(
+            "t",
+            AuditAction::Grant,
+            GrantKind::FsScope,
+            "/x",
+            GrantTier::Session,
+        )
+        .with_access("rw")
+        .with_surface("cli");
+        assert_eq!(
+            serde_json::to_string(&full).unwrap(),
+            r#"{"at":"t","action":"grant","kind":"fs-scope","subject":"/x","access":"rw","tier":"session","surface":"cli"}"#
+        );
+        let bare = AuditEntry::new(
+            "t",
+            AuditAction::Revoke,
+            GrantKind::Tool,
+            "*",
+            GrantTier::Always,
+        )
+        .with_access_opt(None::<String>)
+        .with_surface("doctor");
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"at":"t","action":"revoke","kind":"tool","subject":"*","tier":"always","surface":"doctor"}"#
+        );
+    }
     use crate::config::ScopeAccess;
     use tempfile::tempdir;
 
@@ -1971,15 +2016,15 @@ mod tests {
 
     #[test]
     fn a_log_target_audit_entry_round_trips() {
-        let e = audit_entry(
+        let e = AuditEntry::new(
             "2026-10-03 12:00 UTC",
             AuditAction::Grant,
             GrantKind::LogTarget,
             "/var/log/app.log",
-            Some("ro".into()),
             GrantTier::Always,
-            Some("mcp:logs_approve".into()),
-        );
+        )
+        .with_access("ro")
+        .with_surface("mcp:logs_approve");
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"kind\":\"log-target\""), "{json}");
         let back: AuditEntry = serde_json::from_str(&json).unwrap();
@@ -1993,28 +2038,27 @@ mod tests {
 
         append_audit_at(
             &log,
-            &audit_entry(
+            &AuditEntry::new(
                 "2026-07-12T10:00:00+02:00",
                 AuditAction::Grant,
                 GrantKind::FsScope,
                 "/cache",
-                Some("rw".into()),
                 GrantTier::Always,
-                Some("cli".into()),
-            ),
+            )
+            .with_access("rw")
+            .with_surface("cli"),
         )
         .unwrap();
         append_audit_at(
             &log,
-            &audit_entry(
+            &AuditEntry::new(
                 "2026-07-12T10:00:01+02:00",
                 AuditAction::Revoke,
                 GrantKind::Tool,
                 "cargo_build",
-                None,
                 GrantTier::Always,
-                Some("tui".into()),
-            ),
+            )
+            .with_surface("tui"),
         )
         .unwrap();
 
@@ -2092,15 +2136,15 @@ mod audit_context_tests {
     /// the request it answered, how long the human took, and the risk class.
     #[test]
     fn audit_entry_carries_request_id_and_time_to_decision() {
-        let e = audit_entry(
+        let e = AuditEntry::new(
             "2026-10-02T12:00:00Z",
             AuditAction::Grant,
             GrantKind::FsScope,
             "/x",
-            Some("rw".into()),
             GrantTier::Session,
-            Some("tui".into()),
         )
+        .with_access("rw")
+        .with_surface("tui")
         .with_request("d1", Some(1_700), Some("high"));
         assert_eq!(e.request_id.as_deref(), Some("d1"));
         assert_eq!(e.time_to_decision_ms, Some(1_700));
