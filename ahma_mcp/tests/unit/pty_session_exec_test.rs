@@ -708,3 +708,61 @@ async fn a_running_pty_or_session_command_holds_its_mutex_group() {
         );
     }
 }
+
+// ─── Drift (SPEC R2.7.6) ─────────────────────────────────────────────────────
+
+/// Waits, writes a file in the workspace, and waits again: a run past the
+/// two-second floor whose write falls well inside it, whatever the
+/// filesystem's timestamp resolution.
+fn writes_while_it_runs() -> &'static str {
+    if cfg!(windows) {
+        "Start-Sleep -Seconds 1; Set-Content -Path drift_probe.txt -Value x; Start-Sleep -Seconds 2"
+    } else {
+        "sleep 1; echo x > drift_probe.txt; sleep 2"
+    }
+}
+
+fn changed_during_run(op: &Operation) -> String {
+    op.result
+        .as_ref()
+        .and_then(|r| r.get("changed_during_run"))
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+/// A PTY or session command lists the files that changed in its workspace
+/// while it ran, as a piped command does (SPEC R2.7.6). Neither result had
+/// `changed_during_run`.
+#[tokio::test]
+async fn pty_and_session_commands_report_files_changed_while_they_ran() {
+    let temp = tempdir().unwrap();
+    let (adapter, monitor) = build_adapter(temp.path().to_path_buf());
+    let wd = temp.path().to_str().unwrap();
+
+    let id = adapter
+        .execute_session_async("sess", "drift", writes_while_it_runs(), wd, Some(30), None)
+        .await
+        .expect("session command starts");
+    let op = wait_done(&monitor, &id).await;
+    let changed = changed_during_run(&op);
+    assert!(
+        changed.contains("drift_probe.txt"),
+        "session: {changed:?}, full result: {:?}",
+        op.result
+    );
+
+    #[cfg(unix)]
+    if ahma_mcp::adapter::pty_available() {
+        let id = adapter
+            .execute_pty_async("pty_test", writes_while_it_runs(), wd, Some(30), None)
+            .await
+            .expect("pty command starts");
+        let op = wait_done(&monitor, &id).await;
+        let changed = changed_during_run(&op);
+        assert!(
+            changed.contains("drift_probe.txt"),
+            "pty: {changed:?}, full result: {:?}",
+            op.result
+        );
+    }
+}
