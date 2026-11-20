@@ -2152,7 +2152,7 @@ impl AhmaMcpService {
         };
         tracing::warn!("{}", error_message);
         Err(McpError::new(
-            rmcp::model::ErrorCode(-32001),
+            rmcp::model::ErrorCode(ahma_common::mcp_methods::RpcErrorCode::SandboxNotReady.code()),
             error_message,
             Some(serde_json::json!({
                 "kind": if scopes_pending { "sandbox_scope_uncommitted" }

@@ -283,7 +283,7 @@ async fn reply_invalid_request<W: AsyncWrite + Unpin>(
         "jsonrpc": "2.0",
         "id": id,
         "error": {
-            "code": -32600,
+            "code": ahma_common::mcp_methods::RpcErrorCode::InvalidRequest,
             "message": format!("Invalid request: {err}"),
         },
     });

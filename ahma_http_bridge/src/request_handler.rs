@@ -2,9 +2,8 @@ use crate::bridge::{MCP_SESSION_ID_HEADER, session_id_from_headers};
 use crate::error::BridgeError;
 use crate::session::{McpRoot, SessionManager};
 use ahma_common::mcp_methods::{
-    INITIALIZE_METHOD, INITIALIZED_METHOD, JSONRPC_REQUEST_TIMEOUT, JSONRPC_SANDBOX_FAILED,
-    JSONRPC_SANDBOX_NOT_READY, ROOTS_LIST_CHANGED_METHOD, ROOTS_LIST_METHOD,
-    SAMPLING_CREATE_MESSAGE_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
+    INITIALIZE_METHOD, INITIALIZED_METHOD, ROOTS_LIST_CHANGED_METHOD, ROOTS_LIST_METHOD,
+    RpcErrorCode, SAMPLING_CREATE_MESSAGE_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
     SUBSCRIPTIONS_LISTEN_METHOD, TOOLS_CALL_METHOD,
 };
 use ahma_common::mcp_protocol::ADVERTISED_PROTOCOL_VERSIONS;
@@ -53,7 +52,7 @@ fn payload_id(payload: &Value) -> Value {
 /// notification, or where the request is not knowable). It is always emitted:
 /// a conforming MCP client matches the error to its pending request by `id`,
 /// and an error without one is silently dropped or looks like a hang.
-fn json_rpc_error_value(id: Value, code: i32, message: &str) -> Value {
+fn json_rpc_error_value(id: Value, code: RpcErrorCode, message: &str) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -81,7 +80,7 @@ fn request_timeout_body(payload: &Value, window: Duration) -> Value {
     // the number that elapsed is the bridge's, not the one it requested.
     json_rpc_error_value(
         payload_id(payload),
-        JSONRPC_REQUEST_TIMEOUT,
+        RpcErrorCode::RequestTimeout,
         &format!(
             "Operation still running: the bridge wait window ({}s) elapsed \
              before the tool returned. The operation continues in the \
@@ -107,12 +106,17 @@ fn with_session_header(mut response: Response, session_id: &str) -> Response {
 ///
 /// `id` correlates the error with the request that provoked it — see
 /// [`json_rpc_error_value`]. The HTTP status is unchanged by the id.
-fn error_response_with_status(status: StatusCode, id: Value, code: i32, message: &str) -> Response {
+fn error_response_with_status(
+    status: StatusCode,
+    id: Value,
+    code: RpcErrorCode,
+    message: &str,
+) -> Response {
     json_response_with_status(status, json_rpc_error_value(id, code, message))
 }
 
 /// Create an error response in the appropriate format
-fn error_response(id: Value, code: i32, message: &str) -> Response {
+fn error_response(id: Value, code: RpcErrorCode, message: &str) -> Response {
     error_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, id, code, message)
 }
 
@@ -120,7 +124,7 @@ fn missing_session_id_response(id: Value) -> Response {
     error_response_with_status(
         StatusCode::BAD_REQUEST,
         id,
-        -32600,
+        RpcErrorCode::InvalidRequest,
         "Missing Mcp-Session-Id header. Send initialize request first.",
     )
 }
@@ -132,7 +136,7 @@ pub(crate) fn batch_not_supported_response() -> Response {
     error_response_with_status(
         StatusCode::BAD_REQUEST,
         Value::Null,
-        -32600,
+        RpcErrorCode::InvalidRequest,
         "JSON-RPC batch requests are not supported by this server. Send one request per POST.",
     )
 }
@@ -146,7 +150,7 @@ fn session_not_found_response(id: Value) -> Response {
     error_response_with_status(
         StatusCode::NOT_FOUND,
         id,
-        -32600,
+        RpcErrorCode::InvalidRequest,
         "Session not found or terminated. Send a new initialize request to start a session.",
     )
 }
@@ -162,7 +166,12 @@ fn session_terminated_response(
         info.reason,
         info.terminated_at.elapsed().as_secs_f64()
     );
-    error_response_with_status(StatusCode::NOT_FOUND, id, -32600, &msg)
+    error_response_with_status(
+        StatusCode::NOT_FOUND,
+        id,
+        RpcErrorCode::InvalidRequest,
+        &msg,
+    )
 }
 
 async fn session_has_sampling(s: &crate::session::Session) -> bool {
@@ -252,7 +261,7 @@ async fn handle_routed_sampling_request(
     else {
         return error_response(
             original_id,
-            -32603,
+            RpcErrorCode::Internal,
             "No active IDE session (Cursor, VS Code, etc.) with sampling capability found. \
              Make sure your IDE is running and connected to ahma.",
         );
@@ -286,7 +295,7 @@ async fn handle_routed_sampling_request(
             target_session.routed_requests.remove(&routed_key);
             return error_response(
                 original_id,
-                -32603,
+                RpcErrorCode::Internal,
                 &format!("Failed to serialize routed payload: {e}"),
             );
         }
@@ -296,7 +305,7 @@ async fn handle_routed_sampling_request(
         target_session.routed_requests.remove(&routed_key);
         return error_response(
             original_id,
-            -32603,
+            RpcErrorCode::Internal,
             "Target session's SSE channel is closed",
         );
     }
@@ -308,12 +317,16 @@ async fn handle_routed_sampling_request(
             final_response["id"] = original_id;
             encode_routed_response(session_manager, session_id, is_sse, final_response)
         }
-        Ok(Err(_)) => error_response(original_id, -32603, "Routed request sender dropped"),
+        Ok(Err(_)) => error_response(
+            original_id,
+            RpcErrorCode::Internal,
+            "Routed request sender dropped",
+        ),
         Err(_) => {
             target_session.routed_requests.remove(&routed_key);
             error_response(
                 original_id,
-                JSONRPC_REQUEST_TIMEOUT,
+                RpcErrorCode::RequestTimeout,
                 "Request timed out on the client side",
             )
         }
@@ -495,7 +508,7 @@ fn validate_initialize_payload(payload: &Value) -> Option<Response> {
     {
         Some(error_response(
             payload_id(payload),
-            -32602,
+            RpcErrorCode::InvalidParams,
             "Invalid initialize params: missing params.protocolVersion",
         ))
     } else {
@@ -518,7 +531,7 @@ async fn handle_initialize_error(
         .await;
     error_response(
         request_id,
-        -32603,
+        RpcErrorCode::Internal,
         &format!("Failed to initialize session: {}", error),
     )
 }
@@ -663,7 +676,7 @@ async fn create_session_or_error(
             return Err(error_response_with_status(
                 axum::http::StatusCode::BAD_REQUEST,
                 request_id,
-                -32602,
+                RpcErrorCode::InvalidParams,
                 &format!("Invalid session options: {message}"),
             ));
         }
@@ -684,12 +697,12 @@ fn session_creation_error_response(e: BridgeError, request_id: Value) -> Respons
         BridgeError::SessionLimitExceeded { .. } => error_response_with_status(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             request_id,
-            JSONRPC_REQUEST_TIMEOUT,
+            RpcErrorCode::RequestTimeout,
             &format!("Failed to create session: {}", e),
         ),
         _ => error_response(
             request_id,
-            -32603,
+            RpcErrorCode::Internal,
             &format!("Failed to create session: {}", e),
         ),
     }
@@ -834,7 +847,7 @@ fn build_handshake_timeout_response(
         error_response_with_status(
             StatusCode::GATEWAY_TIMEOUT,
             request_id,
-            JSONRPC_REQUEST_TIMEOUT,
+            RpcErrorCode::RequestTimeout,
             &error_msg,
         ),
         session_id,
@@ -878,7 +891,7 @@ fn check_sandbox_lock(
                 error_response_with_status(
                     StatusCode::FORBIDDEN,
                     request_id,
-                    JSONRPC_SANDBOX_FAILED,
+                    RpcErrorCode::SandboxFailed,
                     &format!("Sandbox configuration failed: {}", error),
                 ),
                 session_id,
@@ -889,7 +902,7 @@ fn check_sandbox_lock(
                 error_response_with_status(
                     StatusCode::FORBIDDEN,
                     request_id,
-                    JSONRPC_SANDBOX_FAILED,
+                    RpcErrorCode::SandboxFailed,
                     "Session terminated",
                 ),
                 session_id,
@@ -922,7 +935,7 @@ fn check_sandbox_lock(
         error_response_with_status(
             StatusCode::CONFLICT,
             request_id,
-            JSONRPC_SANDBOX_NOT_READY,
+            RpcErrorCode::SandboxNotReady,
             get_conflict_message(session_manager.requires_client_roots()),
         ),
         session_id,
@@ -986,7 +999,7 @@ async fn wait_for_initialization(
             error_response_with_status(
                 StatusCode::GATEWAY_TIMEOUT,
                 request_id,
-                JSONRPC_REQUEST_TIMEOUT,
+                RpcErrorCode::RequestTimeout,
                 "Timeout waiting for MCP initialization - client must send notifications/initialized first",
             ),
             session_id,
@@ -1041,7 +1054,7 @@ async fn handle_client_response(
         );
         return error_response(
             payload_id(payload),
-            -32603,
+            RpcErrorCode::Internal,
             &format!("Failed to forward response: {}", e),
         );
     }
@@ -1313,7 +1326,7 @@ async fn forward_request(
                 error_response_with_status(
                     StatusCode::BAD_REQUEST,
                     payload_id(payload),
-                    -32600,
+                    RpcErrorCode::InvalidRequest,
                     &e.to_string(),
                 ),
                 session_id,
@@ -1323,7 +1336,7 @@ async fn forward_request(
             error!(session_id = %session_id, "Failed to send request: {}", e);
             return error_response(
                 payload_id(payload),
-                -32603,
+                RpcErrorCode::Internal,
                 &format!("Failed to send request: {}", e),
             );
         }
@@ -1378,7 +1391,11 @@ async fn forward_request(
     let request_id = payload_id(payload);
     let answer = async move {
         answer.await.unwrap_or_else(|e| {
-            json_rpc_error_value(request_id, -32603, &format!("Request task failed: {e}"))
+            json_rpc_error_value(
+                request_id,
+                RpcErrorCode::Internal,
+                &format!("Request task failed: {e}"),
+            )
         })
     };
     with_session_header(
@@ -1433,7 +1450,7 @@ async fn settle_forwarded(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json_rpc_error_value(
                     payload_id(payload),
-                    -32603,
+                    RpcErrorCode::Internal,
                     &format!("Failed to send request: {}", e),
                 ),
             )
@@ -1823,7 +1840,7 @@ async fn forward_notification(
             // `null`, which is still emitted so the field is never absent.
             error_response(
                 payload_id(payload),
-                -32603,
+                RpcErrorCode::Internal,
                 &format!("Failed to send request: {}", e),
             )
         }
@@ -1950,7 +1967,7 @@ mod tests {
 
     #[test]
     fn json_rpc_error_value_has_id_code_and_message() {
-        let v = json_rpc_error_value(json!(7), -32000, "boom");
+        let v = json_rpc_error_value(json!(7), RpcErrorCode::SandboxFailed, "boom");
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], json!(7), "errors must be correlatable by id");
         assert_eq!(v["error"]["code"], -32000);
@@ -1961,7 +1978,7 @@ mod tests {
     /// an absent `id` is exactly what makes an error impossible to match.
     #[test]
     fn json_rpc_error_value_emits_null_id_rather_than_omitting_it() {
-        let v = json_rpc_error_value(Value::Null, -32603, "boom");
+        let v = json_rpc_error_value(Value::Null, RpcErrorCode::Internal, "boom");
         assert!(
             v.get("id").is_some(),
             "the id field must never be omitted: {v}"
@@ -1991,7 +2008,7 @@ mod tests {
 
     #[tokio::test]
     async fn error_response_defaults_to_500() {
-        let resp = error_response(json!(11), -32603, "internal");
+        let resp = error_response(json!(11), RpcErrorCode::Internal, "internal");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(resp).await;
         assert_eq!(body["id"], json!(11));
@@ -2001,7 +2018,12 @@ mod tests {
 
     #[tokio::test]
     async fn error_response_with_status_honors_status() {
-        let resp = error_response_with_status(StatusCode::FORBIDDEN, json!("x-1"), -32000, "nope");
+        let resp = error_response_with_status(
+            StatusCode::FORBIDDEN,
+            json!("x-1"),
+            RpcErrorCode::SandboxFailed,
+            "nope",
+        );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = body_json(resp).await;
         assert_eq!(body["id"], json!("x-1"));
