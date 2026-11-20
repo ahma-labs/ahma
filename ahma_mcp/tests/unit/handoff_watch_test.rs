@@ -372,3 +372,97 @@ async fn a_removed_hook_is_reported() {
     assert_eq!(report.changes[0].path, sample);
     assert_eq!(report.changes[0].kind, HandoffChangeKind::Removed);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PTY and persistent-session commands
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn finished(monitor: &OperationMonitor, id: &str) -> Operation {
+    tokio::time::timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+        monitor.wait_for_operation(id),
+    )
+    .await
+    .expect("the command finishes")
+    .expect("the operation is known")
+}
+
+/// What a piped command's hook write gets, any other command gets too: the
+/// alert in the result, the alert event, and one audit record per entry —
+/// one, because the result's report is the comparison the audit came from,
+/// not a second inventory.
+async fn assert_hook_reported_once(op: &Operation, root: &Path, path: &str) {
+    let hook = root.join(".git").join("hooks").join("pre-commit");
+    assert!(
+        hook.exists(),
+        "{path}: the command really did write the hook"
+    );
+    let alert = result_alert(op).unwrap_or_else(|| {
+        panic!(
+            "{path}: a trust-handoff alert in the result: {:?}",
+            op.result
+        )
+    });
+    assert!(
+        alert.contains(&format!("{ALERT_PREFIX} {} (created)", hook.display())),
+        "{path}: {alert}"
+    );
+    assert!(
+        op.alerts.iter().any(|a| a.contains(ALERT_PREFIX)),
+        "{path}: the alert event is what the hub and the TUI show: {:?}",
+        op.alerts
+    );
+    assert_eq!(
+        op.result.as_ref().unwrap()["handoff_writes"]["changes"][0]["change"],
+        "created",
+        "{path}"
+    );
+    let records = handoff_records(&op.id).await;
+    assert_eq!(records.len(), 1, "{path}: {records:?}");
+}
+
+/// SPEC R6.1.7: a hook planted by a PTY command leads its result and reaches
+/// the alert stream, as a piped command's does. It reached only the log and
+/// the audit trail.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hook_written_by_a_pty_command_is_reported_in_its_result() {
+    if !ahma_mcp::adapter::pty_available() {
+        eprintln!("SKIP: PTY allocation unavailable in this environment (outer sandbox)");
+        return;
+    }
+    let (_dir, root) = workspace();
+    let (adapter, monitor) = adapter(&root, HandoffWatchMode::Always);
+    let id = adapter
+        .execute_pty_async(
+            "pty_test",
+            create_hook_cmd(),
+            root.to_str().unwrap(),
+            Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
+            None,
+        )
+        .await
+        .expect("dispatch");
+    let op = finished(&monitor, &id).await;
+    assert_hook_reported_once(&op, &root, "pty").await;
+}
+
+/// The same for a command in a persistent shell session.
+#[tokio::test]
+async fn a_hook_written_by_a_session_command_is_reported_in_its_result() {
+    let (_dir, root) = workspace();
+    let (adapter, monitor) = adapter(&root, HandoffWatchMode::Always);
+    let id = adapter
+        .execute_session_async(
+            "session_test",
+            "handoff",
+            create_hook_cmd(),
+            root.to_str().unwrap(),
+            Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
+            None,
+        )
+        .await
+        .expect("dispatch");
+    let op = finished(&monitor, &id).await;
+    assert_hook_reported_once(&op, &root, "session").await;
+}

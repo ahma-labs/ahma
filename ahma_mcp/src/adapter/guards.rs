@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::{PublishEnding, audit, finish_handoff_watch, workspace_queue};
-use crate::operation_monitor::{OperationMonitor, Terminal};
-use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch};
+use crate::operation_monitor::{CommandOutput, OperationMonitor, Terminal};
+use crate::sandbox::handoff_watch::HandoffWatch;
 
 /// What a running command holds until it has ended: its place in the
 /// workspace queue (SPEC R2.7.1), its mutex group gate (R2.7.2), the
@@ -122,12 +122,28 @@ impl RunGuards {
         self.broker.as_ref()
     }
 
-    /// The deny tier compared with its inventory from before the spawn, for a
-    /// command whose process tree is gone and whose result, which carries the
-    /// report, is still to be built.
-    pub(super) async fn take_handoff_report(&mut self) -> Option<HandoffReport> {
-        let watch = self.handoff.take()?;
-        finish_handoff_watch(watch, &self.op_id, &self.subject).await
+    /// Compare the deny tier with its inventory from before the spawn (SPEC
+    /// R6.1.7) and put the report in `output` (`handoff_writes`,
+    /// `handoff_alert`), raising the alert while the operation is still
+    /// active: the `Alert` event is what the hub and the TUI show. For a
+    /// command whose process tree is gone and whose result is still to be
+    /// published; the one way every async path does it. `end` then finds no
+    /// watch, so the deny tier is compared once.
+    pub(super) async fn report_handoff_in(
+        &mut self,
+        output: &mut CommandOutput,
+        monitor: &OperationMonitor,
+    ) {
+        let Some(watch) = self.handoff.take() else {
+            return;
+        };
+        let Some(report) = finish_handoff_watch(watch, &self.op_id, &self.subject).await else {
+            return;
+        };
+        let alert = report.render_alert();
+        output.handoff_writes = Some(report.to_json());
+        output.handoff_alert = Some(alert.clone());
+        monitor.append_alert(&self.op_id, alert).await;
     }
 
     /// End the operation with `ending`.
