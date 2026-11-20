@@ -66,6 +66,14 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
 - `BUILD_ID`: the git hash of the build, used to detect a stale same-version bridge.
 
 **Shared definitions**
+- `shell_words`: how a shell line is read as words, once. `split_strict` fails closed (the
+  workspace-queue lane, R2.7.4, and the edit guard, R2.7.8, treat a refusal as "cannot
+  tell"); `segments` never fails and names what runs, `$(…)` and backticks included
+  (R-PERM.10.1, R-PERM.11, R-ESCAPE.4, R2.7.11); `split_literal` keeps `\` for Windows
+  paths. One assignment rule (the shell's: `NAME=value`), one keyword list, one framing
+  rule, and two readings of wrappers: `harmless_wrapper_len` (writes nothing itself, never
+  `nohup`; decides a lane) and `command_chain` over `RUNS_THE_NEXT` (names the program).
+  Where `split_strict` reads a line, `segments` reads the same words.
 - `prompts`, `skills`, `simplify_args`, `peer_factory`, `state_machine`: prompt templates,
   Agent Skills discovery (R-SK8), the `ahma simplify` arguments (here so the CLI parser and
   `ahma_simplify` need not depend on each other), the transport-agnostic MCP peer factory,

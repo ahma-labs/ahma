@@ -25,6 +25,7 @@
 //! its own arguments (`writes_through_args`). See [`classify_shell_command_at`].
 
 use super::workspace_queue::{Lane, SourceEffect};
+use ahma_common::shell_words::{self, Refusal, StrictWord};
 use std::path::{Path, PathBuf};
 
 /// Programs that only read, whatever their (plain) arguments.
@@ -131,12 +132,6 @@ const READ_ONLY_GIT: &[&str] = &[
     "ls-remote",
 ];
 
-/// Characters that make a command line mean more than "run some programs with
-/// these words, piped or listed": substitutions, grouping, escapes, comments,
-/// history expansion, heredocs. Pipes, lists and redirections are parsed
-/// explicitly below.
-const SHELL_OPERATORS: &[char] = &['`', '(', ')', '{', '}', '\\', '\n', '\r', '#', '!'];
-
 /// A simple command: the words of one pipeline segment.
 type Segment = Vec<String>;
 
@@ -181,148 +176,16 @@ fn redirection(word: &str) -> Option<Redirection> {
     (!rest.contains(['<', '>'])).then(|| Redirection::Write(file(rest)))
 }
 
-/// A tokenized word and whether any `<` or `>` inside it was quoted.
-type TokenWord = (String, bool);
-
-#[derive(Default)]
-struct LineTokenizer {
-    segs: Vec<Vec<TokenWord>>,
-    cur: String,
-    quoted_angle: bool,
-    in_word: bool,
-    quote: Option<char>,
-}
-
-impl LineTokenizer {
-    fn new() -> Self {
-        Self {
-            segs: vec![Vec::new()],
-            ..Self::default()
-        }
-    }
-
-    fn flush(&mut self) {
-        if self.in_word {
-            self.segs.last_mut().unwrap().push((
-                std::mem::take(&mut self.cur),
-                std::mem::take(&mut self.quoted_angle),
-            ));
-            self.in_word = false;
-        }
-    }
-
-    fn push_char(&mut self, c: char) {
-        self.cur.push(c);
-        self.in_word = true;
-    }
-
-    fn consume_operator(&mut self, c: char, next: Option<char>) -> Option<usize> {
-        let op_len = match (c, next) {
-            ('|', Some('|')) | ('&', Some('&')) => 2,
-            ('|', _) | (';', _) => 1,
-            // A bare `&`: background or a redirection we do not model.
-            ('&', _) => return None,
-            _ => 1,
-        };
-        self.flush();
-        if self.segs.last().is_some_and(Vec::is_empty) {
-            return None; // `| cmd`, `cmd ||  | cmd`: not a command line we read
-        }
-        self.segs.push(Vec::new());
-        Some(op_len)
-    }
-
-    fn step_unquoted(&mut self, chars: &[char], i: usize) -> Option<usize> {
-        let c = chars[i];
-        match c {
-            // `!` standing alone negates the command after it: a word of
-            // its own, which the classifier skips like a loop keyword.
-            '!' if !self.in_word && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {
-                self.push_char('!');
-            }
-            // `${NAME}` is the same plain variable as `$NAME`. Anything else
-            // between the braces (`${a:-b}`, `${#a}`) is an expansion this
-            // module does not model.
-            '$' if chars.get(i + 1) == Some(&'{') => {
-                let len = braced_name_len(&chars[i..])?;
-                for &ch in &chars[i..i + len] {
-                    self.push_char(ch);
-                }
-                return Some(len);
-            }
-            // An operator this module does not model, outside quotes only:
-            // a `}` inside a sed script is just a character.
-            c if SHELL_OPERATORS.contains(&c) => return None,
-            '\'' | '"' => {
-                self.quote = Some(c);
-                self.in_word = true;
-            }
-            '&' if self.cur.ends_with('>') || self.cur.ends_with('<') => {
-                // `2>&1`, `>&2`: part of a redirection word, not an operator.
-                self.push_char(c);
-            }
-            '|' if self.cur.ends_with('>') => {
-                // `>|file`: write even under `noclobber`, not a pipe.
-                self.push_char(c);
-            }
-            '&' if chars.get(i + 1) == Some(&'>') => {
-                // `&>file`, `&>>file`: a redirection word of its own.
-                self.flush();
-                self.push_char(c);
-            }
-            '|' | ';' | '&' => return self.consume_operator(c, chars.get(i + 1).copied()),
-            c if c.is_whitespace() => self.flush(),
-            _ => self.push_char(c),
-        }
-        Some(1)
-    }
-}
-
-/// Tokenize words, quoted strings, and the operators `|`, `||`, `&&`, `;`.
-/// Any other `&` (background, `>&2` outside a redirection) is unknown.
-/// Each word carries whether a `<` or `>` in it was *quoted*: that is an
-/// argument (`grep '>' f`), never a redirection.
-fn tokenize_line(command: &str) -> Option<Vec<Vec<TokenWord>>> {
-    if command.contains("<<") {
-        return None;
-    }
-    let mut tok = LineTokenizer::new();
-    let chars: Vec<char> = command.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match tok.quote {
-            Some(q) if c == q => {
-                tok.quote = None;
-                i += 1;
-            }
-            // Inside double quotes a backtick is still a command
-            // substitution; inside single quotes it is a character.
-            Some('"') if c == '`' => return None,
-            Some(_) => {
-                tok.quoted_angle |= c == '<' || c == '>';
-                tok.cur.push(c);
-                i += 1;
-            }
-            None => i += tok.step_unquoted(&chars, i)?,
-        }
-    }
-    if tok.quote.is_some() {
-        return None;
-    }
-    tok.flush();
-    if tok.segs.last().is_some_and(Vec::is_empty) {
-        return None; // trailing operator
-    }
-    Some(tok.segs)
-}
-
 /// Redirections: drop the ones that open no file, collect the files the
 /// writing ones open, refuse anything else with `<`/`>`.
-fn extract_segment_redirections(seg: Vec<TokenWord>, writes: &mut Vec<String>) -> Option<Segment> {
+fn extract_segment_redirections(seg: Vec<StrictWord>, writes: &mut Vec<String>) -> Option<Segment> {
     let mut cleaned = Vec::new();
     let mut words = seg.into_iter();
-    while let Some((w, quoted_angle)) = words.next() {
+    while let Some(StrictWord {
+        text: w,
+        quoted_angle,
+    }) = words.next()
+    {
         if !w.contains(['<', '>']) {
             // `$(…)` is a substitution; a plain `$VAR` reference only reads
             // the environment and is left to the shell.
@@ -344,7 +207,11 @@ fn extract_segment_redirections(seg: Vec<TokenWord>, writes: &mut Vec<String>) -
         let target = match target {
             Some(target) => target,
             None => match words.next() {
-                Some((next, _)) if !next.is_empty() && !next.contains(['<', '>']) => next,
+                Some(StrictWord { text: next, .. })
+                    if !next.is_empty() && !next.contains(['<', '>']) =>
+                {
+                    next
+                }
                 _ => return None,
             },
         };
@@ -366,7 +233,7 @@ fn extract_segment_redirections(seg: Vec<TokenWord>, writes: &mut Vec<String>) -
 /// "cannot tell", i.e. exclusive. Input redirections other than `< /dev/null`
 /// are refused too: they are reads, but not ones this module models.
 fn parse_line(command: &str) -> Option<Line> {
-    let raw_segs = tokenize_line(command)?;
+    let raw_segs = shell_words::split_strict(command).ok()?;
     let mut writes = Vec::new();
     let mut segs = Vec::with_capacity(raw_segs.len());
     for seg in raw_segs {
@@ -452,95 +319,6 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
         }
         p => READ_ONLY_PROGRAMS.contains(&p),
     }
-}
-
-/// Shell keywords that open or close a loop or a conditional around the
-/// commands of a list: `until gh pr checks 87; do sleep 60; done` is a reader
-/// exactly when every command in it is.
-const LIST_KEYWORDS: &[&str] = &["until", "while", "if", "elif", "then", "else", "do", "!"];
-
-/// The length of a `${NAME}` at the start of `chars` (`$`, `{`, a name of
-/// letters, digits and `_`, `}`), or `None` when the braces hold anything else.
-fn braced_name_len(chars: &[char]) -> Option<usize> {
-    let close = chars.iter().skip(2).position(|&c| c == '}')? + 2;
-    let name = &chars[2..close];
-    (!name.is_empty() && name.iter().all(|c| c.is_ascii_alphanumeric() || *c == '_'))
-        .then_some(close + 1)
-}
-
-/// How many leading words are wrappers that only change how the command after
-/// them runs: `timeout`, `time`, `nice`, `caffeinate` and `env NAME=value…`.
-/// Parsed strictly, so a wrapper option this module does not know leaves the
-/// wrapper in place (and the line as unknown as it was). Never `nohup`: it
-/// writes `nohup.out` into the working directory.
-fn wrapper_len<S: AsRef<str>>(words: &[S]) -> usize {
-    let mut at = 0;
-    while let Some(n) = one_wrapper_len(&words[at..]) {
-        at += n;
-    }
-    // A wrapper with nothing after it runs nothing this module can judge.
-    if at >= words.len() { 0 } else { at }
-}
-
-fn one_wrapper_len<S: AsRef<str>>(words: &[S]) -> Option<usize> {
-    let word = |i: usize| words.get(i).map(AsRef::as_ref);
-    let is_duration = |w: &str| {
-        let digits = w.trim_end_matches(['s', 'm', 'h', 'd']);
-        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
-    };
-    match word(0)? {
-        "time" => Some(if word(1) == Some("-p") { 2 } else { 1 }),
-        "nice" => match word(1) {
-            Some("-n") if word(2).is_some_and(|n| n.parse::<i32>().is_ok()) => Some(3),
-            Some(w) if w.starts_with('-') => w[1..].parse::<i32>().ok().map(|_| 2),
-            _ => Some(1),
-        },
-        "caffeinate" => {
-            let flags = words[1..]
-                .iter()
-                .take_while(|w| {
-                    let w = w.as_ref();
-                    w.len() > 1 && w.starts_with('-') && w[1..].chars().all(|c| "dimsu".contains(c))
-                })
-                .count();
-            match word(1 + flags) {
-                Some(w) if w.starts_with('-') => None,
-                _ => Some(1 + flags),
-            }
-        }
-        "env" => {
-            let names = words[1..]
-                .iter()
-                .take_while(|w| is_assignment(w.as_ref()))
-                .count();
-            match word(1 + names) {
-                Some(w) if w.starts_with('-') => None,
-                _ => Some(1 + names),
-            }
-        }
-        "timeout" => {
-            let mut i = 1;
-            loop {
-                match word(i)? {
-                    "-k" | "-s" | "--kill-after" | "--signal" => i += 2,
-                    "--foreground" | "--preserve-status" => i += 1,
-                    w if w.starts_with("--kill-after=") || w.starts_with("--signal=") => i += 1,
-                    w if is_duration(w) => return Some(i + 1),
-                    _ => return None,
-                }
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Whether `word` is a `NAME=value` environment assignment.
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-    })
 }
 
 /// `gh api <args>` (endpoint included) reads unless it names a method other
@@ -773,7 +551,7 @@ pub fn long_running_entry<'a>(
 fn same_program(written: &str, declared: &str) -> bool {
     // `X=/scripts/audition cargo build` runs `cargo`: an assignment is never
     // the program, however its value ends.
-    !is_assignment(written)
+    !shell_words::is_assignment(written)
         && (written == declared
             || written
                 .strip_suffix(declared)
@@ -795,12 +573,17 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     if let Some(c) = inner.iter().find(|c| read_line(c).is_none()) {
         return why_exclusive(c, site);
     }
-    match unparsed_construct(&lifted) {
-        Some('\n' | '\r') => {
+    match shell_words::split_strict(&lifted) {
+        Err(Refusal::Construct('\n' | '\r')) => {
             return "it spans several lines, which ahma does not parse".to_string();
         }
-        Some(c) => return format!("it uses `{c}`, a shell construct ahma does not parse"),
-        None => {}
+        Err(Refusal::Construct(c)) => {
+            return format!("it uses `{c}`, a shell construct ahma does not parse");
+        }
+        // A heredoc was answered above; an operator or an open quote has no
+        // construct to name.
+        Err(_) => return UNREADABLE.to_string(),
+        Ok(_) => {}
     }
     let Some(line) = parse_line(&lifted) else {
         return UNREADABLE.to_string();
@@ -849,39 +632,6 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     "it may write the workspace".to_string()
 }
 
-/// The first character of a construct the tokenizer refuses, outside a
-/// `$(…)` already lifted out: an operator it does not model, a braced
-/// expansion other than `${NAME}`, or a backtick inside double quotes.
-fn unparsed_construct(command: &str) -> Option<char> {
-    let chars: Vec<char> = command.chars().collect();
-    let mut quote: Option<char> = None;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some('"') if c == '`' => return Some('`'),
-            Some(_) => {}
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                '$' if chars.get(i + 1) == Some(&'{') => match braced_name_len(&chars[i..]) {
-                    Some(len) => {
-                        i += len;
-                        continue;
-                    }
-                    None => return Some('{'),
-                },
-                '!' if (i == 0 || chars[i - 1].is_whitespace())
-                    && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {}
-                c if SHELL_OPERATORS.contains(&c) => return Some(c),
-                _ => {}
-            },
-        }
-        i += 1;
-    }
-    None
-}
-
 /// The program a segment runs, when it is the project's own: named by a
 /// relative path (`scripts/x`, `./scripts/x`) or by a path under `cwd`, as a
 /// `[tools] long_running` entry would name it. `None` for a bare name (a
@@ -889,9 +639,11 @@ fn unparsed_construct(command: &str) -> Option<char> {
 fn project_program(seg: &Segment, cwd: &Path) -> Option<String> {
     let words: Vec<&String> = seg
         .iter()
-        .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+        .skip_while(|w| shell_words::is_frame(w))
         .collect();
-    let program = words.get(wrapper_len(&words))?.as_str();
+    let program = words
+        .get(shell_words::harmless_wrapper_len(&words))?
+        .as_str();
     if program.contains(['$', '`', '~', '*', '?', '\'']) {
         return None;
     }
@@ -908,9 +660,9 @@ fn project_program(seg: &Segment, cwd: &Path) -> Option<String> {
 fn segment_head(seg: &Segment) -> String {
     let words: Vec<&String> = seg
         .iter()
-        .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
+        .skip_while(|w| shell_words::is_frame(w))
         .collect();
-    let words = &words[wrapper_len(&words)..];
+    let words = &words[shell_words::harmless_wrapper_len(&words)..];
     let head: Vec<&str> = words.iter().take(2).map(|w| w.as_str()).collect();
     let head = head.join(" ");
     match head.char_indices().nth(40) {
@@ -1296,34 +1048,19 @@ fn read_segments(segs: &[Segment]) -> Option<Reading> {
     Some(reading)
 }
 
-fn is_for_header(words: &[&String]) -> bool {
-    matches!(words, [first, name, rest @ ..]
-        if first.as_str() == "for"
-            && is_assignment(&format!("{name}=x"))
-            && rest.first().is_none_or(|w| w.as_str() == "in"))
-}
-
-fn is_framing_only_segment(seg: &Segment, words: &[&String]) -> bool {
-    matches!(words, [w] if matches!(w.as_str(), "done" | "fi"))
-        // `S=/path;` on its own sets a shell variable and nothing else.
-        || (words.is_empty() && seg.iter().all(|w| is_assignment(w)))
-        // `for f in a b` only names what the loop body reads; the body decides.
-        || is_for_header(words)
-}
-
 fn read_one_segment(seg: &Segment, reading: &mut Reading) -> Option<()> {
     // Loop and conditional keywords, and `NAME=value` assignments, only
     // frame the command that follows; the command decides. The read lane
     // is still the kernel's word: an assignment such as `LD_PRELOAD` that
     // makes a reader try to write fails, it cannot write.
-    let words: Vec<&String> = seg
-        .iter()
-        .skip_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
-        .collect();
-    if is_framing_only_segment(seg, &words) {
+    if shell_words::is_framing_only(seg) {
         return Some(());
     }
-    let words = &words[wrapper_len(&words)..];
+    let words: Vec<&String> = seg
+        .iter()
+        .skip_while(|w| shell_words::is_frame(w))
+        .collect();
+    let words = &words[shell_words::harmless_wrapper_len(&words)..];
     let (program, args) = words.split_first()?;
     let program = program.as_str();
     let args: Vec<String> = args.iter().map(|a| (*a).clone()).collect();
@@ -1355,8 +1092,8 @@ fn read_one_segment(seg: &Segment, reading: &mut Reading) -> Option<()> {
     // that harmless, so it rules out a service verdict.
     let assigns = seg
         .iter()
-        .take_while(|w| LIST_KEYWORDS.contains(&w.as_str()) || is_assignment(w))
-        .any(|w| is_assignment(w));
+        .take_while(|w| shell_words::is_frame(w))
+        .any(|w| shell_words::is_assignment(w));
     reading.writes_through_args |= assigns || writes_through_args(program, args);
     reading.watches |= is_watcher(program, args);
     Some(())
@@ -1616,9 +1353,9 @@ pub fn project_programs(command: &str) -> Vec<String> {
     for seg in &line.segs {
         let words: Vec<&String> = seg
             .iter()
-            .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+            .skip_while(|w| shell_words::is_assignment(w))
             .collect();
-        let Some(program) = words.get(wrapper_len(&words)) else {
+        let Some(program) = words.get(shell_words::harmless_wrapper_len(&words)) else {
             continue;
         };
         let program = program.strip_prefix("./").unwrap_or(program);
@@ -1648,10 +1385,10 @@ fn segment_effect(seg: &[String], declared: &[String]) -> SourceEffect {
     // `VAR=value cmd`: the assignment only sets the command's environment.
     let words: Vec<String> = seg
         .iter()
-        .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+        .skip_while(|w| shell_words::is_assignment(w))
         .cloned()
         .collect();
-    let words = &words[wrapper_len(&words)..];
+    let words = &words[shell_words::harmless_wrapper_len(&words)..];
     let Some((program, args)) = words.split_first() else {
         return Unknown;
     };
@@ -3229,6 +2966,16 @@ mod doubt_tests {
             "mytool status && npm install",
             "sort -o out.txt in.txt",
             "uniq a b",
+            // SPEC R2.7.11: a writer inside a loop, a conditional, a group or a
+            // substitution, or after a line continuation, is still a writer. Each
+            // was soft-held: the program word read was `if`, `{`, `echo` or "".
+            "if true; then cargo build; fi",
+            "while true; do cargo build; done",
+            "! cargo build",
+            "{ cargo build; }",
+            "echo `cargo build`",
+            "echo \"$(cargo build)\"",
+            "FOO=1 \\\n cargo build",
         ] {
             assert!(!held_only_for_doubt(certain), "{certain}");
         }
