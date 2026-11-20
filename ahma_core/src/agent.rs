@@ -1186,22 +1186,33 @@ fn is_read_hint_tool(tool_name: &str) -> bool {
     tool_name == BuiltinTool::ReadFile.name() || tool_name == BuiltinTool::ListDir.name()
 }
 
-/// Decide which harness hints this batch of tool results is eligible for, as
-/// `(inject_error_hint, inject_read_hint)`. Each hint is offered at most once
-/// per run, so an already-sent hint (`*_hinted`) disqualifies its whole batch.
+/// The two harness hints a small model is given, by name: which a run has
+/// been given (each at most once per run), or which a batch of tool results
+/// may receive. Two `bool`s were passed by position, in one order to some
+/// functions and the other order to the rest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TurnHints {
+    /// The hint to read a failed call's error output.
+    pub error: bool,
+    /// The hint to edit a file just read with the edit tools.
+    pub read_file: bool,
+}
+
+/// Decide which harness hints this batch of tool results may receive. Each
+/// hint is given at most once per run, so one already `given` disqualifies
+/// its whole batch.
 fn plan_harness_hints(
     tool_results: &[(String, String, serde_json::Value, bool)],
-    error_hinted: bool,
-    read_file_hinted: bool,
-) -> (bool, bool) {
+    given: TurnHints,
+) -> TurnHints {
     let any_failed = tool_results.iter().any(|(_, _, _, failed)| *failed);
     let any_read_tool = tool_results
         .iter()
         .any(|(_, tool_name, _, _)| is_read_hint_tool(tool_name));
-    (
-        any_failed && !error_hinted,
-        any_read_tool && !read_file_hinted,
-    )
+    TurnHints {
+        error: any_failed && !given.error,
+        read_file: any_read_tool && !given.read_file,
+    }
 }
 
 fn append_hint_to_field(
@@ -1221,23 +1232,13 @@ fn push_tool_message_with_hints(
     tool_name: &str,
     payload: serde_json::Value,
     failed: bool,
-    inject_error_hint: bool,
-    inject_read_hint: bool,
-    error_hinted: &mut bool,
-    read_file_hinted: &mut bool,
+    offer: TurnHints,
+    given: &mut TurnHints,
     result_char_cap: usize,
 ) {
     let mut final_payload = payload;
     if let Some(obj) = final_payload.as_object_mut() {
-        inject_harness_hints_into_payload(
-            obj,
-            tool_name,
-            failed,
-            inject_error_hint,
-            inject_read_hint,
-            error_hinted,
-            read_file_hinted,
-        );
+        inject_harness_hints_into_payload(obj, tool_name, failed, offer, given);
     }
     msg_json.push(serde_json::json!({
         "role": "tool",
@@ -1250,16 +1251,14 @@ fn inject_harness_hints_into_payload(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     tool_name: &str,
     failed: bool,
-    inject_error_hint: bool,
-    inject_read_hint: bool,
-    error_hinted: &mut bool,
-    read_file_hinted: &mut bool,
+    offer: TurnHints,
+    given: &mut TurnHints,
 ) {
     // Each hint fires at most once per run: `failed`/`is_read_hint_tool` gate
-    // *this* call's eligibility, `inject_*_hint` is the caller's per-batch
-    // opt-in (from `plan_harness_hints`), and `!*_hinted` is the run-wide latch.
-    if failed && inject_error_hint && !*error_hinted {
-        *error_hinted = true;
+    // *this* call's eligibility, `offer` is the caller's per-batch opt-in
+    // (from `plan_harness_hints`), and `given` is the run-wide latch.
+    if failed && offer.error && !given.error {
+        given.error = true;
         let key = if obj.contains_key("error") {
             "error"
         } else {
@@ -1271,8 +1270,8 @@ fn inject_harness_hints_into_payload(
             "\n\u{1f4a1} [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]",
         );
     }
-    if is_read_hint_tool(tool_name) && inject_read_hint && !*read_file_hinted {
-        *read_file_hinted = true;
+    if is_read_hint_tool(tool_name) && offer.read_file && !given.read_file {
+        given.read_file = true;
         append_hint_to_field(
             obj,
             "output",
@@ -1345,8 +1344,7 @@ pub async fn execute_agent_turn(
     tx: &Sender<AgentEvent>,
     messages: &[ChatMessage],
     system_prompt: &Option<String>,
-    read_file_hinted: &mut bool,
-    error_hinted: &mut bool,
+    hints: &mut TurnHints,
     gate: Arc<dyn AgentApprovalGate>,
     last_prompt_tokens: &mut u32,
 ) -> bool {
@@ -1404,16 +1402,7 @@ pub async fn execute_agent_turn(
         return false;
     };
 
-    dispatch_turn_tool_calls(
-        completion,
-        mcp_cfg,
-        tx.clone(),
-        gate,
-        msg_json,
-        error_hinted,
-        read_file_hinted,
-    )
-    .await;
+    dispatch_turn_tool_calls(completion, mcp_cfg, tx.clone(), gate, msg_json, hints).await;
 
     true
 }
@@ -1450,8 +1439,7 @@ async fn dispatch_turn_tool_calls(
     tx: Sender<AgentEvent>,
     gate: Arc<dyn AgentApprovalGate>,
     msg_json: &mut Vec<serde_json::Value>,
-    error_hinted: &mut bool,
-    read_file_hinted: &mut bool,
+    hints: &mut TurnHints,
 ) {
     let tool_names: Vec<&str> = completion
         .tool_calls
@@ -1470,10 +1458,10 @@ async fn dispatch_turn_tool_calls(
         .map(|call| execute_single_tool_call(call, mcp_cfg, tx.clone(), gate.clone()));
     let tool_results = join_all(call_futures).await;
 
-    let (inject_error_hint, inject_read_hint) = if mcp_cfg.small_model_harness {
-        plan_harness_hints(&tool_results, *error_hinted, *read_file_hinted)
+    let offer = if mcp_cfg.small_model_harness {
+        plan_harness_hints(&tool_results, *hints)
     } else {
-        (false, false)
+        TurnHints::default()
     };
 
     let result_char_cap = mcp_cfg.tool_result_char_cap();
@@ -1484,10 +1472,8 @@ async fn dispatch_turn_tool_calls(
             &tool_name,
             payload,
             failed,
-            inject_error_hint,
-            inject_read_hint,
-            error_hinted,
-            read_file_hinted,
+            offer,
+            hints,
             result_char_cap,
         );
     }
@@ -1594,8 +1580,7 @@ pub fn spawn_agent_task(
         let mut offered_label = String::new();
 
         let max_turns = mcp.as_ref().map(|c| c.max_turns).unwrap_or(8);
-        let mut read_file_hinted = false;
-        let mut error_hinted = false;
+        let mut hints = TurnHints::default();
         let mut last_prompt_tokens: u32 = 0;
 
         info!(
@@ -1627,8 +1612,7 @@ pub fn spawn_agent_task(
                 &tx,
                 &messages,
                 &sys_prompt,
-                &mut read_file_hinted,
-                &mut error_hinted,
+                &mut hints,
                 gate.clone(),
                 &mut last_prompt_tokens,
             )
@@ -3842,7 +3826,16 @@ mod tests {
                 true,
             ),
         ];
-        let (err, read) = plan_harness_hints(&results, false, false);
+        let TurnHints {
+            error: err,
+            read_file: read,
+        } = plan_harness_hints(
+            &results,
+            TurnHints {
+                error: false,
+                read_file: false,
+            },
+        );
         assert!(err, "a failed call triggers the error hint");
         assert!(read, "a read_file call triggers the read hint");
     }
@@ -3855,7 +3848,16 @@ mod tests {
             serde_json::json!({}),
             false,
         )];
-        let (err, read) = plan_harness_hints(&results, false, false);
+        let TurnHints {
+            error: err,
+            read_file: read,
+        } = plan_harness_hints(
+            &results,
+            TurnHints {
+                error: false,
+                read_file: false,
+            },
+        );
         assert!(!err);
         assert!(read);
     }
@@ -3868,7 +3870,16 @@ mod tests {
             serde_json::json!({}),
             true,
         )];
-        let (err, read) = plan_harness_hints(&results, true, true);
+        let TurnHints {
+            error: err,
+            read_file: read,
+        } = plan_harness_hints(
+            &results,
+            TurnHints {
+                error: true,
+                read_file: true,
+            },
+        );
         assert!(!err, "error already hinted earlier");
         assert!(!read, "read already hinted earlier");
     }
@@ -3881,7 +3892,16 @@ mod tests {
             serde_json::json!({}),
             false,
         )];
-        let (err, read) = plan_harness_hints(&results, false, false);
+        let TurnHints {
+            error: err,
+            read_file: read,
+        } = plan_harness_hints(
+            &results,
+            TurnHints {
+                error: false,
+                read_file: false,
+            },
+        );
         assert!(!err);
         assert!(!read);
     }
@@ -3914,21 +3934,21 @@ mod tests {
         inject_read_hint: bool,
     ) -> (Vec<serde_json::Value>, bool, bool) {
         let mut msgs = Vec::new();
-        let mut error_hinted = false;
-        let mut read_hinted = false;
+        let mut given = TurnHints::default();
         push_tool_message_with_hints(
             &mut msgs,
             call_id.to_string(),
             name,
             payload,
             failed,
-            inject_error_hint,
-            inject_read_hint,
-            &mut error_hinted,
-            &mut read_hinted,
+            TurnHints {
+                error: inject_error_hint,
+                read_file: inject_read_hint,
+            },
+            &mut given,
             100_000,
         );
-        (msgs, error_hinted, read_hinted)
+        (msgs, given.error, given.read_file)
     }
 
     #[test]
@@ -4005,18 +4025,22 @@ mod tests {
     #[test]
     fn push_tool_message_skips_error_hint_when_already_hinted() {
         let mut msgs = Vec::new();
-        let mut error_hinted = true; // a prior tool already emitted the hint
-        let mut read_hinted = false;
+        // A prior tool already emitted the error hint.
+        let mut given = TurnHints {
+            error: true,
+            read_file: false,
+        };
         push_tool_message_with_hints(
             &mut msgs,
             "c".to_string(),
             "build",
             serde_json::json!({"error": "boom"}),
             true,
-            true,
-            false,
-            &mut error_hinted,
-            &mut read_hinted,
+            TurnHints {
+                error: true,
+                read_file: false,
+            },
+            &mut given,
             100_000,
         );
         let content = msgs[0]["content"].as_str().unwrap();
@@ -4027,8 +4051,7 @@ mod tests {
     #[test]
     fn push_tool_message_truncates_large_payload() {
         let mut msgs = Vec::new();
-        let mut error_hinted = false;
-        let mut read_hinted = false;
+        let mut given = TurnHints::default();
         let big = "x".repeat(5000);
         push_tool_message_with_hints(
             &mut msgs,
@@ -4036,10 +4059,8 @@ mod tests {
             "build",
             serde_json::json!({"output": big}),
             false,
-            false,
-            false,
-            &mut error_hinted,
-            &mut read_hinted,
+            TurnHints::default(),
+            &mut given,
             500,
         );
         let content = msgs[0]["content"].as_str().unwrap();
@@ -4903,8 +4924,7 @@ mod tests {
         let client = LlmClient::new("mcp://lbl", "m", None);
         let (tx, mut rx) = mpsc::channel(16);
         let mut msg_json = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let mut read_hinted = false;
-        let mut error_hinted = false;
+        let mut hints = TurnHints::default();
         let mut last_prompt_tokens: u32 = 0;
 
         let cont = execute_agent_turn(
@@ -4915,8 +4935,7 @@ mod tests {
             &tx,
             &[],
             &None,
-            &mut read_hinted,
-            &mut error_hinted,
+            &mut hints,
             Arc::new(AutoApproveGate),
             &mut last_prompt_tokens,
         )
@@ -4959,8 +4978,7 @@ mod tests {
         let client = LlmClient::new(base, "m", None);
         let (tx, rx) = mpsc::channel(16);
         let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
-        let mut read_hinted = false;
-        let mut error_hinted = false;
+        let mut hints = TurnHints::default();
         let mut last_prompt_tokens: u32 = 0;
 
         let cont = execute_agent_turn(
@@ -4971,8 +4989,7 @@ mod tests {
             &tx,
             &[],
             &None,
-            &mut read_hinted,
-            &mut error_hinted,
+            &mut hints,
             Arc::new(AutoApproveGate),
             &mut last_prompt_tokens,
         )
