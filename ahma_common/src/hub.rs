@@ -148,6 +148,41 @@ pub struct GrantSummary {
     pub granted_by: Option<String>,
 }
 
+/// What kind of process a registered instance is, read from its `mode`. The
+/// wire keeps the string (an instance of another version may send one this
+/// build does not know); code reads this. Anything that is not a hooked
+/// command or the TUI's own reporter is a session worker, the reading every
+/// consumer already made by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceMode {
+    /// An MCP session worker (`"stdio"`): runs tools, answers requests.
+    Worker,
+    /// A hooked command's own short-lived reporter (`"hook"`).
+    Hook,
+    /// `ahma tui`'s own reporter (`"tui"`).
+    Tui,
+}
+
+impl InstanceMode {
+    /// The string an instance registers with.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "stdio",
+            Self::Hook => "hook",
+            Self::Tui => "tui",
+        }
+    }
+
+    /// How a registered `mode` is read.
+    pub fn of(mode: &str) -> Self {
+        match mode {
+            "hook" => Self::Hook,
+            "tui" => Self::Tui,
+            _ => Self::Worker,
+        }
+    }
+}
+
 /// Metadata about a registered ahma instance.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceInfo {
@@ -214,6 +249,13 @@ pub struct InstanceInfo {
     /// (SPEC R7.8). `None` for a client ahma cannot identify.
     #[serde(default)]
     pub native_terminal: Option<String>,
+}
+
+impl InstanceInfo {
+    /// What kind of process this is ([`InstanceMode::of`] its `mode`).
+    pub fn kind(&self) -> InstanceMode {
+        InstanceMode::of(&self.mode)
+    }
 }
 
 /// An operation event forwarded from an instance to the hub.
@@ -1957,7 +1999,7 @@ impl Hub {
             .lock()
             .await
             .values()
-            .filter(|i| i.mode != "hook" && i.mode != "tui")
+            .filter(|i| i.kind() == InstanceMode::Worker)
             .map(|i| i.id.clone())
             .collect();
         let history = self.op_history.lock().await;
@@ -2880,7 +2922,7 @@ async fn resolve_target_from(
     }
     let mut candidates: Vec<&InstanceInfo> = instances
         .values()
-        .filter(|i| i.mode != "hook" && i.mode != "tui")
+        .filter(|i| i.kind() == InstanceMode::Worker)
         .collect();
     match candidates.len() {
         1 => Resolution::Instance(candidates.remove(0).id.clone()),
@@ -3617,6 +3659,20 @@ mod tests {
     }
 
     use super::*;
+
+    /// A registered mode is read one way: `hook` and `tui` are themselves,
+    /// anything else (`stdio`, a mode from another version) is a worker, and
+    /// each kind registers with the string it is read back from.
+    #[test]
+    fn an_instance_mode_is_read_one_way() {
+        assert_eq!(InstanceMode::of("hook"), InstanceMode::Hook);
+        assert_eq!(InstanceMode::of("tui"), InstanceMode::Tui);
+        assert_eq!(InstanceMode::of("stdio"), InstanceMode::Worker);
+        assert_eq!(InstanceMode::of("http"), InstanceMode::Worker);
+        for kind in [InstanceMode::Worker, InstanceMode::Hook, InstanceMode::Tui] {
+            assert_eq!(InstanceMode::of(kind.as_str()), kind);
+        }
+    }
     use tokio::io::BufReader;
 
     /// A filesystem-backed Unix socket must end up mode 0600, regardless of the
