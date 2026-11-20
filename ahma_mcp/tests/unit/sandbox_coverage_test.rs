@@ -181,8 +181,7 @@ fn test_sandbox_auto_scoping() {
     )
     .unwrap();
 
-    sandbox.set_roots_received(false);
-
+    // A new sandbox has not received roots.
     assert!(!sandbox.roots_received());
 
     // Path in fake_sandbox is allowed

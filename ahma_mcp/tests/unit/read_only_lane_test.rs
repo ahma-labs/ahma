@@ -17,7 +17,7 @@ fn strict_sandbox(scope: &TempDir) -> Sandbox {
         Default::default(),
     )
     .expect("strict sandbox");
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     sandbox
 }

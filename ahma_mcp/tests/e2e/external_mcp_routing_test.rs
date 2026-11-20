@@ -27,7 +27,7 @@ async fn create_test_mcp() -> anyhow::Result<InProcessMcp> {
     let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, Default::default())?
         .with_explicit_scopes(true);
 
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
 
     let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
@@ -48,7 +48,7 @@ async fn create_test_mcp() -> anyhow::Result<InProcessMcp> {
     )
     .await?;
 
-    adapter.sandbox().set_roots_received(true);
+    adapter.sandbox().mark_roots_received();
 
     let (client_stream, server_stream) = tokio::io::duplex(65536);
     let (client_read, client_write) = tokio::io::split(client_stream);

@@ -91,8 +91,8 @@ impl ScopeLock {
     /// Record whether client workspace roots have been received. This is
     /// negotiation bookkeeping only; it never changes the commit latch, and once
     /// committed the observable [`state`](Self::state) stays `Committed`.
-    pub(crate) fn set_roots_received(&self, received: bool) {
-        self.roots_received.store(received, Ordering::Relaxed);
+    pub(crate) fn mark_roots_received(&self) {
+        self.roots_received.store(true, Ordering::Relaxed);
     }
 
     /// Whether client workspace roots have been received.
@@ -141,7 +141,7 @@ mod tests {
         let lock = ScopeLock::new();
         assert_eq!(lock.state(), ScopeLockState::AwaitingRoots);
 
-        lock.set_roots_received(true);
+        lock.mark_roots_received();
         assert_eq!(lock.state(), ScopeLockState::RootsReceived);
 
         assert!(lock.try_commit());
@@ -167,7 +167,7 @@ mod tests {
         let lock = ScopeLock::new();
         assert!(lock.try_commit());
         // Negotiation bookkeeping after commit must not unlock the scope.
-        lock.set_roots_received(false);
+        lock.mark_roots_received();
         assert_eq!(lock.state(), ScopeLockState::Committed);
         assert!(lock.is_committed());
     }

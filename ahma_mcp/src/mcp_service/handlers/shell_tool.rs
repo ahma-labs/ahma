@@ -1100,7 +1100,9 @@ mod tests {
         )
         .await
         .expect("service must build");
-        service.adapter.sandbox().set_roots_received(roots_received);
+        if roots_received {
+            service.adapter.sandbox().mark_roots_received();
+        }
         service
     }
 

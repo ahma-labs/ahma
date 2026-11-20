@@ -67,7 +67,7 @@ fn committed(scopes: Vec<PathBuf>, mode: SandboxMode, tmp_access: bool) -> Sandb
         },
     )
     .unwrap();
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     sandbox
 }
