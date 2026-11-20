@@ -1573,6 +1573,10 @@ impl Adapter {
         let credential_brokers = self.credential_brokers.clone();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
         let keep_leftovers = self.is_declared_long_running(&command_str);
+        // Its mutex group (SPEC R2.7.2), keyed like the lease and matched on
+        // the line the caller wrote, as for a piped command.
+        let mutex_registry = self.mutex_registry.clone();
+        let workspace = self.workspace_key_for(&safe_wd);
         // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1582,7 +1586,7 @@ impl Adapter {
         );
 
         let task = async move {
-            let Some(mut guards) = guards::RunGuards::begin(
+            let Some(guards) = guards::RunGuards::begin(
                 &monitor,
                 &op_id_task,
                 &tool_task,
@@ -1590,6 +1594,13 @@ impl Adapter {
                 &cancellation_token,
             )
             .await
+            else {
+                return;
+            };
+            // Its mutex group (SPEC R2.7.2), as for a piped command.
+            let Some(mut guards) = guards
+                .gate(&monitor, &mutex_registry, &command_str, &workspace)
+                .await
             else {
                 return;
             };
@@ -1684,6 +1695,8 @@ impl Adapter {
         let op_id_task = op_id.clone();
         let tool_task = tool_name.to_string();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
+        let mutex_registry = self.mutex_registry.clone();
+        let workspace = self.workspace_key_for(&safe_wd);
         // A session command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1693,7 +1706,7 @@ impl Adapter {
         );
 
         let task = async move {
-            let Some(mut guards) = guards::RunGuards::begin(
+            let Some(guards) = guards::RunGuards::begin(
                 &monitor,
                 &op_id_task,
                 &tool_task,
@@ -1701,6 +1714,13 @@ impl Adapter {
                 &cancellation_token,
             )
             .await
+            else {
+                return;
+            };
+            // Its mutex group (SPEC R2.7.2), as for a piped command.
+            let Some(mut guards) = guards
+                .gate(&monitor, &mutex_registry, &command_str, &workspace)
+                .await
             else {
                 return;
             };
@@ -1947,7 +1967,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // Wait for every exclusive operation that arrived earlier in this
     // workspace — in this process or any other — before starting. The lease is
     // held until the operation ends, i.e. until the process tree is gone.
-    let Some(mut guards) =
+    let Some(guards) =
         guards::RunGuards::begin(&monitor, &op_id, &command, ticket, &cancellation_token).await
     else {
         return;
@@ -1958,24 +1978,13 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // event stream (SPEC R15).  MCP progress notifications are pushed by the
     // `progress_push` forwarder subscribed to that stream.
 
-    // ── Command mutex group gate ────────────────────────────────────────────────────
-    // Serialise commands in the same mutex group within the same working
-    // directory.  The permit is held for the entire execution and released
-    // automatically when it drops at the end of this function.
-    let _exclusive_permit = match acquire_mutex_gate(
-        &mutex_registry,
-        &monitor,
-        &op_id,
-        &display_command,
-        &workspace,
-    )
-    .await
-    {
-        Ok(permit) => permit,
-        Err(err) => {
-            guards.end(&monitor, failed(err)).await;
-            return;
-        }
+    // ── Command mutex group gate (SPEC R2.7.2) ─────────────────────────────
+    // Held by the guards for the whole run and handed on with the lease.
+    let Some(mut guards) = guards
+        .gate(&monitor, &mutex_registry, &display_command, &workspace)
+        .await
+    else {
+        return;
     };
 
     let start_time = Instant::now();
@@ -2468,9 +2477,7 @@ impl DriftProbe {
 
 /// Acquire the command's mutex-group gate, if the command belongs to one.
 ///
-/// Split out of [`run_async_operation`] so its early-return control flow
-/// doesn't nest a match inside an `if let` inside that function's straight
-/// line of guard clauses.
+/// The gate every async path waits for, through [`guards::RunGuards::gate`].
 ///
 /// Returns `Ok(None)` when the command isn't gated by any group, `Ok(Some(permit))`
 /// once both the in-memory and filesystem locks are held (or the semaphore was

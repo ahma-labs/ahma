@@ -318,7 +318,7 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   `RunGuards::end` is the one way it ends, and takes
   what the run holds by value: it tells the SSH broker's refusals, compares the deny tier
   (R6.1.7) while the workspace is still held, so another command's writes are not counted as
-  this one's, hands the workspace on, then publishes the ending and audits it. A cancel or a watchdog
+  this one's, hands its mutex group gate (R2.7.2) and the workspace on, then publishes the ending and audits it. A cancel or a watchdog
   timeout asks the task rather than ending the operation under it (R13.3).
   The synchronous path has no operation to show
   as queued, so it **must** announce a wait once (a terminal hook writes it to stderr, where
@@ -332,7 +332,7 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   canonicalized first. Unrelated workspaces never wait for each other. Command mutex groups
   (`tools.mutex_groups`) are keyed the same way — never by working directory, because
   `cargo test` in a member crate and `cargo build` at the root share one `target/` — and
-  match the command line the caller wrote, not the shell program that runs it.
+  match the command line the caller wrote, not the shell program that runs it. Piped, PTY and persistent-session commands take the gate the same way (`RunGuards::gate`): after the workspace lease, held for the whole run and handed on with the lease before the end is published, and a wait past `max_wait_secs` ends the operation `Failed` without running it.
 - **R2.7.3**: **A command that has not started says so.** When a call returns while its
   operation is still waiting for its workspace, the result **must** say `NOT started —
   queued behind` the operation(s) ahead of it, named by id, command and age, that it will run
