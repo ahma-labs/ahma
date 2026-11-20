@@ -63,9 +63,7 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
     let sandbox = Sandbox::new(
         vec![default_scope_for_tools_dir(tools_dir)?],
         mode,
-        false,
-        false,
-        false,
+        Default::default(),
     )?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
@@ -82,7 +80,7 @@ pub async fn create_in_process_mcp(configs: HashMap<String, ToolConfig>) -> Resu
     } else {
         SandboxMode::Strict
     };
-    let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, false, false, false)?;
+    let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, Default::default())?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
@@ -119,7 +117,7 @@ pub async fn create_in_process_mcp_with_scope(
     // — that check governs OS-level kernel enforcement (seatbelt/landlock/AppContainer),
     // not application-level validate_path checks.  SandboxMode::Test bypasses
     // validate_path completely, defeating these tests on Windows CI and macOS+Cursor.
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false)?;
+    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, Default::default())?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
@@ -151,7 +149,7 @@ pub async fn create_in_process_mcp_with_client<C: ClientHandler>(
     } else {
         SandboxMode::Strict
     };
-    let sandbox = Sandbox::new(scopes, mode, false, false, false)?;
+    let sandbox = Sandbox::new(scopes, mode, Default::default())?;
     sandbox.set_roots_received(roots_settled);
     if roots_settled {
         let _ = sandbox.commit_existing_scopes();
@@ -178,9 +176,7 @@ pub async fn create_in_process_mcp_with_broker<C: ClientHandler>(
     let sandbox = Sandbox::new(
         vec![scope.to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
@@ -275,9 +271,7 @@ pub async fn create_in_process_mcp_with_workspace_queue(
     let sandbox = Sandbox::new(
         vec![scope.to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
@@ -424,9 +418,7 @@ async fn build_test_service_inner(
     let sandbox = Sandbox::new(
         vec![temp_dir.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )?;
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();

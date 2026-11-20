@@ -9,7 +9,7 @@ use tempfile::tempdir;
 
 fn make_sandbox(mode: SandboxMode) -> (tempfile::TempDir, Sandbox) {
     let td = tempdir().unwrap();
-    let sandbox = Sandbox::new(vec![td.path().to_path_buf()], mode, false, false, false).unwrap();
+    let sandbox = Sandbox::new(vec![td.path().to_path_buf()], mode, Default::default()).unwrap();
     (td, sandbox)
 }
 

@@ -51,9 +51,7 @@ async fn test_tool_availability_integration_with_tempfile() -> Result<()> {
     let sandbox = ahma_mcp::sandbox::Sandbox::new(
         vec![temp_dir.path().to_path_buf()],
         ahma_mcp::sandbox::SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )?;
     let working_dir = std::path::Path::new(".");
 

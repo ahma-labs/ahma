@@ -831,9 +831,11 @@ fn create_sandbox_instance(
     let s = sandbox::Sandbox::new(
         scopes.clone(),
         policy.mode,
-        cfg.no_temp_files,
-        cfg.log_monitor,
-        policy.tmp_access,
+        sandbox::SandboxOptions {
+            no_temp_files: cfg.no_temp_files,
+            livelog: cfg.log_monitor,
+            tmp_access: policy.tmp_access,
+        },
     )
     .context("Failed to initialize sandbox")?
     .with_explicit_scopes(explicit_scopes)

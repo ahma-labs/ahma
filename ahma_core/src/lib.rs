@@ -47,7 +47,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let sandbox = Arc::new(Sandbox::new(vec![], SandboxMode::Strict, false, false, false)?);
+//!     let sandbox = Arc::new(Sandbox::new(vec![], SandboxMode::Strict, Default::default())?);
 //!     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
 //!         Duration::from_secs(300),
 //!     )));
@@ -58,7 +58,7 @@
 
 // Re-export core MCP types for embedders
 pub use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor, OperationStatus};
-pub use ahma_mcp::sandbox::{Sandbox, SandboxMode};
+pub use ahma_mcp::sandbox::{Sandbox, SandboxMode, SandboxOptions};
 pub use ahma_mcp::{Adapter, AhmaMcpService};
 
 // Re-export LLM client for direct use

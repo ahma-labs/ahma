@@ -43,7 +43,7 @@ fn build_adapter(scope: std::path::PathBuf) -> (Arc<Adapter>, Arc<OperationMonit
     ));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let sandbox =
-        Arc::new(Sandbox::new(vec![scope], SandboxMode::Test, false, false, false).unwrap());
+        Arc::new(Sandbox::new(vec![scope], SandboxMode::Test, Default::default()).unwrap());
     (
         Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap()),
         monitor,

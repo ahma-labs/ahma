@@ -463,13 +463,21 @@ async fn red_team_secret_env_scrubbed_from_subprocess() {
 /// Test that no_temp_files mode is properly set on Sandbox
 #[test]
 fn red_team_no_temp_files_flag_setting() {
-    let sandbox = Sandbox::new(vec![], SandboxMode::Strict, true, false, false).unwrap();
+    let sandbox = Sandbox::new(
+        vec![],
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions {
+            no_temp_files: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
     assert!(
         sandbox.is_no_temp_files(),
         "no_temp_files should be enabled"
     );
 
-    let sandbox_default = Sandbox::new(vec![], SandboxMode::Strict, false, false, false).unwrap();
+    let sandbox_default = Sandbox::new(vec![], SandboxMode::Strict, Default::default()).unwrap();
     assert!(
         !sandbox_default.is_no_temp_files(),
         "no_temp_files should be disabled by default"
@@ -739,9 +747,10 @@ async fn red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder()
     let sandbox = Sandbox::new(
         vec![scope_dir.path().to_path_buf()],
         SandboxMode::Strict,
-        true, // no_temp_files: avoid the blanket /tmp read+write rule
-        false,
-        false,
+        ahma_mcp::sandbox::SandboxOptions {
+            no_temp_files: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
     )
     .unwrap();
     let scope = scope_dir.path().to_path_buf();
@@ -796,9 +805,10 @@ async fn red_team_spawned_child_landlock_enforced_from_worker_thread() {
     let sandbox = Sandbox::new(
         vec![scope_dir.path().to_path_buf()],
         SandboxMode::Strict,
-        true, // no_temp_files: avoid the blanket /tmp read+write rule
-        false,
-        false,
+        ahma_mcp::sandbox::SandboxOptions {
+            no_temp_files: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
     )
     .unwrap();
 

@@ -58,7 +58,15 @@ fn temp() -> PathBuf {
 /// What `ahma serve --sandbox-scope <ws> [--tmp]` starts with: an enforcing
 /// sandbox whose scope is committed before any client connects.
 fn committed(scopes: Vec<PathBuf>, mode: SandboxMode, tmp_access: bool) -> Sandbox {
-    let sandbox = Sandbox::new(scopes, mode, false, false, tmp_access).unwrap();
+    let sandbox = Sandbox::new(
+        scopes,
+        mode,
+        ahma_mcp::sandbox::SandboxOptions {
+            tmp_access,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
     sandbox.set_roots_received(true);
     let _ = sandbox.commit_existing_scopes();
     sandbox
@@ -222,7 +230,15 @@ async fn with_nobody_to_ask_the_temp_dir_stays_out_and_the_scope_is_still_announ
         .with_roots(vec![Root::new(ahma_common::file_uri::encode_file_uri(&ws))]);
     let notifications = client.notifications();
     // Uncommitted: the scope commits from the client's roots, as for an IDE.
-    let sandbox = Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, true).unwrap();
+    let sandbox = Sandbox::new(
+        Vec::new(),
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions {
+            tmp_access: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
     let (mcp, _broker) = create_in_process_mcp_with_broker_and_sandbox(client, sandbox, None)
         .await
         .unwrap();

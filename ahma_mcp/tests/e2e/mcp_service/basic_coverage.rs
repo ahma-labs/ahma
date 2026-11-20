@@ -43,9 +43,7 @@ async fn build_service_inline(
         Sandbox::new(
             vec![temp_dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

@@ -278,9 +278,7 @@ mod tests {
         Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("tempdir is a valid scope")
     }
@@ -555,9 +553,7 @@ mod tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let wd = resolve(&sb, "cargo", &Map::new()).unwrap();

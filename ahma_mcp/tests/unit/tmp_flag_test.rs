@@ -17,7 +17,7 @@ fn test_temp_dir_can_be_added_to_scopes() {
 
     // Create sandbox with both a project dir and temp dir as scopes
     let scopes = vec![temp.path().to_path_buf(), temp_dir.clone()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false).unwrap();
+    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, Default::default()).unwrap();
 
     // Verify temp dir is accessible
     let temp_file = temp_dir.join("test_file.txt");
@@ -39,7 +39,7 @@ fn test_temp_dir_scope_is_canonicalized() {
 
     let project_temp = tempdir().unwrap();
     let scopes = vec![project_temp.path().to_path_buf(), temp_dir.clone()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false).unwrap();
+    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, Default::default()).unwrap();
 
     // Get the scopes and verify temp dir is canonicalized
     let sandbox_scopes = sandbox.scopes();
@@ -61,7 +61,15 @@ fn test_no_temp_files_blocks_temp_access() {
 
     // Create sandbox with temp in scopes BUT no_temp_files=true
     let scopes = vec![project_temp.path().to_path_buf(), temp_dir.clone()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, true, false, false).unwrap();
+    let sandbox = Sandbox::new(
+        scopes,
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions {
+            no_temp_files: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
 
     // Verify no_temp_files is set
     assert!(sandbox.is_no_temp_files(), "no_temp_files should be true");
@@ -92,7 +100,7 @@ fn test_sandbox_without_temp_scope() {
 
     // Create sandbox with only project dir (no temp)
     let scopes = vec![project_temp.path().to_path_buf()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false).unwrap();
+    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, Default::default()).unwrap();
 
     // Temp dir path should be outside scope
     let temp_dir = std::env::temp_dir();
@@ -120,7 +128,7 @@ fn test_multiple_scopes_with_temp() {
         project2.path().to_path_buf(),
         temp_dir.clone(),
     ];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false).unwrap();
+    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, Default::default()).unwrap();
 
     // All three scopes should be accessible
     let path1 = project1.path().join("file1.txt");
@@ -173,7 +181,7 @@ fn test_temp_dir_not_duplicated_in_scopes() {
 
     // Add temp dir twice
     let scopes = vec![temp_dir.clone(), temp_dir.clone()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Test, false, false, false).unwrap();
+    let sandbox = Sandbox::new(scopes, SandboxMode::Test, Default::default()).unwrap();
 
     // Count occurrences of canonical temp in scopes
     let sandbox_scopes = sandbox.scopes();
@@ -205,7 +213,15 @@ fn test_commit_does_not_carry_temp_on_a_tmp_request() {
 
     // A provisional scope that includes temp (as `ahma tool run --tmp` seeds it).
     let scopes = vec![project1.path().to_path_buf(), temp_dir.clone()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, true).unwrap();
+    let sandbox = Sandbox::new(
+        scopes,
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions {
+            tmp_access: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
     assert!(
         sandbox.scopes().iter().any(|s| s == &canonical_temp),
         "Initial scopes should contain temp dir"
@@ -243,7 +259,7 @@ fn test_update_scopes_no_temp_when_tmp_access_false() {
 
     // Create sandbox with tmp_access=false but with temp in initial scopes
     let scopes = vec![project1.path().to_path_buf(), temp_dir.clone()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false).unwrap();
+    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, Default::default()).unwrap();
 
     // Update scopes to a new project (no temp) — temp should NOT be re-added
     assert_eq!(
@@ -275,7 +291,15 @@ fn test_update_scopes_no_temp_duplication() {
 
     // Create sandbox with tmp_access=true
     let scopes = vec![project.path().to_path_buf(), temp_dir.clone()];
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, true).unwrap();
+    let sandbox = Sandbox::new(
+        scopes,
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions {
+            tmp_access: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
 
     // Update scopes WITH temp already included — should not duplicate
     assert_eq!(

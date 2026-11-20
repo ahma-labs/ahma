@@ -116,9 +116,7 @@ async fn test_multiline_argument_with_echo() {
         Sandbox::new(
             scopes,
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -242,9 +240,7 @@ fn setup_git_test_repo_and_adapter(
         Sandbox::new(
             scopes,
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -509,9 +505,7 @@ async fn test_special_characters_in_arguments() {
         Sandbox::new(
             vec![std::env::temp_dir()],
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
