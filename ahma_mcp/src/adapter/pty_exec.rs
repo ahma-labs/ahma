@@ -504,7 +504,7 @@ mod tests {
             Default::default(),
         )
         .expect("sandbox construction");
-        sandbox.set_roots_received(true);
+        sandbox.mark_roots_received();
         sandbox
     }
 
