@@ -1089,6 +1089,15 @@ where
                                 reconnected_detail(reconnects, "bridge_unreachable", true),
                             )
                             .await;
+                            // The replay just delivered the client's
+                            // `notifications/initialized` (cached above); its
+                            // own copy must not follow it onto the fresh session.
+                            if val.get("method").and_then(|m| m.as_str())
+                                == Some(INITIALIZED_METHOD)
+                            {
+                                forwarded_any = true;
+                                continue;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1260,6 +1269,10 @@ where
                                     // The reconnect handshake just proved the
                                     // (fresh) bridge is alive and responsive.
                                     bridge_responded = true;
+                                    // The replay opened a session on it: the
+                                    // teardown must close it, and the handshake
+                                    // deadline must not end the proxy under it.
+                                    forwarded_any = true;
                                     reconnects += 1;
                                     // Disclose the rebuild to the client (#485).
                                     // The request that tripped the failure was
@@ -3096,5 +3109,93 @@ mod tests {
             0,
             "notifications have no id, so no error can be relayed to stdio"
         );
+    }
+
+    #[tokio::test]
+    async fn a_threshold_reconnect_leaves_a_session_the_teardown_closes() {
+        // The replay delivered `initialize` on the fresh transport, so a
+        // session exists there even though every forward before the
+        // reconnect failed. The teardown must close it (DELETE /mcp), and the
+        // handshake deadline — which watches the same flag — must not end it.
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = MockStdio::new(
+                VecDeque::from(vec![
+                    client_initialize(0),
+                    client_request(1),
+                    client_request(2),
+                ]),
+                sent.clone(),
+            );
+            let fresh_closed = Arc::new(AtomicUsize::new(0));
+            let fresh_closed_inner = fresh_closed.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                Ok(MockClient {
+                    closed: fresh_closed_inner.clone(),
+                    ..healthy_client(Arc::new(AtomicUsize::new(0)))
+                })
+            };
+
+            let result =
+                run_transport_proxy(stdio, dead_client(), "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok_and(|responded| responded));
+            assert_eq!(
+                session_event_kinds(&sent.lock()),
+                vec!["reconnected".to_string()]
+            );
+            assert_eq!(
+                fresh_closed.load(Ordering::SeqCst),
+                1,
+                "the adopted transport holds a session; the teardown must close it"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_while_disconnected_delivers_initialized_once() {
+        // The bridge answers `initialize`, then closes before the client's
+        // `notifications/initialized` arrives (it idled out, or handed over).
+        // The replay on the fresh transport sends the cached notification;
+        // the client's own copy must not follow it.
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut stdio = MockStdio::new(
+                VecDeque::from(vec![
+                    client_initialize(0),
+                    client_notifications_initialized(),
+                ]),
+                sent.clone(),
+            );
+            stdio.inbound_delay = Some(Duration::from_millis(50));
+            let first = MockClient {
+                inbound: VecDeque::from(vec![bridge_response(0)]),
+                receive_none_after: Some(1),
+                ..healthy_client(Arc::new(AtomicUsize::new(0)))
+            };
+            let fresh_sent = Arc::new(Mutex::new(Vec::new()));
+            let fresh_sent_inner = fresh_sent.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                Ok(MockClient {
+                    sent: Some(fresh_sent_inner.clone()),
+                    ..healthy_client(Arc::new(AtomicUsize::new(0)))
+                })
+            };
+
+            let result =
+                run_transport_proxy(stdio, first, "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok());
+            let methods: Vec<String> = fresh_sent
+                .lock()
+                .iter()
+                .map(|m| m["method"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                methods,
+                vec!["initialize".to_string(), INITIALIZED_METHOD.to_string()],
+                "the replay delivers each handshake message exactly once"
+            );
+        })
+        .await;
     }
 }
