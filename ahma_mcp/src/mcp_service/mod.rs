@@ -3872,7 +3872,7 @@ mod tests {
         assert_eq!(wd.path, "/explicit/path");
 
         // No arg + a client-reported scope -> substitute the first scope, and say so.
-        sandbox.set_roots_received(true);
+        sandbox.mark_roots_received();
         let wd = handlers::working_directory::resolve(sandbox, "cargo", &serde_json::Map::new())
             .unwrap();
         let scope = sandbox

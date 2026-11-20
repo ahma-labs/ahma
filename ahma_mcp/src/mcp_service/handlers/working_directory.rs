@@ -287,7 +287,7 @@ mod tests {
     /// directory that may legitimately be substituted.
     fn roots_sandbox(scope: &std::path::Path) -> Sandbox {
         let sb = default_scope_sandbox(scope);
-        sb.set_roots_received(true);
+        sb.mark_roots_received();
         sb
     }
 
@@ -518,7 +518,7 @@ mod tests {
         let sb = container_sandbox(container.path());
         let root = dunce::canonicalize(container.path()).unwrap();
         // The client later reports a usable root: provenance moves to roots/list.
-        sb.set_roots_received(true);
+        sb.mark_roots_received();
         let before = sb.scopes().to_vec();
 
         let wd = resolve(

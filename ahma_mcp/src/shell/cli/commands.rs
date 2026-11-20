@@ -324,14 +324,14 @@ fn run_settings_set(
             SettingsReach::of(&target, named_with_path)
         )
     );
-    if edit.before != edit.after {
+    if edit.changed() {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
             &chrono::Local::now().to_rfc3339(),
             "cli",
             SettingsFile::for_path(&target).label(),
             key,
-            &edit.before,
-            &edit.after,
+            edit.before.as_deref(),
+            edit.after.as_deref(),
         ));
     }
     Ok(())

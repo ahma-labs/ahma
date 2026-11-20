@@ -65,7 +65,7 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
         mode,
         Default::default(),
     )?;
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
 }
@@ -81,7 +81,7 @@ pub async fn create_in_process_mcp(configs: HashMap<String, ToolConfig>) -> Resu
         SandboxMode::Strict
     };
     let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, Default::default())?;
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
 }
@@ -118,7 +118,7 @@ pub async fn create_in_process_mcp_with_scope(
     // not application-level validate_path checks.  SandboxMode::Test bypasses
     // validate_path completely, defeating these tests on Windows CI and macOS+Cursor.
     let sandbox = Sandbox::new(scopes, SandboxMode::Strict, Default::default())?;
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     wire_in_process_mcp(configs, sandbox).await
 }
@@ -150,8 +150,8 @@ pub async fn create_in_process_mcp_with_client<C: ClientHandler>(
         SandboxMode::Strict
     };
     let sandbox = Sandbox::new(scopes, mode, Default::default())?;
-    sandbox.set_roots_received(roots_settled);
     if roots_settled {
+        sandbox.mark_roots_received();
         let _ = sandbox.commit_existing_scopes();
     }
     wire_in_process_mcp_with_client(client, configs, sandbox).await
@@ -178,7 +178,7 @@ pub async fn create_in_process_mcp_with_broker<C: ClientHandler>(
         SandboxMode::Test,
         Default::default(),
     )?;
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     create_in_process_mcp_with_broker_and_sandbox(client, sandbox, hub_tx).await
 }
@@ -273,7 +273,7 @@ pub async fn create_in_process_mcp_with_workspace_queue(
         SandboxMode::Test,
         Default::default(),
     )?;
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     let mcp = wire_in_process_mcp_with_queue(
         (),
@@ -320,7 +320,7 @@ async fn wire_in_process_mcp_with_queue<C: ClientHandler>(
         .with_workspace_queue(queue),
     );
 
-    // NOTE: `set_roots_received` is the *caller's* decision, made on the sandbox
+    // NOTE: `mark_roots_received` is the *caller's* decision, made on the sandbox
     // before it is handed here. It used to be forced to `true` at this point,
     // which silently made it impossible to build an in-process server whose
     // scope is not yet settled — and therefore impossible to observe the
@@ -420,7 +420,7 @@ async fn build_test_service_inner(
         SandboxMode::Test,
         Default::default(),
     )?;
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     let sandbox = Arc::new(sandbox);
     let adapter = Arc::new(Adapter::new(
