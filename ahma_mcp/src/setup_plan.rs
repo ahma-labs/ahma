@@ -1280,14 +1280,28 @@ fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
         ),
     ] {
         if on {
+            // Back to the default is `unset`, unless the default is itself on
+            // (the login keychain): then only `false` turns it off.
+            let on_by_default = ahma_common::config::setting_docs()
+                .iter()
+                .any(|d| d.dotted() == key && d.default == "true");
+            let undo = if on_by_default {
+                Change::Set {
+                    file: SettingsFile::User,
+                    key: key.into(),
+                    value: "false".into(),
+                }
+            } else {
+                Change::Unset {
+                    file: SettingsFile::User,
+                    key: key.into(),
+                }
+            };
             out.push(AllowRow {
                 area: "switch",
                 subject: what.into(),
                 detail: key.into(),
-                undo: Undo::Proposal(Change::Unset {
-                    file: SettingsFile::User,
-                    key: key.into(),
-                }),
+                undo: Undo::Proposal(undo),
             });
         }
     }
@@ -1664,6 +1678,28 @@ mod tests {
         _home: tempfile::TempDir,
         ws: tempfile::TempDir,
         env: Env,
+    }
+
+    /// A switch that is on by default (the login keychain) is undone by
+    /// turning it off. Undoing every switch by unsetting it went back to the
+    /// default, which for the keychain is on: the offered undo changed nothing.
+    #[test]
+    fn a_switch_on_by_default_is_undone_by_turning_it_off() {
+        let f = fixture();
+        let rows = allow_rows(&f.env, &AhmaSettings::default());
+        let keychain = rows
+            .iter()
+            .find(|r| r.detail == "sandbox.allow_keychain")
+            .expect("the keychain is allowed by default");
+        assert!(
+            matches!(
+                &keychain.undo,
+                Undo::Proposal(Change::Set { key, value, .. })
+                    if key == "sandbox.allow_keychain" && value == "false"
+            ),
+            "{:?}",
+            keychain.undo
+        );
     }
 
     fn fixture() -> Fixture {
