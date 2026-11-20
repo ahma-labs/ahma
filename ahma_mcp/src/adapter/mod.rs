@@ -1577,6 +1577,11 @@ impl Adapter {
         // the line the caller wrote, as for a piped command.
         let mutex_registry = self.mutex_registry.clone();
         let workspace = self.workspace_key_for(&safe_wd);
+        // Drift (SPEC R2.7.6): this command is exclusive, never a service.
+        let drift = DriftProbe {
+            root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
+            lane: workspace_queue::Lane::Exclusive,
+        };
         // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1604,6 +1609,8 @@ impl Adapter {
             else {
                 return;
             };
+            // As on the piped path: after the queue and the gate, before the spawn.
+            let started = Instant::now();
             if watch_handoff {
                 guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
             }
@@ -1633,6 +1640,7 @@ impl Adapter {
                 keep_leftovers,
             )
             .await;
+            let finished = carry_run_reports(finished, &drift, started).await;
             // A deny-tier write reaches the log and the audit trail, not the
             // result text.
             guards.end(&monitor, finished).await;
@@ -1697,6 +1705,11 @@ impl Adapter {
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
         let mutex_registry = self.mutex_registry.clone();
         let workspace = self.workspace_key_for(&safe_wd);
+        // Drift (SPEC R2.7.6): this command is exclusive, never a service.
+        let drift = DriftProbe {
+            root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
+            lane: workspace_queue::Lane::Exclusive,
+        };
         // A session command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1724,6 +1737,8 @@ impl Adapter {
             else {
                 return;
             };
+            // As on the piped path: after the queue and the gate, before the spawn.
+            let started = Instant::now();
             if watch_handoff {
                 guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
             }
@@ -1739,6 +1754,7 @@ impl Adapter {
                 &monitor,
             )
             .await;
+            let finished = carry_run_reports(finished, &drift, started).await;
             // As for PTY: a deny-tier write reaches the log and the audit trail.
             guards.end(&monitor, finished).await;
         };
@@ -2477,6 +2493,19 @@ impl DriftProbe {
 
 /// Acquire the command's mutex-group gate, if the command belongs to one.
 ///
+/// A PTY or session command's ending with what its result owes beyond the
+/// output, as a piped command's result has it: the files that changed in its
+/// workspace while it ran (SPEC R2.7.6). Only an ending that carries output
+/// (`Exited`) has a place for it.
+async fn carry_run_reports(ending: Terminal, drift: &DriftProbe, started: Instant) -> Terminal {
+    let mut output = match ending {
+        Terminal::Exited(output) => output,
+        other => return other,
+    };
+    output.changed_during_run = drift.report(started.elapsed()).await;
+    Terminal::Exited(output)
+}
+
 /// The gate every async path waits for, through [`guards::RunGuards::gate`].
 ///
 /// Returns `Ok(None)` when the command isn't gated by any group, `Ok(Some(permit))`

@@ -424,7 +424,7 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   longest scope containing the working directory) — in the result
   (`changed_during_run`), saying who could have written them: anyone including the command,
   or, for a read-only command, someone else. It is detection, not prevention: optimistic
-  concurrency, with no watcher and nothing to clean up.
+  concurrency, with no watcher and nothing to clean up. PTY and persistent-session commands are exclusive (R2.7.1) and carry the same report in their result.
 - **R2.7.7**: **No stale locks, by construction.** The cross-process half of the lease is
   an advisory kernel lock (`flock` / `LockFileEx`) on a rendezvous file in the per-user
   runtime directory (`<runtime dir>/locks`), **never** inside any sandbox scope, where the
