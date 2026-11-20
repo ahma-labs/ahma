@@ -576,7 +576,7 @@ Server configuration (everything except MTDF tool definitions) **must** be deter
 
 ### R-CFG5: Provenance and Observability
 
-- **R-CFG5.1**: `ahma settings show --origin` **must** print every effective setting with its value, source (`cli` / `project` / `user` / `default`), and for file sources the file path.
+- **R-CFG5.1**: `ahma settings show --origin` **must** print every effective setting with its value, source (`cli` / `project` / `user` / `default`), and for file sources the file path. Every setting but the ledger keys (R-CFG10.7: grants, which their own commands list: `ahma sandbox list`, `ahma permissions list`, …), each a row of `settings_origin::setting_rows`; every flag that overrides a setting is recorded as its source; and a secret key's value (`auth.require_token`) is shown as `<redacted>` in every report.
 - **R-CFG5.2**: At startup the server **must** log one `info` line per setting whose effective value differs from the compiled-in default, including its source. Security-tier deviations, and keys with no known tier, **must** log at `warn`. The report and `ahma settings show --origin` use one provenance resolver (`ahma_common::settings_origin`), so they cannot name different sources for one key.
 - **R-CFG5.3**: The documented precedence and the implemented precedence **must** be the same and **must** be covered by a matrix test (every source pair, at least one Preference and one Security key).
 

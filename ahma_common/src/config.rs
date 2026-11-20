@@ -4374,6 +4374,178 @@ mod tests {
     /// Every field is set to something other than its compiled-in default so that
     /// a missing field in [`AhmaSettings::render_documented`] would surface as a
     /// lost value when this round-trips through TOML.
+    /// Every key is in every list it must be in, and in no list it must not be.
+    /// Written against the hand-maintained lists before the SettingKey schema
+    /// so existing drift is visible first; one schema replacing them must keep it green.
+    #[test]
+    fn every_setting_key_appears_in_every_list_it_must() {
+        use std::collections::BTreeSet;
+        let documented: BTreeSet<String> = setting_docs().iter().map(SettingDoc::dotted).collect();
+
+        // 1. The documented keys are exactly the fields. `all_non_default_settings` is a
+        //    struct literal (a new field does not compile until it is set) with every
+        //    Option `Some`, so serialising it names every field.
+        let full = toml::Value::try_from(all_non_default_settings()).unwrap();
+        let full = full.as_table().unwrap();
+        let fields: BTreeSet<String> = full
+            .iter()
+            .flat_map(|(t, v)| {
+                v.as_table()
+                    .into_iter()
+                    .flat_map(move |k| k.keys().map(move |k| format!("{t}.{k}")))
+            })
+            .collect();
+        assert_eq!(
+            documented, fields,
+            "render_documented and AhmaSettings disagree on the key set"
+        );
+
+        // 2. Every hand list names only real keys.
+        let rows = crate::settings_origin::setting_rows(
+            &AhmaSettings::default(),
+            &AhmaSettings::default(),
+        );
+        let lists: [(&str, Vec<String>); 5] = [
+            (
+                "SECURITY_KEYS",
+                SECURITY_KEYS
+                    .iter()
+                    .map(|(t, k)| format!("{t}.{k}"))
+                    .collect(),
+            ),
+            (
+                "OPTIONAL_PREFERENCE_KEYS",
+                OPTIONAL_PREFERENCE_KEYS
+                    .iter()
+                    .map(|(t, k)| format!("{t}.{k}"))
+                    .collect(),
+            ),
+            (
+                "SECRET_KEYS",
+                crate::settings_origin::SECRET_KEYS
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect(),
+            ),
+            (
+                "CLI_ONLY_KEYS",
+                crate::settings_origin::CLI_ONLY_KEYS
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect(),
+            ),
+            (
+                "setting_rows",
+                rows.iter().map(|r| r.key.to_string()).collect(),
+            ),
+        ];
+        for (list, keys) in lists {
+            let unknown: Vec<&String> = keys.iter().filter(|k| !documented.contains(*k)).collect();
+            assert!(
+                unknown.is_empty(),
+                "{list} names keys that are not settings: {unknown:?}"
+            );
+        }
+        for t in SECURITY_TABLES {
+            assert!(
+                documented.iter().any(|k| k.starts_with(&format!("{t}."))),
+                "SECURITY_TABLES names {t}, which has no key"
+            );
+        }
+
+        // 3. The classifications agree with each other and with the SPEC.
+        for d in setting_docs() {
+            let (t, k) = (d.table.as_str(), d.key.as_str());
+            let tier = settings_tier(t, k);
+            assert!(tier.is_some(), "{t}.{k} has no tier (R-CFG2.1)");
+            if SECURITY_TABLES.contains(&t) {
+                assert_eq!(
+                    tier,
+                    Some(SettingsTier::Security),
+                    "{t}.{k} is in a security table"
+                );
+            }
+            if ledger_key_command(t, k).is_some() {
+                assert_eq!(
+                    tier,
+                    Some(SettingsTier::Security),
+                    "ledger key {t}.{k} must be Security"
+                );
+            }
+        }
+        let ledger: BTreeSet<String> = setting_docs()
+            .iter()
+            .filter(|d| ledger_key_command(&d.table, &d.key).is_some())
+            .map(SettingDoc::dotted)
+            .collect();
+        assert_eq!(
+            ledger,
+            BTreeSet::from(
+                [
+                    "log_targets.approvals",
+                    "network.allow",
+                    "permissions.tool_approvals",
+                    "sandbox.persistent_scopes",
+                    "sandbox.ssh_sign",
+                    "web.always_allow",
+                    "web.never_allow",
+                ]
+                .map(String::from)
+            ),
+            "ledger keys differ from SPEC R-CFG10.7's list"
+        );
+
+        // 4. Each provenance row reads the field its key names: setting that one key
+        //    in a file moves exactly that row (catches `row!("a.b", a.c)`).
+        for row in &rows {
+            let (t, k) = row.key.split_once('.').unwrap();
+            let one: toml::Table = [(
+                t.to_string(),
+                toml::Value::Table([(k.to_string(), full[t][k].clone())].into_iter().collect()),
+            )]
+            .into_iter()
+            .collect();
+            let s: AhmaSettings = toml::Value::Table(one).try_into().unwrap();
+            let moved: Vec<&str> =
+                crate::settings_origin::setting_rows(&s, &AhmaSettings::default())
+                    .into_iter()
+                    .filter(|r| r.value != r.default)
+                    .map(|r| r.key)
+                    .collect();
+            assert_eq!(
+                moved,
+                [row.key],
+                "row `{}` does not read the field it names",
+                row.key
+            );
+        }
+    }
+
+    /// R-CFG5.1: `settings show --origin` and the startup report cover every
+    /// setting except the ledger keys (grants, listed by their own commands:
+    /// `ahma sandbox list`, `ahma permissions list`, …). They covered 22 of 76.
+    #[test]
+    fn origin_report_lists_every_setting_but_the_ledgers() {
+        use std::collections::BTreeSet;
+        let want: BTreeSet<String> = setting_docs()
+            .iter()
+            .filter(|d| ledger_key_command(&d.table, &d.key).is_none())
+            .map(SettingDoc::dotted)
+            .collect();
+        let rows: BTreeSet<String> = crate::settings_origin::setting_rows(
+            &AhmaSettings::default(),
+            &AhmaSettings::default(),
+        )
+        .iter()
+        .map(|r| r.key.to_string())
+        .collect();
+        let missing: Vec<&String> = want.difference(&rows).collect();
+        assert!(
+            missing.is_empty(),
+            "R-CFG5.1: the origin report omits {missing:?}"
+        );
+    }
+
     fn all_non_default_settings() -> AhmaSettings {
         AhmaSettings {
             lmstudio: LmStudioSettings {
@@ -4434,7 +4606,7 @@ mod tests {
                 env_allow: vec!["GITHUB_TOKEN".into()],
                 allow_keychain: false,
                 signal_other_processes: true,
-                allow_gpu: false,
+                allow_gpu: true,
                 deny_credential_reads: vec![PathBuf::from("~/.ssh")],
                 allow_credential_reads: vec![PathBuf::from("~/.aws")],
                 profiles: vec!["rust".into()],
@@ -4493,8 +4665,8 @@ mod tests {
                     granted_by: Some("user".into()),
                     surface: Some("tui".into()),
                 }],
-                advisor: true,
-                advisor_timeout_secs: 6,
+                advisor: false,
+                advisor_timeout_secs: 9,
             },
             log_targets: crate::permissions::LogTargetSettings {
                 approvals: vec![crate::permissions::LogTargetApproval {
