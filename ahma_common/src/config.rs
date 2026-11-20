@@ -1051,6 +1051,38 @@ pub fn default_await_timeout_secs() -> u64 {
 }
 
 /// Default idle watchdog timeout in seconds (see [`DEFAULT_IDLE_TIMEOUT_SECS`]).
+/// A time limit read from the settings file, where `0` means none. Read once,
+/// where the setting is used, so each consumer matches on [`Limit::Never`]
+/// instead of remembering that `0` is not "at once".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    Never,
+    After(std::time::Duration),
+}
+
+impl Limit {
+    /// A setting's seconds: `0` is [`Limit::Never`].
+    pub fn from_secs(secs: u64) -> Self {
+        match secs {
+            0 => Self::Never,
+            s => Self::After(std::time::Duration::from_secs(s)),
+        }
+    }
+
+    /// The limit, or `None` when there is none.
+    pub fn duration(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Never => None,
+            Self::After(d) => Some(d),
+        }
+    }
+
+    /// Whether `elapsed` has reached the limit; never, for [`Limit::Never`].
+    pub fn reached(self, elapsed: std::time::Duration) -> bool {
+        self.duration().is_some_and(|d| elapsed >= d)
+    }
+}
+
 pub fn default_idle_timeout_secs() -> u64 {
     DEFAULT_IDLE_TIMEOUT_SECS
 }
@@ -3987,6 +4019,19 @@ fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A setting's `0` is no limit, never a limit reached at once.
+    #[test]
+    fn a_zero_limit_is_never_reached() {
+        use std::time::Duration;
+        assert_eq!(Limit::from_secs(0), Limit::Never);
+        assert!(!Limit::from_secs(0).reached(Duration::from_secs(u64::MAX / 2)));
+        assert_eq!(Limit::from_secs(0).duration(), None);
+        let minute = Limit::from_secs(60);
+        assert!(!minute.reached(Duration::from_secs(59)));
+        assert!(minute.reached(Duration::from_secs(60)));
+        assert_eq!(minute.duration(), Some(Duration::from_secs(60)));
+    }
 
     /// Under the test harness, a test that did not choose a home never gets
     /// the developer's real one (see `test_run_home`).

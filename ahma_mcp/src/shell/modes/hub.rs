@@ -36,6 +36,7 @@
 //! cap.
 
 use crate::shell::cli::AppConfig;
+use ahma_common::config::Limit;
 use ahma_common::hub::{HubBindError, HubServer};
 use ahma_common::hub_history::StopReason;
 use ahma_http_bridge::{BridgeConfig, HubExit, ListenerKind, start_bridge};
@@ -55,14 +56,14 @@ pub(crate) fn idle_exit_due(
     hub_connections: usize,
     mcp_sessions: usize,
     idle_for: std::time::Duration,
-    timeout_secs: u64,
+    timeout: Limit,
 ) -> bool {
     if hub_connections > 0 || mcp_sessions > 0 {
         return false;
     }
-    // A zero timeout means "stay forever", which is what an operator who runs
-    // the hub deliberately wants.
-    timeout_secs > 0 && idle_for.as_secs() >= timeout_secs
+    // No limit means "stay forever", which is what an operator who runs the
+    // hub deliberately wants.
+    timeout.reached(idle_for)
 }
 
 /// Consecutive quiet looks a drain needs before it hands over.
@@ -95,7 +96,7 @@ pub(crate) fn drain_step(
     work_in_flight: usize,
     quiet_checks: u32,
     draining_for: std::time::Duration,
-    cap_secs: u64,
+    cap: Limit,
 ) -> DrainStep {
     if work_in_flight == 0 {
         return if quiet_checks >= DRAIN_QUIET_CHECKS {
@@ -104,7 +105,7 @@ pub(crate) fn drain_step(
             DrainStep::Wait
         };
     }
-    if cap_secs > 0 && draining_for.as_secs() >= cap_secs {
+    if cap.reached(draining_for) {
         DrainStep::Interrupt
     } else {
         DrainStep::Wait
@@ -323,10 +324,11 @@ const SUCCESSOR_POLL: std::time::Duration = std::time::Duration::from_millis(250
 /// gone whatever happened.
 async fn take_rendezvous_as_successor(
     socket: &std::path::Path,
-    drain_cap_secs: u64,
+    drain_cap: Limit,
 ) -> std::result::Result<HubServer, HubBindError> {
-    let patience =
-        (drain_cap_secs > 0).then(|| std::time::Duration::from_secs(drain_cap_secs + 60));
+    let patience = drain_cap
+        .duration()
+        .map(|cap| cap + std::time::Duration::from_secs(60));
     let started = std::time::SystemTime::now();
     let socket_str = socket.to_string_lossy();
     loop {
@@ -424,7 +426,7 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     }
 
     let taken = if successor {
-        take_rendezvous_as_successor(&socket, config.hub_drain_timeout_secs).await
+        take_rendezvous_as_successor(&socket, Limit::from_secs(config.hub_drain_timeout_secs)).await
     } else {
         HubServer::lock_at(socket.clone()).await
     };
@@ -478,8 +480,8 @@ pub async fn run_hub_mode(config: AppConfig, successor: bool) -> Result<()> {
     let idle_task = spawn_idle_watcher(
         hub_connections,
         active_sessions.clone(),
-        idle_timeout_secs,
-        config.hub_drain_timeout_secs,
+        Limit::from_secs(idle_timeout_secs),
+        Limit::from_secs(config.hub_drain_timeout_secs),
         hub.events(),
         exit.clone(),
         interrupted.clone(),
@@ -659,8 +661,8 @@ fn build_bridge_config(
 fn spawn_idle_watcher(
     hub_connections: Arc<AtomicUsize>,
     active_sessions: Arc<AtomicUsize>,
-    timeout_secs: u64,
-    drain_cap_secs: u64,
+    timeout: Limit,
+    drain_cap: Limit,
     events: ahma_common::hub::HubEvents,
     exit: Arc<HubExit>,
     interrupted: Arc<parking_lot::Mutex<Vec<String>>>,
@@ -682,7 +684,7 @@ fn spawn_idle_watcher(
                     0
                 };
                 let draining_for = now.duration_since(started).unwrap_or_default();
-                match drain_step(work, quiet_checks, draining_for, drain_cap_secs) {
+                match drain_step(work, quiet_checks, draining_for, drain_cap) {
                     DrainStep::Wait => continue,
                     DrainStep::HandOver => {
                         // Sessions are left open on purpose: when the socket
@@ -695,7 +697,7 @@ fn spawn_idle_watcher(
                     DrainStep::Interrupt => {
                         tracing::warn!(
                             work,
-                            drain_cap_secs,
+                            ?drain_cap,
                             "ahma hub: drain cap reached with work still in flight; \
                              ending it so the successor can take over"
                         );
@@ -713,7 +715,7 @@ fn spawn_idle_watcher(
             let hub_now = hub_connections.load(Ordering::Relaxed);
             let sessions_now = active_sessions.load(Ordering::SeqCst);
             let idle_for = clock.observe(hub_now > 0 || sessions_now > 0, now);
-            if idle_exit_due(hub_now, sessions_now, idle_for, timeout_secs) {
+            if idle_exit_due(hub_now, sessions_now, idle_for, timeout) {
                 exit.request(StopReason::Idle);
                 return;
             }
@@ -863,10 +865,30 @@ mod tests {
     /// exit while an editor was mid-build with no TUI attached.
     #[test]
     fn idle_exit_needs_both_halves_empty_for_the_full_window() {
-        assert!(!idle_exit_due(1, 0, Duration::from_secs(600), 60));
-        assert!(!idle_exit_due(0, 1, Duration::from_secs(600), 60));
-        assert!(!idle_exit_due(0, 0, Duration::from_secs(59), 60));
-        assert!(idle_exit_due(0, 0, Duration::from_secs(60), 60));
+        assert!(!idle_exit_due(
+            1,
+            0,
+            Duration::from_secs(600),
+            Limit::from_secs(60)
+        ));
+        assert!(!idle_exit_due(
+            0,
+            1,
+            Duration::from_secs(600),
+            Limit::from_secs(60)
+        ));
+        assert!(!idle_exit_due(
+            0,
+            0,
+            Duration::from_secs(59),
+            Limit::from_secs(60)
+        ));
+        assert!(idle_exit_due(
+            0,
+            0,
+            Duration::from_secs(60),
+            Limit::from_secs(60)
+        ));
     }
 
     /// A draining hub hands over the moment no work is in flight — with
@@ -877,14 +899,20 @@ mod tests {
     #[test]
     fn a_drain_hands_over_once_nothing_is_in_flight() {
         let minute = Duration::from_secs(60);
-        assert_eq!(drain_step(2, 0, minute, 3600), DrainStep::Wait);
         assert_eq!(
-            drain_step(0, 1, minute, 3600),
+            drain_step(2, 0, minute, Limit::from_secs(3600)),
+            DrainStep::Wait
+        );
+        assert_eq!(
+            drain_step(0, 1, minute, Limit::from_secs(3600)),
             DrainStep::Wait,
             "one quiet look is not enough: a tool call answered a moment ago \
              may not have reported its operation yet"
         );
-        assert_eq!(drain_step(0, 2, minute, 3600), DrainStep::HandOver);
+        assert_eq!(
+            drain_step(0, 2, minute, Limit::from_secs(3600)),
+            DrainStep::HandOver
+        );
     }
 
     /// Work that never goes quiet is ended at the cap, which is disclosed
@@ -893,12 +921,15 @@ mod tests {
     fn a_drain_ends_what_is_left_at_its_cap() {
         let hour = Duration::from_secs(3600);
         assert_eq!(
-            drain_step(1, 0, hour - Duration::from_secs(1), 3600),
+            drain_step(1, 0, hour - Duration::from_secs(1), Limit::from_secs(3600)),
             DrainStep::Wait
         );
-        assert_eq!(drain_step(1, 0, hour, 3600), DrainStep::Interrupt);
         assert_eq!(
-            drain_step(1, 0, hour * 24, 0),
+            drain_step(1, 0, hour, Limit::from_secs(3600)),
+            DrainStep::Interrupt
+        );
+        assert_eq!(
+            drain_step(1, 0, hour * 24, Limit::from_secs(0)),
             DrainStep::Wait,
             "0 waits for as long as the work takes"
         );
@@ -911,12 +942,12 @@ mod tests {
     #[test]
     fn a_subscriber_does_not_hold_a_draining_hub_open() {
         assert_eq!(
-            drain_step(0, 2, Duration::ZERO, 3600),
+            drain_step(0, 2, Duration::ZERO, Limit::from_secs(3600)),
             DrainStep::HandOver,
             "subscribers are not in-flight work"
         );
         assert!(
-            !idle_exit_due(3, 0, Duration::from_secs(600), 60),
+            !idle_exit_due(3, 0, Duration::from_secs(600), Limit::from_secs(60)),
             "outside a drain a subscriber still counts as attached"
         );
     }
@@ -1079,7 +1110,12 @@ mod tests {
     /// terminal should not disappear because nobody happened to be attached.
     #[test]
     fn a_zero_timeout_never_expires() {
-        assert!(!idle_exit_due(0, 0, Duration::from_secs(86_400), 0));
+        assert!(!idle_exit_due(
+            0,
+            0,
+            Duration::from_secs(86_400),
+            Limit::from_secs(0)
+        ));
     }
 
     /// A successor waits for the draining hub to let the rendezvous go, then
@@ -1093,7 +1129,7 @@ mod tests {
 
         let waiting = tokio::spawn({
             let sock = sock.clone();
-            async move { take_rendezvous_as_successor(&sock, 3600).await }
+            async move { take_rendezvous_as_successor(&sock, Limit::from_secs(3600)).await }
         });
         // Still held: the successor must not have given up.
         tokio::time::sleep(SUCCESSOR_POLL * 2).await;
@@ -1138,7 +1174,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
-            take_rendezvous_as_successor(&sock, 3600),
+            take_rendezvous_as_successor(&sock, Limit::from_secs(3600)),
         )
         .await
         .expect("a successor with nothing to succeed does not wait");
