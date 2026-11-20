@@ -5071,7 +5071,7 @@ fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url:
 fn virtual_provider_for_instance(
     inst: &ahma_common::hub::InstanceInfo,
 ) -> Option<ahma_llm_monitor::LocalProvider> {
-    if !inst.sampling || inst.mode == "hook" || inst.mode == "tui" {
+    if !inst.sampling || inst.kind() != ahma_common::hub::InstanceMode::Worker {
         return None;
     }
     let who = inst.client.as_deref().unwrap_or(&inst.label);

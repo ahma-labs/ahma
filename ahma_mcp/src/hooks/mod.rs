@@ -1645,7 +1645,7 @@ fn register_hook_with_hub(
     crate::hub_reporter::set_initial_identity(session_id, None);
     Some(crate::hub_reporter::spawn_reporter(
         operation_monitor,
-        "hook",
+        ahma_common::hub::InstanceMode::Hook.as_str(),
         cwd.to_string(),
         "hook",
         None,

@@ -71,7 +71,7 @@ impl TuiReporter {
 pub fn register_msg(session_id: &str, workspace: &str) -> ClientMsg {
     ClientMsg::Register {
         pid: std::process::id(),
-        mode: "tui".to_string(),
+        mode: ahma_common::hub::InstanceMode::Tui.as_str().to_string(),
         scope: workspace.to_string(),
         label: "ahma-tui".to_string(),
         client: Some("ahma-tui".to_string()),
@@ -252,7 +252,9 @@ mod tests {
                 break;
             };
             match msg {
-                HubMsg::InstanceRegistered { instance } if instance.mode == "tui" => {
+                HubMsg::InstanceRegistered { instance }
+                    if instance.kind() == ahma_common::hub::InstanceMode::Tui =>
+                {
                     registered_tui = true;
                     assert_eq!(instance.client.as_deref(), Some("ahma-tui"));
                     assert_eq!(instance.scope, "/work/project");

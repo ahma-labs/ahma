@@ -15,7 +15,7 @@ use crate::task_tree::{
     GroupCounts, LOCAL_GROUP, RowKind, TreeOptions, TreeRow, emit_group_ops, scope_matches_project,
     short_path,
 };
-use ahma_common::hub::InstanceInfo;
+use ahma_common::hub::{InstanceInfo, InstanceMode};
 use std::collections::{HashMap, HashSet};
 
 /// What a section represents. Ordering of the variants is display order.
@@ -145,7 +145,7 @@ fn bucket_ops_by_section(
     let hook_instances: HashSet<&str> = opts
         .instances
         .iter()
-        .filter(|i| i.mode == "hook")
+        .filter(|i| i.kind() == InstanceMode::Hook)
         .map(|i| i.id.as_str())
         .collect();
 
@@ -217,7 +217,7 @@ fn assemble_sections(
         .iter()
         .filter(|i| instance_visible(i, opts) && !is_agent_tool_session(i))
     {
-        let key = if info.mode == "hook" {
+        let key = if info.kind() == InstanceMode::Hook {
             HOOKS_KEY.to_string()
         } else {
             info.id.clone()
@@ -308,7 +308,7 @@ fn kind_for(key: &str, info: Option<&InstanceInfo>) -> SectionKind {
     }
     match info {
         Some(i) if i.ended_epoch_ms.is_some() => SectionKind::Ended,
-        Some(i) if i.mode == "tui" => SectionKind::Local,
+        Some(i) if i.kind() == InstanceMode::Tui => SectionKind::Local,
         Some(_) => SectionKind::Client,
         // Work whose instance is gone from the list entirely.
         None => SectionKind::Ended,
@@ -323,7 +323,7 @@ fn client_name(key: &str, info: Option<&InstanceInfo>) -> String {
         return "this terminal (you)".to_string();
     }
     match info {
-        Some(i) if i.mode == "tui" => tui_client_name(i),
+        Some(i) if i.kind() == InstanceMode::Tui => tui_client_name(i),
         Some(i) => external_client_name(i),
         None => "ended session".to_string(),
     }

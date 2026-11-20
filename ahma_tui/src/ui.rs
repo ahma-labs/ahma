@@ -2756,7 +2756,7 @@ fn session_scope_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let live: Vec<_> = state
         .active_instances
         .iter()
-        .filter(|i| i.ended_epoch_ms.is_none() && i.mode != "tui")
+        .filter(|i| i.ended_epoch_ms.is_none() && i.kind() != ahma_common::hub::InstanceMode::Tui)
         .collect();
     if live.is_empty() {
         return lines;
