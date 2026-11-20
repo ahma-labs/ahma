@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{AhmaSettings, settings_path};
 use crate::permissions::{
-    AuditAction, GrantKind, GrantTier, TRUSTED_WORKSPACE_TOOL, append_audit, audit_entry,
+    AuditAction, AuditEntry, GrantKind, GrantTier, TRUSTED_WORKSPACE_TOOL, append_audit,
     workspace_key,
 };
 
@@ -189,15 +189,16 @@ fn apply_remove_missing_scopes(paths: &[PathBuf], now: &str) -> anyhow::Result<S
             .retain(|scope| !paths.contains(&scope.path));
     })?;
     for path in paths {
-        append_audit(&audit_entry(
-            now.to_string(),
-            AuditAction::Revoke,
-            GrantKind::FsScope,
-            path.display().to_string(),
-            None,
-            GrantTier::Always,
-            Some("doctor".to_string()),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                now.to_string(),
+                AuditAction::Revoke,
+                GrantKind::FsScope,
+                path.display().to_string(),
+                GrantTier::Always,
+            )
+            .with_surface("doctor"),
+        );
     }
     Ok(format!("Removed {} granted folder(s)", paths.len()))
 }
@@ -218,15 +219,16 @@ fn apply_revoke_scopes(keys: &[(PathBuf, PathBuf)], now: &str) -> anyhow::Result
         }
     }
     for (path, workspace) in keys {
-        append_audit(&audit_entry(
-            now.to_string(),
-            AuditAction::Revoke,
-            GrantKind::FsScope,
-            path.display().to_string(),
-            None,
-            GrantTier::Always,
-            Some(format!("doctor: from {}", workspace.display())),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                now.to_string(),
+                AuditAction::Revoke,
+                GrantKind::FsScope,
+                path.display().to_string(),
+                GrantTier::Always,
+            )
+            .with_surface(format!("doctor: from {}", workspace.display())),
+        );
     }
     Ok(format!(
         "Revoked {} grant(s) into another repository",
@@ -241,15 +243,16 @@ fn apply_forget_missing_workspaces(paths: &[PathBuf], now: &str) -> anyhow::Resu
             .retain(|a| !paths.contains(&a.workspace));
     })?;
     for path in paths {
-        append_audit(&audit_entry(
-            now.to_string(),
-            AuditAction::Revoke,
-            GrantKind::Tool,
-            "*",
-            None,
-            GrantTier::Always,
-            Some(format!("doctor: {}", path.display())),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                now.to_string(),
+                AuditAction::Revoke,
+                GrantKind::Tool,
+                "*",
+                GrantTier::Always,
+            )
+            .with_surface(format!("doctor: {}", path.display())),
+        );
     }
     Ok(format!("Forgot approvals for {} folder(s)", paths.len()))
 }
@@ -274,15 +277,16 @@ fn apply_repair_antigravity_permissions(
         clean_antigravity_ide_mcp(path)?;
         files_cleaned += 1;
     }
-    append_audit(&audit_entry(
-        now.to_string(),
-        AuditAction::Grant,
-        GrantKind::Tool,
-        "antigravity-permissions",
-        None,
-        GrantTier::Always,
-        Some("doctor".to_string()),
-    ));
+    append_audit(
+        &AuditEntry::new(
+            now.to_string(),
+            AuditAction::Grant,
+            GrantKind::Tool,
+            "antigravity-permissions",
+            GrantTier::Always,
+        )
+        .with_surface("doctor"),
+    );
     Ok(format!(
         "Cleaned Antigravity permissions in {files_cleaned} file(s)"
     ))
@@ -3166,18 +3170,18 @@ fn check_decision_habits(entries: &[crate::permissions::AuditEntry], out: &mut V
 #[cfg(test)]
 mod decision_habit_tests {
     use super::*;
-    use crate::permissions::{AuditAction, AuditEntry, GrantKind, GrantTier, audit_entry};
+    use crate::permissions::{AuditAction, AuditEntry, GrantKind, GrantTier};
 
     fn entry(ms: u64, followed: Option<bool>) -> AuditEntry {
-        audit_entry(
+        AuditEntry::new(
             "t",
             AuditAction::Grant,
             GrantKind::FsScope,
             "/x",
-            Some("rw".into()),
             GrantTier::Session,
-            Some("tui".into()),
         )
+        .with_access("rw")
+        .with_surface("tui")
         .with_request("d", Some(ms), None)
         .with_advice(followed.map(|_| "advisor: session".into()), followed)
     }

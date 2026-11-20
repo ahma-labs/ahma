@@ -295,15 +295,15 @@ fn audit(
     surface: Surface,
 ) {
     ahma_common::permissions::append_audit(
-        &ahma_common::permissions::audit_entry(
+        &ahma_common::permissions::AuditEntry::new(
             chrono::Local::now().to_rfc3339(),
             action,
             GrantKind::FsScope,
             ask.question.dir.display().to_string(),
-            access.map(|a| a.short().to_string()),
             tier,
-            Some(surface.as_str().to_string()),
         )
+        .with_access_opt(access.map(|a| a.short().to_string()))
+        .with_surface(surface.as_str().to_string())
         .with_request(ask.decision_id(), None, None),
     );
 }

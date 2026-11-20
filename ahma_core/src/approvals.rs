@@ -34,8 +34,8 @@ use std::sync::OnceLock;
 
 use ahma_common::config::{AhmaSettings, settings_path};
 use ahma_common::permissions::{
-    AuditAction, GrantKind, GrantTier, PermissionSettings, TRUSTED_WORKSPACE_TOOL, append_audit,
-    audit_entry, migrate_legacy_approvals, workspace_key, workspace_key_async,
+    AuditAction, AuditEntry, GrantKind, GrantTier, PermissionSettings, TRUSTED_WORKSPACE_TOOL,
+    append_audit, migrate_legacy_approvals, workspace_key, workspace_key_async,
 };
 use tracing::{debug, warn};
 
@@ -317,15 +317,16 @@ fn revoke_workspace_tools(
     .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
     let now = chrono::Local::now().to_rfc3339();
     for tool in &removed {
-        append_audit(&audit_entry(
-            now.clone(),
-            AuditAction::Revoke,
-            GrantKind::Tool,
-            tool,
-            None,
-            GrantTier::Always,
-            Some("tui".to_string()),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                now.clone(),
+                AuditAction::Revoke,
+                GrantKind::Tool,
+                tool,
+                GrantTier::Always,
+            )
+            .with_surface("tui"),
+        );
     }
     Ok(removed.len())
 }
@@ -367,15 +368,16 @@ fn persist_workspace_grant(
         .map_err(|e| std::io::Error::other(format!("failed to write {}: {e:#}", path.display())))?;
 
     if added {
-        append_audit(&audit_entry(
-            now.to_rfc3339(),
-            AuditAction::Grant,
-            GrantKind::Tool,
-            subject,
-            None,
-            GrantTier::Always,
-            Some("tui".to_string()),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                now.to_rfc3339(),
+                AuditAction::Grant,
+                GrantKind::Tool,
+                subject,
+                GrantTier::Always,
+            )
+            .with_surface("tui"),
+        );
     }
     Ok(())
 }

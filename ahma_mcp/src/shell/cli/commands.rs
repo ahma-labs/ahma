@@ -798,15 +798,17 @@ fn run_sandbox_grant_session(
         granted_by: Some(by.unwrap_or_else(|| "cli".to_string())),
     };
     ahma_common::session_grants::record(&store, &grant)?;
-    ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
-        chrono::Local::now().to_rfc3339(),
-        ahma_common::permissions::AuditAction::Grant,
-        ahma_common::permissions::GrantKind::FsScope,
-        canonical.display().to_string(),
-        Some(access.short().to_string()),
-        ahma_common::permissions::GrantTier::Session,
-        Some("cli".to_string()),
-    ));
+    ahma_common::permissions::append_audit(
+        &ahma_common::permissions::AuditEntry::new(
+            chrono::Local::now().to_rfc3339(),
+            ahma_common::permissions::AuditAction::Grant,
+            ahma_common::permissions::GrantKind::FsScope,
+            canonical.display().to_string(),
+            ahma_common::permissions::GrantTier::Session,
+        )
+        .with_access(access.short().to_string())
+        .with_surface("cli"),
+    );
     println!(
         "✓ Granted {} access to {} for this terminal session (workspace {}).",
         access.label(),
@@ -975,22 +977,24 @@ fn run_sandbox_revoke(
 // ─────────────────────────────────────────────────────────────────────────────
 
 use ahma_common::permissions::{
-    AuditAction, GrantKind, GrantTier, append_audit, audit_entry, records, workspace_key,
+    AuditAction, AuditEntry, GrantKind, GrantTier, append_audit, records, workspace_key,
 };
 
 /// Record a ledger change in the audit trail. Never fails the operation it is
 /// recording: the grant was already confirmed by a human and is safely written;
 /// losing the *record* of it is the lesser harm.
 fn audit(action: AuditAction, kind: GrantKind, subject: String, access: Option<String>) {
-    append_audit(&audit_entry(
-        chrono::Local::now().to_rfc3339(),
-        action,
-        kind,
-        subject,
-        access,
-        GrantTier::Always,
-        Some("cli".to_string()),
-    ));
+    append_audit(
+        &AuditEntry::new(
+            chrono::Local::now().to_rfc3339(),
+            action,
+            kind,
+            subject,
+            GrantTier::Always,
+        )
+        .with_access_opt(access)
+        .with_surface("cli"),
+    );
 }
 
 /// Print the elevated-risk warnings for a grant the CLI is about to write
