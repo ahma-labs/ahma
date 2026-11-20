@@ -631,10 +631,12 @@ impl HarnessIntent {
     /// `tools.timeout_secs`.
     pub fn limit(&self, cfg: &AppConfig) -> Option<TimeLimit> {
         if self.background {
-            return (cfg.background_timeout_secs > 0).then_some(TimeLimit {
-                secs: cfg.background_timeout_secs,
-                source: "tools.background_timeout_secs",
-            });
+            return ahma_common::config::Limit::from_secs(cfg.background_timeout_secs)
+                .duration()
+                .map(|limit| TimeLimit {
+                    secs: limit.as_secs(),
+                    source: "tools.background_timeout_secs",
+                });
         }
         Some(match self.timeout_ms {
             Some(ms) => TimeLimit {
