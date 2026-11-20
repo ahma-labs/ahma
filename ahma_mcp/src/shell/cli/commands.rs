@@ -476,7 +476,7 @@ fn handle_prompts_update() -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
-    use ahma_common::config::settings_path;
+    use ahma_common::config::{ScopeAccess, settings_path};
 
     let file = settings_path()
         .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
@@ -494,7 +494,23 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         } => {
             let lease_secs = lease.as_deref().map(parse_lease_arg).transpose()?;
             run_sandbox_grant(
-                &file, dir, read_only, workspace, global, session, by, note, lease_secs,
+                &file,
+                GrantRequest {
+                    dir,
+                    access: if read_only {
+                        ScopeAccess::Ro
+                    } else {
+                        ScopeAccess::Rw
+                    },
+                    workspace: resolve_cli_workspace(workspace, global)?,
+                    lifetime: if session {
+                        GrantLifetime::Session
+                    } else {
+                        GrantLifetime::Persistent { lease_secs }
+                    },
+                    by,
+                    note,
+                },
             )
         }
         SandboxCommand::Renew {
@@ -668,26 +684,42 @@ fn run_sandbox_renew(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_sandbox_grant(
-    file: &std::path::Path,
+/// What `ahma sandbox grant` was asked for, its flags already resolved — one
+/// named value in place of nine positional parameters, three of them `bool`s
+/// and two of them adjacent `Option<String>`s a swap would still compile.
+struct GrantRequest {
+    /// The directory to grant, as typed (`~` not yet expanded).
     dir: PathBuf,
-    read_only: bool,
+    access: ahma_common::config::ScopeAccess,
+    /// The workspace the grant is bound to (SPEC R5.4.11); `None` is the
+    /// legacy global record (`--global`).
     workspace: Option<PathBuf>,
-    global: bool,
-    session: bool,
+    lifetime: GrantLifetime,
+    /// What asked for it (`--by`).
     by: Option<String>,
+    /// Why it exists (`--note`). A session grant does not record it.
     note: Option<String>,
-    lease_secs: Option<u64>,
-) -> Result<()> {
-    use ahma_common::config::{GrantOutcome, ScopeAccess};
+}
 
-    let access = if read_only {
-        ScopeAccess::Ro
-    } else {
-        ScopeAccess::Rw
-    };
-    let workspace = resolve_cli_workspace(workspace, global)?;
+/// How long a CLI grant lasts.
+enum GrantLifetime {
+    /// `--session`: this terminal session only, nothing written (SPEC R-PERM.4.4).
+    Session,
+    /// Written to settings.toml; a lease of `lease_secs` when `--for` was given.
+    Persistent { lease_secs: Option<u64> },
+}
+
+fn run_sandbox_grant(file: &std::path::Path, req: GrantRequest) -> Result<()> {
+    use ahma_common::config::GrantOutcome;
+
+    let GrantRequest {
+        dir,
+        access,
+        workspace,
+        lifetime,
+        by,
+        note,
+    } = req;
     let settings = load_sandbox_settings(file)?;
 
     // Surface the elevated-risk warnings before writing; the hard denylist
@@ -702,9 +734,12 @@ fn run_sandbox_grant(
     warn_elevated_risk_grant(&dir, &live_scopes);
     drop(settings);
 
-    if session {
-        return run_sandbox_grant_session(dir, access, workspace, by);
-    }
+    let lease_secs = match lifetime {
+        GrantLifetime::Session => {
+            return run_sandbox_grant_session(dir, access, workspace, by);
+        }
+        GrantLifetime::Persistent { lease_secs } => lease_secs,
+    };
 
     let outcome = ahma_common::scope_grant::persist_grant(
         file,
