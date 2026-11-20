@@ -102,37 +102,7 @@ pub fn test_sandbox_exec_available() -> Result<(), SandboxError> {
 /// probe in [`test_sandbox_exec_available`] only ever runs when this says
 /// `true`. Every child of a confined process inherits the confinement — that
 /// is what makes deferring to the outer sandbox safe in kind.
-#[cfg(target_os = "macos")]
-pub fn process_is_seatbelt_confined() -> bool {
-    // SANDBOX_CHECK_NO_REPORT: answer without logging a violation.
-    const SANDBOX_CHECK_NO_REPORT: libc::c_int = 0x0002;
-    unsafe extern "C" {
-        // libsystem_sandbox: `int sandbox_check(pid_t pid, const char *operation,
-        // int type, ...)`. With a NULL operation it reports whether the process
-        // is sandboxed at all: 1 when confined, 0 when not, -1 on error.
-        fn sandbox_check(
-            pid: libc::pid_t,
-            operation: *const libc::c_char,
-            type_: libc::c_int,
-            ...
-        ) -> libc::c_int;
-    }
-    // SAFETY: plain FFI query on our own pid with a NULL operation, which the
-    // documented calling convention permits; no pointers are retained.
-    let rc = unsafe {
-        sandbox_check(
-            std::process::id() as libc::pid_t,
-            std::ptr::null(),
-            SANDBOX_CHECK_NO_REPORT,
-        )
-    };
-    rc == 1
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn process_is_seatbelt_confined() -> bool {
-    false
-}
+pub use ahma_common::seatbelt::this_process_is_confined as process_is_seatbelt_confined;
 
 /// The outer sandbox ahma must defer to because macOS refuses to nest its
 /// Seatbelt profile inside it (SPEC R7.6), or `None` when ahma can enforce.

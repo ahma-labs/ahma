@@ -1684,33 +1684,10 @@ fn find_git_root_or_worktree(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// If `git_root` is a worktree whose `.git` file points to a parent git directory,
-/// resolve the main repository root containing that git directory.
+/// If `git_root` is a worktree, the main repository it belongs to: the one
+/// checking resolver every surface uses (`scope_grant::resolve_worktree_main_repo`).
 fn resolve_worktree_main_repo(git_root: &Path) -> Option<PathBuf> {
-    let git_entry = git_root.join(".git");
-    if !git_entry.is_file() {
-        return None;
-    }
-    let content = std::fs::read_to_string(&git_entry).ok()?;
-    let line = content
-        .lines()
-        .find(|l| l.trim_start().starts_with("gitdir:"))?;
-    let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
-    let gitdir_path = Path::new(raw_gitdir);
-    let resolved = if gitdir_path.is_relative() {
-        git_root.join(gitdir_path)
-    } else {
-        gitdir_path.to_path_buf()
-    };
-    let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
-    let parent = canon_gitdir.parent()?;
-    let grandparent = parent.parent()?;
-    let great_grandparent = grandparent.parent()?;
-    if grandparent.file_name().and_then(|n| n.to_str()) == Some(".git") {
-        Some(great_grandparent.to_path_buf())
-    } else {
-        None
-    }
+    ahma_common::scope_grant::resolve_worktree_main_repo(git_root, &git_root.join(".git"))
 }
 
 /// Resolve the sandbox scopes for a hooked command starting from `cwd`.

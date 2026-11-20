@@ -85,31 +85,7 @@ fn outer_write_blocked() -> bool {
 /// Whether `pid` runs inside a Seatbelt sandbox, asked of the kernel. Any
 /// pid may be asked; a daemon a sandboxed command left behind inherits the
 /// command's profile and answers `true` for the rest of its life.
-#[cfg(target_os = "macos")]
-pub fn pid_is_seatbelt_confined(pid: u32) -> bool {
-    const SANDBOX_CHECK_NO_REPORT: libc::c_int = 0x0002;
-    unsafe extern "C" {
-        fn sandbox_check(
-            pid: libc::pid_t,
-            operation: *const libc::c_char,
-            type_: libc::c_int,
-            ...
-        ) -> libc::c_int;
-    }
-    // SAFETY: a NULL operation only asks whether the pid is sandboxed at all.
-    unsafe {
-        sandbox_check(
-            pid as libc::pid_t,
-            std::ptr::null(),
-            SANDBOX_CHECK_NO_REPORT,
-        ) == 1
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn pid_is_seatbelt_confined(_pid: u32) -> bool {
-    false
-}
+pub use ahma_common::seatbelt::pid_is_confined as pid_is_seatbelt_confined;
 
 /// Long-lived helpers running *inside* a sandbox that no longer has a parent:
 /// a build daemon (sccache, a Gradle or Kotlin daemon) started by a sandboxed

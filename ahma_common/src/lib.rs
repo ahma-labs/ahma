@@ -68,6 +68,7 @@ pub mod process_guard;
 pub mod prompts;
 pub mod sandbox_state;
 pub mod scope_grant;
+pub mod seatbelt;
 pub mod session_event;
 pub mod session_grants;
 pub mod settings_origin;
