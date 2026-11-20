@@ -500,33 +500,21 @@ fn message_is_replayed_by_handshake(val: &serde_json::Value) -> bool {
     )
 }
 
-/// Rebuild the bridge connection and transparently resend the one request whose
-/// forward failed, replacing `client` with the fresh transport.
+/// Transparently resend, on a freshly reconnected transport, the one request
+/// whose forward failed because the bridge endpoint was gone.
 ///
 /// Resending is safe and is *not* a duplicate execution: this path only runs
 /// when the failure proved the endpoint was gone, so the request never reached
 /// the bridge at all.
 ///
-/// Returns `Ok(true)` when the request was resent, `Ok(false)` when the
-/// reconnect succeeded but the resend did not (the caller must then answer the
-/// request with an error), and `Err` when the reconnect itself failed.
-async fn reconnect_and_resend<C>(
-    client: &mut C,
-    pending: &serde_json::Value,
-    reconnect: &mut dyn FnMut() -> Result<C>,
-    handshake: &CachedHandshake,
-    transport: &str,
-    respawn: Option<&mut BridgeRespawnFn>,
-) -> Result<bool>
+/// Returns whether the request went out. When it did not, the caller must
+/// answer it with an error.
+async fn resend_pending<C>(fresh: &mut C, pending: &serde_json::Value, transport: &str) -> bool
 where
     C: Transport<RoleClient>,
     C::Error: std::fmt::Debug,
 {
-    let mut fresh = reconnect_with_retries(reconnect, handshake, transport, respawn).await?;
-    // Best-effort: release the dead connection's resources. Bounded so a broken
-    // close() cannot stall the now-healthy session waiting on it.
-    let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
-    let resent = match serde_json::from_value::<TxJsonRpcMessage<RoleClient>>(pending.clone()) {
+    match serde_json::from_value::<TxJsonRpcMessage<RoleClient>>(pending.clone()) {
         Ok(msg) => match fresh.send(msg).await {
             Ok(()) => true,
             Err(e) => {
@@ -547,9 +535,152 @@ where
             );
             false
         }
-    };
-    *client = fresh;
-    Ok(resent)
+    }
+}
+
+/// Why the proxy rebuilt its bridge transport: the `cause` of the
+/// `reconnected` disclosure (#485), and what happened to the request that
+/// triggered the rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconnectCause {
+    /// A request arrived while the bridge was unreachable. Nothing was in
+    /// flight; the triggering request is forwarded on the fresh transport.
+    BridgeUnreachable,
+    /// A forward failed because the bridge endpoint was gone. The request
+    /// never reached the bridge, so it was resent on the fresh transport;
+    /// `resent` says whether that worked.
+    EndpointGone { resent: bool },
+    /// Forwards kept failing until the threshold tripped. The request that
+    /// tripped it was already answered with an error.
+    TransportFailure,
+}
+
+impl ReconnectCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BridgeUnreachable => "bridge_unreachable",
+            Self::EndpointGone { .. } => "endpoint_gone",
+            Self::TransportFailure => "transport_failure",
+        }
+    }
+
+    /// Whether the client's request reached the fresh transport, so it has
+    /// nothing to retry.
+    fn in_flight_resent(self) -> bool {
+        match self {
+            Self::BridgeUnreachable => true,
+            Self::EndpointGone { resent } => resent,
+            Self::TransportFailure => false,
+        }
+    }
+}
+
+/// The proxy's bridge transport, and the per-session state that describes it.
+///
+/// Every transport swap goes through [`BridgeConnection::adopt`], so what a
+/// successful reconnect resets is written once (R-LIFECYCLE.3, R8.8.3). Three
+/// reconnect paths used to reset it by hand and drifted apart: one that skipped
+/// `forwarded_any` left a session on the fresh bridge that the teardown never
+/// closed and the handshake deadline could exit under.
+struct BridgeConnection<C> {
+    /// The bridge transport: live, or dead while `disconnected`.
+    client: C,
+    /// Whether a bridge session could exist. Until the client's `initialize`
+    /// reaches a bridge, the bridge never creates a session for this proxy (and
+    /// the underlying rmcp worker is parked awaiting the first message without
+    /// observing its cancellation token). In that state `client.close()` would
+    /// block forever, so the teardown only closes when this is set. It also
+    /// disarms the handshake deadline (R-LIFECYCLE.2).
+    forwarded_any: bool,
+    /// Whether the bridge ever responded. This is the signal
+    /// `handle_version_checks` uses to detect a stale bridge: a healthy bridge
+    /// always replies to `initialize`; a stale one closes silently.
+    bridge_responded: bool,
+    /// Consecutive failures to forward a request on the current transport.
+    /// Reset on any success, and on adopting a fresh transport. A single
+    /// failure does not tear the session down (see
+    /// [`MAX_CONSECUTIVE_FORWARD_FAILURES`]).
+    consecutive_forward_failures: u32,
+    /// Transparent reconnects this session (#485), overlaid on heartbeats.
+    reconnects: u32,
+    /// The monotonic seq of the session events that disclose them (R8.8.1).
+    event_seq: u64,
+    /// The bridge could not be reached (or closed a handshaken session). The
+    /// proxy stays attached and reconnects when the next request arrives.
+    disconnected: bool,
+    /// Whether this outage has been disclosed; one `reconnect_failed` per outage.
+    outage_disclosed: bool,
+}
+
+impl<C> BridgeConnection<C>
+where
+    C: Transport<RoleClient>,
+{
+    fn new(client: C) -> Self {
+        Self {
+            client,
+            forwarded_any: false,
+            bridge_responded: false,
+            consecutive_forward_failures: 0,
+            reconnects: 0,
+            event_seq: 0,
+            disconnected: false,
+            outage_disclosed: false,
+        }
+    }
+
+    /// Swap in a freshly reconnected transport whose handshake replay
+    /// succeeded, reset the session state for it, and disclose the rebuild
+    /// downstream. Every reconnect path ends here, whatever triggered it.
+    async fn adopt<S>(
+        &mut self,
+        fresh: C,
+        cause: ReconnectCause,
+        stdio: &mut S,
+        handshake: &mut CachedHandshake,
+    ) where
+        S: Transport<RoleServer>,
+        S::Error: std::fmt::Debug,
+    {
+        // Best-effort: release the dead connection's resources. Bounded so a
+        // broken close() cannot stall the now-healthy session waiting on it.
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.client.close()).await;
+        self.client = fresh;
+        // The replay opened a session on the fresh transport: the teardown
+        // must close it, and the handshake deadline must not end the proxy
+        // under it — even if the request that follows fails to forward.
+        self.forwarded_any = true;
+        // The replay's `initialize` answer proved the fresh bridge is alive.
+        self.bridge_responded = true;
+        // Failures on the dead transport say nothing about this one.
+        self.consecutive_forward_failures = 0;
+        self.disconnected = false;
+        self.outage_disclosed = false;
+        self.reconnects += 1;
+        let detail = reconnected_detail(self.reconnects, cause);
+        announce_reconnect(stdio, &mut self.event_seq, handshake, detail).await;
+    }
+
+    /// Record that a reconnect burst failed: the proxy stays attached and
+    /// retries when the next request arrives. The outage is disclosed once,
+    /// however many requests arrive during it (R-LIFECYCLE.3).
+    async fn mark_unreachable<S>(&mut self, stdio: &mut S, err: &anyhow::Error)
+    where
+        S: Transport<RoleServer>,
+        S::Error: std::fmt::Debug,
+    {
+        self.disconnected = true;
+        if !self.outage_disclosed {
+            self.outage_disclosed = true;
+            emit_session_event_downstream(
+                stdio,
+                &mut self.event_seq,
+                ahma_common::session_event::SessionEventKind::ReconnectFailed,
+                reconnect_failed_detail(err),
+            )
+            .await;
+        }
+    }
 }
 
 /// Build the `detail` payload for the transparent-reconnect disclosure (#485).
@@ -558,8 +689,8 @@ where
 /// the fresh transport the client has nothing to do, and telling it the request
 /// "was answered with an error and can be retried" would be a lie that invites
 /// a duplicate call.
-fn reconnected_detail(reconnects: u32, cause: &str, in_flight_resent: bool) -> serde_json::Value {
-    let (in_flight_request, message) = if in_flight_resent {
+fn reconnected_detail(reconnects: u32, cause: ReconnectCause) -> serde_json::Value {
+    let (in_flight_request, message) = if cause.in_flight_resent() {
         (
             "resent",
             "ahma bridge session was rebuilt transparently and the in-flight request was \
@@ -573,7 +704,7 @@ fn reconnected_detail(reconnects: u32, cause: &str, in_flight_resent: bool) -> s
         )
     };
     serde_json::json!({
-        "cause": cause,
+        "cause": cause.as_str(),
         "reconnects": reconnects,
         "in_flight_request": in_flight_request,
         "message": message,
@@ -885,7 +1016,7 @@ async fn run_proxy_client_socket(
 
 async fn run_transport_proxy<S, C>(
     mut stdio: S,
-    mut client: C,
+    client: C,
     transport: &str,
     handshake_deadline: Option<Duration>,
     reconnect: &mut dyn FnMut() -> Result<C>,
@@ -902,29 +1033,9 @@ where
     C::Error: std::fmt::Debug + std::fmt::Display + Send,
 {
     let mut handshake = CachedHandshake::default();
-    // Track whether we ever forwarded a message to the bridge.  Until the client sends
-    // `initialize`, the bridge never creates a session for this proxy (and the underlying
-    // rmcp worker is parked awaiting the first message without observing its cancellation
-    // token).  In that state `client.close()` would block forever, so we must only attempt
-    // the teardown when a session could actually exist.
-    let mut forwarded_any = false;
-    // Track whether the bridge ever responded (sent a message back to the client).
-    // This is the signal used by handle_version_checks to detect a stale bridge:
-    // a healthy bridge always replies to `initialize`; a stale one closes silently.
-    let mut bridge_responded = false;
-    // Count consecutive failures to forward a request to the bridge. Reset on any
-    // success. A single failure no longer tears the session down (see
-    // MAX_CONSECUTIVE_FORWARD_FAILURES).
-    let mut consecutive_forward_failures: u32 = 0;
-    // Session-health disclosure (#485): transparent reconnects this session and
-    // the monotonic seq for the events that disclose them.
-    let mut reconnects: u32 = 0;
-    let mut event_seq: u64 = 0;
-    // The bridge could not be reached (or closed a handshaken session). The
-    // proxy stays attached and reconnects when the next request arrives.
-    let mut disconnected = false;
-    // Whether this outage has been disclosed; one `reconnect_failed` per outage.
-    let mut outage_disclosed = false;
+    // The bridge transport and the session state that describes it. A
+    // reconnect swaps the transport only through `BridgeConnection::adopt`.
+    let mut conn = BridgeConnection::new(client);
 
     // Handshake deadline: if the client never sends its first message (the
     // `initialize` handshake) within this window, the connection was spawned
@@ -938,7 +1049,7 @@ where
     loop {
         tokio::select! {
             biased;
-            _ = &mut handshake_timer, if !forwarded_any => {
+            _ = &mut handshake_timer, if !conn.forwarded_any => {
                 tracing::warn!(
                     transport,
                     ?deadline,
@@ -977,12 +1088,12 @@ where
                         }
                     };
 
-                    if let Err(e) = client.send(init_msg).await {
+                    if let Err(e) = conn.client.send(init_msg).await {
                         tracing::error!(transport, error = %e, "Failed to send synthesized initialize to bridge");
                         continue;
                     }
 
-                    let init_resp = match client.receive().await {
+                    let init_resp = match conn.client.receive().await {
                         Some(resp) => resp,
                         None => {
                             tracing::error!(transport, "Bridge closed connection while waiting for initialize response");
@@ -1039,12 +1150,12 @@ where
                     });
                     handshake.observe_client_to_bridge(&notif_init);
                     if let Ok(notif_msg) = serde_json::from_value::<TxJsonRpcMessage<RoleClient>>(notif_init) {
-                        let _ = client.send(notif_msg).await;
+                        let _ = conn.client.send(notif_msg).await;
                     }
 
-                    consecutive_forward_failures = 0;
-                    forwarded_any = true;
-                    bridge_responded = true;
+                    conn.consecutive_forward_failures = 0;
+                    conn.forwarded_any = true;
+                    conn.bridge_responded = true;
                     continue;
                 }
 
@@ -1060,7 +1171,7 @@ where
                     continue;
                 }
                 handshake.observe_client_to_bridge(&val);
-                if disconnected {
+                if conn.disconnected {
                     match reconnect_with_retries(
                         reconnect,
                         &handshake,
@@ -1070,23 +1181,15 @@ where
                     .await
                     {
                         Ok(fresh) => {
-                            let _ =
-                                tokio::time::timeout(Duration::from_secs(2), client.close()).await;
-                            client = fresh;
-                            disconnected = false;
-                            outage_disclosed = false;
-                            consecutive_forward_failures = 0;
-                            bridge_responded = true;
-                            reconnects += 1;
                             tracing::warn!(
                                 transport,
                                 "Proxy reconnected to a live bridge; session resumed"
                             );
-                            announce_reconnect(
+                            conn.adopt(
+                                fresh,
+                                ReconnectCause::BridgeUnreachable,
                                 &mut stdio,
-                                &mut event_seq,
                                 &mut handshake,
-                                reconnected_detail(reconnects, "bridge_unreachable", true),
                             )
                             .await;
                             // The replay just delivered the client's
@@ -1095,7 +1198,6 @@ where
                             if val.get("method").and_then(|m| m.as_str())
                                 == Some(INITIALIZED_METHOD)
                             {
-                                forwarded_any = true;
                                 continue;
                             }
                         }
@@ -1105,16 +1207,7 @@ where
                                 error = %e,
                                 "Bridge still unreachable; answering the request with an error"
                             );
-                            if !outage_disclosed {
-                                outage_disclosed = true;
-                                emit_session_event_downstream(
-                                    &mut stdio,
-                                    &mut event_seq,
-                                    ahma_common::session_event::SessionEventKind::ReconnectFailed,
-                                    reconnect_failed_detail(&e),
-                                )
-                                .await;
-                            }
+                            conn.mark_unreachable(&mut stdio, &e).await;
                             if let Some(id) = request_id {
                                 relay_forward_failure_to_client(
                                     &mut stdio,
@@ -1139,7 +1232,7 @@ where
                 // and inflates the failure count below. Recovery is the
                 // reconnect path, which rebuilds the transport and replays the
                 // handshake.
-                if let Err(e) = client.send(msg).await {
+                if let Err(e) = conn.client.send(msg).await {
                     // A single forward failure must NOT tear down the whole
                     // multiplexed session. Only the per-request timeout is
                     // returned by the bridge as an ordinary HTTP 200 response;
@@ -1175,9 +1268,7 @@ where
                             "Bridge endpoint is gone; reconnecting immediately and resending \
                              the request rather than waiting for repeated failures"
                         );
-                        match reconnect_and_resend(
-                            &mut client,
-                            &val,
+                        match reconnect_with_retries(
                             reconnect,
                             &handshake,
                             transport,
@@ -1185,27 +1276,26 @@ where
                         )
                         .await
                         {
-                            Ok(resent) => {
-                                // The reconnect handshake just proved the (fresh)
-                                // bridge is alive and responsive.
-                                bridge_responded = true;
-                                reconnects += 1;
-                                if resent {
-                                    consecutive_forward_failures = 0;
-                                    forwarded_any = true;
-                                } else {
-                                    consecutive_forward_failures += 1;
-                                    if let Some(id) = request_id.clone() {
-                                        relay_forward_failure_to_client(&mut stdio, id, None).await;
-                                    }
+                            Ok(mut fresh) => {
+                                // Resend before adopting, so the disclosure can
+                                // say whether the request reached the fresh
+                                // bridge; the error relay still precedes it.
+                                let resent = resend_pending(&mut fresh, &val, transport).await;
+                                if !resent && let Some(id) = request_id.clone() {
+                                    relay_forward_failure_to_client(&mut stdio, id, None).await;
                                 }
-                                announce_reconnect(
+                                conn.adopt(
+                                    fresh,
+                                    ReconnectCause::EndpointGone { resent },
                                     &mut stdio,
-                                    &mut event_seq,
                                     &mut handshake,
-                                    reconnected_detail(reconnects, "endpoint_gone", resent),
                                 )
                                 .await;
+                                if !resent {
+                                    // The failed resend is the fresh transport's
+                                    // first forward failure.
+                                    conn.consecutive_forward_failures += 1;
+                                }
                                 continue;
                             }
                             Err(reconnect_err) => {
@@ -1219,11 +1309,11 @@ where
                         }
                     }
 
-                    consecutive_forward_failures += 1;
+                    conn.consecutive_forward_failures += 1;
                     tracing::warn!(
                         transport,
                         error = %rendered,
-                        failures = consecutive_forward_failures,
+                        failures = conn.consecutive_forward_failures,
                         "Failed to forward request to bridge; relaying error to client, session preserved"
                     );
                     if let Some(id) = request_id {
@@ -1236,7 +1326,7 @@ where
                         };
                         relay_forward_failure_to_client(&mut stdio, id, recovered).await;
                     }
-                    if consecutive_forward_failures >= MAX_CONSECUTIVE_FORWARD_FAILURES {
+                    if conn.consecutive_forward_failures >= MAX_CONSECUTIVE_FORWARD_FAILURES {
                         // Only worth reconnecting once a real handshake has been
                         // observed — otherwise there is no session to preserve
                         // (mirrors the handshake-deadline exit above: an
@@ -1256,37 +1346,15 @@ where
                                         "Proxy reconnected to bridge after transport failure; \
                                          session resumed transparently"
                                     );
-                                    // Best-effort: release the dead connection's
-                                    // resources. Bounded so a broken close() cannot
-                                    // stall the now-healthy session waiting on it.
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_secs(2),
-                                        client.close(),
-                                    )
-                                    .await;
-                                    client = fresh;
-                                    consecutive_forward_failures = 0;
-                                    // The reconnect handshake just proved the
-                                    // (fresh) bridge is alive and responsive.
-                                    bridge_responded = true;
-                                    // The replay opened a session on it: the
-                                    // teardown must close it, and the handshake
-                                    // deadline must not end the proxy under it.
-                                    forwarded_any = true;
-                                    reconnects += 1;
-                                    // Disclose the rebuild to the client (#485).
                                     // The request that tripped the failure was
-                                    // answered with an error above; name it so
-                                    // the client can re-issue.
-                                    announce_reconnect(
+                                    // answered with an error above; the
+                                    // disclosure names it so the client can
+                                    // re-issue.
+                                    conn.adopt(
+                                        fresh,
+                                        ReconnectCause::TransportFailure,
                                         &mut stdio,
-                                        &mut event_seq,
                                         &mut handshake,
-                                        reconnected_detail(
-                                            reconnects,
-                                            "transport_failure",
-                                            false,
-                                        ),
                                     )
                                     .await;
                                     continue;
@@ -1294,37 +1362,29 @@ where
                                 Err(e) => {
                                     tracing::error!(
                                         transport,
-                                        failures = consecutive_forward_failures,
+                                        failures = conn.consecutive_forward_failures,
                                         error = %e,
                                         "Bridge transport failed repeatedly and reconnect also \
                                          failed; staying attached and retrying on the next request"
                                     );
-                                    disconnected = true;
-                                    outage_disclosed = true;
-                                    emit_session_event_downstream(
-                                        &mut stdio,
-                                        &mut event_seq,
-                                        ahma_common::session_event::SessionEventKind::ReconnectFailed,
-                                        reconnect_failed_detail(&e),
-                                    )
-                                    .await;
+                                    conn.mark_unreachable(&mut stdio, &e).await;
                                     continue;
                                 }
                             }
                         }
                         tracing::error!(
                             transport,
-                            failures = consecutive_forward_failures,
+                            failures = conn.consecutive_forward_failures,
                             "Proxy exiting: bridge transport failed repeatedly (genuinely dead)"
                         );
                         break;
                     }
                     continue;
                 }
-                consecutive_forward_failures = 0;
-                forwarded_any = true;
+                conn.consecutive_forward_failures = 0;
+                conn.forwarded_any = true;
             }
-            client_msg = client.receive(), if !disconnected => {
+            client_msg = conn.client.receive(), if !conn.disconnected => {
                 let Some(msg) = client_msg else {
                     if handshake.init_request.is_some() {
                         // The bridge exited on idle, crashed, or handed over to
@@ -1334,7 +1394,7 @@ where
                             transport,
                             "Bridge connection closed; will reconnect on the next request"
                         );
-                        disconnected = true;
+                        conn.disconnected = true;
                         continue;
                     }
                     tracing::info!(
@@ -1351,7 +1411,7 @@ where
                 // every other message forwards as the typed value it arrived as
                 // (the server-to-client message type is identical on both
                 // transports).
-                let tx_msg = if overlay_heartbeat_reconnects(&mut val, reconnects) {
+                let tx_msg = if overlay_heartbeat_reconnects(&mut val, conn.reconnects) {
                     serde_json::from_value(val).unwrap()
                 } else {
                     msg
@@ -1364,7 +1424,7 @@ where
                     );
                     break;
                 }
-                bridge_responded = true;
+                conn.bridge_responded = true;
             }
         }
     }
@@ -1377,8 +1437,8 @@ where
     // parked before its cancellation-aware main loop).  Even then we bound the call with a
     // timeout as a backstop in case the worker is mid-handshake; the bridge's SSE-drop
     // grace period guarantees eventual cleanup regardless.
-    if forwarded_any {
-        match tokio::time::timeout(Duration::from_secs(6), client.close()).await {
+    if conn.forwarded_any {
+        match tokio::time::timeout(Duration::from_secs(6), conn.client.close()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::debug!(transport, error = ?e, "Proxy close error (non-fatal)")
@@ -1388,7 +1448,7 @@ where
             }
         }
     }
-    Ok(bridge_responded)
+    Ok(conn.bridge_responded)
 }
 
 #[cfg(test)]
@@ -3194,6 +3254,74 @@ mod tests {
                 methods,
                 vec!["initialize".to_string(), INITIALIZED_METHOD.to_string()],
                 "the replay delivers each handshake message exactly once"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_gone_endpoint_reconnect_whose_resend_fails_leaves_a_session_the_teardown_closes() {
+        // The gone-endpoint recovery adopted a fresh transport and the replay
+        // opened a session on it; then resending the failed request failed
+        // too. That session still exists, so the teardown must close it — the
+        // rule every reconnect path follows
+        // (`a_threshold_reconnect_leaves_a_session_the_teardown_closes`).
+        // `initialize` itself fails first, so nothing was ever forwarded
+        // before the reconnect: only adopting the fresh transport can mark it.
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = MockStdio::new(
+                VecDeque::from(vec![client_initialize(0), client_request(1)]),
+                sent.clone(),
+            );
+            // `initialize` is a replayed handshake message, so its gone-endpoint
+            // failure takes the failure-count path; request 1's takes the fast
+            // path.
+            let gone = MockClient {
+                send_error_text: GONE_ENDPOINT_SEND_ERROR,
+                ..dead_client()
+            };
+            let fresh_closed = Arc::new(AtomicUsize::new(0));
+            let fresh_closed_inner = fresh_closed.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                Ok(MockClient {
+                    // Send 1 is the replayed `initialize`; send 2, the resend,
+                    // fails.
+                    fail_sends_from: 2,
+                    closed: fresh_closed_inner.clone(),
+                    ..healthy_client(Arc::new(AtomicUsize::new(0)))
+                })
+            };
+
+            let result = run_transport_proxy(stdio, gone, "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok_and(|responded| responded));
+            assert_eq!(
+                fresh_closed.load(Ordering::SeqCst),
+                1,
+                "the adopted transport holds a session; the teardown must close it"
+            );
+            let sent = sent.lock();
+            assert!(
+                sent.iter()
+                    .any(|m| m["id"] == serde_json::json!(1) && m.get("error").is_some()),
+                "the request whose resend failed is answered with an error: {sent:?}"
+            );
+            assert_eq!(
+                session_event_kinds(&sent),
+                vec!["reconnected".to_string()],
+                "got {sent:?}"
+            );
+            let event = sent
+                .iter()
+                .find(|m| {
+                    m.get("method").and_then(|m| m.as_str())
+                        == Some(ahma_common::session_event::SESSION_EVENT_METHOD)
+                })
+                .unwrap();
+            assert_eq!(event["params"]["detail"]["cause"], "endpoint_gone");
+            assert_eq!(
+                event["params"]["detail"]["in_flight_request"],
+                "answered_with_error"
             );
         })
         .await;
