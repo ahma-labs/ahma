@@ -8,7 +8,7 @@ use ahma_mcp::utils::logging::init_test_logging;
 use serde_json::json;
 use tempfile::tempdir;
 
-/// Test the normalize_option_type function behavior through schema generation
+/// Test how option types are read (`OptionType::read`) through schema generation
 #[tokio::test]
 async fn test_schema_generation_normalizes_option_types() {
     init_test_logging();

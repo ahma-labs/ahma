@@ -93,8 +93,8 @@ impl<'a> ArgProcessor<'a> {
 
     fn emit_boolean_flag_if_true(&mut self, key: &str, value: &Value) -> ArgHandled {
         let option_config = self.schema.option(key);
-        let is_boolean_option = option_config
-            .is_some_and(|opt| crate::mcp_service::schema::is_boolean_type(&opt.option_type));
+        let is_boolean_option =
+            option_config.is_some_and(|opt| opt.kind() == crate::config::OptionType::Boolean);
 
         // Check if this looks like a boolean value (native bool or string for boolean options)
         let bool_value = if is_boolean_option {

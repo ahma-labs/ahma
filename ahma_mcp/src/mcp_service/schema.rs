@@ -7,25 +7,6 @@ use std::sync::Arc;
 
 use crate::config::{CommandOption, SubcommandConfig, ToolConfig};
 
-/// Whether an MTDF option's declared type is boolean, by the same reading the
-/// tool schema gives it ([`normalize_option_type`]): what a client is told is
-/// a flag, the argument processor must emit as one.
-pub fn is_boolean_type(option_type: &str) -> bool {
-    normalize_option_type(option_type) == "boolean"
-}
-
-/// Normalizes option types to JSON Schema types.
-pub fn normalize_option_type(option_type: &str) -> &'static str {
-    match option_type {
-        "bool" | "boolean" => "boolean",
-        "int" | "integer" => "integer",
-        "array" => "array",
-        "number" => "number",
-        "string" => "string",
-        _ => "string",
-    }
-}
-
 /// Builds a common string property schema with a description.
 pub fn string_property(description: &str) -> Value {
     json!({
@@ -151,8 +132,10 @@ pub fn get_schema_for_options(sub_config: &SubcommandConfig) -> (Map<String, Val
 /// Builds a JSON schema map for a single argument or option.
 fn build_arg_schema(arg: &CommandOption) -> Map<String, Value> {
     let mut schema = Map::new();
-    let param_type = normalize_option_type(&arg.option_type);
-    schema.insert("type".to_string(), Value::String(param_type.to_string()));
+    schema.insert(
+        "type".to_string(),
+        Value::String(arg.kind().as_json().to_string()),
+    );
 
     schema.extend(
         arg.description
@@ -165,7 +148,7 @@ fn build_arg_schema(arg: &CommandOption) -> Map<String, Value> {
             .map(|f| ("format".to_string(), Value::String(f.clone()))),
     );
 
-    if param_type == "array" {
+    if arg.kind() == crate::config::OptionType::Array {
         schema.insert("items".to_string(), Value::Object(build_items_schema(arg)));
     }
     schema
@@ -408,32 +391,27 @@ mod tests {
     use super::*;
     use crate::config::{CommandOption, ItemsSpec, SubcommandConfig};
 
-    // ============= normalize_option_type tests =============
+    // ============= option type reading =============
 
     #[test]
-    fn test_normalize_option_type_bool_variants() {
-        assert_eq!(normalize_option_type("bool"), "boolean");
-        assert_eq!(normalize_option_type("boolean"), "boolean");
-    }
-
-    #[test]
-    fn test_normalize_option_type_int_variants() {
-        assert_eq!(normalize_option_type("int"), "integer");
-        assert_eq!(normalize_option_type("integer"), "integer");
-    }
-
-    #[test]
-    fn test_normalize_option_type_passthrough() {
-        assert_eq!(normalize_option_type("array"), "array");
-        assert_eq!(normalize_option_type("number"), "number");
-        assert_eq!(normalize_option_type("string"), "string");
-    }
-
-    #[test]
-    fn test_normalize_option_type_unknown_defaults_to_string() {
-        assert_eq!(normalize_option_type("unknown"), "string");
-        assert_eq!(normalize_option_type("foo"), "string");
-        assert_eq!(normalize_option_type(""), "string");
+    fn an_option_type_is_read_one_way() {
+        use crate::config::OptionType;
+        for (spelling, json) in [
+            ("bool", "boolean"),
+            ("boolean", "boolean"),
+            ("int", "integer"),
+            ("integer", "integer"),
+            ("array", "array"),
+            ("number", "number"),
+            ("string", "string"),
+            ("unknown", "string"),
+            ("", "string"),
+        ] {
+            assert_eq!(OptionType::read(spelling).as_json(), json, "{spelling}");
+        }
+        for spelling in OptionType::CANONICAL {
+            assert_eq!(OptionType::read(spelling).as_json(), spelling);
+        }
     }
 
     // ============= livelog runtime-parameter schema =============
