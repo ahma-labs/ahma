@@ -1640,9 +1640,10 @@ impl Adapter {
                 keep_leftovers,
             )
             .await;
-            let finished = carry_run_reports(finished, &drift, started).await;
-            // A deny-tier write reaches the log and the audit trail, not the
-            // result text.
+            // The PTY process is gone: the result carries the drift and
+            // deny-tier reports, as a piped command's does.
+            let finished =
+                carry_run_reports(finished, &drift, started, &mut guards, &monitor).await;
             guards.end(&monitor, finished).await;
         };
         self.spawn_operation_task(&op_id, task).await;
@@ -1754,8 +1755,9 @@ impl Adapter {
                 &monitor,
             )
             .await;
-            let finished = carry_run_reports(finished, &drift, started).await;
-            // As for PTY: a deny-tier write reaches the log and the audit trail.
+            // The command has ended (the session's shell lives on): as for PTY.
+            let finished =
+                carry_run_reports(finished, &drift, started, &mut guards, &monitor).await;
             guards.end(&monitor, finished).await;
         };
         self.spawn_operation_task(&op_id, task).await;
@@ -2497,12 +2499,25 @@ impl DriftProbe {
 /// output, as a piped command's result has it: the files that changed in its
 /// workspace while it ran (SPEC R2.7.6). Only an ending that carries output
 /// (`Exited`) has a place for it.
-async fn carry_run_reports(ending: Terminal, drift: &DriftProbe, started: Instant) -> Terminal {
+/// A PTY or session command's ending with what its result owes beyond the
+/// output, as a piped command's result has it, in the same order: the files
+/// that changed in its workspace while it ran (SPEC R2.7.6), then the
+/// deny-tier report and its alert (R6.1.7). Only an ending that carries output
+/// (`Exited`) has a place for them; any other leaves the watch for
+/// `RunGuards::end`, which reports it to the log and the audit trail.
+async fn carry_run_reports(
+    ending: Terminal,
+    drift: &DriftProbe,
+    started: Instant,
+    guards: &mut guards::RunGuards,
+    monitor: &OperationMonitor,
+) -> Terminal {
     let mut output = match ending {
         Terminal::Exited(output) => output,
         other => return other,
     };
     output.changed_during_run = drift.report(started.elapsed()).await;
+    guards.report_handoff_in(&mut output, monitor).await;
     Terminal::Exited(output)
 }
 
@@ -3274,9 +3289,6 @@ async fn finalize_streaming_operation(
         Some(probe) => probe.report(start_time.elapsed()).await,
         None => None,
     };
-    // The process tree is gone: compare the deny tier with its inventory from
-    // before the spawn (SPEC R6.1.7).
-    let handoff_report = guards.take_handoff_report().await;
 
     let mut output = CommandOutput {
         stdout: stdout_str,
@@ -3294,14 +3306,9 @@ async fn finalize_streaming_operation(
         changed_during_run,
         ..CommandOutput::default()
     };
-    if let Some(report) = handoff_report {
-        let alert = report.render_alert();
-        output.handoff_writes = Some(report.to_json());
-        output.handoff_alert = Some(alert.clone());
-        // Before the terminal transition, while the operation is still active:
-        // the `Alert` event is what the hub and the TUI show.
-        op_monitor.append_alert(op_id, alert).await;
-    }
+    // The process tree is gone: the deny-tier report (SPEC R6.1.7) goes in
+    // the result, and its alert out before the terminal transition.
+    guards.report_handoff_in(&mut output, op_monitor).await;
     // The process tree is gone and the drift probe has looked: the guards
     // hand the workspace on, then publish. The terminal event carries the
     // result to all subscribers (MCP progress push, hub, TUI).
