@@ -84,5 +84,6 @@ pub mod ssh_sign;
 pub mod state_machine;
 pub mod test_isolation;
 pub mod timeouts;
+pub mod timestamp;
 pub mod web_approval;
 pub mod web_policy;

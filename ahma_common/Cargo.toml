@@ -34,6 +34,10 @@ clap.workspace = true
 dirs.workspace = true
 sha2.workspace = true
 dunce.workspace = true
+jiff.workspace = true
+# The OS's own time zone, ignoring `TZ`, as chrono's `Local` found it
+# (`timestamp::local_tz`). Already in the graph.
+iana-time-zone = "0.1.65"
 url.workspace = true
 # No default features: `rcgen`'s default is the `ring` provider, which would be a second
 # rustls crypto provider next to the mandatory `aws-lc-rs` (rustls' default, and the only one

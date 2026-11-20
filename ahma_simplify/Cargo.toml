@@ -18,8 +18,8 @@ deprecated = "allow"
 [dependencies]
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
-chrono.workspace = true
 dunce.workspace = true
+jiff.workspace = true
 opener = "0.8"
 pulldown-cmark = "0.13"
 quick-xml = "0.41"

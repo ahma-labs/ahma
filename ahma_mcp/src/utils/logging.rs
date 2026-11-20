@@ -634,7 +634,7 @@ fn try_create_file_appender() -> Option<tracing_appender::rolling::RollingFileAp
 fn try_update_current_log_symlink(log_dir: &Path) {
     use std::os::unix::fs::symlink;
 
-    let today = chrono::Local::now().format("%Y-%m-%d");
+    let today = ahma_common::timestamp::local_date_today();
     let dated_name = format!("{MCP_LOG_BASENAME}.{today}");
     let symlink_path = log_dir.join(MCP_LOG_BASENAME);
 

@@ -27,8 +27,9 @@ no.
 
 ## Format
 
-One JSON object per line, `type`-tagged, with an RFC 3339 `timestamp`. It is the
-same envelope and the same field names the task-vault audit log uses, so a single
+One JSON object per line, `type`-tagged, with an RFC 3339 `timestamp` (UTC,
+written `+00:00`). It is the same envelope and the same field names the
+task-vault audit log uses, so a single
 reader parses both.
 
 ### `tool_call`

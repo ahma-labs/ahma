@@ -1055,7 +1055,7 @@ async fn resolve_scope_grant(
         } => {
             ahma_common::permissions::append_audit(
                 &ahma_common::permissions::AuditEntry::new(
-                    chrono::Local::now().to_rfc3339(),
+                    ahma_common::timestamp::rfc3339_local_now(),
                     ahma_common::permissions::AuditAction::Deny,
                     crate::sandbox::permission_broker::audit_kind(reason),
                     path.display().to_string(),

@@ -21,10 +21,10 @@ ahma_mcp = { path = "../ahma_mcp" }
 ahma_core = { path = "../ahma_core" }
 anyhow.workspace = true
 async-trait.workspace = true
-chrono = { workspace = true }
 crossterm.workspace = true
 dunce.workspace = true
 futures.workspace = true
+jiff.workspace = true
 # Same spec as ahma_simplify, so it is one artifact, not a second flavour.
 pulldown-cmark = "0.13"
 ratatui.workspace = true

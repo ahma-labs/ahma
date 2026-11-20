@@ -328,7 +328,7 @@ fn run_settings_set(
     );
     if edit.changed() {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
-            &chrono::Local::now().to_rfc3339(),
+            &ahma_common::timestamp::rfc3339_local_now(),
             "cli",
             SettingsFile::for_path(&target).label(),
             key,
@@ -667,7 +667,7 @@ fn run_sandbox_renew(
             path: &existing.path,
             access: existing.access,
             granted_by: existing.granted_by.clone(),
-            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::local_date_today()),
             note: existing.note.clone(),
             surface: "cli",
             live_scopes: &[],
@@ -752,7 +752,7 @@ fn run_sandbox_grant(file: &std::path::Path, req: GrantRequest) -> Result<()> {
             path: &dir,
             access,
             granted_by: by,
-            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::local_date_today()),
             note,
             surface: "cli",
             live_scopes: &live_scopes,
@@ -840,7 +840,7 @@ fn run_sandbox_grant_session(
     ahma_common::session_grants::record(&store, &grant)?;
     ahma_common::permissions::append_audit(
         &ahma_common::permissions::AuditEntry::new(
-            chrono::Local::now().to_rfc3339(),
+            ahma_common::timestamp::rfc3339_local_now(),
             ahma_common::permissions::AuditAction::Grant,
             ahma_common::permissions::GrantKind::FsScope,
             canonical.display().to_string(),
@@ -1026,7 +1026,7 @@ use ahma_common::permissions::{
 fn audit(action: AuditAction, kind: GrantKind, subject: String, access: Option<String>) {
     append_audit(
         &AuditEntry::new(
-            chrono::Local::now().to_rfc3339(),
+            ahma_common::timestamp::rfc3339_local_now(),
             action,
             kind,
             subject,
@@ -2479,7 +2479,7 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
         let mut answer = String::new();
         stdin.lock().read_line(&mut answer)?;
         if answer.trim().eq_ignore_ascii_case("y") {
-            let now = chrono::Local::now().to_rfc3339();
+            let now = ahma_common::timestamp::rfc3339_local_now();
             match fix.apply(&now) {
                 Ok(done) => println!("{done}."),
                 Err(e) => println!("Could not apply: {e:#}"),

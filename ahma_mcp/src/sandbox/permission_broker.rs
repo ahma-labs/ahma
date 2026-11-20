@@ -399,7 +399,7 @@ impl PermissionBroker {
             } => {
                 append_audit(
                     &AuditEntry::new(
-                        chrono::Local::now().to_rfc3339(),
+                        ahma_common::timestamp::rfc3339_local_now(),
                         AuditAction::Deny,
                         audit_kind(reason),
                         path.display().to_string(),
@@ -470,11 +470,11 @@ fn record_scope_grant_persistence(
     live_scopes: &[std::path::PathBuf],
     workspace: Option<&Path>,
 ) -> bool {
-    let granted_at = chrono::Local::now();
+    let granted_at = ahma_common::timestamp::local_now();
     if !ans.tier.is_persistent() {
         append_audit(
             &AuditEntry::new(
-                granted_at.to_rfc3339(),
+                ahma_common::timestamp::rfc3339_zoned(&granted_at),
                 AuditAction::Grant,
                 GrantKind::FsScope,
                 ans.path.display().to_string(),
@@ -508,7 +508,7 @@ fn record_scope_grant_persistence(
             path: ans.path,
             access: ans.access,
             granted_by,
-            granted_at: Some(granted_at.format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::date(&granted_at)),
             note: None,
             surface: ans.surface,
             live_scopes,
@@ -635,7 +635,7 @@ pub(crate) fn apply_log_target_answer(
     } else {
         append_audit(
             &AuditEntry::new(
-                chrono::Local::now().to_rfc3339(),
+                ahma_common::timestamp::rfc3339_local_now(),
                 AuditAction::Grant,
                 GrantKind::LogTarget,
                 target.display().to_string(),
