@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use ahma_common::config::{PersistentScope, ScopeAccess};
-use ahma_common::harness_asks::{self, Question, Refusal};
+use ahma_common::harness_asks::{self, CommandDigest, Question, Refusal};
 
 /// The `run-shell` flag that carries an approved question's token. Only the
 /// hook writes it: a command the agent itself wrote with this flag is refused
@@ -85,7 +85,7 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
         access,
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
-        command_digest: Some(ahma_common::harness_asks::command_digest(command)),
+        command_digest: Some(CommandDigest::of(command)),
         programs: ahma_common::harness_asks::command_programs(command),
     };
     if let Err(e) = harness_asks::record_refusal(&dir, &workspace_for(cwd), refusal) {
@@ -436,7 +436,7 @@ pub(super) fn record_escape(cwd: &Path, command: &str, why: &str) {
         return;
     };
     let refusal = harness_asks::EscapeRefusal {
-        command_digest: ahma_common::harness_asks::command_digest(command),
+        command_digest: CommandDigest::of(command),
         why: why.to_string(),
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
@@ -1557,7 +1557,7 @@ mod tests {
     #[test]
     fn the_escape_dialog_is_plain() {
         let refusal = harness_asks::EscapeRefusal {
-            command_digest: "d".into(),
+            command_digest: CommandDigest::of("d"),
             why: crate::sandbox::mach::blocked_line("com.google.Chrome.MachPortRendezvousServer"),
             at: 0,
             harness_pid: None,

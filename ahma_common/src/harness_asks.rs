@@ -82,7 +82,7 @@ pub struct Refusal {
     /// Digest of the command that was refused: the dialog asks when that
     /// command is run again, never before an unrelated one (SPEC R-PERM.10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command_digest: Option<String>,
+    pub command_digest: Option<CommandDigest>,
     /// The programs that command ran ([`command_programs`]): a later command
     /// running one of them is asked about too (SPEC R-PERM.10.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -291,11 +291,32 @@ pub fn with_sudo_askpass(command: &str) -> String {
     out
 }
 
-/// The digest a command is recorded and matched under: of the command with
-/// surrounding whitespace trimmed, so a re-run that differs only by a
-/// trailing newline is still "the same command" (SPEC R-PERM.10).
-pub fn command_digest(command: &str) -> String {
-    crate::digest::sha256_hex(command.trim().as_bytes())
+/// The digest a command line is recorded and matched under (SPEC R-PERM.10, R-ESCAPE.1): the
+/// SHA-256, in lowercase hex, of the command with surrounding whitespace trimmed, so a re-run
+/// that differs only by a trailing newline is still "the same command".
+///
+/// Its own type so a command line is never compared with a digest, nor one passed where the
+/// other is expected: [`CommandDigest::of`] is the only way to make one from a command. It is
+/// stored as the bare hex string every earlier ahma wrote (`serde(transparent)`), so the
+/// store's format is unchanged; reading a stored record is the one other way in.
+///
+/// ```compile_fail
+/// let d: ahma_common::harness_asks::CommandDigest = String::from("make build").into();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CommandDigest(String);
+
+impl CommandDigest {
+    /// The digest of `command`.
+    pub fn of(command: &str) -> Self {
+        Self(crate::digest::sha256_hex(command.trim().as_bytes()))
+    }
+}
+
+/// A fresh one-use token for a question put through the harness dialog.
+fn new_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Whether `command` can use the SSH agent: `ssh`, `scp`, `sftp`, `rsync`, or
@@ -368,10 +389,10 @@ pub fn may_use_ssh_agent(command: &str) -> bool {
 /// the question never came. A refusal recorded without a digest (an older
 /// ahma) matches any command.
 pub fn refused_for(refusal: &Refusal, command: &str) -> bool {
-    let Some(digest) = refusal.command_digest.as_deref() else {
+    let Some(digest) = refusal.command_digest.as_ref() else {
         return true;
     };
-    digest == command_digest(command)
+    *digest == CommandDigest::of(command)
         || command_programs(command)
             .iter()
             .any(|p| refusal.programs.contains(p))
@@ -467,8 +488,8 @@ pub fn is_volume_root(dir: &Path) -> bool {
 /// without a command (an MCP `run_terminal_command`) be asked about at all —
 /// without ever holding an unrelated command such as `cargo build` or
 /// `git status`.
-pub fn refused_for_ssh(recorded: Option<&str>, command: &str) -> bool {
-    recorded.is_some_and(|d| d == command_digest(command)) || may_use_ssh_agent(command)
+pub fn refused_for_ssh(recorded: Option<&CommandDigest>, command: &str) -> bool {
+    recorded.is_some_and(|d| *d == CommandDigest::of(command)) || may_use_ssh_agent(command)
 }
 
 /// A question put to the human through a harness dialog.
@@ -481,7 +502,7 @@ pub struct Asked {
     pub token: String,
     /// Digest of the command the dialog approved: a token is honoured only
     /// for that command.
-    pub command_digest: String,
+    pub command_digest: CommandDigest,
     pub asked_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_pid: Option<u32>,
@@ -538,7 +559,7 @@ impl Answered {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscapeRefusal {
     /// Digest of the exact command: only that command is ever offered.
-    pub command_digest: String,
+    pub command_digest: CommandDigest,
     /// What the kernel refused, for the dialog.
     pub why: String,
     pub at: u64,
@@ -573,7 +594,7 @@ pub fn next_escape_question(
     session_id: &str,
     command: &str,
 ) -> Option<EscapeRefusal> {
-    let digest = command_digest(command);
+    let digest = CommandDigest::of(command);
     asks.escapes
         .iter()
         .find(|r| {
@@ -594,7 +615,7 @@ pub fn mark_escape_asked(
     refusal: &EscapeRefusal,
     now: u64,
 ) -> Result<String> {
-    let token = uuid::Uuid::new_v4().simple().to_string();
+    let token = new_token();
     let asked = AskedEscape {
         session_id: session_id.to_string(),
         refusal: refusal.clone(),
@@ -616,21 +637,7 @@ pub fn take_escape_approved(
     command: &str,
     now: u64,
 ) -> Option<AskedEscape> {
-    let digest = command_digest(command);
-    update(dir, workspace, now, |asks| {
-        let asked = asks.escapes_asked.iter_mut().find(|a| {
-            a.token == token
-                && !a.used
-                && a.refusal.command_digest == digest
-                && now.saturating_sub(a.asked_at) <= TOKEN_TTL_SECS
-        })?;
-        asked.used = true;
-        let asked = asked.clone();
-        asks.escapes.retain(|r| r.command_digest != digest);
-        Some(asked)
-    })
-    .ok()
-    .flatten()
+    spend(dir, workspace, token, &CommandDigest::of(command), now)
 }
 
 /// A question put to the human before a command that works in another repository (SPEC
@@ -641,7 +648,7 @@ pub struct AskedRepo {
     /// The other repository's root.
     pub repo: PathBuf,
     pub token: String,
-    pub command_digest: String,
+    pub command_digest: CommandDigest,
     pub asked_at: u64,
     #[serde(default)]
     pub used: bool,
@@ -736,12 +743,12 @@ pub fn mark_repo_asked(
     command: &str,
     now: u64,
 ) -> Result<String> {
-    let token = uuid::Uuid::new_v4().simple().to_string();
+    let token = new_token();
     let asked = AskedRepo {
         session_id: session_id.to_string(),
         repo: repo.to_path_buf(),
         token: token.clone(),
-        command_digest: command_digest(command),
+        command_digest: CommandDigest::of(command),
         asked_at: now,
         used: false,
     };
@@ -758,25 +765,7 @@ pub fn take_repo_approved(
     command: &str,
     now: u64,
 ) -> Option<AskedRepo> {
-    let digest = command_digest(command);
-    update(dir, workspace, now, |asks| {
-        let asked = asks.repos_asked.iter_mut().find(|a| {
-            a.token == token
-                && !a.used
-                && a.command_digest == digest
-                && now.saturating_sub(a.asked_at) <= TOKEN_TTL_SECS
-        })?;
-        asked.used = true;
-        let asked = asked.clone();
-        asks.repos_acknowledged.push(RepoAck {
-            session_id: asked.session_id.clone(),
-            repo: asked.repo.clone(),
-            at: now,
-        });
-        Some(asked)
-    })
-    .ok()
-    .flatten()
+    spend(dir, workspace, token, &CommandDigest::of(command), now)
 }
 
 /// One signature the SSH key broker refused a hooked command because no grant
@@ -802,7 +791,7 @@ pub struct SshRefusal {
     /// Digest of the command that was refused: the dialog asks when that
     /// command is run again, never before an unrelated one (SPEC R-PERM.10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command_digest: Option<String>,
+    pub command_digest: Option<CommandDigest>,
 }
 
 impl SshRefusal {
@@ -818,7 +807,7 @@ pub struct AskedSsh {
     pub session_id: String,
     pub refusal: SshRefusal,
     pub token: String,
-    pub command_digest: String,
+    pub command_digest: CommandDigest,
     pub asked_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_pid: Option<u32>,
@@ -1015,6 +1004,146 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
         .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
 }
 
+/// What spending a one-use token reads and writes of the record that carries it.
+struct Ticket<'a> {
+    token: &'a str,
+    /// The command the token approves: the one the dialog was shown for.
+    approves: &'a CommandDigest,
+    asked_at: u64,
+    used: &'a mut bool,
+}
+
+impl Ticket<'_> {
+    /// Whether this record honours `token` for the command `digest` names at `now`: it carries
+    /// that token, is unspent, was issued for exactly that command, and is no older than
+    /// [`TOKEN_TTL_SECS`].
+    fn honours(&self, token: &str, digest: &CommandDigest, now: u64) -> bool {
+        self.token == token
+            && !*self.used
+            && self.approves == digest
+            && now.saturating_sub(self.asked_at) <= TOKEN_TTL_SECS
+    }
+}
+
+/// A question put through the harness dialog with a one-use token (SPEC R-PERM.10): where its
+/// kind is kept, and what a spent token settles.
+trait OneUseToken: Clone {
+    /// Where records of this kind are kept.
+    fn records(asks: &mut WorkspaceAsks) -> &mut Vec<Self>;
+    fn ticket(&mut self) -> Ticket<'_>;
+    /// What a yes settles, under the same lock as the spend.
+    fn settle(&self, asks: &mut WorkspaceAsks, now: u64);
+}
+
+impl OneUseToken for Asked {
+    fn records(asks: &mut WorkspaceAsks) -> &mut Vec<Self> {
+        &mut asks.asked
+    }
+    fn ticket(&mut self) -> Ticket<'_> {
+        Ticket {
+            token: &self.token,
+            approves: &self.command_digest,
+            asked_at: self.asked_at,
+            used: &mut self.used,
+        }
+    }
+    /// The refusals under the approved folder are answered.
+    fn settle(&self, asks: &mut WorkspaceAsks, _now: u64) {
+        let dir = &self.question.dir;
+        asks.refusals.retain(|r| !r.path.starts_with(dir));
+    }
+}
+
+impl OneUseToken for AskedSsh {
+    fn records(asks: &mut WorkspaceAsks) -> &mut Vec<Self> {
+        &mut asks.ssh_asked
+    }
+    /// Bound to the command the dialog was shown for, not the one first refused: a refusal of
+    /// `git fetch origin` is asked before `git fetch`, and approves `git fetch`.
+    fn ticket(&mut self) -> Ticket<'_> {
+        Ticket {
+            token: &self.token,
+            approves: &self.command_digest,
+            asked_at: self.asked_at,
+            used: &mut self.used,
+        }
+    }
+    /// The refused signature is answered.
+    fn settle(&self, asks: &mut WorkspaceAsks, _now: u64) {
+        asks.ssh_refusals.retain(|r| !r.same_subject(&self.refusal));
+    }
+}
+
+impl OneUseToken for AskedRepo {
+    fn records(asks: &mut WorkspaceAsks) -> &mut Vec<Self> {
+        &mut asks.repos_asked
+    }
+    fn ticket(&mut self) -> Ticket<'_> {
+        Ticket {
+            token: &self.token,
+            approves: &self.command_digest,
+            asked_at: self.asked_at,
+            used: &mut self.used,
+        }
+    }
+    /// The yes is remembered for its harness session (SPEC R-PERM.11).
+    fn settle(&self, asks: &mut WorkspaceAsks, now: u64) {
+        asks.repos_acknowledged.push(RepoAck {
+            session_id: self.session_id.clone(),
+            repo: self.repo.clone(),
+            at: now,
+        });
+    }
+}
+
+impl OneUseToken for AskedEscape {
+    fn records(asks: &mut WorkspaceAsks) -> &mut Vec<Self> {
+        &mut asks.escapes_asked
+    }
+    /// An escape is asked only before exactly the refused command, so the refusal's digest is
+    /// the approved command's.
+    fn ticket(&mut self) -> Ticket<'_> {
+        Ticket {
+            token: &self.token,
+            approves: &self.refusal.command_digest,
+            asked_at: self.asked_at,
+            used: &mut self.used,
+        }
+    }
+    /// The refusal is forgotten, so the next refusal of the same command is asked about again
+    /// (SPEC R-ESCAPE.1).
+    fn settle(&self, asks: &mut WorkspaceAsks, _now: u64) {
+        let digest = &self.refusal.command_digest;
+        asks.escapes.retain(|r| r.command_digest != *digest);
+    }
+}
+
+/// Spend a one-use `token` for exactly the command `digest` names (SPEC R-PERM.10, R-PERM.11,
+/// R-CRED.3, R-ESCAPE.2): the first record of kind `A` that [honours](Ticket::honours) it is
+/// marked spent, and what it settles is settled, in one locked step. A token is good once.
+/// `None` when no record honours it, or the store cannot be read or written: a token that
+/// cannot be spent approves nothing.
+fn spend<A: OneUseToken>(
+    dir: &Path,
+    workspace: &Path,
+    token: &str,
+    digest: &CommandDigest,
+    now: u64,
+) -> Option<A> {
+    update(dir, workspace, now, |asks| {
+        let records = A::records(asks);
+        let i = records
+            .iter_mut()
+            .position(|a| a.ticket().honours(token, digest, now))?;
+        *records[i].ticket().used = true;
+        let spent = records[i].clone();
+        spent.settle(asks, now);
+        Some(spent)
+    })
+    .ok()
+    .flatten()
+}
+
 /// Remember that the SSH key broker refused a hooked command in `workspace`.
 pub fn record_ssh_refusal(dir: &Path, workspace: &Path, refusal: SshRefusal) -> Result<()> {
     update(dir, workspace, refusal.at, |asks| {
@@ -1035,7 +1164,7 @@ pub fn next_ssh_question(
 ) -> Option<SshRefusal> {
     asks.ssh_refusals
         .iter()
-        .filter(|r| refused_for_ssh(r.command_digest.as_deref(), command) && !covered(r))
+        .filter(|r| refused_for_ssh(r.command_digest.as_ref(), command) && !covered(r))
         .find(|r| {
             !asks
                 .ssh_asked
@@ -1056,12 +1185,12 @@ pub fn mark_ssh_asked(
     harness_pid: Option<u32>,
     now: u64,
 ) -> Result<String> {
-    let token = uuid::Uuid::new_v4().simple().to_string();
+    let token = new_token();
     let asked = AskedSsh {
         session_id: session_id.to_string(),
         refusal: refusal.clone(),
         token: token.clone(),
-        command_digest: command_digest(command),
+        command_digest: CommandDigest::of(command),
         asked_at: now,
         harness_pid,
         used: false,
@@ -1078,22 +1207,7 @@ pub fn take_ssh_approved(
     command: &str,
     now: u64,
 ) -> Option<AskedSsh> {
-    let digest = command_digest(command);
-    update(dir, workspace, now, |asks| {
-        let asked = asks.ssh_asked.iter_mut().find(|a| {
-            a.token == token
-                && !a.used
-                && a.command_digest == digest
-                && now.saturating_sub(a.asked_at) <= TOKEN_TTL_SECS
-        })?;
-        asked.used = true;
-        let asked = asked.clone();
-        asks.ssh_refusals
-            .retain(|r| !r.same_subject(&asked.refusal));
-        Some(asked)
-    })
-    .ok()
-    .flatten()
+    spend(dir, workspace, token, &CommandDigest::of(command), now)
 }
 
 /// Every workspace's records in `dir`, without what has expired, ordered by
@@ -1276,12 +1390,12 @@ pub fn ask_next(
         view.refusals.retain(|r| consider(r));
         let question = next_question(&view, session_id, covered, home, scopes)?;
         let pid = harness_pid.or_else(|| view.refusals.iter().find_map(|r| r.harness_pid))?;
-        let token = uuid::Uuid::new_v4().simple().to_string();
+        let token = new_token();
         asks.asked.push(Asked {
             session_id: session_id.to_string(),
             question: question.clone(),
             token: token.clone(),
-            command_digest: command_digest(command),
+            command_digest: CommandDigest::of(command),
             asked_at: now,
             harness_pid: Some(pid),
             used: false,
@@ -1301,12 +1415,12 @@ pub fn mark_asked(
     harness_pid: Option<u32>,
     now: u64,
 ) -> Result<String> {
-    let token = uuid::Uuid::new_v4().simple().to_string();
+    let token = new_token();
     let asked = Asked {
         session_id: session_id.to_string(),
         question: question.clone(),
         token: token.clone(),
-        command_digest: command_digest(command),
+        command_digest: CommandDigest::of(command),
         asked_at: now,
         harness_pid,
         used: false,
@@ -1325,22 +1439,7 @@ pub fn take_approved(
     command: &str,
     now: u64,
 ) -> Option<Asked> {
-    let digest = command_digest(command);
-    update(dir, workspace, now, |asks| {
-        let asked = asks.asked.iter_mut().find(|a| {
-            a.token == token
-                && !a.used
-                && a.command_digest == digest
-                && now.saturating_sub(a.asked_at) <= TOKEN_TTL_SECS
-        })?;
-        asked.used = true;
-        let asked = asked.clone();
-        let dir = &asked.question.dir;
-        asks.refusals.retain(|r| !r.path.starts_with(dir));
-        Some(asked)
-    })
-    .ok()
-    .flatten()
+    spend(dir, workspace, token, &CommandDigest::of(command), now)
 }
 
 /// The deepest directory containing both `a` and `b`, if they share any.
@@ -1461,7 +1560,7 @@ mod tests {
             label: "github.com".into(),
             at: 100,
             harness_pid: Some(7),
-            command_digest: Some(crate::digest::sha256_hex(b"git push")),
+            command_digest: Some(CommandDigest::of("git push")),
         };
         record_ssh_refusal(dir.path(), ws, refusal.clone()).unwrap();
         record_ssh_refusal(
@@ -1517,7 +1616,7 @@ mod tests {
             dir.path(),
             ws,
             EscapeRefusal {
-                command_digest: crate::digest::sha256_hex(cmd.as_bytes()),
+                command_digest: CommandDigest::of(cmd),
                 why: "lsopen".into(),
                 at: 100,
                 harness_pid: Some(7),
@@ -2068,7 +2167,7 @@ mod tests {
             label: "github.com".into(),
             at: 100,
             harness_pid: Some(7),
-            command_digest: Some(crate::digest::sha256_hex(b"git fetch origin")),
+            command_digest: Some(CommandDigest::of("git fetch origin")),
         };
         record_ssh_refusal(dir.path(), ws, refusal).unwrap();
         let asks = load(dir.path(), ws, 100);
@@ -2086,6 +2185,10 @@ mod tests {
         // Approving with git fetch spends the token
         let q = next_ssh_question(&asks, "s1", "git fetch", &|_| false).unwrap();
         let token = mark_ssh_asked(dir.path(), ws, "s1", &q, "git fetch", Some(7), 100).unwrap();
+        assert!(
+            take_ssh_approved(dir.path(), ws, &token, "git fetch origin", 100).is_none(),
+            "the token approves the command asked about, not the one first refused"
+        );
         assert!(take_ssh_approved(dir.path(), ws, &token, "git fetch", 100).is_some());
     }
 
@@ -2119,12 +2222,15 @@ mod tests {
     #[test]
     fn a_command_is_the_same_command_whatever_its_surrounding_whitespace() {
         assert_eq!(
-            command_digest("  make build\n"),
-            command_digest("make build")
+            CommandDigest::of("  make build\n"),
+            CommandDigest::of("make build")
         );
-        assert_ne!(command_digest("make build"), command_digest("make  build"));
+        assert_ne!(
+            CommandDigest::of("make build"),
+            CommandDigest::of("make  build")
+        );
         let mut refused = refusal(Path::new("/w/x"), ScopeAccess::Rw);
-        refused.command_digest = Some(command_digest("make build"));
+        refused.command_digest = Some(CommandDigest::of("make build"));
         assert!(refused_for(&refused, "make build\n"));
     }
 
@@ -2190,7 +2296,7 @@ mod tests {
     fn a_refusal_is_asked_about_before_the_same_program_runs_again() {
         let refused_command = "cd ios/Neubit && xcodebuild -scheme Neubit build";
         let mut refused = refusal(Path::new("/w/x"), ScopeAccess::Rw);
-        refused.command_digest = Some(command_digest(refused_command));
+        refused.command_digest = Some(CommandDigest::of(refused_command));
         refused.programs = command_programs(refused_command);
         assert!(refused_for(&refused, refused_command));
         assert!(refused_for(
@@ -2322,5 +2428,147 @@ mod tests {
         assert_eq!(entered("{ cd /w/neubit4; make; }"), [true]);
         assert_eq!(entered("time cd /w/neubit4 && ls"), [true]);
         assert_eq!(entered("sudo ls /w/neubit4"), [false]);
+    }
+
+    /// SPEC R-PERM.10, R-PERM.11, R-CRED.3, R-ESCAPE.2: every one-use token the harness dialog
+    /// issues (folder, repository, SSH signature, escape) is spent by one rule: only for the
+    /// command it was issued for, whatever its surrounding whitespace; only while unspent; only
+    /// within [`TOKEN_TTL_SECS`], to the last second; and an attempt that fails spends nothing.
+    #[test]
+    fn every_one_use_token_is_spent_by_one_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, ws) = (tmp.path(), Path::new("/ws/repo"));
+        let (cmd, at) = ("make heavy", 100);
+        let question = Question {
+            dir: PathBuf::from("/c"),
+            access: ScopeAccess::Rw,
+            covers: vec![PathBuf::from("/c/x")],
+            programs: Vec::new(),
+        };
+        let ssh = SshRefusal {
+            key: "SHA256:key".into(),
+            key_comment: String::new(),
+            destination: "host:SHA256:host".into(),
+            label: "github.com".into(),
+            at,
+            harness_pid: Some(7),
+            command_digest: None,
+        };
+        let escape = EscapeRefusal {
+            command_digest: CommandDigest::of(cmd),
+            why: "lsopen".into(),
+            at,
+            harness_pid: Some(7),
+        };
+        record_escape(dir, ws, escape.clone()).unwrap();
+        type Take = fn(&Path, &Path, &str, &str, u64) -> bool;
+        let kinds: [(&str, String, Take); 4] = [
+            (
+                "folder",
+                mark_asked(dir, ws, "s1", &question, cmd, Some(7), at).unwrap(),
+                |d, w, t, c, n| take_approved(d, w, t, c, n).is_some(),
+            ),
+            (
+                "repository",
+                mark_repo_asked(dir, ws, "s1", Path::new("/other"), cmd, at).unwrap(),
+                |d, w, t, c, n| take_repo_approved(d, w, t, c, n).is_some(),
+            ),
+            (
+                "ssh",
+                mark_ssh_asked(dir, ws, "s1", &ssh, cmd, Some(7), at).unwrap(),
+                |d, w, t, c, n| take_ssh_approved(d, w, t, c, n).is_some(),
+            ),
+            (
+                "escape",
+                mark_escape_asked(dir, ws, "s1", &escape, at).unwrap(),
+                |d, w, t, c, n| take_escape_approved(d, w, t, c, n).is_some(),
+            ),
+        ];
+        for (kind, token, take) in kinds {
+            assert!(
+                !take(dir, ws, &token, "make other", at + 1),
+                "{kind}: another command"
+            );
+            assert!(
+                !take(dir, ws, "not-a-token", cmd, at + 1),
+                "{kind}: unknown token"
+            );
+            assert!(
+                !take(dir, ws, &token, cmd, at + TOKEN_TTL_SECS + 1),
+                "{kind}: expired"
+            );
+            assert!(
+                take(dir, ws, &token, "  make heavy\n", at + TOKEN_TTL_SECS),
+                "{kind}: good to the last second, whitespace aside, after failed attempts"
+            );
+            assert!(
+                !take(dir, ws, &token, cmd, at + TOKEN_TTL_SECS),
+                "{kind}: good once"
+            );
+        }
+    }
+
+    /// The store's format (SPEC R-PERM.10): a command's digest is the bare lowercase hex SHA-256
+    /// of the trimmed command line. Records an earlier ahma wrote still spend, and what is saved
+    /// back keeps that shape.
+    #[test]
+    fn a_digest_is_stored_as_the_bare_hex_it_always_was() {
+        const MAKE_HEAVY: &str = "72da4b304f62a4713851f0200e20485c3bb0585c4cf519bbf9c31ae29ed93359";
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, ws) = (tmp.path(), Path::new("/ws/repo"));
+        let raw = serde_json::json!({
+            "workspace": ws,
+            "refusals": [{"path": "/c/x", "grant_dir": "/c", "access": "rw", "at": 100,
+                          "command_digest": MAKE_HEAVY}],
+            "asked": [{"session_id": "s1",
+                       "question": {"dir": "/c", "access": "rw", "covers": ["/c/x"]},
+                       "token": "t-folder", "command_digest": MAKE_HEAVY, "asked_at": 100,
+                       "harness_pid": 7}],
+            "ssh_asked": [{"session_id": "s1",
+                           "refusal": {"key": "SHA256:k", "destination": "host:SHA256:h",
+                                       "at": 100, "command_digest": MAKE_HEAVY},
+                           "token": "t-ssh", "command_digest": MAKE_HEAVY, "asked_at": 100}],
+            "repos_asked": [{"session_id": "s1", "repo": "/other", "token": "t-repo",
+                             "command_digest": MAKE_HEAVY, "asked_at": 100}],
+            "escapes_asked": [{"session_id": "s1",
+                               "refusal": {"command_digest": MAKE_HEAVY, "why": "lsopen",
+                                           "at": 100},
+                               "token": "t-escape", "asked_at": 100}],
+        });
+        std::fs::write(file_for(dir, ws), serde_json::to_vec(&raw).unwrap()).unwrap();
+        let asks = load(dir, ws, 101);
+        assert!(refused_for(&asks.refusals[0], "make heavy\n"));
+        assert!(!refused_for(&asks.refusals[0], "make other"));
+        assert!(take_approved(dir, ws, "t-folder", "make heavy", 101).is_some());
+        assert!(take_ssh_approved(dir, ws, "t-ssh", "make heavy", 101).is_some());
+        assert!(take_repo_approved(dir, ws, "t-repo", "make heavy", 101).is_some());
+        assert!(take_escape_approved(dir, ws, "t-escape", "make heavy", 101).is_some());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file_for(dir, ws)).unwrap()).unwrap();
+        for pointer in [
+            "/asked/0/command_digest",
+            "/ssh_asked/0/command_digest",
+            "/ssh_asked/0/refusal/command_digest",
+            "/repos_asked/0/command_digest",
+            "/escapes_asked/0/refusal/command_digest",
+        ] {
+            assert_eq!(
+                saved.pointer(pointer),
+                Some(&serde_json::json!(MAKE_HEAVY)),
+                "{pointer}"
+            );
+        }
+    }
+
+    /// The type itself: a trimmed line, hashed, serialized as the bare hex
+    /// every earlier ahma stored.
+    #[test]
+    fn a_command_digest_is_the_trimmed_line_hashed_and_serialized_bare() {
+        let d = CommandDigest::of("  make heavy\n");
+        assert_eq!(d, CommandDigest::of("make heavy"));
+        assert_eq!(
+            serde_json::to_string(&d).unwrap(),
+            "\"72da4b304f62a4713851f0200e20485c3bb0585c4cf519bbf9c31ae29ed93359\""
+        );
     }
 }
