@@ -999,13 +999,12 @@ impl Adapter {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let child = match cmd.spawn() {
-            Ok(child) => child,
+        let mut guard = match ProcessGroupGuard::spawn(&mut cmd) {
+            Ok(guard) => guard,
             Err(e) => {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
         };
-        let mut guard = ProcessGroupGuard::of(&cmd, child);
 
         // Read stdout/stderr concurrently with `wait()` (not after `wait()`
         // returns) so a chatty child can't fill the pipe buffer and deadlock —
@@ -2697,8 +2696,8 @@ async fn execute_with_streaming(
     proc_cmd.stdout(std::process::Stdio::piped());
     proc_cmd.stderr(std::process::Stdio::piped());
 
-    let child = match proc_cmd.spawn() {
-        Ok(child) => child,
+    let mut guard = match ProcessGroupGuard::spawn(proc_cmd) {
+        Ok(guard) => guard,
         Err(e) => {
             guards
                 .end(
@@ -2709,7 +2708,6 @@ async fn execute_with_streaming(
             return;
         }
     };
-    let mut guard = ProcessGroupGuard::of(proc_cmd, child);
 
     let stdout = guard.child_mut().stdout.take().expect("stdout piped");
     let stderr = guard.child_mut().stderr.take().expect("stderr piped");

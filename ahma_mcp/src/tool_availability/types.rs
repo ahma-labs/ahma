@@ -149,8 +149,8 @@ impl ProbePlan {
         // availability probe is exactly the kind of thing that shells out, so
         // the leak is real; route the kill through the shared chokepoint, which
         // takes down the group and confirms the reap.
-        let child = match command.spawn() {
-            Ok(child) => child,
+        let mut guard = match ProcessGroupGuard::spawn(&mut command) {
+            Ok(guard) => guard,
             Err(e) => {
                 return (
                     ProbeExit::NotRun,
@@ -159,7 +159,6 @@ impl ProbePlan {
                 );
             }
         };
-        let mut guard = ProcessGroupGuard::of(&command, child);
 
         // Read both pipes concurrently with the wait, not after it: a probe that
         // fills a pipe buffer would otherwise deadlock against its own timeout.
