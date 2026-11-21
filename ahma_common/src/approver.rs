@@ -2,7 +2,7 @@
 //! R-PERM.2.1, R-CFG10.5).
 //!
 //! Every writer of `~/.ahma/permissions-audit.jsonl` — and of the `surface` of
-//! a ledger row — takes an [`ApproverSurface`] and renders it through
+//! a ledger row — takes an [`ApproverSurface`](crate::approver::ApproverSurface) and renders it through
 //! `Display`, so the set of names a record can carry is this enum and nothing
 //! else. The readers (`AuditEntry`, `GrantRecord`, the ledger rows) keep a
 //! plain `Option<String>`: an old record may hold any string, and reading one
