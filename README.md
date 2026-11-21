@@ -371,10 +371,11 @@ with `ahma permissions grant ssh-sign`. See [docs/ssh-agent-broker.md](docs/ssh-
 
 A sandboxed command can't start a browser itself, so ahma opens `http`/`https` links for it,
 outside the sandbox, in your default browser — only for sites you allowed, for every repo or
-one, with `ahma permissions grant open-url github.com`. Each hooked command's `BROWSER` is
-ahma's own helper, and a whole-line `open https://…` runs as it; a link to any other site is
-refused with one line, and when the command runs again Claude Code's own dialog asks you (yes
-opens it this time). A link sends its whole address to that site, so allow only sites you
+one, with `ahma permissions grant open-url github.com`. Each command's `BROWSER` is ahma's
+own helper, and a whole-line `open https://…` runs as it. A link to any other site is asked
+about: over MCP in your client's own prompt while the command waits; from a hook it is refused
+with one line, and when the command runs again Claude Code's own dialog asks you (yes opens it
+this time). A link sends its whole address to that site, so allow only sites you
 trust. See [docs/open-links.md](docs/open-links.md).
 
 ### Task Vaults — one directory per task *(experimental)*

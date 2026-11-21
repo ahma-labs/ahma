@@ -7,8 +7,9 @@
 //!   each argument and prints the broker's line.
 //! - `broker` and `host` (Unix): the unsandboxed side, one broker per
 //!   command on its own socket, and the factory that gives each command one.
-//! - [`consent`](crate::links::consent): who says yes;
-//!   [`opener`](crate::links::opener): what opens an allowed link.
+//! - [`consent`](crate::links::consent): who says yes for a hooked command;
+//!   `live` (Unix): who says yes on the MCP path, asked while the command
+//!   waits; [`opener`](crate::links::opener): what opens an allowed link.
 
 pub mod policy;
 
@@ -20,3 +21,5 @@ pub mod opener;
 pub mod broker;
 #[cfg(unix)]
 pub mod host;
+#[cfg(unix)]
+pub mod live;

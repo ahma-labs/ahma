@@ -9,8 +9,8 @@ use crate::sandbox::handoff_watch::HandoffWatch;
 
 /// What a running command holds until it has ended: its place in the
 /// workspace queue (SPEC R2.7.1), its mutex group gate (R2.7.2), the
-/// deny-tier watch (R6.1.7) and its SSH key
-/// broker (R-CRED.1).
+/// deny-tier watch (R6.1.7), its SSH key broker (R-CRED.1) and its link
+/// broker (R-LINK.1).
 ///
 /// [`RunGuards::end`] is the one way to end the operation, and it takes the
 /// guards by value. Every ending therefore runs the same steps in the same
@@ -31,6 +31,8 @@ pub(super) struct RunGuards {
     handoff: Option<HandoffWatch>,
     #[cfg(unix)]
     broker: Option<crate::credentials::ssh_agent::host::BrokerLease>,
+    #[cfg(unix)]
+    links: Option<crate::links::host::LinkLease>,
 }
 
 impl RunGuards {
@@ -56,6 +58,8 @@ impl RunGuards {
             handoff: None,
             #[cfg(unix)]
             broker: None,
+            #[cfg(unix)]
+            links: None,
         };
         match super::wait_for_lease(ticket, monitor, op_id, cancel).await {
             // Held until the operation ends: until its process tree is gone.
@@ -122,6 +126,12 @@ impl RunGuards {
         self.broker.as_ref()
     }
 
+    /// Hold the command's link broker (SPEC R-LINK.1) until it has ended.
+    #[cfg(unix)]
+    pub(super) fn hold_links(&mut self, links: Option<crate::links::host::LinkLease>) {
+        self.links = links;
+    }
+
     /// Compare the deny tier with its inventory from before the spawn (SPEC
     /// R6.1.7) and put the report in `output` (`handoff_writes`,
     /// `handoff_alert`), raising the alert while the operation is still
@@ -168,6 +178,8 @@ impl RunGuards {
             handoff,
             #[cfg(unix)]
             broker,
+            #[cfg(unix)]
+            links,
         } = self;
         // What the broker refused, one line each (SPEC R-CRED.10): before the
         // terminal transition, so a waiter observes it deterministically
@@ -178,11 +190,21 @@ impl RunGuards {
                 monitor.append_alert_unique(&op_id, refusal).await;
             }
         }
+        // And what the link broker refused, once each (SPEC R-LINK.6), so a
+        // tool that hid the helper's line still leaves it in the result.
+        #[cfg(unix)]
+        if let Some(links) = &links {
+            for refusal in links.refusal_lines() {
+                monitor.append_alert_unique(&op_id, refusal).await;
+            }
+        }
         if let Some(watch) = handoff {
             let _ = finish_handoff_watch(watch, &op_id, &subject).await;
         }
         #[cfg(unix)]
         drop(broker);
+        #[cfg(unix)]
+        drop(links);
         // The gate was taken after the lease: handed on first.
         drop(mutex);
         drop(lease);

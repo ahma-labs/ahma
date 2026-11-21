@@ -50,6 +50,41 @@ impl LocalResolver for DnsResolver {
     }
 }
 
+/// Who is told, as it happens, what a command's link broker refused and
+/// what it is asking a human while the command waits (SPEC R-LINK.6): on the
+/// MCP path, an alert on the command's operation. Shared by the broker and
+/// its consent, and set once the command's operation is known
+/// ([`LinkLease::watch`](crate::links::host::LinkLease::watch)); until then,
+/// and when nobody watches, nothing is told.
+#[derive(Clone, Default)]
+pub struct LinkWatch(Arc<Mutex<Option<LinkWatcher>>>);
+
+/// What a [`LinkWatch`] tells: one line.
+pub type LinkWatcher = Arc<dyn Fn(&str) + Send + Sync>;
+
+impl std::fmt::Debug for LinkWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LinkWatch")
+            .field(&self.0.lock().is_some())
+            .finish()
+    }
+}
+
+impl LinkWatch {
+    /// Tell `watcher` from now on.
+    pub fn set(&self, watcher: LinkWatcher) {
+        *self.0.lock() = Some(watcher);
+    }
+
+    /// Tell whoever watches `line`.
+    pub fn tell(&self, line: &str) {
+        let watcher = self.0.lock().clone();
+        if let Some(watcher) = watcher {
+            watcher(line);
+        }
+    }
+}
+
 /// What the broker did, in order, for the command's result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkEvent {
@@ -68,6 +103,7 @@ pub struct LinkBroker {
     /// Links this command asked for, opened or not (SPEC R-LINK.8).
     asked: AtomicUsize,
     events: Mutex<Vec<LinkEvent>>,
+    watch: LinkWatch,
 }
 
 impl LinkBroker {
@@ -80,13 +116,30 @@ impl LinkBroker {
         opener: Arc<dyn Opener>,
         resolver: Arc<dyn LocalResolver>,
     ) -> Arc<Self> {
+        Self::watched(consent, opener, resolver, LinkWatch::default())
+    }
+
+    /// A broker that tells `watch` each refusal; its consent may hold the
+    /// same watch, to say while it asks.
+    pub fn watched(
+        consent: Arc<dyn LinkConsent>,
+        opener: Arc<dyn Opener>,
+        resolver: Arc<dyn LocalResolver>,
+        watch: LinkWatch,
+    ) -> Arc<Self> {
         Arc::new(Self {
             consent,
             opener,
             resolver,
             asked: AtomicUsize::new(0),
             events: Mutex::new(Vec::new()),
+            watch,
         })
+    }
+
+    /// Who is told what this broker refuses, as it refuses it.
+    pub fn watch(&self) -> &LinkWatch {
+        &self.watch
     }
 
     /// What the broker did for this command so far.
@@ -165,6 +218,7 @@ impl LinkBroker {
 
     fn refuse(&self, line: String) -> LinkReply {
         self.events.lock().push(LinkEvent::Refused(line.clone()));
+        self.watch.tell(&line);
         LinkReply {
             opened: false,
             line,

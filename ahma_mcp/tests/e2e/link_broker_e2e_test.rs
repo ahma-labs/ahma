@@ -195,3 +195,93 @@ fn a_browser_given_a_file_says_whose_it_is() {
     assert!(said.contains(&page.display().to_string()), "{said}");
     assert_eq!(opened(home.path()), "");
 }
+
+/// SPEC R-LINK.1, R-LINK.6: on the MCP path the command's `$BROWSER` is the
+/// real helper, which asks the broker; the broker asks the MCP client while
+/// the command waits, and "this time" opens the link in that same run — the
+/// helper prints the broker's line and the opener records the address. The
+/// server is in process, its client a [`RecordingClient`] that answers
+/// `elicitation/create`; the helper is the real `ahma` binary, under its
+/// helper name. Before, an MCP command was served no broker.
+///
+/// [`RecordingClient`]: ahma_mcp::test_utils::recording_client::RecordingClient
+#[tokio::test]
+async fn an_mcp_command_opens_a_link_once_the_client_answers_this_time() {
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+    use ahma_mcp::test_utils::recording_client::RecordingClient;
+    let bin = ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma");
+    let home = tempfile::tempdir().unwrap();
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+    let (_ws, ws) = workspace();
+    let helper = ahma_mcp::links::host::helper_link_in(home.path(), &bin).unwrap();
+    let links = std::sync::Arc::new(
+        ahma_mcp::links::live::LiveLinks::new(
+            Some(home.path().join(".ahma").join("settings.toml")),
+            vec![ws.clone()],
+            None,
+        )
+        .with_helper(helper),
+    );
+    let client = RecordingClient::new("link-e2e").with_elicitation(Some("once"));
+    let prompts = client.elicitation().unwrap();
+    let mcp =
+        ahma_mcp::test_utils::in_process::create_in_process_mcp_with_links(client, &ws, links)
+            .await
+            .expect("in-process server");
+
+    let sc = ahma_mcp::AhmaMcpService::build_shell_subcommand_config(
+        None,
+        &ahma_mcp::adapter::ExecutionMode::AsyncResultPush,
+    );
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "command".into(),
+        serde_json::json!(r#""$BROWSER" 'https://example.com/x?a=1'"#),
+    );
+    args.insert("c_flag".into(), serde_json::json!(true));
+    let id = mcp
+        .service
+        .adapter
+        .execute_async_in_dir_with_options(
+            "run_terminal_command",
+            ahma_mcp::shell_pool::platform_shell_program(),
+            ws.to_str().unwrap(),
+            ahma_mcp::adapter::AsyncExecOptions {
+                id: None,
+                args: Some(args),
+                timeout: Some(TestTimeouts::get(TimeoutCategory::ToolCall).as_secs()),
+                subcommand_config: Some(&sc),
+                log_monitor_config: None,
+            },
+        )
+        .await
+        .expect("dispatch");
+    let op = tokio::time::timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+        mcp.service.operation_monitor.wait_for_operation(&id),
+    )
+    .await
+    .expect("the command finishes")
+    .expect("the operation is known");
+    let out = op
+        .result
+        .as_ref()
+        .and_then(|r| r.get("stdout"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        out.contains("ahma opened https://example.com/x?a=1"),
+        "{out} {:?}",
+        op.result
+    );
+    assert!(
+        opened(home.path()).contains("\"url\":\"https://example.com/x?a=1\""),
+        "{}",
+        opened(home.path())
+    );
+    let asked = prompts.messages();
+    assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+    assert!(asked[0].contains("Site: example.com"), "{}", asked[0]);
+}

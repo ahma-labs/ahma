@@ -14,6 +14,7 @@
 //! Windows support (ConPTY) is pending; `pty: true` fails fast there with an
 //! actionable error.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -61,6 +62,23 @@ pub fn pty_available() -> bool {
     }
 }
 
+/// What a PTY command gets from the brokers that serve it (SPEC R-CRED.1,
+/// R-LINK.1): their variables, and whether a link broker serves it, which
+/// its sandbox profile reads as it is built (`links::host::building_for`).
+#[derive(Debug, Default)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) struct BrokerEnv {
+    pub(super) vars: Vec<(&'static str, OsString)>,
+    pub(super) links_served: bool,
+}
+
+impl BrokerEnv {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn push(&mut self, key: &'static str, value: OsString) {
+        self.vars.push((key, value));
+    }
+}
+
 /// Run `command_str` under a PTY through the standard operation lifecycle.
 ///
 /// Mirrors `execute_with_streaming`: emits output lines via the monitor and
@@ -76,12 +94,12 @@ pub(super) async fn run_pty_operation(
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
-    ssh_auth_sock: Option<&Path>,
+    brokers: &BrokerEnv,
     keep_leftovers: bool,
 ) -> Terminal {
     #[cfg(windows)]
     {
-        let _ = (ssh_auth_sock, monitor, op_id);
+        let _ = (brokers, monitor, op_id);
         Terminal::Failed(
             "pty: true is not yet supported on Windows (ConPTY integration pending). \
              Run the command without the pty parameter."
@@ -98,7 +116,7 @@ pub(super) async fn run_pty_operation(
         cancellation_token,
         op_id,
         monitor,
-        ssh_auth_sock,
+        brokers,
         keep_leftovers,
     )
     .await
@@ -182,14 +200,17 @@ mod unix {
         sandbox: &Sandbox,
         command_str: &str,
         working_dir: &Path,
-        ssh_auth_sock: Option<&Path>,
+        brokers: &BrokerEnv,
         keep_leftovers: bool,
     ) -> Result<PtyParts> {
         use anyhow::Context;
 
-        let mut wrapped = sandbox
-            .create_shell_command(platform_shell_program(), command_str, working_dir)
-            .context("failed to build sandboxed PTY command")?;
+        // Built knowing whether a link broker serves this command: its
+        // profile, and no other, may then reach the broker directory.
+        let mut wrapped = crate::adapter::build_for_this_command(brokers.links_served, || {
+            sandbox.create_shell_command(platform_shell_program(), command_str, working_dir)
+        })
+        .context("failed to build sandboxed PTY command")?;
         // A command a human declared long-running may leave its server
         // running (SPEC R2.7.10, R-PROC.5).
         if keep_leftovers {
@@ -232,10 +253,11 @@ mod unix {
                 }
             }
         }
-        // Its own SSH key broker (SPEC R-CRED.1): the profile refuses it the
-        // human's agent (R-CRED.11), so this is the only agent it has.
-        if let Some(sock) = ssh_auth_sock {
-            cmd.env("SSH_AUTH_SOCK", sock);
+        // Its own brokers: the SSH key broker (SPEC R-CRED.1), whose socket
+        // is the only agent it has (the profile refuses it the human's,
+        // R-CRED.11), and the link broker's helper and socket (R-LINK.1).
+        for (key, value) in &brokers.vars {
+            cmd.env(key, value);
         }
         cmd.stdin(std::process::Stdio::from(slave_fd.try_clone()?));
         cmd.stdout(std::process::Stdio::from(slave_fd.try_clone()?));
@@ -358,21 +380,16 @@ mod unix {
         cancellation_token: &tokio_util::sync::CancellationToken,
         op_id: &str,
         monitor: &Arc<OperationMonitor>,
-        ssh_auth_sock: Option<&Path>,
+        brokers: &BrokerEnv,
         keep_leftovers: bool,
     ) -> Terminal {
         let start_time = Instant::now();
 
-        let (mut killer, mut line_rx, mut exit_rx) = match setup_pty(
-            sandbox,
-            command_str,
-            working_dir,
-            ssh_auth_sock,
-            keep_leftovers,
-        ) {
-            Ok(parts) => parts,
-            Err(e) => return Terminal::Failed(format!("Failed to start PTY command: {e}")),
-        };
+        let (mut killer, mut line_rx, mut exit_rx) =
+            match setup_pty(sandbox, command_str, working_dir, brokers, keep_leftovers) {
+                Ok(parts) => parts,
+                Err(e) => return Terminal::Failed(format!("Failed to start PTY command: {e}")),
+            };
 
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
         let mut collected = crate::adapter::BoundedLineCollector::default();
@@ -562,7 +579,7 @@ mod tests {
                 &CancellationToken::new(),
                 op_id,
                 &monitor,
-                None,
+                &BrokerEnv::default(),
                 keep,
             )
             .await
@@ -642,7 +659,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
-            None,
+            &BrokerEnv::default(),
             false,
         )
         .await
@@ -699,7 +716,10 @@ mod tests {
             &CancellationToken::new(),
             op_id,
             &monitor,
-            Some(&broker),
+            &BrokerEnv {
+                vars: vec![("SSH_AUTH_SOCK", broker.clone().into_os_string())],
+                links_served: false,
+            },
             false,
         )
         .await
@@ -753,7 +773,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
-            None,
+            &BrokerEnv::default(),
             false,
         )
         .await
@@ -802,7 +822,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
-            None,
+            &BrokerEnv::default(),
             false,
         )
         .await
@@ -848,7 +868,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
-            None,
+            &BrokerEnv::default(),
             false,
         )
         .await
@@ -898,7 +918,7 @@ mod tests {
             &token,
             op_id,
             &monitor,
-            None,
+            &BrokerEnv::default(),
             false,
         )
         .await

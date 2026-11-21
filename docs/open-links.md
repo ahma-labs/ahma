@@ -1,8 +1,9 @@
 # Opening web links from inside the sandbox
 
 **Status:** Experimental (v0.22.19). macOS and Linux, for commands run through the terminal
-hooks (Claude Code's Bash tool); MCP `run_terminal_command` follows. On Windows commands open
-links as they would without ahma: there is no sandbox boundary there yet. SPEC:
+hooks (Claude Code's Bash tool) and through MCP (`run_terminal_command`, with or without
+`pty`). On Windows commands open links as they would without ahma: there is no sandbox
+boundary there yet. SPEC:
 [R-LINK](../SPEC.md), [R6.2.10](../SPEC.md).
 
 ## Why
@@ -33,7 +34,7 @@ ahma permissions grant open-url github.com --yes
 # In this repo only:
 ahma permissions grant open-url github.com --this-repo --yes
 
-# Inside any hooked command, these now open in your browser:
+# Inside any command ahma runs (hooked or over MCP), these now open in your browser:
 gh pr view 12 --web
 "$BROWSER" https://github.com/ahma-labs/ahma
 open https://github.com/ahma-labs/ahma        # runs as `ahma open-url`, and says so
@@ -44,9 +45,35 @@ ahma permissions revoke open-url github.com --yes
 ahma permissions revoke open-url --yes        # every site
 ```
 
-A link to a site you have not allowed is not opened: the command fails at once with one line
-that names the exact `ahma permissions grant open-url <site>` and the address, so the agent can
-show it to you. A hooked command is never paused to ask.
+A hooked command is never paused to ask: a link to a site you have not allowed is not opened,
+and the command fails at once with one line that names the exact
+`ahma permissions grant open-url <site>` and the address, so the agent can show it to you. A
+command run over MCP waits while you are asked ([below](#asked-in-your-mcp-client)).
+
+## Asked in your MCP client
+
+A command run through ahma's MCP server (`run_terminal_command`, with or without `pty`) waits
+while ahma asks you in the MCP client's own prompt (`elicitation/create`), for at most that
+client's question budget (45–120 s). The command's operation carries an alert saying it is
+waiting for you, and the question shows the site on its own line, the address, any note, and
+the guidance above. The answers, deny first and the default:
+
+| Answer | What it does |
+|---|---|
+| Deny | Not opened. ahma does not ask about that site again in this session. |
+| This time | This link opens now. Nothing is remembered; the next link to the site is asked again. |
+| Always for this site — all repos | Saved to `[open_url] allow`, as `ahma permissions grant open-url <site>` would. |
+| Always for this site — this repo only | Saved for this repo, as `--this-repo` would. |
+| Always (any site) | Any public site. Offered only where it would cover the link. |
+
+Every yes is in `permissions-audit.jsonl`, with the surface `harness`. Two commands opening the
+same site at once share one question. Link questions count toward the session's budget of five
+questions in ten minutes.
+
+When nobody can be asked — the client does not show questions, the question was closed or
+timed out, an earlier question failed, or the budget is spent — the link is not opened, and the
+line names the grant and says why you were not asked. A question closed without an answer
+decides nothing: the next link to that site is asked again.
 
 ## Asked in Claude Code
 
@@ -69,18 +96,18 @@ harness dialog.
 
 ## How it works
 
-1. Every command ahma runs from a terminal hook gets `BROWSER` and `GH_BROWSER` set to
+1. Every command ahma runs, from a terminal hook or over MCP, gets `BROWSER` and `GH_BROWSER` set to
    `ahma-open-url` — ahma's own binary under that name — and a socket of its own to the ahma
    process that started it, which answers only that command.
 2. The helper sends each address to that process, outside the sandbox. It checks it: `http`
    or `https`, a real host, no `user@` before the host, no spaces or backslashes, at most
    8 KB. It opens what it checked, in its plain ASCII form, never the text the command passed.
 3. If you allowed the site, it runs `open` (macOS) or `xdg-open` (Linux) with the address.
-   If not, the command gets the line above, and the refusal is remembered for Claude Code's
-   dialog.
+   If not, over MCP it asks you while the command waits; from a hook the command gets the line
+   above, and the refusal is remembered for Claude Code's dialog.
 4. `ahma open-url <URL>…` is the same helper by name. A command line that is exactly `open`
    or `xdg-open` and one `http`/`https` address (bare, or quoted as a literal) runs as it, and
-   the result's first line says so. Any other form (`open -a …`, two addresses, an unquoted
+   ahma says so: the result's first line from a hook, an alert on an MCP operation. Any other form (`open -a …`, two addresses, an unquoted
    `&`) runs as written; if the sandbox refuses it, ahma names the exact `ahma open-url '<URL>'`
    to run instead, and does not offer to run it outside the sandbox.
 5. Only a command that has a link broker may reach the broker's socket directory; another
@@ -117,9 +144,11 @@ lengths of its query and fragment.
 ## Limits
 
 - At most 5 links per command, each at most 8 KB.
-- Asked only in Claude Code, and only when the command runs again. MCP clients, the TUI and
-  other harnesses do not ask yet (SPEC R-LINK.6): there a link to a site you have not allowed
-  is refused with the grant line.
+- Asked in Claude Code's dialog when a hooked command runs again, and in the MCP client's prompt
+  while an MCP command waits. The TUI, `ahma web` and `ahma desktop` do not ask yet (SPEC
+  R-LINK.6): a client that cannot show questions gets the grant line.
+- Commands in a persistent shell session (`session_id`) share one long-lived shell, so they get
+  no link broker of their own; a browser launch there fails as before.
 - A site you allow can forward your browser elsewhere (an open redirect); allow sites you trust.
 - A name that resolves to a public address when ahma checks it and to a local one later (DNS
   rebinding) is not caught: the browser looks the name up again.

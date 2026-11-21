@@ -510,6 +510,12 @@ struct Inner {
     answered: std::collections::VecDeque<AnsweredQuestion>,
 }
 
+/// One question charged to the session's prompt budget
+/// ([`GrantCoordinator::charge_question`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a question that reached nobody gives its charge back"]
+pub struct QuestionCharge(u64);
+
 /// At most this many automatic prompts per [`PROMPT_WINDOW_SECS`] per session;
 /// past it the agent is told to ask the human in conversation instead
 /// (SPEC R-PERM.4.5). A sixth interrupt in ten minutes is not a question the
@@ -574,6 +580,37 @@ impl GrantCoordinator {
     pub fn budget_exhausted(&self) -> bool {
         let inner = self.inner.lock();
         Self::prompts_in_window(&inner.raised_window, now_secs()) >= PROMPT_BUDGET
+    }
+
+    /// Charge one automatic question that is not a filesystem grant — a link
+    /// question (SPEC R-LINK.6) — to this session's prompt budget (R-PERM.4.5),
+    /// which every automatic question shares. `None` when the budget is spent:
+    /// nothing may be raised. A question that then reached nobody gives its
+    /// charge back ([`Self::refund_question`]), as [`Self::cancel_unseen`] does.
+    pub fn charge_question(&self) -> Option<QuestionCharge> {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        inner
+            .raised_window
+            .retain(|t| now.saturating_sub(*t) < PROMPT_WINDOW_SECS);
+        if inner.raised_window.len() >= PROMPT_BUDGET {
+            tracing::warn!(
+                "question not raised: {PROMPT_BUDGET} prompts already in the last \
+                 {PROMPT_WINDOW_SECS}s; the agent must ask the human in conversation"
+            );
+            return None;
+        }
+        inner.raised_window.push(now);
+        Some(QuestionCharge(now))
+    }
+
+    /// Give back a [`Self::charge_question`] charge: the question reached
+    /// nobody, so it interrupted no one (SPEC R-PERM.4.5).
+    pub fn refund_question(&self, charge: QuestionCharge) {
+        let mut inner = self.inner.lock();
+        if let Some(i) = inner.raised_window.iter().position(|t| *t == charge.0) {
+            inner.raised_window.remove(i);
+        }
     }
 
     fn prompts_in_window(window: &[u64], now: u64) -> usize {
@@ -2967,6 +3004,42 @@ mod request_context_tests {
             "the {}th prompt in one window is not raised",
             PROMPT_BUDGET + 1
         );
+        assert!(c.budget_exhausted());
+    }
+
+    /// SPEC R-PERM.4.5, R-LINK.6: a link question spends the same budget as a
+    /// grant question, and one that reached nobody gives its charge back.
+    #[test]
+    fn a_link_question_shares_the_budget_and_an_unseen_one_is_refunded() {
+        let c = GrantCoordinator::new();
+        let dirs: Vec<_> = (0..PROMPT_BUDGET)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect();
+        for d in dirs.iter().take(PROMPT_BUDGET - 1) {
+            assert!(
+                c.begin(
+                    d.path(),
+                    ScopeAccess::Rw,
+                    GrantReason::PreExecViolation,
+                    None
+                )
+                .is_some()
+            );
+        }
+        let unseen = c.charge_question().expect("one left");
+        assert!(c.charge_question().is_none(), "the budget is shared");
+        assert!(
+            c.begin(
+                dirs[PROMPT_BUDGET - 1].path(),
+                ScopeAccess::Rw,
+                GrantReason::PreExecViolation,
+                None
+            )
+            .is_none(),
+            "a link question counted toward it"
+        );
+        c.refund_question(unseen);
+        let _seen = c.charge_question().expect("refunded");
         assert!(c.budget_exhausted());
     }
 }

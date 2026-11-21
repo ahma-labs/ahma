@@ -224,6 +224,23 @@ pub fn persist_open_url_allow(
     Ok(true)
 }
 
+/// Audit an answer that saves nothing (SPEC R-LINK.9): "this time"
+/// ([`GrantTier::Once`]) or "this site, this session" ([`GrantTier::Session`])
+/// for `host`, given at `surface` at Unix time `at`. Nothing is written to
+/// the settings file; the record is what says it was granted.
+pub fn audit_unsaved_grant(host: &str, tier: GrantTier, surface: &ApproverSurface, at: u64) {
+    crate::permissions::append_audit(
+        &AuditEntry::new(
+            crate::config::fmt_utc_datetime(at),
+            AuditAction::Grant,
+            GrantKind::OpenUrl,
+            host.to_ascii_lowercase(),
+            tier,
+        )
+        .with_surface(surface),
+    );
+}
+
 /// Remove what [`OpenUrlSettings::matching`] names from the settings file and
 /// audit each removal; what was removed.
 pub fn revoke_open_url(
