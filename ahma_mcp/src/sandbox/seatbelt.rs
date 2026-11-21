@@ -680,11 +680,12 @@ fn hub_rendezvous_denies_for(runtime_dir: Option<&Path>, socket: &Path) -> Strin
     rules
 }
 
-/// Whether this process serves its commands any broker on a socket in the
-/// agent directory: the SSH key broker, in `[sandbox] ssh_agent = "broker"`
-/// mode (SPEC R-CRED.11), or the link broker, whatever that mode says (SPEC
-/// R-LINK.1). A broker added later is one more term here, not another mode
-/// check in the profile.
+/// Whether the command whose profile is being built is served any broker on
+/// a socket in the agent directory: the SSH key broker, which this process
+/// serves every command in `[sandbox] ssh_agent = "broker"` mode (SPEC
+/// R-CRED.11), or a link broker, which is leased per command whatever that
+/// mode says (SPEC R-LINK.1, `links::host::building_for`). A broker added
+/// later is one more term here, not another mode check in the profile.
 fn brokers_served() -> bool {
     super::ssh_agent::serves_ssh_broker() || crate::links::host::served()
 }
@@ -1497,9 +1498,9 @@ mod tests {
         );
     }
 
-    /// SPEC R-LINK.1: a process that serves the link broker lets its commands
-    /// connect to the broker directory under every `[sandbox] ssh_agent`
-    /// mode, in the profile itself — not only in `broker_rules`.
+    /// SPEC R-LINK.1: a command served a link broker may connect to the
+    /// broker directory under every `[sandbox] ssh_agent` mode, in the
+    /// profile itself — not only in `broker_rules`.
     #[test]
     fn a_served_link_broker_is_reachable_under_every_ssh_mode() {
         use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode};
@@ -1511,13 +1512,43 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        crate::links::host::mark_served();
         for mode in [SshAgentMode::Off, SshAgentMode::Passthrough] {
             set_ssh_agent_mode(mode);
-            assert!(super::brokers_served(), "{mode:?}");
-            let profile = sb.generate_seatbelt_profile_test(dir.path());
+            let profile = crate::links::host::building_for(true, || {
+                assert!(super::brokers_served(), "{mode:?}");
+                sb.generate_seatbelt_profile_test(dir.path())
+            });
             assert!(profile.contains(&allow), "{mode:?}:\n{profile}");
         }
+        set_ssh_agent_mode(SshAgentMode::Broker);
+    }
+
+    /// SPEC R-LINK.1: the connect allow is the command's own. A command
+    /// built after one that was served a link broker, with the SSH key broker
+    /// off, gets no connect into the broker directory: being served is not a
+    /// process-wide switch that stays on.
+    #[test]
+    fn a_link_broker_opens_the_connect_only_for_the_command_it_serves() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode};
+        let allow = broker_connect_allow().expect("a runtime dir");
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            Default::default(),
+        )
+        .unwrap();
+        set_ssh_agent_mode(SshAgentMode::Off);
+        let served = crate::links::host::building_for(true, || {
+            sb.generate_seatbelt_profile_test(dir.path())
+        });
+        assert!(served.contains(&allow), "{served}");
+        let next = crate::links::host::building_for(false, || {
+            sb.generate_seatbelt_profile_test(dir.path())
+        });
+        assert!(!next.contains(&allow), "{next}");
+        let unmarked = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(!unmarked.contains(&allow), "{unmarked}");
         set_ssh_agent_mode(SshAgentMode::Broker);
     }
 
