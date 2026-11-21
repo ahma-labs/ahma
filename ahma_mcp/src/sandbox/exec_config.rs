@@ -1466,11 +1466,16 @@ mod tests {
             let dirs = resolve_git_dirs(root);
             assert!(dirs.contains(&alt), "{refused:?}: {dirs:?}");
         }
-        std::fs::create_dir_all(root.join("git-alt  /hooks")).unwrap();
-        let spaced = dunce::canonicalize(root.join("git-alt  ")).unwrap();
-        std::fs::write(root.join(".git"), "gitdir: git-alt  \n").unwrap();
-        let dirs = resolve_git_dirs(root);
-        assert!(dirs.contains(&spaced) && dirs.contains(&alt), "{dirs:?}");
+        // Windows refuses a directory name ending in spaces, so there no pointer
+        // can name one.
+        #[cfg(not(windows))]
+        {
+            std::fs::create_dir_all(root.join("git-alt  /hooks")).unwrap();
+            let spaced = dunce::canonicalize(root.join("git-alt  ")).unwrap();
+            std::fs::write(root.join(".git"), "gitdir: git-alt  \n").unwrap();
+            let dirs = resolve_git_dirs(root);
+            assert!(dirs.contains(&spaced) && dirs.contains(&alt), "{dirs:?}");
+        }
     }
 
     #[test]
