@@ -125,6 +125,41 @@ mod ahma_mcp_tests {
         );
     }
 
+    /// SPEC R-LINK.1, R-DOC.7: `ahma open-url --help` is clap's help, saying
+    /// what it opens and whose consent it needs; outside a command ahma runs,
+    /// `ahma open-url <URL>` opens nothing, says so, and fails.
+    #[test]
+    fn test_ahma_open_url_help_and_no_broker() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let help = test_command(&binary)
+            .args(["open-url", "--help"])
+            .output()
+            .expect("Failed to execute ahma open-url --help");
+        // Whatever width clap wrapped it to.
+        let text = String::from_utf8_lossy(&help.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(help.status.success(), "{text}");
+        for must in [
+            "http and https",
+            "never files or apps",
+            "ahma permissions grant open-url",
+            "BROWSER",
+        ] {
+            assert!(text.contains(must), "{must}: {text}");
+        }
+
+        let outside = test_command(&binary)
+            .args(["open-url", "https://example.com/"])
+            .env_remove("AHMA_LINK_SOCK")
+            .output()
+            .expect("Failed to execute ahma open-url");
+        let said = String::from_utf8_lossy(&outside.stderr);
+        assert_eq!(outside.status.code(), Some(1), "{said}");
+        assert!(said.contains("nothing was opened"), "{said}");
+    }
+
     /// `ahma settings explain` says what a key is, who may set it and the one
     /// command that changes it, and offers the near names for a typo
     /// (SPEC R-CFG11).

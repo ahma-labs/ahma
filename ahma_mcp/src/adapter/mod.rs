@@ -257,6 +257,13 @@ pub struct Adapter {
     /// result. `None` leaves the human's own agent socket in place.
     #[cfg(unix)]
     credential_brokers: Option<Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>>,
+    /// Gives each command a link broker (SPEC R-LINK.1): `BROWSER` and
+    /// `GH_BROWSER` name ahma's link helper and `AHMA_LINK_SOCK` its socket,
+    /// and what it refused is one line in the result. `None` leaves the
+    /// command's `BROWSER` alone. Served on the synchronous path (the
+    /// terminal hook's) today.
+    #[cfg(unix)]
+    link_brokers: Option<Arc<dyn crate::links::host::LinkBrokerFactory>>,
     /// Whether the trust-handoff deny tier is inventoried around each command
     /// (SPEC R6.1.7). [`HandoffWatchMode::Auto`] watches exactly where the
     /// kernel does not hold the tier; [`Adapter::with_handoff_watch`] overrides it.
@@ -314,6 +321,8 @@ impl Adapter {
             scope_grant_notifier: None,
             #[cfg(unix)]
             credential_brokers: None,
+            #[cfg(unix)]
+            link_brokers: None,
             handoff_watch: HandoffWatchMode::Auto,
         })
     }
@@ -539,6 +548,38 @@ impl Adapter {
             .as_ref()?
             .lease_for_command(working_dir, command)?;
         cmd.env("SSH_AUTH_SOCK", lease.socket());
+        Some(lease)
+    }
+
+    /// Serve each command a link broker from `factory` (SPEC R-LINK.1). From
+    /// now on every command's sandbox profile lets it connect to a socket in
+    /// the broker directory, whatever `[sandbox] ssh_agent` says.
+    #[cfg(unix)]
+    pub fn with_link_brokers(
+        mut self,
+        factory: Arc<dyn crate::links::host::LinkBrokerFactory>,
+    ) -> Self {
+        crate::links::host::mark_served();
+        self.link_brokers = Some(factory);
+        self
+    }
+
+    /// The link lease for a command about to run in `working_dir`, with the
+    /// command pointed at it. Held until the command has finished.
+    #[cfg(unix)]
+    fn lease_link_broker(
+        &self,
+        cmd: &mut tokio::process::Command,
+        working_dir: &std::path::Path,
+        command: Option<&str>,
+    ) -> Option<crate::links::host::LinkLease> {
+        let lease = self
+            .link_brokers
+            .as_ref()?
+            .lease_for_command(working_dir, command)?;
+        for (key, value) in lease.env() {
+            cmd.env(key, value);
+        }
         Some(lease)
     }
 
@@ -985,6 +1026,9 @@ impl Adapter {
         }
         #[cfg(unix)]
         let broker = self.lease_credential_broker(&mut cmd, safe_wd, Some(effective_command));
+        // Its link broker (SPEC R-LINK.1), held until the command has ended.
+        #[cfg(unix)]
+        let links = self.lease_link_broker(&mut cmd, safe_wd, Some(effective_command));
         // The tag the kernel's records of this command's denials carry
         // (SPEC R-DENY.1).
         let denial_tag = sandbox::kernel_denials::tag_of(cmd.as_std().get_args());
@@ -1084,6 +1128,20 @@ impl Adapter {
         // (SPEC R-CRED.10), on whichever side the result is.
         #[cfg(unix)]
         let result = match broker.as_ref().and_then(broker_refusals) {
+            Some(lines) => match result {
+                Ok(out) => Ok(format!("{out}\n{lines}")),
+                Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
+            },
+            None => result,
+        };
+        // What the link broker refused, once each, unless the helper's own
+        // line already reached the output (SPEC R-LINK.6): a tool that ran
+        // `$BROWSER` may have swallowed it.
+        #[cfg(unix)]
+        let result = match links
+            .as_ref()
+            .and_then(|l| link_refusals(l, &stdout, &stderr))
+        {
             Some(lines) => match result {
                 Ok(out) => Ok(format!("{out}\n{lines}")),
                 Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
@@ -2198,6 +2256,24 @@ fn broker_refusal_lines(lease: &crate::credentials::ssh_agent::host::BrokerLease
 #[cfg(unix)]
 fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> Option<String> {
     let lines = broker_refusal_lines(lease);
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The lines the link broker refused this command (SPEC R-LINK.6), once
+/// each, leaving out any the helper already printed into `stdout`/`stderr`:
+/// one line per refusal, never two copies, and never none because the tool
+/// that ran `$BROWSER` hid its output.
+#[cfg(unix)]
+fn link_refusals(
+    lease: &crate::links::host::LinkLease,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    let lines: Vec<String> = lease
+        .refusal_lines()
+        .into_iter()
+        .filter(|line| !stdout.contains(line.as_str()) && !stderr.contains(line.as_str()))
+        .collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 

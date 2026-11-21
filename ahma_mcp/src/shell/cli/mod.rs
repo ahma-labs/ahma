@@ -1126,6 +1126,14 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Queue => commands::run_queue_command(),
         Subcommands::Ps { filter } => commands::run_ps_command(filter.as_deref()),
         Subcommands::Explain { topic } => commands::run_explain_command(topic.as_deref()),
+        // `ahma`'s own `main` runs the helper before parsing (SPEC R-LINK.1);
+        // this is the same helper for a binary that does not.
+        Subcommands::OpenUrl { urls } => {
+            match crate::links::helper::run(&urls, crate::links::helper::socket_from_env()) {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
     }
 }
 
@@ -1577,6 +1585,12 @@ pub enum Subcommands {
         /// The topic; omit it for the list of topics.
         #[arg(value_name = "TOPIC")]
         topic: Option<String>,
+    },
+    /// Open a web link in the human's default browser from inside a command ahma runs (SPEC R-LINK). A sandboxed command cannot start a browser itself (SPEC R6.2.10), so this asks the ahma process outside the sandbox to open it: only http and https links, never files or apps, and only for a site the human allowed with `ahma permissions grant open-url <SITE>`; otherwise nothing opens and the line printed names that grant. Commands ahma runs also get this helper as `BROWSER` and `GH_BROWSER`, so `gh … --web` uses it without being asked. Outside a command ahma runs it opens nothing and says so. Exits 0 when every link opened, 1 otherwise.
+    OpenUrl {
+        /// The http or https addresses to open, in order; it stops at the first one not opened.
+        #[arg(value_name = "URL", required = true)]
+        urls: Vec<String>,
     },
 }
 

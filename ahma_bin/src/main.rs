@@ -28,6 +28,14 @@ use ahma_mcp::utils::logging::{
 const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    // The link helper (SPEC R-LINK.1), run inside the sandbox as `$BROWSER`
+    // or `ahma open-url`: first, before any runtime, settings or CLI parsing,
+    // because `cargo doc --open` runs `$BROWSER <file>` with no other words
+    // and the helper must start in a sandbox that cannot read `~/.ahma`.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = ahma_mcp::links::helper::dispatch(&argv) {
+        std::process::exit(code);
+    }
     // `sudo`'s password dialog (SPEC R-ESCAPE.4 (b)): before arguments are parsed or settings
     // read, since a prompt must not depend on either.
     let mut args = std::env::args();
