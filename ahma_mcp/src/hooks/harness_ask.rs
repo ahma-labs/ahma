@@ -431,16 +431,15 @@ pub(super) fn ssh_ask_reason(refusal: &harness_asks::SshRefusal) -> String {
 /// The refused link to ask about before `command` runs in `cwd`, with the
 /// token that approves it (SPEC R-LINK.6): one the link broker refused this
 /// command, or a command opening the same site, when it last ran here; that
-/// no saved grant covers now (for a local site or one off the egress allow
-/// list, only a grant naming it, R-LINK.4, R-LINK.5); and that this harness
-/// session has not declined.
+/// no saved or session grant covers now (for a local site or one off the
+/// egress allow list, only a grant naming it, R-LINK.4, R-LINK.5); and that
+/// this harness session has not declined, in this dialog or in the TUI.
 pub(super) fn next_link_ask(
     cwd: &Path,
     session_id: &str,
     command: &str,
     settings_file: Option<&Path>,
 ) -> Option<(harness_asks::LinkRefusal, String)> {
-    use crate::egress::HostPattern;
     let dir = harness_asks::default_dir()?;
     let workspace = workspace_for(cwd);
     let now = ahma_common::session_grants::now_secs();
@@ -448,20 +447,8 @@ pub(super) fn next_link_ask(
     if asks.link_refusals.is_empty() {
         return None;
     }
-    let saved = settings_file
-        .and_then(|f| ahma_common::config::AhmaSettings::load_from_result(f).ok())
-        .map(|s| s.open_url)
-        .unwrap_or_default();
-    let grants =
-        crate::links::policy::LinkGrants::from_settings(&saved, &workspace, Vec::new(), Vec::new());
-    // As `policy::decide` reads a grant: "any site" never covers a local
-    // site or one off the egress allow list.
-    let covered = |r: &harness_asks::LinkRefusal| {
-        grants.always.iter().any(|p| match p {
-            HostPattern::Any => !r.local && !r.outside_egress,
-            named => named.matches(&r.host),
-        })
-    };
+    let grants = crate::links::consent::hook_grants(settings_file, &workspace, Vec::new());
+    let covered = |r: &harness_asks::LinkRefusal| grants.covers(&r.host, r.local, r.outside_egress);
     let refusal = harness_asks::next_link_question(
         &asks,
         session_id,
@@ -491,7 +478,7 @@ pub(super) fn next_link_ask(
 ///
 /// [`LinkQuestion::text`]: crate::links::policy::LinkQuestion::text
 pub(super) fn link_ask_reason(refusal: &harness_asks::LinkRefusal, workspace: &Path) -> String {
-    let question = link_question(refusal);
+    let question = crate::links::policy::LinkQuestion::from_refusal(refusal);
     let answers: String = crate::links::policy::harness_dialog_answers(&question, workspace)
         .iter()
         .map(|a| format!("\n- {a}"))
@@ -501,17 +488,6 @@ pub(super) fn link_ask_reason(refusal: &harness_asks::LinkRefusal, workspace: &P
          site.\n\n{}\n\nYour answers:{answers}",
         question.text()
     )
-}
-
-/// The question a recorded refusal asks, as every surface words it.
-fn link_question(refusal: &harness_asks::LinkRefusal) -> crate::links::policy::LinkQuestion {
-    crate::links::policy::LinkQuestion {
-        host: refusal.host.clone(),
-        shown: refusal.shown.clone(),
-        local: refusal.local,
-        outside_egress: refusal.outside_egress,
-        internationalised: refusal.host.split('.').any(|l| l.starts_with("xn--")),
-    }
 }
 
 /// Remember that `command` in `cwd` was refused something no grant or setting
@@ -1054,6 +1030,53 @@ mod tests {
         assert!(
             next_link_ask(&ws, "session-1", cmd, None).is_none(),
             "a no is remembered for the session"
+        );
+    }
+
+    /// SPEC R-LINK.4, R-LINK.6: a site allowed for this session in the TUI
+    /// is not asked about in the harness dialog: the session grant covers it,
+    /// as a saved grant does.
+    #[test]
+    fn a_site_allowed_for_the_session_elsewhere_is_not_asked_in_the_dialog() {
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", tmp.path()) };
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let workspace = workspace_for(&ws);
+        let cmd = "gh pr view 12 --web";
+        let now = ahma_common::session_grants::now_secs();
+        let dir = harness_asks::default_dir().unwrap();
+        harness_asks::record_link_refusal(
+            &dir,
+            &workspace,
+            harness_asks::LinkRefusal {
+                host: "github.com".into(),
+                shown: "https://github.com/o/r/pull/12".into(),
+                local: false,
+                outside_egress: false,
+                at: now,
+                harness_pid: Some(std::process::id()),
+                command_digest: Some(harness_asks::CommandDigest::of(cmd)),
+            },
+        )
+        .unwrap();
+        ahma_common::open_url::record_session(
+            &ahma_common::open_url::session_dir().unwrap(),
+            &ahma_common::open_url::OpenUrlSessionGrant {
+                site: "github.com".into(),
+                workspace: workspace.clone(),
+                owner_pid: std::process::id(),
+                granted_at: now,
+                granted_by: Some("tui".into()),
+            },
+            &ahma_common::approver::ApproverSurface::Tui,
+        )
+        .unwrap();
+        assert!(
+            next_link_ask(&ws, "session-1", cmd, None).is_none(),
+            "covered by the session grant"
         );
     }
 

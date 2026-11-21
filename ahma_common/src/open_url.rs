@@ -9,6 +9,14 @@
 //! and matched by the egress `HostPattern` in `ahma_mcp`; this module stores
 //! the normalised text and never interprets it, so the settings file reads
 //! exactly like `[network] allow`.
+//!
+//! A "this site, this session" answer for a hooked command is not saved: it
+//! is one owner-only file per grant under `runtime_dir()/open-url-sessions/`
+//! ([`record_session`]), bound to the harness process whose life it lasts and
+//! to the repo it was given in, like an SSH-signing session grant
+//! ([`crate::ssh_sign`]) — gone when that process exits, or after
+//! [`crate::session_grants::MAX_AGE_SECS`], whichever is first (SPEC R-LINK.4,
+//! R-PERM.4.4).
 
 use std::path::{Path, PathBuf};
 
@@ -282,6 +290,151 @@ pub fn revoke_open_url(
     Ok(removed)
 }
 
+/// One "this site, this session" grant for hooked commands (SPEC R-LINK.4):
+/// links to `site` open, without asking, for commands the harness process
+/// `owner_pid` runs in `workspace`, while it lives and for at most
+/// [`crate::session_grants::MAX_AGE_SECS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenUrlSessionGrant {
+    /// The site, an exact host: lowercased ASCII (punycode for an
+    /// internationalised name). Never a wildcard: a session answer names the
+    /// site that was asked about.
+    pub site: String,
+    /// The repo it was given in (canonical root); commands working in it, or
+    /// beneath it, may open the site's links.
+    pub workspace: PathBuf,
+    /// The harness process whose life bounds it.
+    pub owner_pid: u32,
+    /// Unix seconds when it was given.
+    pub granted_at: u64,
+    /// Where it was given (`"tui"`, `"web"`, `"desktop"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_by: Option<String>,
+}
+
+impl OpenUrlSessionGrant {
+    /// Whether this grant opens links to `host` for a command working in
+    /// `workspace`.
+    pub fn covers(&self, host: &str, workspace: &Path) -> bool {
+        self.site.eq_ignore_ascii_case(host) && workspace.starts_with(&self.workspace)
+    }
+}
+
+/// The directory session grants for links live in:
+/// `runtime_dir()/open-url-sessions`.
+pub fn session_dir() -> Option<PathBuf> {
+    Some(crate::hub::runtime_dir()?.join("open-url-sessions"))
+}
+
+/// Record `grant` under `dir`, owner-only, and audit it with the `surface`
+/// that answered (SPEC R-LINK.9): the one writer of the session tier. One file
+/// per (owner, site, workspace): giving it again replaces it.
+pub fn record_session(
+    dir: &Path,
+    grant: &OpenUrlSessionGrant,
+    surface: &ApproverSurface,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let key = format!(
+        "{}\0{}",
+        grant.site.to_ascii_lowercase(),
+        grant.workspace.display()
+    );
+    let file = dir.join(format!(
+        "{}-{}.json",
+        grant.owner_pid,
+        &crate::digest::sha256_hex(key.as_bytes())[..16]
+    ));
+    crate::fs_atomic::write(&file, serde_json::to_vec_pretty(grant)?)
+        .with_context(|| format!("write {}", file.display()))?;
+    // Recorded as every unsaved answer is, on every surface: the site, tier
+    // session (SPEC R-LINK.9).
+    audit_unsaved_grant(&grant.site, GrantTier::Session, surface, grant.granted_at);
+    Ok(file)
+}
+
+/// Every session grant under `dir` still in force: its owner alive
+/// (`pid_alive`) and no older than [`crate::session_grants::MAX_AGE_SECS`].
+/// The files of the others, and any file that is not a grant, are removed.
+pub fn active_sessions(
+    dir: &Path,
+    now: u64,
+    pid_alive: &dyn Fn(u32) -> bool,
+) -> Vec<OpenUrlSessionGrant> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let grant = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<OpenUrlSessionGrant>(&raw).ok());
+        match grant {
+            Some(g)
+                if now.saturating_sub(g.granted_at) <= crate::session_grants::MAX_AGE_SECS
+                    && pid_alive(g.owner_pid) =>
+            {
+                out.push(g)
+            }
+            _ => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.site.cmp(&b.site).then(a.owner_pid.cmp(&b.owner_pid)));
+    out
+}
+
+/// End the session grants for `site` (every site when `None`) given in
+/// `workspace` (every repo when `None`), as a revoke of the saved grant does:
+/// the undo the guidance names takes effect now, not when the session ends
+/// (SPEC R-LINK.7, R-PERM.11). Each is audited as revoked with `surface`.
+/// Returns the sites ended, in the order found.
+pub fn revoke_sessions(
+    dir: &Path,
+    site: Option<&str>,
+    workspace: Option<&Path>,
+    surface: &ApproverSurface,
+) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ended = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        let Some(grant) = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<OpenUrlSessionGrant>(&raw).ok())
+        else {
+            continue;
+        };
+        let hit = site.is_none_or(|s| grant.site.eq_ignore_ascii_case(s))
+            && workspace.is_none_or(|ws| grant.workspace == ws);
+        if hit && std::fs::remove_file(&path).is_ok() {
+            crate::permissions::append_audit(
+                &AuditEntry::new(
+                    crate::config::fmt_utc_datetime(crate::config::unix_now()),
+                    AuditAction::Revoke,
+                    GrantKind::OpenUrl,
+                    grant.site.to_ascii_lowercase(),
+                    GrantTier::Session,
+                )
+                .with_surface(surface),
+            );
+            ended.push(grant.site);
+        }
+    }
+    ended
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +538,119 @@ mod tests {
                 (AuditAction::Revoke, "github.com in /w/a", Some("cli")),
             ]
         );
+    }
+
+    fn session(site: &str, ws: &str, pid: u32, at: u64) -> OpenUrlSessionGrant {
+        OpenUrlSessionGrant {
+            site: site.into(),
+            workspace: PathBuf::from(ws),
+            owner_pid: pid,
+            granted_at: at,
+            granted_by: Some("tui".into()),
+        }
+    }
+
+    /// SPEC R-LINK.4, R-PERM.4.4: "this site, this session" for a hooked
+    /// command is an owner-only file bound to the harness process and the
+    /// repo: in force while that process lives and for at most 12 hours,
+    /// for that site in that repo only, and audited as a session grant from
+    /// the surface that gave it (R-LINK.9).
+    #[test]
+    fn a_session_grant_opens_its_site_in_its_repo_while_its_harness_lives() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let dir = home.path().join("open-url-sessions");
+        let now = crate::session_grants::now_secs();
+        let live = session("github.com", "/w/a", 1, now);
+        record_session(&dir, &live, &ApproverSurface::Tui).unwrap();
+        record_session(&dir, &live, &ApproverSurface::Tui).unwrap();
+        record_session(
+            &dir,
+            &session("docs.rs", "/w/a", 2, now),
+            &ApproverSurface::Tui,
+        )
+        .unwrap();
+        let alive = |pid: u32| pid == 1;
+        assert_eq!(active_sessions(&dir, now, &alive), vec![live.clone()]);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "giving it again replaces it, and a dead owner's grant is removed"
+        );
+        assert!(live.covers("GitHub.com", Path::new("/w/a")));
+        assert!(live.covers("github.com", Path::new("/w/a/sub")));
+        assert!(!live.covers("github.com", Path::new("/w/b")), "one repo");
+        assert!(
+            !live.covers("gist.github.com", Path::new("/w/a")),
+            "one site"
+        );
+        assert!(
+            active_sessions(&dir, now + crate::session_grants::MAX_AGE_SECS + 1, &alive).is_empty(),
+            "never longer than the session tier's bound"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "owner-only");
+        }
+        let audit = crate::permissions::read_audit_entries(
+            &home.path().join(".ahma").join("permissions-audit.jsonl"),
+        );
+        let grants: Vec<_> = audit
+            .iter()
+            .filter(|e| e.kind == GrantKind::OpenUrl && e.action == AuditAction::Grant)
+            .map(|e| (e.subject.as_str(), e.tier, e.surface.as_deref()))
+            .collect();
+        assert_eq!(grants[0], ("github.com", GrantTier::Session, Some("tui")));
+    }
+
+    /// SPEC R-LINK.7, R-PERM.11: the undo every question names ends a
+    /// session grant now, for that site (or every site) and that repo (or
+    /// every repo), and says so in the audit trail.
+    #[test]
+    fn a_revoke_ends_the_session_grants_it_names() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let dir = home.path().join("open-url-sessions");
+        let now = crate::session_grants::now_secs();
+        for g in [
+            session("github.com", "/w/a", 1, now),
+            session("github.com", "/w/b", 1, now),
+            session("docs.rs", "/w/a", 1, now),
+        ] {
+            record_session(&dir, &g, &ApproverSurface::Tui).unwrap();
+        }
+        let cli = ApproverSurface::Cli;
+        assert_eq!(
+            revoke_sessions(&dir, Some("GitHub.com"), Some(Path::new("/w/a")), &cli),
+            ["github.com"]
+        );
+        let left = |dir: &Path| {
+            let mut v: Vec<_> = active_sessions(dir, now, &|_| true)
+                .into_iter()
+                .map(|g| (g.site, g.workspace))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            left(&dir),
+            [
+                ("docs.rs".to_string(), PathBuf::from("/w/a")),
+                ("github.com".to_string(), PathBuf::from("/w/b"))
+            ]
+        );
+        assert_eq!(revoke_sessions(&dir, None, None, &cli).len(), 2);
+        assert!(left(&dir).is_empty());
+        let revoked = crate::permissions::read_audit_entries(
+            &home.path().join(".ahma").join("permissions-audit.jsonl"),
+        )
+        .into_iter()
+        .filter(|e| e.action == AuditAction::Revoke && e.tier == GrantTier::Session)
+        .count();
+        assert_eq!(revoked, 3);
     }
 }

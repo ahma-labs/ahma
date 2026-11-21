@@ -53,11 +53,21 @@ Criteria specified in §3 or in the root SPEC are cited by id, not restated.
   placeholders in a command's label (`[question]`, `<url>`) are never matched: they describe
   arguments, and `/q` once highlighted `/doctor [question]` above `/quit`. The highlight
   returns to the top whenever the query changes.
-- **Approval gates (root R-WEB.6, R-WEB.6.3, R-PERM.7.1, R-PERM.3.8, R-PERM.3.10, R-PERM.10(e))**: the TUI
+- **Approval gates (root R-WEB.6, R-WEB.6.3, R-PERM.7.1, R-PERM.3.8, R-PERM.3.10, R-PERM.10(e), R-LINK.6)**: the TUI
   renders and resolves chat tool approval (`y`/`n`), sandbox scope grants and web egress; all
   three deny on Enter/Esc. A denied operation is selectable and `a` re-raises its grant
   question. The grant queue also holds the questions refused terminal-hook commands left for
   the harness dialog, read from their records (`harness_asks`) and answered by the TUI itself.
+  A link a hooked command was refused is a question of its own (`state::LinkAskGate`), queued
+  and withdrawn the same way, showing the question and guidance every surface shows
+  (`links::policy::LinkQuestion::text`) and the answers `LinkQuestion::choices(Surface::TuiForHarness)`
+  gives, deny first: `n` deny, `s` this site for this session, `a` always for this site — all
+  repos, `r` — this repo only, `*` any site (only where it covers the link); no "this time",
+  since nothing waits. Granting keys wait out `GRANT_ARMING_DELAY`; a saving key shows the exact
+  line it writes and saves on its second press. The session answer is the hook-side session
+  grant file (root R-LINK.4); every answer settles the recorded refusal, so Claude Code's dialog
+  does not ask it too, and a deny is remembered for that harness's session. Only `ahma tui`
+  reads link questions for now: `ahma web` and `ahma desktop` do not render one yet.
 - **Trusted folders (root R-PERM.1.2, R-PERM.1.3)**.
 - **Guided setup, help and settings (R24.12)**.
 - **Minimal chrome (R24.11)**.

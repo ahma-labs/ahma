@@ -14,19 +14,31 @@
 //! R-PERM.3.5). The answer is applied here, the way the hook applies a yes
 //! from the dialog, and recorded as answered so the dialog never asks it too.
 //!
+//! A link a hooked command was refused (SPEC R-LINK.6) is a question of its
+//! own, a [`HarnessLinkAsk`], shown in the link question
+//! ([`LinkAskGate`]) with the answers `links::policy` offers this surface:
+//! deny, this site for this session, and the lasting ones. Its session answer
+//! is a session grant file bound to the harness process
+//! (`ahma_common::open_url::record_session`), which the hook reads as it
+//! reads a saved grant.
+//!
 //! [`ScopeGrantGate`]: crate::state::ScopeGrantGate
 //! [`ScopeGrantGate::from_harness_ask`]: crate::state::ScopeGrantGate::from_harness_ask
+//! [`LinkAskGate`]: crate::state::LinkAskGate
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahma_common::approver::ApproverSurface;
 use ahma_common::config::{PersistentScope, ScopeAccess};
+use ahma_common::harness_asks::LinkRefusal;
 use ahma_common::harness_asks::{self, Question, WorkspaceAsks};
+use ahma_common::open_url::{OpenUrlBinding, OpenUrlSessionGrant};
 use ahma_common::permissions::{AuditAction, GrantKind, GrantTier};
 use ahma_common::scope_grant::{
     GrantContext, GrantDecision, GrantEvidence, GrantReason, GrantRequester, ScopeGrantRequest,
 };
+use ahma_mcp::links::policy::{self as link_policy, Effect, LinkChoice, LinkGrants, LinkQuestion};
 use anyhow::{Context, Result};
 
 /// How often the TUI re-reads the records.
@@ -312,6 +324,233 @@ fn audit(
     );
 }
 
+/// A link a hooked command was refused, waiting for a harness dialog (SPEC
+/// R-LINK.6), with what an answer binds to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessLinkAsk {
+    /// The repo the refused command ran in: a "this repo only" answer and a
+    /// session answer are bound to it.
+    pub workspace: PathBuf,
+    pub refusal: LinkRefusal,
+    /// The live harness process that was refused. A session answer lasts as
+    /// long as it does.
+    pub harness_pid: u32,
+}
+
+impl HarnessLinkAsk {
+    /// The same for the same question on every poll, so a repeat is
+    /// recognised and a question that stopped waiting can be withdrawn.
+    pub fn decision_id(&self) -> String {
+        let key = format!(
+            "{}\0{}\0{}",
+            self.workspace.display(),
+            self.refusal.host.to_ascii_lowercase(),
+            self.harness_pid
+        );
+        let digest = ahma_common::digest::sha256_hex(key.as_bytes());
+        format!("harness-link-{}", &digest[..16])
+    }
+
+    /// The question, worded as every surface words it (SPEC R-LINK.7).
+    pub fn question(&self) -> LinkQuestion {
+        LinkQuestion::from_refusal(&self.refusal)
+    }
+
+    /// What the TUI offers for it, deny first (SPEC R-LINK.6): nothing waits
+    /// on a hooked command, so no "this time".
+    pub fn choices(&self) -> Vec<LinkChoice> {
+        self.question().choices(link_policy::Surface::TuiForHarness)
+    }
+
+    /// What a saving `choice` writes, for the step that shows it before it is
+    /// taken (SPEC R-PERM.3.5); `None` for one that saves nothing.
+    pub fn save_line(&self, choice: LinkChoice) -> Option<String> {
+        let Effect::Persist(pattern, binding) =
+            link_policy::effect(choice, &self.refusal.host, &self.workspace)
+        else {
+            return None;
+        };
+        Some(match binding {
+            OpenUrlBinding::AllRepos => {
+                format!(
+                    "adds \"{pattern}\" to [open_url] allow (all repos) in ~/.ahma/settings.toml"
+                )
+            }
+            OpenUrlBinding::Repo(repo) => format!(
+                "adds \"{pattern}\" to [open_url] repos for {} (this repo only) in \
+                 ~/.ahma/settings.toml",
+                repo.display()
+            ),
+        })
+    }
+}
+
+/// Every refused link waiting on this machine for a live harness.
+pub fn pending_links() -> Vec<HarnessLinkAsk> {
+    let Some(dir) = harness_asks::default_dir() else {
+        return Vec::new();
+    };
+    let now = ahma_common::session_grants::now_secs();
+    let all = harness_asks::load_all(&dir, now);
+    // Nothing refused anywhere is the usual case: read nothing else.
+    if all.iter().all(|a| a.link_refusals.is_empty()) {
+        return Vec::new();
+    }
+    let settings = ahma_common::config::settings_path();
+    let granted = |workspace: &Path| {
+        ahma_mcp::links::consent::hook_grants(settings.as_deref(), workspace, Vec::new())
+    };
+    pending_links_from(&all, &granted, &ahma_mcp::sandbox::session_tier::pid_alive)
+}
+
+/// The refused links waiting in `all`: what no saved or session grant covers
+/// (`granted`, per workspace, read as the hook reads it), not denied for its
+/// harness and not being asked in its dialog
+/// ([`harness_asks::pending_link_refusals`]), whose harness process is still
+/// `alive`. A refusal whose harness has exited is not listed: nothing could
+/// bound a session answer.
+pub fn pending_links_from(
+    all: &[WorkspaceAsks],
+    granted: &dyn Fn(&Path) -> LinkGrants,
+    alive: &dyn Fn(u32) -> bool,
+) -> Vec<HarnessLinkAsk> {
+    let mut out = Vec::new();
+    for asks in all.iter().filter(|a| !a.link_refusals.is_empty()) {
+        let grants = granted(&asks.workspace);
+        let covered = |r: &LinkRefusal| grants.covers(&r.host, r.local, r.outside_egress);
+        for refusal in harness_asks::pending_link_refusals(asks, &covered) {
+            let Some(harness_pid) = refusal.harness_pid.filter(|pid| alive(*pid)) else {
+                continue;
+            };
+            out.push(HarnessLinkAsk {
+                workspace: asks.workspace.clone(),
+                refusal,
+                harness_pid,
+            });
+        }
+    }
+    out
+}
+
+/// Apply the human's `choice` on `ask` and settle the refusal, so the harness
+/// dialog does not ask it too. Returns the line for the TUI's log. `surface`
+/// is where the human answered: what the audit and the grant record (SPEC
+/// R-GUI.7, R-LINK.9).
+pub fn answer_link(
+    ask: &HarnessLinkAsk,
+    choice: LinkChoice,
+    surface: &ApproverSurface,
+) -> Result<String> {
+    let dir = harness_asks::default_dir().context("ahma's runtime directory is unknown")?;
+    let sessions =
+        ahma_common::open_url::session_dir().context("ahma's runtime directory is unknown")?;
+    answer_link_in(
+        &dir,
+        &sessions,
+        ahma_common::config::settings_path().as_deref(),
+        ask,
+        choice,
+        surface,
+        ahma_common::session_grants::now_secs(),
+    )
+}
+
+/// [`answer_link`] against the records in `dir`, the session grants in
+/// `sessions` and the settings file `settings_file`.
+///
+/// An answer the question does not offer here is a deny: never widened. Deny
+/// is remembered for the harness's session (SPEC R-LINK.6). "This site, this
+/// session" is a session grant bound to the harness process and the repo
+/// (R-LINK.4). A lasting answer is written by the one audited writer,
+/// `persist_open_url_allow` (R-LINK.9). The refusal is settled only once its
+/// answer took, so a grant that could not be written leaves the question.
+pub fn answer_link_in(
+    dir: &Path,
+    sessions: &Path,
+    settings_file: Option<&Path>,
+    ask: &HarnessLinkAsk,
+    choice: LinkChoice,
+    surface: &ApproverSurface,
+    now: u64,
+) -> Result<String> {
+    let host = ask.refusal.host.to_ascii_lowercase();
+    let choice = if ask.choices().contains(&choice) {
+        choice
+    } else {
+        LinkChoice::Deny
+    };
+    let (declined, message) = match link_policy::effect(choice, &host, &ask.workspace) {
+        Effect::Refuse { .. } | Effect::OpenOnce => {
+            ahma_common::permissions::append_audit(
+                &ahma_common::permissions::AuditEntry::new(
+                    ahma_common::timestamp::rfc3339_local_now(),
+                    AuditAction::Deny,
+                    GrantKind::OpenUrl,
+                    host.clone(),
+                    GrantTier::Session,
+                )
+                .with_surface(surface)
+                .with_request(ask.decision_id(), None, None),
+            );
+            (
+                true,
+                format!(
+                    "Denied opening {host} links; the agent's harness will not ask about it again \
+                     this session"
+                ),
+            )
+        }
+        Effect::Session(_) => {
+            ahma_common::open_url::record_session(
+                sessions,
+                &OpenUrlSessionGrant {
+                    site: host.clone(),
+                    workspace: ask.workspace.clone(),
+                    owner_pid: ask.harness_pid,
+                    granted_at: now,
+                    granted_by: Some(surface.to_string()),
+                },
+                surface,
+            )?;
+            (
+                false,
+                format!(
+                    "Allowed {host} links for commands in {} until the agent's harness exits (not \
+                     saved); re-run the command to open it",
+                    ask.workspace.display()
+                ),
+            )
+        }
+        Effect::Persist(pattern, binding) => {
+            let file =
+                settings_file.context("cannot save the grant: ahma's settings file is unknown")?;
+            ahma_common::open_url::persist_open_url_allow(
+                file,
+                &pattern.to_string(),
+                &binding,
+                surface,
+            )?;
+            (
+                false,
+                format!(
+                    "Allowed {pattern} links for {} — saved to ~/.ahma/settings.toml (undo with \
+                     `ahma permissions revoke open-url`); re-run the command to open it",
+                    binding.describe()
+                ),
+            )
+        }
+    };
+    harness_asks::answer_link(
+        dir,
+        &ask.workspace,
+        &host,
+        Some(ask.harness_pid),
+        declined,
+        now,
+    )?;
+    Ok(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +782,233 @@ mod tests {
         )
         .unwrap();
         assert!(line.starts_with("Denied"), "{line}");
+    }
+
+    mod links {
+        use super::*;
+        use ahma_common::harness_asks::{CommandDigest, LinkRefusal};
+        use ahma_mcp::links::policy::LinkChoice::*;
+
+        struct LinkFixture {
+            home: tempfile::TempDir,
+            dir: PathBuf,
+            sessions: PathBuf,
+            settings: PathBuf,
+            ws: PathBuf,
+        }
+
+        const CMD: &str = "gh pr view 12 --web";
+
+        /// A hooked command in `ws`, run by this (live) process standing in for
+        /// the harness, was refused a link to `host`. Audit and grants go to a
+        /// private test home.
+        fn link_fixture(host: &str, local: bool) -> LinkFixture {
+            let home = tempfile::tempdir().unwrap();
+            // SAFETY: nextest runs each test in its own process.
+            unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+            let dir = home.path().join("asks");
+            let ws = home.path().join("ws");
+            harness_asks::record_link_refusal(
+                &dir,
+                &ws,
+                LinkRefusal {
+                    host: host.into(),
+                    shown: format!("http://{host}/o/r/pull/12"),
+                    local,
+                    outside_egress: false,
+                    at: 100,
+                    harness_pid: Some(std::process::id()),
+                    command_digest: Some(CommandDigest::of(CMD)),
+                },
+            )
+            .unwrap();
+            LinkFixture {
+                sessions: home.path().join("open-url-sessions"),
+                settings: home.path().join(".ahma").join("settings.toml"),
+                dir,
+                ws,
+                home,
+            }
+        }
+
+        fn no_grants(_: &Path) -> LinkGrants {
+            LinkGrants::default()
+        }
+
+        fn waiting(f: &LinkFixture) -> Vec<HarnessLinkAsk> {
+            pending_links_from(
+                &harness_asks::load_all(&f.dir, 200),
+                &no_grants,
+                &|pid: u32| pid == std::process::id(),
+            )
+        }
+
+        fn answer(f: &LinkFixture, choice: LinkChoice) -> String {
+            let ask = waiting(f).remove(0);
+            answer_link_in(
+                &f.dir,
+                &f.sessions,
+                Some(&f.settings),
+                &ask,
+                choice,
+                &ApproverSurface::Tui,
+                201,
+            )
+            .unwrap()
+        }
+
+        /// The harness dialog would ask about it next: what a TUI answer must
+        /// settle (SPEC R-PERM.3.8).
+        fn dialog_asks(f: &LinkFixture) -> bool {
+            let asks = harness_asks::load(&f.dir, &f.ws, 202);
+            harness_asks::next_link_question(&asks, "s1", CMD, &|_| None, &|_| false).is_some()
+        }
+
+        fn audited(f: &LinkFixture) -> Vec<(AuditAction, GrantTier, Option<String>)> {
+            ahma_common::permissions::read_audit_entries(
+                &f.home.path().join(".ahma").join("permissions-audit.jsonl"),
+            )
+            .into_iter()
+            .filter(|e| e.kind == GrantKind::OpenUrl)
+            .map(|e| (e.action, e.tier, e.surface))
+            .collect()
+        }
+
+        /// SPEC R-LINK.6: a hooked command's refused link is listed while its
+        /// harness lives and no grant covers the site, with the question every
+        /// surface shows (ending with the guidance, R-LINK.7) and this
+        /// surface's answers, deny first: this site for this session, then
+        /// always for this site in all repos before this repo, then any site
+        /// only where it would cover the link.
+        #[test]
+        fn a_hooked_link_refusal_is_listed_with_session_and_always() {
+            let f = link_fixture("github.com", false);
+            let asks = waiting(&f);
+            assert_eq!(asks.len(), 1, "{asks:?}");
+            let ask = &asks[0];
+            assert_eq!(ask.harness_pid, std::process::id());
+            assert_eq!(ask.decision_id(), waiting(&f)[0].decision_id(), "stable");
+            assert_eq!(
+                ask.choices(),
+                [
+                    Deny,
+                    Session,
+                    AlwaysSiteAllRepos,
+                    AlwaysSiteThisRepo,
+                    AlwaysAny
+                ]
+            );
+            let text = ask.question().text();
+            assert!(text.contains("Site: github.com"), "{text}");
+            assert!(text.ends_with(ahma_common::open_url::GUIDANCE), "{text}");
+            assert!(ask.save_line(Session).is_none(), "nothing saved");
+            assert!(
+                ask.save_line(AlwaysSiteThisRepo)
+                    .unwrap()
+                    .contains(&f.ws.display().to_string())
+            );
+
+            let local = link_fixture("localhost", true);
+            assert_eq!(
+                waiting(&local)[0].choices(),
+                [Deny, Session, AlwaysSiteAllRepos, AlwaysSiteThisRepo],
+                "no any-site answer for a local site"
+            );
+
+            let gone = pending_links_from(
+                &harness_asks::load_all(&f.dir, 200),
+                &no_grants,
+                &|_: u32| false,
+            );
+            assert!(gone.is_empty(), "its harness exited");
+            let any = |_: &Path| LinkGrants {
+                always: vec![ahma_mcp::egress::HostPattern::Any],
+                ..LinkGrants::default()
+            };
+            let alive = |pid: u32| pid == std::process::id();
+            assert!(
+                pending_links_from(&harness_asks::load_all(&f.dir, 200), &any, &alive).is_empty(),
+                "covered by a grant"
+            );
+            assert_eq!(
+                pending_links_from(&harness_asks::load_all(&local.dir, 200), &any, &alive).len(),
+                1,
+                "any site never covers a local one"
+            );
+        }
+
+        /// SPEC R-LINK.4: "this site, this session" is a session grant file
+        /// bound to the harness process and the repo — what the hook reads —
+        /// audited from the TUI; the refusal is settled, so neither the TUI nor
+        /// the harness dialog asks it again (R-PERM.3.8).
+        #[test]
+        fn a_session_answer_is_the_session_grant_the_hook_reads() {
+            let f = link_fixture("github.com", false);
+            assert!(dialog_asks(&f));
+            let line = answer(&f, Session);
+            assert!(line.contains("until the agent's harness exits"), "{line}");
+            let grants = ahma_common::open_url::active_sessions(&f.sessions, 202, &|pid| {
+                pid == std::process::id()
+            });
+            assert_eq!(grants.len(), 1, "{grants:?}");
+            assert!(grants[0].covers("github.com", &f.ws));
+            assert_eq!(grants[0].granted_by.as_deref(), Some("tui"));
+            assert!(waiting(&f).is_empty(), "answered");
+            assert!(!dialog_asks(&f), "the dialog does not ask it too");
+            assert_eq!(
+                audited(&f),
+                [(AuditAction::Grant, GrantTier::Session, Some("tui".into()))]
+            );
+        }
+
+        /// The lasting answers are written by the one audited writer, for every
+        /// repo or for this one, and settle the refusal.
+        #[test]
+        fn an_always_answer_is_saved_for_all_repos_or_this_repo() {
+            let f = link_fixture("github.com", false);
+            answer(&f, AlwaysSiteThisRepo);
+            let saved = ahma_common::config::AhmaSettings::load_from_result(&f.settings).unwrap();
+            assert!(saved.open_url.allow.is_empty());
+            assert_eq!(saved.open_url.allowed_in(&f.ws), ["github.com"]);
+            assert!(!dialog_asks(&f));
+
+            let g = link_fixture("docs.rs", false);
+            answer(&g, AlwaysSiteAllRepos);
+            let saved = ahma_common::config::AhmaSettings::load_from_result(&g.settings).unwrap();
+            assert_eq!(saved.open_url.allow, ["docs.rs"]);
+            assert_eq!(
+                audited(&g),
+                [(AuditAction::Grant, GrantTier::Always, Some("tui".into()))]
+            );
+        }
+
+        /// SPEC R-LINK.6: a deny is remembered for the harness's session — the
+        /// site is not listed or asked in its dialog again, even when refused
+        /// again — and an answer this surface does not offer ("this time") is
+        /// a deny, never widened.
+        #[test]
+        fn a_deny_is_remembered_for_the_harness_session_and_once_is_a_deny() {
+            for choice in [Deny, Once] {
+                let f = link_fixture("github.com", false);
+                let line = answer(&f, choice);
+                assert!(line.starts_with("Denied"), "{choice:?}: {line}");
+                let asks = harness_asks::load(&f.dir, &f.ws, 202);
+                assert!(harness_asks::link_denied_for(
+                    &asks,
+                    Some(std::process::id()),
+                    "github.com"
+                ));
+                assert!(waiting(&f).is_empty());
+                assert!(!dialog_asks(&f));
+                assert!(
+                    !f.sessions.exists() && !f.settings.exists(),
+                    "a deny grants nothing"
+                );
+                assert_eq!(
+                    audited(&f),
+                    [(AuditAction::Deny, GrantTier::Session, Some("tui".into()))]
+                );
+            }
+        }
     }
 }

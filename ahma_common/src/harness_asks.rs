@@ -703,6 +703,10 @@ pub struct WorkspaceAsks {
     /// Questions about them put to the human through the harness dialog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links_asked: Vec<AskedLink>,
+    /// Sites a human denied at another surface (the TUI) for a harness process, before its
+    /// dialog asked (SPEC R-LINK.6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links_denied: Vec<LinkDenied>,
 }
 
 /// Record that a plain read of `repo` from this workspace was noted in `session_id`. `true` the
@@ -1012,6 +1016,8 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
         .retain(|r| now.saturating_sub(r.at) <= MAX_AGE_SECS);
     asks.links_asked
         .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
+    asks.links_denied
+        .retain(|d| now.saturating_sub(d.at) <= MAX_AGE_SECS);
 }
 
 /// What spending a one-use token reads and writes of the record that carries it.
@@ -1328,8 +1334,79 @@ pub fn next_link_question(
                 || opens.as_deref().is_some_and(|h| r.same_subject(h))
         })
         .filter(|r| !covered(r))
+        .filter(|r| !link_denied_for(asks, r.harness_pid, &r.host))
         .find(|r| !link_declined(asks, session_id, &r.host))
         .cloned()
+}
+
+/// A site a human denied at another surface for one harness process (SPEC R-LINK.6): remembered
+/// for that harness session, as a no in its own dialog is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkDenied {
+    pub host: String,
+    /// The harness process whose session the deny lasts for. `None` denies it for every one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_pid: Option<u32>,
+    pub at: u64,
+}
+
+/// Whether a human denied links to `host` at another surface for the harness process
+/// `harness_pid` ([`answer_link`]).
+pub fn link_denied_for(asks: &WorkspaceAsks, harness_pid: Option<u32>, host: &str) -> bool {
+    asks.links_denied.iter().any(|d| {
+        d.host.eq_ignore_ascii_case(host)
+            && (d.harness_pid.is_none() || d.harness_pid == harness_pid)
+    })
+}
+
+/// The refused links a surface other than the harness dialog may ask about (the TUI, SPEC
+/// R-LINK.6): one per site, that no grant covers (`covered`), not denied for the harness that
+/// was refused, and not put to that harness's dialog without a yes — a site is asked at most
+/// once at a time, and a dialog's no is that session's answer.
+pub fn pending_link_refusals(
+    asks: &WorkspaceAsks,
+    covered: &dyn Fn(&LinkRefusal) -> bool,
+) -> Vec<LinkRefusal> {
+    let same_harness = |a: Option<u32>, b: Option<u32>| a.is_none() || a == b;
+    asks.link_refusals
+        .iter()
+        .filter(|r| !covered(r))
+        .filter(|r| !link_denied_for(asks, r.harness_pid, &r.host))
+        .filter(|r| {
+            !asks.links_asked.iter().any(|a| {
+                !a.used
+                    && a.refusal.same_subject(&r.host)
+                    && same_harness(a.harness_pid, r.harness_pid)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Record that a human answered the refused link to `host` at another surface for the harness
+/// process `harness_pid` (SPEC R-LINK.6, R-PERM.3.8): that harness's refusals of the site are
+/// settled, so its dialog does not ask too, and a deny (`declined`) is remembered for its session.
+/// A yes leaves its grant to say the rest: a session grant or a saved one covers the site.
+pub fn answer_link(
+    dir: &Path,
+    workspace: &Path,
+    host: &str,
+    harness_pid: Option<u32>,
+    declined: bool,
+    now: u64,
+) -> Result<()> {
+    update(dir, workspace, now, |asks| {
+        asks.link_refusals.retain(|r| {
+            !(r.same_subject(host) && (harness_pid.is_none() || r.harness_pid == harness_pid))
+        });
+        if declined {
+            asks.links_denied.push(LinkDenied {
+                host: host.to_ascii_lowercase(),
+                harness_pid,
+                at: now,
+            });
+        }
+    })
 }
 
 /// Record that `refusal` was put to the human in `session_id` before `command`, returning the
@@ -1859,6 +1936,79 @@ mod tests {
         let asks = load(dir.path(), ws, 110);
         assert!(next_link_question(&asks, "s2", cmd, &opens, &never).is_some());
         assert!(next_link_question(&asks, "s1", cmd, &opens, &never).is_none());
+    }
+
+    /// SPEC R-LINK.6, R-PERM.3.8: a refused link another surface (the TUI) answers first is not
+    /// asked in the harness dialog too. It is listed there only while no grant covers it and no
+    /// dialog is asking it; a deny there is remembered for that harness's session, as a no in
+    /// its dialog is, and a yes settles the refusal for its grant to cover. Another harness's
+    /// refusal of the same site is its own question.
+    #[test]
+    fn a_link_answered_at_another_surface_is_not_asked_in_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Path::new("/ws/repo");
+        let cmd = "gh pr view 12 --web";
+        let refusal = |host: &str, pid: u32, at: u64| LinkRefusal {
+            host: host.into(),
+            shown: format!("https://{host}/x"),
+            local: false,
+            outside_egress: false,
+            at,
+            harness_pid: Some(pid),
+            command_digest: Some(CommandDigest::of(cmd)),
+        };
+        let none = |_: &str| None;
+        let never = |_: &LinkRefusal| false;
+        record_link_refusal(dir.path(), ws, refusal("github.com", 7, 100)).unwrap();
+        record_link_refusal(dir.path(), ws, refusal("docs.rs", 7, 100)).unwrap();
+        let asks = load(dir.path(), ws, 101);
+        let hosts = |asks: &WorkspaceAsks| -> Vec<String> {
+            pending_link_refusals(asks, &never)
+                .into_iter()
+                .map(|r| r.host)
+                .collect()
+        };
+        assert_eq!(hosts(&asks), ["github.com", "docs.rs"]);
+        assert!(
+            pending_link_refusals(&asks, &|r: &LinkRefusal| r.host == "docs.rs")
+                .iter()
+                .all(|r| r.host != "docs.rs"),
+            "a covered site is not listed"
+        );
+
+        // Denied in the TUI: settled, and remembered for that harness's session.
+        answer_link(dir.path(), ws, "GitHub.com", Some(7), true, 102).unwrap();
+        let asks = load(dir.path(), ws, 103);
+        assert_eq!(hosts(&asks), ["docs.rs"]);
+        assert!(link_denied_for(&asks, Some(7), "github.com"));
+        record_link_refusal(dir.path(), ws, refusal("github.com", 7, 104)).unwrap();
+        let asks = load(dir.path(), ws, 105);
+        assert_eq!(hosts(&asks), ["docs.rs"], "refused again: still denied");
+        let next = next_link_question(&asks, "s1", cmd, &none, &never).expect("docs.rs");
+        assert_eq!(
+            next.host, "docs.rs",
+            "the dialog does not ask the denied site"
+        );
+
+        // A yes in the TUI settles the refusal; its grant covers what follows.
+        answer_link(dir.path(), ws, "docs.rs", Some(7), false, 106).unwrap();
+        let asks = load(dir.path(), ws, 107);
+        assert!(next_link_question(&asks, "s1", cmd, &none, &never).is_none());
+        assert!(
+            !link_denied_for(&asks, Some(7), "docs.rs"),
+            "a yes is not a no"
+        );
+
+        // Another harness process: its own question, in the TUI and in its dialog.
+        record_link_refusal(dir.path(), ws, refusal("github.com", 8, 108)).unwrap();
+        let asks = load(dir.path(), ws, 109);
+        assert!(!link_denied_for(&asks, Some(8), "github.com"));
+        assert_eq!(hosts(&asks), ["github.com"]);
+        let q = next_link_question(&asks, "s2", cmd, &none, &never).expect("asked");
+
+        // Put to its dialog and not yet answered yes: asked once at a time, so not listed.
+        mark_link_asked(dir.path(), ws, "s2", &q, cmd, Some(8), 110).unwrap();
+        assert!(hosts(&load(dir.path(), ws, 111)).is_empty());
     }
 
     /// SPEC R-ESCAPE: an escape is offered for exactly the refused command,

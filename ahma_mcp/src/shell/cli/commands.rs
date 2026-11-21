@@ -1238,45 +1238,91 @@ fn grant_open_url(
 }
 
 /// `ahma permissions revoke open-url [SITE]`: previews what it removes and
-/// removes it, audited, only with `--yes`.
+/// removes it, audited, only with `--yes`. A "this site, this session" grant
+/// given in the TUI ends with it, now (SPEC R-LINK.7, R-PERM.11); `--global`
+/// names only the grants for every repo, which a session grant never is.
 fn revoke_open_url(
     file: &std::path::Path,
     site: Option<&str>,
     binding: Option<&ahma_common::open_url::OpenUrlBinding>,
     yes: bool,
 ) -> Result<()> {
+    use ahma_common::open_url::OpenUrlBinding;
     let pattern = site.map(|s| open_url_pattern(Some(s))).transpose()?;
     let settings = ahma_common::config::AhmaSettings::load_from_result(file)
         .map_err(|e| anyhow::anyhow!(e))?;
     let found = settings.open_url.matching(pattern.as_deref(), binding);
-    if found.is_empty() {
+    let session_repo: Option<Option<&std::path::Path>> = match binding {
+        None => Some(None),
+        Some(OpenUrlBinding::Repo(ws)) => Some(Some(ws.as_path())),
+        Some(OpenUrlBinding::AllRepos) => None,
+    };
+    let session_dir = ahma_common::open_url::session_dir();
+    let sessions: Vec<_> = match (&session_dir, session_repo) {
+        (Some(dir), Some(repo)) => ahma_common::open_url::active_sessions(
+            dir,
+            ahma_common::session_grants::now_secs(),
+            &crate::sandbox::pid_alive,
+        )
+        .into_iter()
+        .filter(|g| {
+            pattern
+                .as_deref()
+                .is_none_or(|p| g.site.eq_ignore_ascii_case(p))
+                && repo.is_none_or(|ws| g.workspace == ws)
+        })
+        .collect(),
+        _ => Vec::new(),
+    };
+    if found.is_empty() && sessions.is_empty() {
         println!(
             "Nothing to revoke: no open-url grant for {}.",
             pattern.as_deref().unwrap_or("any site")
         );
         return Ok(());
     }
-    let describe = |list: &[(String, ahma_common::open_url::OpenUrlBinding)]| {
+    let describe = |list: &[(String, OpenUrlBinding)]| {
         list.iter()
             .map(|(p, b)| format!("{p} ({})", b.describe()))
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let describe_sessions = sessions
+        .iter()
+        .map(|g| format!("{} (repo {})", g.site, g.workspace.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
     if !yes {
-        println!("Would remove the open-url grant for {}.", describe(&found));
+        if !found.is_empty() {
+            println!("Would remove the open-url grant for {}.", describe(&found));
+        }
+        if !sessions.is_empty() {
+            println!("Would end the session grant for {describe_sessions}.");
+        }
         println!();
         println!("File: {}", file.display());
         println!();
         println!("Nothing was changed. Re-run with --yes to apply.");
         return Ok(());
     }
-    let removed = ahma_common::open_url::revoke_open_url(
-        file,
-        pattern.as_deref(),
-        binding,
-        &ApproverSurface::Cli,
-    )?;
-    println!("✓ Revoked: the open-url grant for {}.", describe(&removed));
+    if !found.is_empty() {
+        let removed = ahma_common::open_url::revoke_open_url(
+            file,
+            pattern.as_deref(),
+            binding,
+            &ApproverSurface::Cli,
+        )?;
+        println!("✓ Revoked: the open-url grant for {}.", describe(&removed));
+    }
+    if let (Some(dir), Some(repo), false) = (&session_dir, session_repo, sessions.is_empty()) {
+        ahma_common::open_url::revoke_sessions(
+            dir,
+            pattern.as_deref(),
+            repo,
+            &ApproverSurface::Cli,
+        );
+        println!("✓ Ended: the session grant for {describe_sessions}.");
+    }
     Ok(())
 }
 
@@ -3938,6 +3984,45 @@ mod tests {
         let err = grant_open_url_cli(Some("github.com"), None, Some("8h"), true).unwrap_err();
         assert!(format!("{err:#}").contains("until revoked"), "{err:#}");
         assert!(!ledger(home.path()).exists(), "nothing written");
+    }
+
+    /// SPEC R-LINK.7, R-PERM.11: the undo every link question names ends a
+    /// "this site, this session" grant now, not when the harness exits;
+    /// `--global` (the grants for every repo) leaves it.
+    #[test]
+    fn an_open_url_revoke_ends_the_session_grants_now() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let ws = dunce::canonicalize(home.path()).unwrap().join("repo");
+        let dir = ahma_common::open_url::session_dir().unwrap();
+        let live = |dir: &std::path::Path| {
+            ahma_common::open_url::active_sessions(
+                dir,
+                ahma_common::session_grants::now_secs(),
+                &|_| true,
+            )
+        };
+        ahma_common::open_url::record_session(
+            &dir,
+            &ahma_common::open_url::OpenUrlSessionGrant {
+                site: "github.com".into(),
+                workspace: ws.clone(),
+                owner_pid: std::process::id(),
+                granted_at: ahma_common::session_grants::now_secs(),
+                granted_by: Some("tui".into()),
+            },
+            &ApproverSurface::Tui,
+        )
+        .unwrap();
+        revoke_open_url_cli(Some("github.com"), None, true);
+        assert_eq!(live(&dir).len(), 1, "--global names only all-repos grants");
+        revoke_open_url_cli(Some("docs.rs"), None, false);
+        assert_eq!(live(&dir).len(), 1, "another site's revoke leaves it");
+        revoke_open_url_cli(Some("GitHub.com"), None, false);
+        assert!(
+            live(&dir).is_empty(),
+            "ended now, with nothing saved to revoke"
+        );
     }
 
     /// A revoke without a site removes every grant; `--global` only those for

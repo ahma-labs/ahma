@@ -94,6 +94,26 @@ so it names every answer, in this order:
 Each yes is recorded in `permissions-audit.jsonl` as a one-time `open-url` grant from the
 harness dialog.
 
+## Answered first in `ahma tui`
+
+While Claude Code runs, `ahma tui` shows the same question as soon as the link is refused —
+the site, the address, the notes and the guidance — so you can answer before the agent runs
+the command again. Nothing waits on the refused command, so there is no "this time"; the other
+answers are there, deny first:
+
+| Key | Answer | What it does |
+|---|---|---|
+| `n`, Enter, Esc | Deny | Not opened, and not asked again in that Claude Code session. |
+| `s` | This site, this session | Commands in this repo may open that site's links until Claude Code exits (at most 12 hours). Not saved: an owner-only file in ahma's runtime directory. |
+| `a` | Always for this site — all repos | Saved to `[open_url] allow`. |
+| `r` | Always for this site — this repo only | Saved to `[open_url] repos` for this repo. |
+| `*` | Always (any site) | Saved as `*`; offered only where it would cover the link. |
+
+`a`, `r` and `*` first show the exact line they add, and a second press saves it. Whatever you
+answer, Claude Code's dialog does not ask the same question; the agent re-runs the command and
+it opens, or is refused naming the grant. Every answer is recorded in `permissions-audit.jsonl`
+with the surface `tui`. `ahma web` and `ahma desktop` do not show these questions yet.
+
 ## How it works
 
 1. Every command ahma runs, from a terminal hook or over MCP, gets `BROWSER` and `GH_BROWSER` set to
@@ -133,7 +153,7 @@ grant never lets commands reach a site, and a network grant never opens links.
 | `[open_url] allow` | Sites whose links open without asking in every repo: `github.com`, `*.github.io` (one label), `*` (any public site). Written by `ahma permissions grant open-url`. |
 | `[open_url] repos` | The same, for one repo (`--this-repo`, `--workspace <DIR>`). |
 | `ahma permissions grant open-url [SITE]` | Preview, then `--yes` to save. No site = any public site. |
-| `ahma permissions revoke open-url [SITE]` | Remove one site, or with no site every one. |
+| `ahma permissions revoke open-url [SITE]` | Remove one site, or with no site every one; also ends a "this site, this session" answer for it now (not with `--global`). |
 | `ahma open-url <URL>…` | The helper, by name, inside a command ahma runs. |
 | `BROWSER`, `GH_BROWSER`, `AHMA_LINK_SOCK` | Set by ahma for each command; do not set them yourself. |
 
@@ -144,9 +164,10 @@ lengths of its query and fragment.
 ## Limits
 
 - At most 5 links per command, each at most 8 KB.
-- Asked in Claude Code's dialog when a hooked command runs again, and in the MCP client's prompt
-  while an MCP command waits. The TUI, `ahma web` and `ahma desktop` do not ask yet (SPEC
-  R-LINK.6): a client that cannot show questions gets the grant line.
+- Asked in Claude Code's dialog when a hooked command runs again, in `ahma tui` as soon as a
+  hooked command is refused, and in the MCP client's prompt while an MCP command waits. The TUI
+  does not answer an MCP command's question yet, and `ahma web` and `ahma desktop` ask nothing
+  yet (SPEC R-LINK.6): a client that cannot show questions gets the grant line.
 - Commands in a persistent shell session (`session_id`) share one long-lived shell, so they get
   no link broker of their own; a browser launch there fails as before.
 - A site you allow can forward your browser elsewhere (an open redirect); allow sites you trust.
@@ -162,5 +183,6 @@ lengths of its query and fragment.
 
 [security-sandbox.md](security-sandbox.md) (LaunchServices, R6.2.10) ·
 [ssh-agent-broker.md](ssh-agent-broker.md) (the same broker shape for SSH keys) ·
+[tui.md](tui.md) (approval gates) ·
 [network-egress.md](network-egress.md) · [permissions.md](permissions.md) ·
 [environment-variables.md](environment-variables.md) · [SPEC R-LINK](../SPEC.md)

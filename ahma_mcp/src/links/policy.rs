@@ -297,6 +297,16 @@ impl LinkGrants {
             denied,
         }
     }
+
+    /// Whether a saved or session grant opens links to `host` (SPEC R-LINK.4,
+    /// R-LINK.5): a grant naming it does; "any site" only when the host is
+    /// neither `local` nor `outside_egress`.
+    pub fn covers(&self, host: &str, local: bool, outside_egress: bool) -> bool {
+        self.always.iter().chain(&self.session).any(|p| match p {
+            HostPattern::Any => !local && !outside_egress,
+            named => named.matches(host),
+        })
+    }
 }
 
 /// The network restriction in force (SPEC R-LINK.5), whatever the surface:
@@ -416,6 +426,19 @@ pub struct LinkQuestion {
 }
 
 impl LinkQuestion {
+    /// The question a link a hooked command was refused asks, recorded for
+    /// the harness dialog and the TUI (SPEC R-LINK.6): the same at every
+    /// surface that reads the record.
+    pub fn from_refusal(refusal: &ahma_common::harness_asks::LinkRefusal) -> Self {
+        Self {
+            host: refusal.host.to_ascii_lowercase(),
+            shown: refusal.shown.clone(),
+            local: refusal.local,
+            outside_egress: refusal.outside_egress,
+            internationalised: refusal.host.split('.').any(|l| l.starts_with("xn--")),
+        }
+    }
+
     /// The answers `surface` offers, deny first (R-PERM.3.4), then the one
     /// that remembers nothing or least, then "always for this site" for all
     /// repos before this repo only. "Always (any site)" only where it would
@@ -488,11 +511,7 @@ pub fn decide(
         Egress::Open => false,
         Egress::Restricted(allows) => !local && !allows(host),
     };
-    let covers = |p: &HostPattern| match p {
-        HostPattern::Any => !local && !outside_egress,
-        named => named.matches(host),
-    };
-    if grants.always.iter().chain(&grants.session).any(covers) {
+    if grants.covers(host, local, outside_egress) {
         return LinkDecision::Open;
     }
     if grants.denied.iter().any(|d| d.eq_ignore_ascii_case(host)) {

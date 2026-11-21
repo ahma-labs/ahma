@@ -900,6 +900,11 @@ pub fn runtime_dir() -> Option<PathBuf> {
 /// Where [`runtime_dir`] is, without creating it (see the Unix version).
 #[cfg(not(unix))]
 pub fn runtime_dir_location() -> Option<PathBuf> {
+    // Under a test harness the private test home, as on Unix (SPEC R-ISO.1).
+    #[cfg(debug_assertions)]
+    if crate::test_isolation::spawned_under_test_harness() {
+        return Some(crate::config::ahma_home_dir()?.join(".ahma"));
+    }
     std::env::var("LOCALAPPDATA")
         .ok()
         .filter(|x| !x.is_empty())
@@ -5511,21 +5516,34 @@ mod tests {
     }
 
     /// SPEC R-ISO.1: under a test harness the runtime directory is the
-    /// private test home, never the real user's `XDG_RUNTIME_DIR`.
-    #[cfg(unix)]
+    /// private test home on every platform, never the real user's
+    /// `XDG_RUNTIME_DIR` or `%LOCALAPPDATA%\ahma\run`. Windows once kept the
+    /// real one, so parallel tests shared session grants and a test counting
+    /// them read its neighbours'.
     #[test]
     fn under_a_test_harness_the_runtime_dir_is_the_test_home() {
+        const PLATFORM_VARS: [&str; 2] = ["XDG_RUNTIME_DIR", "LOCALAPPDATA"];
         let tmp = tempfile::tempdir().unwrap();
         let _g = ENV_MUTEX.lock();
-        let prev = std::env::var_os("XDG_RUNTIME_DIR");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let prev: Vec<_> = PLATFORM_VARS
+            .iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        for k in PLATFORM_VARS {
+            unsafe { std::env::set_var(k, tmp.path()) };
+        }
         let dir = runtime_dir().expect("a runtime dir");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        let location = runtime_dir_location();
+        for (k, v) in prev {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
         }
         assert!(!dir.starts_with(tmp.path()), "{}", dir.display());
-        assert_eq!(dir, crate::config::ahma_home_dir().unwrap().join(".ahma"));
+        let private = crate::config::ahma_home_dir().unwrap().join(".ahma");
+        assert_eq!(dir, private);
+        assert_eq!(location, Some(private));
     }
 
     #[test]

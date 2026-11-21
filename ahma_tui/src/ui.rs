@@ -60,6 +60,7 @@ fn draw_overlay(
         Overlay::Settings => draw_settings_panel(frame, state, theme, full),
         Overlay::Setup => draw_setup_view(frame, state, theme, full),
         Overlay::WebApproval => draw_web_approval_modal(frame, state, theme, full),
+        Overlay::LinkAsk => draw_link_ask_modal(frame, state, theme, full),
         Overlay::ScopeGrant => draw_scope_grant_modal(frame, state, theme, full),
         Overlay::Trust => draw_trust_modal(frame, state, theme, full),
         Overlay::DoctorConfirm => draw_doctor_confirm(frame, state, theme, full),
@@ -4672,6 +4673,108 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
         GatePopup {
             title,
             width: 76,
+            body: lines,
+            answers,
+            notes,
+            watched: None,
+            reveal_watched: false,
+            scroll: gate.scroll,
+            unicode: state.unicode,
+        },
+    );
+    gate.view.set(view);
+}
+
+/// A link a hooked command was refused, asked here before the harness dialog
+/// asks it (SPEC R-LINK.6): the question every surface shows, ending with the
+/// guidance (R-LINK.7), then the answers this surface offers, deny first.
+fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    use ahma_mcp::links::policy::LinkChoice;
+    let Some(gate) = &state.link_ask else {
+        return;
+    };
+    let waiting = state.link_ask_queue.len();
+    let title = if waiting == 0 {
+        " Link · open in your browser? ".to_string()
+    } else {
+        format!(" Link · open in your browser? ({waiting} more waiting) ")
+    };
+    let question = gate.ask.question();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "An earlier hooked command in {} was refused this link.",
+                gate.ask.workspace.display()
+            ),
+            theme.dim(),
+        )),
+        Line::from(""),
+    ];
+    for row in question.text().lines() {
+        let style = if row.starts_with("Site: ") {
+            theme.success().bold()
+        } else {
+            theme.normal()
+        };
+        lines.push(Line::from(Span::styled(row.to_string(), style)));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "The command was not paused: an answer here applies when the agent runs it again, \
+             and Claude Code's dialog does not ask it too.",
+            theme.dim(),
+        )),
+    ]);
+    let answers = gate
+        .choices
+        .iter()
+        .filter_map(|choice| {
+            let key = crate::state::LinkAskGate::key_for(*choice)?;
+            let (key_style, label) = match choice {
+                LinkChoice::Deny => (theme.failed().bold(), "Deny (default)".to_string()),
+                LinkChoice::Session => (theme.pending().bold(), choice.label().to_string()),
+                _ => (theme.success().bold(), choice.label().to_string()),
+            };
+            Some(vec![
+                Span::styled(format!("[{key}] "), key_style),
+                Span::styled(label, theme.normal()),
+            ])
+        })
+        .collect();
+    let mut notes = vec![Line::from(Span::styled(
+        "  Enter / Esc = Deny",
+        theme.dim(),
+    ))];
+    // Pinned with the answers, so the line a second press saves is on screen
+    // whenever that key is (R-PERM.3.5); any site says first that one site is
+    // safer (R-LINK.7).
+    if let Some(choice) = gate.confirm
+        && let (Some(key), Some(line)) = (
+            crate::state::LinkAskGate::key_for(choice),
+            gate.ask.save_line(choice),
+        )
+    {
+        if choice == LinkChoice::AlwaysAny {
+            notes.push(Line::from(Span::styled(
+                format!("  {}", ahma_common::open_url::ANY_SITE_WARNING),
+                theme.pending(),
+            )));
+        }
+        notes.push(Line::from(Span::styled(
+            format!("  [{key}] again {line}"),
+            theme.pending().bold(),
+        )));
+    }
+    notes.extend(gate_typing_note(state, theme));
+
+    let view = draw_gate_popup(
+        frame,
+        theme,
+        area,
+        GatePopup {
+            title,
+            width: 84,
             body: lines,
             answers,
             notes,

@@ -1670,6 +1670,87 @@ impl WebApprovalGate {
     }
 }
 
+/// A link a refused terminal-hook command left for the harness dialog (SPEC
+/// R-LINK.6), asked here first. Rendered as a top overlay like the web
+/// question; the default/Enter choice is the safe Deny. Read from the
+/// records, never from the hub, and answered by the TUI itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkAskGate {
+    pub decision_id: String,
+    pub ask: crate::harness_asks::HarnessLinkAsk,
+    /// The answers offered, deny first, in the order `links::policy` gives.
+    pub choices: Vec<ahma_mcp::links::policy::LinkChoice>,
+    /// When the question took the screen; granting keys in the
+    /// [`GRANT_ARMING_DELAY`] after it are swallowed (SPEC R-PERM.3.5).
+    pub shown_at: std::time::Instant,
+    /// A saving answer pressed once: the exact line it writes is on screen,
+    /// and the same key again saves it (SPEC R-PERM.3.5).
+    pub confirm: Option<ahma_mcp::links::policy::LinkChoice>,
+    /// Body rows scrolled past; the answers are pinned (SPEC R-PERM.3.10).
+    pub scroll: usize,
+    /// What the last frame showed, published by the renderer.
+    pub view: std::cell::Cell<GateView>,
+    /// No surface has shown this question yet (see [`ScopeGrantGate`]).
+    pub awaiting_presentation: bool,
+}
+
+/// The key that gives each answer to a link question in the terminal. "This
+/// time" has none: nothing waits on a hooked command (SPEC R-LINK.6).
+pub const LINK_ASK_KEYS: [(char, ahma_mcp::links::policy::LinkChoice); 5] = {
+    use ahma_mcp::links::policy::LinkChoice::*;
+    [
+        ('n', Deny),
+        ('s', Session),
+        ('a', AlwaysSiteAllRepos),
+        ('r', AlwaysSiteThisRepo),
+        ('*', AlwaysAny),
+    ]
+};
+
+impl LinkAskGate {
+    /// The key for `choice` ([`LINK_ASK_KEYS`]).
+    pub fn key_for(choice: ahma_mcp::links::policy::LinkChoice) -> Option<char> {
+        LINK_ASK_KEYS
+            .iter()
+            .find(|(_, c)| *c == choice)
+            .map(|(k, _)| *k)
+    }
+
+    pub fn from_ask(ask: crate::harness_asks::HarnessLinkAsk) -> Self {
+        Self {
+            decision_id: ask.decision_id(),
+            choices: ask.choices(),
+            ask,
+            shown_at: std::time::Instant::now(),
+            confirm: None,
+            scroll: 0,
+            view: Default::default(),
+            awaiting_presentation: false,
+        }
+    }
+
+    /// Start the arming delay again (see [`ScopeGrantGate::restart_arming`]).
+    pub fn restart_arming(&mut self, wait_for_presentation: bool) {
+        self.shown_at = std::time::Instant::now();
+        self.awaiting_presentation = wait_for_presentation;
+        self.confirm = None;
+    }
+
+    /// A surface reports having shown the question (see
+    /// [`ScopeGrantGate::presented`]).
+    pub fn presented(&mut self) {
+        if self.awaiting_presentation {
+            self.awaiting_presentation = false;
+            self.shown_at = std::time::Instant::now();
+        }
+    }
+
+    /// Whether a granting key may answer yet ([`GRANT_ARMING_DELAY`]).
+    pub fn armed(&self) -> bool {
+        !self.awaiting_presentation && self.shown_at.elapsed() >= GRANT_ARMING_DELAY
+    }
+}
+
 // ─── Click target ─────────────────────────────────────────────────────────────
 
 /// Which operation an action is about. Operation ids are unique only within
@@ -2172,6 +2253,11 @@ pub struct AppState {
     /// Web-egress questions that arrived while one was open, oldest first
     /// (parallel to `scope_grant_queue`): a new one never replaces the open one.
     pub web_approval_queue: VecDeque<WebApprovalGate>,
+    /// A link a refused terminal-hook command left for the harness dialog,
+    /// asked here first (SPEC R-LINK.6), if any.
+    pub link_ask: Option<LinkAskGate>,
+    /// Link questions waiting behind it, oldest first.
+    pub link_ask_queue: VecDeque<LinkAskGate>,
     /// Measured prompt-reading speed (tokens/second) per model label, from
     /// this session's own turns. Feeds the "~2m left" estimate.
     pub read_rates: std::collections::HashMap<String, f64>,
@@ -2621,6 +2707,8 @@ pub enum Overlay {
     ScopeGrant,
     /// A web egress question.
     WebApproval,
+    /// A link a hooked command was refused (SPEC R-LINK.6).
+    LinkAsk,
     /// The guided setup view.
     Setup,
     /// The settings panel.
@@ -2631,11 +2719,12 @@ pub enum Overlay {
 
 /// Every [`Overlay`], topmost first. Security questions sit over everything
 /// else; the trust and doctor questions over the grant questions.
-pub const OVERLAYS_TOP_FIRST: [Overlay; 7] = [
+pub const OVERLAYS_TOP_FIRST: [Overlay; 8] = [
     Overlay::DoctorConfirm,
     Overlay::Trust,
     Overlay::ScopeGrant,
     Overlay::WebApproval,
+    Overlay::LinkAsk,
     Overlay::Setup,
     Overlay::Settings,
     Overlay::Modal,
@@ -2819,6 +2908,7 @@ impl AppState {
             Overlay::Trust => self.trust_prompt.is_some(),
             Overlay::ScopeGrant => self.scope_grant.is_some(),
             Overlay::WebApproval => self.web_approval.is_some(),
+            Overlay::LinkAsk => self.link_ask.is_some(),
             Overlay::Setup => self.setup_view.open,
             Overlay::Settings => self.settings_editor.open,
             Overlay::Modal => !matches!(self.modal, ModalState::None),
@@ -3003,6 +3093,8 @@ impl AppState {
             scope_grant_queue: VecDeque::new(),
             web_approval: None,
             web_approval_queue: VecDeque::new(),
+            link_ask: None,
+            link_ask_queue: VecDeque::new(),
             read_rates: std::collections::HashMap::new(),
             turn_retries: 0,
             recent_llms: session
