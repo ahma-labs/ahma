@@ -765,7 +765,9 @@ fn parse_op_times(op_val: &Value, op: &mut Operation) {
     let now_local = ahma_common::timestamp::local_now();
     if now_local >= s_dt {
         let diff_secs = now_local.duration_since(&s_dt).as_secs().max(0) as u64;
-        op.started_at = Some(std::time::Instant::now() - Duration::from_secs(diff_secs));
+        // Checked: on Windows an `Instant` cannot precede boot, so an operation that
+        // started before this machine booted has none (and keeps its wall-clock times).
+        op.started_at = std::time::Instant::now().checked_sub(Duration::from_secs(diff_secs));
     }
 
     let Some(e_dt) = parse_rfc3339_field(op_val, "end_time") else {
@@ -1118,6 +1120,24 @@ mod tests {
             "2026-11-21T08:15:30.123456Z"
                 .parse::<jiff::Timestamp>()
                 .unwrap()
+        );
+    }
+
+    /// `Instant` counts from boot on Windows and Linux, so an operation that
+    /// started before this machine booted has no `Instant`. It must keep its
+    /// wall-clock times and duration rather than panic.
+    #[test]
+    fn mcp_parse_op_times_survives_a_start_before_boot() {
+        let v = json!({
+            "start_time": "2000-01-01T00:00:00Z",
+            "end_time": "2000-01-01T00:00:05Z",
+        });
+        let mut op = Operation::new("id", "tool", OpStatus::Succeeded);
+        parse_op_times(&v, &mut op);
+        assert_eq!(op.duration_ms, Some(5000));
+        assert_eq!(
+            op.started_time.timestamp(),
+            "2000-01-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap()
         );
     }
 
