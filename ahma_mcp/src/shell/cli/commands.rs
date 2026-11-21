@@ -1090,17 +1090,194 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
             kind,
             subject,
             workspace,
+            this_repo,
             global,
             yes,
-        } => revoke_permission(&file, load()?, &kind, &subject, workspace, global, yes),
+        } => {
+            if parse_kind(&kind)? == GrantKind::OpenUrl {
+                let binding = open_url_revoke_binding(workspace, this_repo, global)?;
+                return revoke_open_url(&file, subject.as_deref(), binding.as_ref(), yes);
+            }
+            let subject = subject_or_bail(&kind, subject)?;
+            revoke_permission(&file, load()?, &kind, &subject, workspace, global, yes)
+        }
         PermissionsCommand::Grant {
             kind,
             subject,
             workspace,
+            this_repo,
             lease,
             yes,
-        } => grant_permission(&file, &kind, &subject, workspace, lease.as_deref(), yes),
+        } => {
+            if parse_kind(&kind)? == GrantKind::OpenUrl {
+                if lease.is_some() {
+                    anyhow::bail!(
+                        "an open-url grant lasts until revoked; `--for` is not offered for it \
+                         (revoke with `ahma permissions revoke open-url <site> --yes`)"
+                    );
+                }
+                let binding = open_url_grant_binding(workspace, this_repo)?;
+                let settings = load()?;
+                return grant_open_url(&file, &settings, subject.as_deref(), binding, yes);
+            }
+            let subject = subject_or_bail(&kind, subject)?;
+            grant_permission(&file, &kind, &subject, workspace, lease.as_deref(), yes)
+        }
     }
+}
+
+/// Every kind but `open-url` names what it grants or revokes.
+fn subject_or_bail(kind: &str, subject: Option<String>) -> Result<String> {
+    subject.with_context(|| format!("`{kind}` needs a SUBJECT: what to grant or revoke"))
+}
+
+/// The repo an `open-url` grant is bound to (SPEC R-LINK.11): every repo
+/// unless `--this-repo` or `--workspace` names one.
+fn open_url_grant_binding(
+    workspace: Option<PathBuf>,
+    this_repo: bool,
+) -> Result<ahma_common::open_url::OpenUrlBinding> {
+    use ahma_common::open_url::OpenUrlBinding;
+    if workspace.is_none() && !this_repo {
+        return Ok(OpenUrlBinding::AllRepos);
+    }
+    let ws = resolve_cli_workspace(workspace, false)?
+        .context("cannot determine this repo; pass --workspace <DIR>")?;
+    Ok(OpenUrlBinding::Repo(ws))
+}
+
+/// Where an `open-url` revoke looks: everywhere (`None`), only the grants
+/// for all repos (`--global`), or only one repo's.
+fn open_url_revoke_binding(
+    workspace: Option<PathBuf>,
+    this_repo: bool,
+    global: bool,
+) -> Result<Option<ahma_common::open_url::OpenUrlBinding>> {
+    use ahma_common::open_url::OpenUrlBinding;
+    if global {
+        return Ok(Some(OpenUrlBinding::AllRepos));
+    }
+    if workspace.is_none() && !this_repo {
+        return Ok(None);
+    }
+    open_url_grant_binding(workspace, this_repo).map(Some)
+}
+
+/// A site as `[open_url]` stores it: a host pattern, lowercased; `*` when
+/// none is named (SPEC R-LINK.4).
+fn open_url_pattern(site: Option<&str>) -> Result<String> {
+    let raw = site.unwrap_or("*");
+    let pattern = crate::egress::HostPattern::parse(raw)
+        .map_err(|e| anyhow::anyhow!("`{raw}` is not a site ahma can allow: {e}"))?;
+    Ok(pattern.to_string())
+}
+
+/// `ahma permissions grant open-url [SITE]` (SPEC R-LINK.11): previews the
+/// line and the guidance, writes only with `--yes`, through the one audited
+/// writer.
+fn grant_open_url(
+    file: &std::path::Path,
+    settings: &ahma_common::config::AhmaSettings,
+    site: Option<&str>,
+    binding: ahma_common::open_url::OpenUrlBinding,
+    yes: bool,
+) -> Result<()> {
+    use ahma_common::open_url::{ANY_SITE_WARNING, GUIDANCE, OpenUrlBinding};
+    let pattern = open_url_pattern(site)?;
+    let any = pattern == "*";
+    let line = match &binding {
+        OpenUrlBinding::AllRepos => format!("[open_url] allow = \"{pattern}\" (all repos)"),
+        OpenUrlBinding::Repo(ws) => format!(
+            "[open_url] repos = {{ workspace = \"{}\", allow = \"{pattern}\" }} (this repo only)",
+            ws.display()
+        ),
+    };
+    if !yes {
+        println!("Would add: {line}");
+        println!();
+        if any {
+            println!("{ANY_SITE_WARNING}");
+            println!();
+        }
+        if settings.network.restrict {
+            println!(
+                "Network restriction is on: any site here means any site on your network \
+                 allow list; other sites still need their own grant."
+            );
+            println!();
+        }
+        println!("{GUIDANCE}");
+        println!();
+        println!("File: {}", file.display());
+        println!();
+        println!("Nothing was changed. Re-run with --yes to apply.");
+        return Ok(());
+    }
+    if !ahma_common::open_url::persist_open_url_allow(
+        file,
+        &pattern,
+        &binding,
+        &ApproverSurface::Cli,
+    )? {
+        println!("Already granted: {line}");
+        return Ok(());
+    }
+    println!("✓ Granted: {line}");
+    println!();
+    let revoke_flag = match binding {
+        OpenUrlBinding::AllRepos => "",
+        OpenUrlBinding::Repo(_) => " --this-repo",
+    };
+    let site_arg = if any {
+        String::new()
+    } else {
+        format!(" {pattern}")
+    };
+    println!("Revoke with: ahma permissions revoke open-url{site_arg}{revoke_flag} --yes");
+    Ok(())
+}
+
+/// `ahma permissions revoke open-url [SITE]`: previews what it removes and
+/// removes it, audited, only with `--yes`.
+fn revoke_open_url(
+    file: &std::path::Path,
+    site: Option<&str>,
+    binding: Option<&ahma_common::open_url::OpenUrlBinding>,
+    yes: bool,
+) -> Result<()> {
+    let pattern = site.map(|s| open_url_pattern(Some(s))).transpose()?;
+    let settings = ahma_common::config::AhmaSettings::load_from_result(file)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let found = settings.open_url.matching(pattern.as_deref(), binding);
+    if found.is_empty() {
+        println!(
+            "Nothing to revoke: no open-url grant for {}.",
+            pattern.as_deref().unwrap_or("any site")
+        );
+        return Ok(());
+    }
+    let describe = |list: &[(String, ahma_common::open_url::OpenUrlBinding)]| {
+        list.iter()
+            .map(|(p, b)| format!("{p} ({})", b.describe()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !yes {
+        println!("Would remove the open-url grant for {}.", describe(&found));
+        println!();
+        println!("File: {}", file.display());
+        println!();
+        println!("Nothing was changed. Re-run with --yes to apply.");
+        return Ok(());
+    }
+    let removed = ahma_common::open_url::revoke_open_url(
+        file,
+        pattern.as_deref(),
+        binding,
+        &ApproverSurface::Cli,
+    )?;
+    println!("✓ Revoked: the open-url grant for {}.", describe(&removed));
+    Ok(())
 }
 
 /// `ahma permissions grant`: today the `ssh-sign` kind (SPEC R-CRED.3).
@@ -1116,8 +1293,9 @@ fn grant_permission(
     let kind = parse_kind(kind)?;
     if kind != GrantKind::SshSign {
         anyhow::bail!(
-            "`ahma permissions grant` grants `ssh-sign`; use `ahma sandbox grant` for a \
-             directory, `ahma network allow` for a host and `ahma egress allow` for a domain."
+            "`ahma permissions grant` grants `ssh-sign` and `open-url`; use `ahma sandbox \
+             grant` for a directory, `ahma network allow` for a host and `ahma egress allow` \
+             for a domain."
         );
     }
     let Some((key, destination)) = subject.split_once(" for ") else {
@@ -1192,9 +1370,10 @@ fn parse_kind(s: &str) -> Result<GrantKind> {
         "tool" => Ok(GrantKind::Tool),
         "log-target" | "log" | "logs" => Ok(GrantKind::LogTarget),
         "ssh-sign" | "ssh" => Ok(GrantKind::SshSign),
+        "open-url" | "url" | "link" => Ok(GrantKind::OpenUrl),
         other => anyhow::bail!(
             "unknown permission kind '{other}' (expected: fs-scope, ssh-sign, web-domain, \
-             net-host, tool, or log-target)"
+             net-host, tool, log-target, or open-url)"
         ),
     }
 }
@@ -1706,6 +1885,9 @@ fn revoke_permission(
         GrantKind::HookUnsandboxed => anyhow::bail!(
             "hook consent is session-scoped and never persisted; revoke it with \
                  `ahma hooks revoke`"
+        ),
+        GrantKind::OpenUrl => anyhow::bail!(
+            "an open-url grant is revoked with `ahma permissions revoke open-url [SITE]`"
         ),
         GrantKind::Setting => anyhow::bail!(
             "a setting change is an audit record, not a grant; undo one with \
@@ -3601,8 +3783,9 @@ mod tests {
             run_permissions_command(PermissionsArgs {
                 command: PermissionsCommand::Grant {
                     kind: "ssh-sign".into(),
-                    subject: subject.into(),
+                    subject: Some(subject.into()),
                     workspace: Some(ws.clone()),
+                    this_repo: false,
                     lease: Some("8h".into()),
                     yes,
                 },
@@ -3630,8 +3813,9 @@ mod tests {
             run_permissions_command(PermissionsArgs {
                 command: PermissionsCommand::Grant {
                     kind: "ssh-sign".into(),
-                    subject: "id_ed25519 for github.com".into(),
+                    subject: Some("id_ed25519 for github.com".into()),
                     workspace: Some(ws.clone()),
+                    this_repo: false,
                     lease: None,
                     yes: true,
                 },
@@ -3643,8 +3827,9 @@ mod tests {
         run_permissions_command(PermissionsArgs {
             command: PermissionsCommand::Revoke {
                 kind: "ssh-sign".into(),
-                subject: subject.into(),
+                subject: Some(subject.into()),
                 workspace: None,
+                this_repo: false,
                 global: false,
                 yes: true,
             },
@@ -3653,6 +3838,158 @@ mod tests {
         let settings =
             ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
         assert!(settings.sandbox.ssh_sign.is_empty());
+    }
+
+    fn grant_open_url_cli(
+        site: Option<&str>,
+        workspace: Option<PathBuf>,
+        lease: Option<&str>,
+        yes: bool,
+    ) -> Result<()> {
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Grant {
+                kind: "open-url".into(),
+                subject: site.map(Into::into),
+                workspace,
+                this_repo: false,
+                lease: lease.map(Into::into),
+                yes,
+            },
+        })
+    }
+
+    fn revoke_open_url_cli(site: Option<&str>, workspace: Option<PathBuf>, global: bool) {
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "open-url".into(),
+                subject: site.map(Into::into),
+                workspace,
+                this_repo: false,
+                global,
+                yes: true,
+            },
+        })
+        .unwrap();
+    }
+
+    fn open_url_settings(home: &std::path::Path) -> ahma_common::open_url::OpenUrlSettings {
+        ahma_common::config::AhmaSettings::load_from_result(&ledger(home))
+            .unwrap()
+            .open_url
+    }
+
+    /// SPEC R-LINK.11: a site is granted for every repo by default, only with
+    /// `--yes`, normalised, listed as `open-url`, and audited as from the CLI.
+    #[test]
+    fn an_open_url_grant_is_for_all_repos_and_written_only_with_yes() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        grant_open_url_cli(Some("GitHub.com"), None, None, false).unwrap();
+        assert!(!ledger(home.path()).exists(), "a preview writes nothing");
+
+        grant_open_url_cli(Some("GitHub.com"), None, None, true).unwrap();
+        let s = open_url_settings(home.path());
+        assert_eq!(s.allow, ["github.com"]);
+        assert!(s.repos.is_empty());
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        assert!(
+            ahma_common::permissions::records(&settings)
+                .iter()
+                .any(|r| r.kind == GrantKind::OpenUrl
+                    && r.subject == "github.com"
+                    && r.scope_note.as_deref() == Some("all repos"))
+        );
+        let audit =
+            std::fs::read_to_string(home.path().join(".ahma").join("permissions-audit.jsonl"))
+                .unwrap();
+        assert!(
+            audit.contains("\"kind\":\"open-url\"") && audit.contains("\"surface\":\"cli\""),
+            "{audit}"
+        );
+    }
+
+    /// `--workspace` binds a grant to one repo; no site is any public site.
+    #[test]
+    fn an_open_url_grant_for_one_repo_and_for_any_site() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let ws = home.path().join("repo");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        grant_open_url_cli(Some("*.github.io"), Some(ws.clone()), None, true).unwrap();
+        grant_open_url_cli(None, None, None, true).unwrap();
+        let s = open_url_settings(home.path());
+        assert_eq!(s.allow, ["*"]);
+        assert_eq!(s.repos.len(), 1);
+        assert_eq!(s.repos[0].workspace, dunce::canonicalize(&ws).unwrap());
+        assert_eq!(s.repos[0].allow, ["*.github.io"]);
+    }
+
+    /// What a grant names must be a site, and it lasts until revoked: a URL,
+    /// a port and a lease are refused, saying why, and nothing is written.
+    #[test]
+    fn an_open_url_grant_refuses_a_url_a_port_or_a_lease() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        for site in ["https://github.com/x", "github.com:443"] {
+            let err = grant_open_url_cli(Some(site), None, None, true).unwrap_err();
+            assert!(format!("{err:#}").contains("not a site"), "{site}: {err:#}");
+        }
+        let err = grant_open_url_cli(Some("github.com"), None, Some("8h"), true).unwrap_err();
+        assert!(format!("{err:#}").contains("until revoked"), "{err:#}");
+        assert!(!ledger(home.path()).exists(), "nothing written");
+    }
+
+    /// A revoke without a site removes every grant; `--global` only those for
+    /// all repos; `--workspace` only that repo's.
+    #[test]
+    fn an_open_url_revoke_reaches_where_it_says() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let ws = home.path().join("repo");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let grant_both = || {
+            grant_open_url_cli(Some("github.com"), None, None, true).unwrap();
+            grant_open_url_cli(Some("github.com"), Some(ws.clone()), None, true).unwrap();
+        };
+        grant_both();
+        revoke_open_url_cli(Some("github.com"), None, true);
+        let s = open_url_settings(home.path());
+        assert!(s.allow.is_empty());
+        assert_eq!(s.repos[0].allow, ["github.com"], "the repo's grant stays");
+
+        revoke_open_url_cli(Some("github.com"), Some(ws.clone()), false);
+        assert_eq!(
+            open_url_settings(home.path()),
+            ahma_common::open_url::OpenUrlSettings::default()
+        );
+
+        grant_both();
+        revoke_open_url_cli(None, None, false);
+        assert_eq!(
+            open_url_settings(home.path()),
+            ahma_common::open_url::OpenUrlSettings::default(),
+            "no site and no repo: every grant goes"
+        );
+    }
+
+    /// Every other kind still names what it grants or revokes.
+    #[test]
+    fn a_kind_other_than_open_url_needs_a_subject() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let err = run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "net-host".into(),
+                subject: None,
+                workspace: None,
+                this_repo: false,
+                global: false,
+                yes: true,
+            },
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("needs a SUBJECT"), "{err:#}");
     }
 
     #[test]
@@ -3728,8 +4065,9 @@ mod tests {
         run_permissions_command(PermissionsArgs {
             command: PermissionsCommand::Revoke {
                 kind: "fs-scope".into(),
-                subject: cache.display().to_string(),
+                subject: Some(cache.display().to_string()),
                 workspace: None,
+                this_repo: false,
                 global: true,
                 yes: false,
             },
@@ -3746,8 +4084,9 @@ mod tests {
         run_permissions_command(PermissionsArgs {
             command: PermissionsCommand::Revoke {
                 kind: "fs-scope".into(),
-                subject: cache.display().to_string(),
+                subject: Some(cache.display().to_string()),
                 workspace: None,
+                this_repo: false,
                 global: true,
                 yes: true,
             },
@@ -3932,8 +4271,9 @@ mod tests {
         let err = run_permissions_command(PermissionsArgs {
             command: PermissionsCommand::Revoke {
                 kind: "flesscope".into(),
-                subject: "/tmp/x".into(),
+                subject: Some("/tmp/x".into()),
                 workspace: None,
+                this_repo: false,
                 global: false,
                 yes: true,
             },
@@ -4076,8 +4416,9 @@ mod tests {
         run_permissions_command(PermissionsArgs {
             command: PermissionsCommand::Revoke {
                 kind: "net-host".into(),
-                subject: "crates.io".into(),
+                subject: Some("crates.io".into()),
                 workspace: None,
+                this_repo: false,
                 global: false,
                 yes: false,
             },
@@ -4090,8 +4431,9 @@ mod tests {
         run_permissions_command(PermissionsArgs {
             command: PermissionsCommand::Revoke {
                 kind: "net-host".into(),
-                subject: "crates.io".into(),
+                subject: Some("crates.io".into()),
                 workspace: None,
+                this_repo: false,
                 global: false,
                 yes: true,
             },
@@ -4165,8 +4507,9 @@ mod tests {
                 command: PermissionsCommand::Revoke {
                     kind: "log-target".into(),
                     // As typed by a human: not necessarily canonical.
-                    subject: target.display().to_string(),
+                    subject: Some(target.display().to_string()),
                     workspace: Some(ws.path().to_path_buf()),
+                    this_repo: false,
                     global: false,
                     yes,
                 },

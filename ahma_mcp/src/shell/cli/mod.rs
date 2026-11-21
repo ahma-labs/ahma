@@ -1605,24 +1605,27 @@ pub enum PermissionsCommand {
     /// Show every permission currently granted, with its kind, tier, and
     /// provenance, and name the file that holds them.
     List {
-        /// Show only one kind: `fs-scope`, `ssh-sign` (a key the SSH key broker may sign with for one destination), `web-domain`, `net-host`, `tool`, or `log-target` (a file outside the workspace that a `.ahma/logs/*.log` symlink may point at, approved with `logs_approve`).
+        /// Show only one kind: `fs-scope`, `ssh-sign` (a key the SSH key broker may sign with for one destination), `web-domain`, `net-host`, `tool`, `log-target` (a file outside the workspace that a `.ahma/logs/*.log` symlink may point at, approved with `logs_approve`), or `open-url` (a site whose web links commands may open in your browser).
         #[arg(long = "kind", value_name = "KIND")]
         kind: Option<String>,
         /// Show only leases that end within this long (`12h`, `2d`): what to renew before a long unattended run.
         #[arg(long = "expiring", value_name = "DURATION")]
         expiring: Option<String>,
     },
-    /// Grant a permission by kind and subject. Today: `ssh-sign`, which lets the SSH key broker sign with one key for one destination in one workspace (SPEC R-CRED.3); other kinds have their own commands (`ahma sandbox grant`, `ahma network allow`, `ahma egress allow`). Previews the exact settings line and requires `--yes` to write. Example: `ahma permissions grant ssh-sign "SHA256:abc… for host:SHA256:def…" --yes`, as a refusal names it.
+    /// Grant a permission by kind and subject. `ssh-sign` lets the SSH key broker sign with one key for one destination in one workspace (SPEC R-CRED.3). `open-url [SITE]` lets commands ahma runs open http and https links on SITE in your default browser without asking, in every repo, or with `--this-repo` in this repo only (no SITE: any public site, never localhost or a private address); opening a link sends its whole address to that website, in the browser where you are signed in, and an address can carry data from your project, so allow only sites you trust: one site is safer than any site, and one repo safer than all repos; ahma never opens files or apps this way (SPEC R-LINK). Other kinds have their own commands (`ahma sandbox grant`, `ahma network allow`, `ahma egress allow`). Previews the exact settings line and requires `--yes` to write. Examples: `ahma permissions grant ssh-sign "SHA256:abc… for host:SHA256:def…" --yes`, as a refusal names it; `ahma permissions grant open-url github.com --yes`.
     Grant {
-        /// Kind of permission: `ssh-sign`.
+        /// Kind of permission: `ssh-sign` or `open-url`.
         #[arg(value_name = "KIND")]
         kind: String,
-        /// For `ssh-sign`: `<key fingerprint> for <destination>`, the destination being `host:<host key fingerprint>` or `sshsig:<namespace>`.
+        /// For `ssh-sign`: `<key fingerprint> for <destination>`, the destination being `host:<host key fingerprint>` or `sshsig:<namespace>`. For `open-url`: a site (`github.com`), a one-label wildcard (`*.github.io`), or nothing for any public site.
         #[arg(value_name = "SUBJECT")]
-        subject: String,
-        /// The workspace whose commands may use it. Defaults to the git repository enclosing the current directory.
-        #[arg(long = "workspace", value_name = "PATH")]
+        subject: Option<String>,
+        /// The workspace whose commands may use it. For `ssh-sign`, defaults to the git repository enclosing the current directory; for `open-url`, binds the grant to that repo instead of every repo.
+        #[arg(long = "workspace", value_name = "PATH", conflicts_with = "this_repo")]
         workspace: Option<PathBuf>,
+        /// For `open-url`: allow the site in the git repository enclosing the current directory only, rather than in every repo.
+        #[arg(long = "this-repo")]
+        this_repo: bool,
         /// Grant it for this long (`8h`, `7d`) instead of until revoked.
         #[arg(long = "for", value_name = "DURATION")]
         lease: Option<String>,
@@ -1638,16 +1641,19 @@ pub enum PermissionsCommand {
     ///   ahma permissions revoke tool cargo_build --workspace ~/code/proj
     ///   ahma permissions revoke log-target /var/log/app.log --workspace ~/code/proj
     Revoke {
-        /// Kind of permission: `fs-scope`, `ssh-sign`, `web-domain`, `net-host`, `tool`, or `log-target`.
+        /// Kind of permission: `fs-scope`, `ssh-sign`, `web-domain`, `net-host`, `tool`, `log-target`, or `open-url`.
         #[arg(value_name = "KIND")]
         kind: String,
-        /// The path, domain pattern, host, or tool name to revoke.
+        /// The path, domain pattern, host, site or tool name to revoke. For `open-url` it may be left out, to stop allowing every site.
         #[arg(value_name = "SUBJECT")]
-        subject: String,
-        /// For `tool`, `log-target` and `fs-scope`: which workspace the permission is bound to. Defaults to the current directory for `tool` and `log-target`, and to the git repository enclosing it for `fs-scope`.
-        #[arg(long = "workspace", value_name = "PATH", conflicts_with = "global")]
+        subject: Option<String>,
+        /// For `tool`, `log-target`, `fs-scope` and `open-url`: which workspace the permission is bound to. Defaults to the current directory for `tool` and `log-target`, and to the git repository enclosing it for `fs-scope`; for `open-url`, without it the site is revoked in every repo and for all repos.
+        #[arg(long = "workspace", value_name = "PATH", conflicts_with_all = ["global", "this_repo"])]
         workspace: Option<PathBuf>,
-        /// For `fs-scope`: revoke the legacy global grant, the one that applies to every workspace.
+        /// For `open-url`: revoke only the grant bound to the git repository enclosing the current directory.
+        #[arg(long = "this-repo", conflicts_with = "global")]
+        this_repo: bool,
+        /// For `fs-scope`: revoke the legacy global grant, the one that applies to every workspace. For `open-url`: revoke only the grant for all repos.
         #[arg(long = "global")]
         global: bool,
         /// Apply the previewed change (without this, nothing is written).

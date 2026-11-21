@@ -148,6 +148,9 @@ pub mod harness_target;
 pub mod hooks;
 /// Background reporter that registers this instance with the hub.
 pub mod hub_reporter;
+/// Web links a sandboxed command asks ahma to open in the human's browser
+/// (SPEC R-LINK).
+pub mod links;
 /// Live log monitoring pipeline (LLM-powered issue detection).
 pub mod livelog;
 /// LLM Completion Service provider.

@@ -2317,6 +2317,10 @@ pub struct AhmaSettings {
     /// `[permissions]` rejects unknown keys (see
     /// [`LogTargetSettings`](crate::permissions::LogTargetSettings)).
     pub log_targets: crate::permissions::LogTargetSettings,
+    /// Sites whose web links commands ahma runs may open in the default
+    /// browser, in every repo or in one (SPEC R-LINK.4) — part of the same
+    /// ledger. A table of its own for the reason `[log_targets]` is.
+    pub open_url: crate::open_url::OpenUrlSettings,
 }
 
 impl AhmaSettings {
@@ -3221,6 +3225,24 @@ impl AhmaSettings {
             toml_log_target_approvals(&self.log_targets.approvals),
             toml_log_target_approvals(&d.log_targets.approvals),
         );
+
+        // ── Web links opened in the browser ──────────────────────────────────
+        w.section(
+            "Web links commands may open in your default browser (SPEC R-LINK)",
+            "open_url",
+        );
+        w.setting(
+            &format!("Sites whose http and https links commands ahma runs may open in your default browser without asking, in every repo: exact (`github.com`), one-label wildcard (`*.github.io`), or `*` for any public site (never localhost or a private address). {} Change with `ahma permissions grant open-url` and `ahma permissions revoke open-url`.", crate::open_url::GUIDANCE),
+            "allow",
+            toml_str_list(&self.open_url.allow),
+            toml_str_list(&d.open_url.allow),
+        );
+        w.setting(
+            "Sites allowed in one repo only, as `allow` is for every repo (`ahma permissions grant open-url <site> --this-repo`).",
+            "repos",
+            toml_open_url_repos(&self.open_url.repos),
+            toml_open_url_repos(&d.open_url.repos),
+        );
     }
 
     /// [`Self::ensure_current`] against the standard `~/.ahma/settings.toml`.
@@ -3545,6 +3567,20 @@ fn toml_tool_approvals(v: &[crate::permissions::ToolApproval]) -> String {
 /// Render approved log targets as an inline TOML array of inline tables,
 /// omitting the optional fields that are unset (matching serde's
 /// `skip_serializing_if`).
+fn toml_open_url_repos(v: &[crate::open_url::OpenUrlRepo]) -> String {
+    let items: Vec<String> = v
+        .iter()
+        .map(|r| {
+            format!(
+                "{{ workspace = {}, allow = {} }}",
+                toml_path(&r.workspace),
+                toml_str_list(&r.allow)
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
 fn toml_log_target_approvals(v: &[crate::permissions::LogTargetApproval]) -> String {
     let items: Vec<String> = v
         .iter()
@@ -3778,6 +3814,9 @@ pub fn ledger_key_command(table: &str, key: &str) -> Option<&'static str> {
             "`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved"
         }
         ("network", "allow") => "`ahma network allow <host>` / `ahma network revoke <host>`",
+        ("open_url", "allow") | ("open_url", "repos") => {
+            "`ahma permissions grant open-url <site>` / `ahma permissions revoke open-url <site>`"
+        }
         ("web", "always_allow") => "`ahma egress allow <domain>` / `ahma egress revoke <domain>`",
         ("web", "never_allow") => "`ahma egress deny <domain>` / `ahma egress revoke <domain>`",
         _ => return None,
@@ -4490,6 +4529,8 @@ mod tests {
                 [
                     "log_targets.approvals",
                     "network.allow",
+                    "open_url.allow",
+                    "open_url.repos",
                     "permissions.tool_approvals",
                     "sandbox.persistent_scopes",
                     "sandbox.ssh_sign",
@@ -4686,6 +4727,13 @@ mod tests {
                     surface: Some("mcp:logs_approve".into()),
                 }],
             },
+            open_url: crate::open_url::OpenUrlSettings {
+                allow: vec!["github.com".into()],
+                repos: vec![crate::open_url::OpenUrlRepo {
+                    workspace: PathBuf::from("/home/u/proj"),
+                    allow: vec!["*.example.org".into()],
+                }],
+            },
         }
     }
 
@@ -4737,6 +4785,7 @@ mod tests {
             "[auth]",
             "[permissions]",
             "[log_targets]",
+            "[open_url]",
         ] {
             assert!(
                 !text.contains(table),
@@ -4781,6 +4830,8 @@ mod tests {
             ("sandbox.ssh_sign", "ahma permissions"),
             ("permissions.tool_approvals", "ahma permissions"),
             ("log_targets.approvals", "ahma permissions"),
+            ("open_url.allow", "ahma permissions grant open-url"),
+            ("open_url.repos", "ahma permissions grant open-url"),
             ("network.allow", "ahma network allow"),
             ("web.always_allow", "ahma egress allow"),
             ("web.never_allow", "ahma egress deny"),
@@ -6354,6 +6405,9 @@ const SECURITY_TABLES: &[&str] = &[
     // sandbox may read. A cloned repository must not be able to approve a log
     // symlink of its own pointing at `~/.ssh/id_ed25519`.
     "log_targets",
+    // A cloned repository must not be able to let its commands open links in
+    // the human's signed-in browser (SPEC R-LINK.4).
+    "open_url",
 ];
 
 /// Individual Security-tier keys inside otherwise-Preference tables.
@@ -6520,6 +6574,8 @@ mod tier_tests {
             ("tools", "long_running"),
             ("permissions", "tool_approvals"),
             ("log_targets", "approvals"),
+            ("open_url", "allow"),
+            ("open_url", "repos"),
         ] {
             assert_eq!(
                 settings_tier(table, key),
@@ -7004,6 +7060,9 @@ allow = ["evil.example"]
 [log_targets]
 approvals = [{ workspace = "/w", targets = ["/home/u/.ssh/id_ed25519"] }]
 
+[open_url]
+allow = ["*"]
+
 [tools]
 timeout_secs = 42
 "#,
@@ -7019,6 +7078,7 @@ timeout_secs = 42
             "auth.require_token",
             "network.allow",
             "log_targets.approvals",
+            "open_url.allow",
         ] {
             assert!(
                 load.rejected_security.iter().any(|k| k == refused),
