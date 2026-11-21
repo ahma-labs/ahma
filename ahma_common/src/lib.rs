@@ -16,7 +16,7 @@
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
 //! | Per-user hub | [`hub`], [`hub_history`] |
 //! | MCP wire | [`mcp_methods`], [`mcp_protocol`], [`session_event`], [`keepalive`], [`sse`], [`peer_factory`] |
-//! | Process and platform | [`exe_identity`], [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`] |
+//! | Process and platform | [`exe_identity`], [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`], [`git`] |
 //! | Shared definitions | [`harness`], [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`], [`shell_words`] |
 //!
 //! ## Design Goal: Workspace Consistency
@@ -44,6 +44,7 @@ pub mod exe_identity;
 pub mod file_uri;
 pub mod fs_atomic;
 pub mod fs_lock;
+pub mod git;
 pub mod grant;
 pub mod grant_prompt;
 /// Every AI harness ahma knows, listed once; the MCP-client, setup-target and
