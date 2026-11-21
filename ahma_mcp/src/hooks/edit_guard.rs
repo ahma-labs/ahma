@@ -317,16 +317,22 @@ fn scope_refusal(path: &Path, allowed: &[PathBuf]) -> String {
 }
 
 /// The directories a native edit may touch: the hook sandbox scope for `cwd`
-/// (the enclosing repository, SPEC R5.2.1), every persistent `rw` grant, and
-/// the temp directory — the same set a hooked shell command may write.
+/// (the enclosing repository, SPEC R5.2.1), every persistent `rw` grant that
+/// applies to that scope (R5.4.11), and the temp directory — the same set a
+/// hooked shell command may write.
 pub fn allowed_edit_scopes(
     cwd: &Path,
     persistent: &[ahma_common::config::PersistentScope],
 ) -> Vec<PathBuf> {
     let mut allowed = super::resolve_hook_sandbox_scopes(cwd);
+    let applies = |scope: &ahma_common::config::PersistentScope| {
+        ahma_common::scope_grant::grant_applies(scope.workspace.as_deref(), &allowed)
+    };
+    let granted: Vec<&ahma_common::config::PersistentScope> =
+        persistent.iter().filter(|s| applies(s)).collect();
     // SPEC R5.5.7: the harness's own working set needs no grant.
     allowed.extend(harness_owned_dirs_for_this_user());
-    for scope in persistent {
+    for scope in granted {
         if scope.access.is_write() {
             let raw = ahma_common::config::expand_home(&scope.path);
             allowed.push(dunce::canonicalize(&raw).unwrap_or(raw));
@@ -1188,6 +1194,38 @@ mod scope_tests {
                 Some(&ro_allowed),
             )
             .is_some()
+        );
+    }
+
+    /// SPEC R5.4.11: a grant bound to one workspace widens only that
+    /// workspace. A native edit in another repository must not be admitted by
+    /// it, as a hooked shell command already is not.
+    #[test]
+    fn an_rw_grant_bound_to_another_workspace_does_not_admit_an_edit() {
+        let td = tempdir().unwrap();
+        let mine = repo(&td.path().join("mine"));
+        let theirs = repo(&td.path().join("theirs"));
+        let cache = td.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = dunce::canonicalize(&cache).unwrap();
+        let grant = ahma_common::config::PersistentScope {
+            path: cache.clone(),
+            access: ahma_common::config::ScopeAccess::Rw,
+            workspace: Some(theirs.clone()),
+            granted_by: Some("user".into()),
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        };
+        let in_theirs = allowed_edit_scopes(&theirs, std::slice::from_ref(&grant));
+        assert!(
+            in_theirs.contains(&cache),
+            "the grant admits edits in the workspace it was made for: {in_theirs:?}"
+        );
+        let in_mine = allowed_edit_scopes(&mine, &[grant]);
+        assert!(
+            !in_mine.contains(&cache),
+            "a grant bound to another workspace admits nothing here: {in_mine:?}"
         );
     }
 
