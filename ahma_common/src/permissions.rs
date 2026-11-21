@@ -79,6 +79,10 @@ pub enum GrantKind {
     /// A key the SSH key broker may sign with for one destination in one
     /// workspace (`[[sandbox.ssh_sign]]`, SPEC R-CRED.3).
     SshSign,
+    /// A site whose http/https links commands ahma runs may open in the
+    /// human's default browser, in every repo or in one (`[open_url]`, SPEC
+    /// R-LINK.4).
+    OpenUrl,
     /// A change to an ordinary setting (`tools.timeout_secs`, `sandbox.allow_gpu`),
     /// recorded in the audit log only. It grants nothing and is not a ledger
     /// record, so it is never listed by `ahma permissions list` (SPEC R-CFG10.5).
@@ -96,18 +100,20 @@ impl GrantKind {
             GrantKind::LogTarget => "log-target",
             GrantKind::HookUnsandboxed => "hook-unsandboxed",
             GrantKind::SshSign => "ssh-sign",
+            GrantKind::OpenUrl => "open-url",
             GrantKind::Setting => "setting",
         }
     }
 
     /// Every kind, in the order `ahma permissions list` groups them.
-    pub const ALL: [GrantKind; 8] = [
+    pub const ALL: [GrantKind; 9] = [
         GrantKind::FsScope,
         GrantKind::SshSign,
         GrantKind::WebDomain,
         GrantKind::NetHost,
         GrantKind::Tool,
         GrantKind::LogTarget,
+        GrantKind::OpenUrl,
         GrantKind::HookUnsandboxed,
         GrantKind::Setting,
     ];
@@ -123,7 +129,8 @@ impl GrantKind {
             | GrantKind::NetHost
             | GrantKind::Tool
             | GrantKind::LogTarget
-            | GrantKind::SshSign => true,
+            | GrantKind::SshSign
+            | GrantKind::OpenUrl => true,
             GrantKind::HookUnsandboxed | GrantKind::Setting => false,
         }
     }
@@ -348,7 +355,28 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
     }));
     out.extend(tool_approval_records(&settings.permissions.tool_approvals));
     out.extend(log_target_records(&settings.log_targets.approvals));
+    out.extend(open_url_records(&settings.open_url));
     out
+}
+
+fn open_url_records(
+    open_url: &crate::open_url::OpenUrlSettings,
+) -> impl Iterator<Item = GrantRecord> + '_ {
+    open_url
+        .matching(None, None)
+        .into_iter()
+        .map(|(pattern, binding)| GrantRecord {
+            kind: GrantKind::OpenUrl,
+            subject: pattern,
+            access: None,
+            tier: GrantTier::Always,
+            granted_by: None,
+            granted_at: None,
+            surface: None,
+            note: None,
+            scope_note: Some(binding.describe()),
+            expires_at: None,
+        })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2041,9 +2069,15 @@ mod tests {
                 GrantKind::NetHost,
                 GrantKind::Tool,
                 GrantKind::LogTarget,
+                GrantKind::OpenUrl,
             ]
         );
         assert!(!GrantKind::HookUnsandboxed.is_persisted());
+        assert_eq!(GrantKind::OpenUrl.label(), "open-url");
+        assert_eq!(
+            serde_json::to_string(&GrantKind::OpenUrl).unwrap(),
+            "\"open-url\""
+        );
         assert_eq!(
             serde_json::to_string(&GrantKind::SshSign).unwrap(),
             "\"ssh-sign\""

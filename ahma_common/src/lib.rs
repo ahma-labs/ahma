@@ -64,6 +64,7 @@ pub mod mcp_protocol;
 pub mod net_approval;
 pub mod observability;
 pub mod op_identity;
+pub mod open_url;
 /// Transport-agnostic MCP peer factory abstraction (P6).
 pub mod peer_factory;
 pub mod permissions;
