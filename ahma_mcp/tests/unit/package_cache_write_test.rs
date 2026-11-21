@@ -20,9 +20,7 @@ fn test_sandbox_package_cache_write_default_is_true() {
     let sandbox = Sandbox::new(
         vec![tmp.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert!(
@@ -37,9 +35,7 @@ fn test_sandbox_with_package_cache_write_disabled() {
     let sandbox = Sandbox::new(
         vec![tmp.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap()
     .with_package_cache_write(false);
@@ -55,9 +51,7 @@ fn test_sandbox_with_package_cache_write_enabled_is_noop() {
     let sandbox = Sandbox::new(
         vec![tmp.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap()
     .with_package_cache_write(true);
@@ -73,9 +67,7 @@ fn test_sandbox_clone_preserves_package_cache_write_flag() {
     let sandbox = Sandbox::new(
         vec![tmp.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap()
     .with_package_cache_write(false);
@@ -142,9 +134,7 @@ mod seatbelt_profile_tests {
         let sandbox = Sandbox::new(
             vec![scope.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         // Default: package_cache_write = true
@@ -175,9 +165,7 @@ mod seatbelt_profile_tests {
         let sandbox = Sandbox::new(
             vec![scope.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let profile = profile_for(&sandbox, &scope);
@@ -218,9 +206,7 @@ mod seatbelt_profile_tests {
         let sandbox = Sandbox::new(
             vec![scope.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_package_cache_write(false);
@@ -263,9 +249,7 @@ mod seatbelt_profile_tests {
         let sandbox = Sandbox::new(
             vec![scope.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let profile = profile_for(&sandbox, &scope);
@@ -302,9 +286,7 @@ mod seatbelt_profile_tests {
         let sandbox = Sandbox::new(
             vec![scope.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let profile = profile_for(&sandbox, &scope);

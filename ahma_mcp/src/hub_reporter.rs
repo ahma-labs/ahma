@@ -1054,15 +1054,14 @@ async fn resolve_scope_grant(
             reason,
         } => {
             ahma_common::permissions::append_audit(
-                &ahma_common::permissions::audit_entry(
-                    chrono::Local::now().to_rfc3339(),
+                &ahma_common::permissions::AuditEntry::new(
+                    ahma_common::timestamp::rfc3339_local_now(),
                     ahma_common::permissions::AuditAction::Deny,
                     crate::sandbox::permission_broker::audit_kind(reason),
                     path.display().to_string(),
-                    None,
                     ahma_common::permissions::GrantTier::Session,
-                    Some(surface.to_string()),
                 )
+                .with_surface(surface.to_string())
                 .with_request(&decision_id, time_to_decision_ms, None)
                 .with_advice(advice.0.clone(), advice.1),
             );

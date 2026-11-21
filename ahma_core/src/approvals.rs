@@ -34,8 +34,8 @@ use std::sync::OnceLock;
 
 use ahma_common::config::{AhmaSettings, settings_path};
 use ahma_common::permissions::{
-    AuditAction, GrantKind, GrantTier, PermissionSettings, TRUSTED_WORKSPACE_TOOL, append_audit,
-    audit_entry, migrate_legacy_approvals, workspace_key, workspace_key_async,
+    AuditAction, AuditEntry, GrantKind, GrantTier, PermissionSettings, TRUSTED_WORKSPACE_TOOL,
+    append_audit, migrate_legacy_approvals, workspace_key, workspace_key_async,
 };
 use tracing::{debug, warn};
 
@@ -315,17 +315,18 @@ fn revoke_workspace_tools(
         );
     })
     .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-    let now = chrono::Local::now().to_rfc3339();
+    let now = ahma_common::timestamp::rfc3339_local_now();
     for tool in &removed {
-        append_audit(&audit_entry(
-            now.clone(),
-            AuditAction::Revoke,
-            GrantKind::Tool,
-            tool,
-            None,
-            GrantTier::Always,
-            Some("tui".to_string()),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                now.clone(),
+                AuditAction::Revoke,
+                GrantKind::Tool,
+                tool,
+                GrantTier::Always,
+            )
+            .with_surface("tui"),
+        );
     }
     Ok(removed.len())
 }
@@ -354,11 +355,11 @@ fn persist_workspace_grant(
     })?;
 
     let key = workspace_key(workspace);
-    let now = chrono::Local::now();
+    let now = ahma_common::timestamp::local_now();
     let added = grant(
         &mut settings.permissions,
         &key,
-        Some(now.format("%Y-%m-%d").to_string()),
+        Some(ahma_common::timestamp::date(&now)),
         Some("tui".to_string()),
     );
 
@@ -367,15 +368,16 @@ fn persist_workspace_grant(
         .map_err(|e| std::io::Error::other(format!("failed to write {}: {e:#}", path.display())))?;
 
     if added {
-        append_audit(&audit_entry(
-            now.to_rfc3339(),
-            AuditAction::Grant,
-            GrantKind::Tool,
-            subject,
-            None,
-            GrantTier::Always,
-            Some("tui".to_string()),
-        ));
+        append_audit(
+            &AuditEntry::new(
+                ahma_common::timestamp::rfc3339_zoned(&now),
+                AuditAction::Grant,
+                GrantKind::Tool,
+                subject,
+                GrantTier::Always,
+            )
+            .with_surface("tui"),
+        );
     }
     Ok(())
 }

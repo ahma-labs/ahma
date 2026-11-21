@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use ahma_common::config::{PersistentScope, ScopeAccess};
-use ahma_common::harness_asks::{self, Question, Refusal};
+use ahma_common::harness_asks::{self, CommandDigest, Question, Refusal};
 
 /// The `run-shell` flag that carries an approved question's token. Only the
 /// hook writes it: a command the agent itself wrote with this flag is refused
@@ -85,7 +85,7 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
         access,
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
-        command_digest: Some(ahma_common::harness_asks::command_digest(command)),
+        command_digest: Some(CommandDigest::of(command)),
         programs: ahma_common::harness_asks::command_programs(command),
     };
     if let Err(e) = harness_asks::record_refusal(&dir, &workspace_for(cwd), refusal) {
@@ -436,7 +436,7 @@ pub(super) fn record_escape(cwd: &Path, command: &str, why: &str) {
         return;
     };
     let refusal = harness_asks::EscapeRefusal {
-        command_digest: ahma_common::harness_asks::command_digest(command),
+        command_digest: CommandDigest::of(command),
         why: why.to_string(),
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
@@ -602,7 +602,7 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
         q.access,
         Some(&workspace),
         owner,
-        "harness dialog",
+        ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG,
     );
     let verb = if q.access.is_write() { "write" } else { "read" };
     Some(Approval {
@@ -704,7 +704,7 @@ fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Res
             path: &q.dir,
             access: q.access,
             granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string()),
-            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::local_date_today()),
             note: None,
             surface: "harness",
             // Never above the workspace it was approved in (R-PERM.4.3).
@@ -739,22 +739,25 @@ fn apply_ssh_approval(asked: &harness_asks::AskedSsh, workspace: &Path, now: u64
             workspace: workspace.to_path_buf(),
             granted_at: now,
             expires_at: None,
-            granted_by: Some("harness dialog".into()),
+            granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string()),
             owner_pid: Some(owner),
         };
         ahma_common::ssh_sign::record_session(&dir, &grant).ok()
     });
     match recorded {
         Some(_) => {
-            ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
-                ahma_common::config::fmt_utc_datetime(now),
-                ahma_common::permissions::AuditAction::Grant,
-                ahma_common::permissions::GrantKind::SshSign,
-                format!("{} for {}", r.key, r.destination),
-                None,
-                ahma_common::permissions::GrantTier::Session,
-                Some("harness dialog".into()),
-            ));
+            ahma_common::permissions::append_audit(
+                &ahma_common::permissions::AuditEntry::new(
+                    ahma_common::config::fmt_utc_datetime(now),
+                    ahma_common::permissions::AuditAction::Grant,
+                    ahma_common::permissions::GrantKind::SshSign,
+                    format!("{} for {}", r.key, r.destination),
+                    ahma_common::permissions::GrantTier::Session,
+                )
+                // The surface, as every other harness-dialog record has it;
+                // "harness dialog" is the grant's maker (`granted_by`).
+                .with_surface("harness"),
+            );
             format!(
                 "ahma: approved — commands in this workspace may sign with {} for {} for this \
                  session.",
@@ -1131,29 +1134,43 @@ mod tests {
         );
 
         // A grant the dialog's own yes made is no deliberate setup, saved or for the
-        // session: the session kind is read back as `session grant (harness dialog)`,
-        // which used to count as a human's because it was not the exact dialog mark.
-        for (n, by) in ["harness dialog", "session grant (harness dialog)"]
-            .into_iter()
-            .enumerate()
-        {
-            let repo = tmp.path().join(format!("dialog-made-{n}"));
+        // session. The session kind was once read back as `session grant (harness
+        // dialog)`, which counted as a human's because it was not the exact dialog
+        // mark; it is built here the way the sandbox builds it.
+        for kind in ["saved", "session"] {
+            let repo = tmp.path().join(format!("dialog-made-{kind}"));
             std::fs::create_dir_all(repo.join(".git")).unwrap();
             let repo = dunce::canonicalize(&repo).unwrap();
+            let by = ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string();
+            let scope = if kind == "saved" {
+                PersistentScope {
+                    path: repo.clone(),
+                    access: ScopeAccess::Rw,
+                    workspace: Some(ws.clone()),
+                    granted_by: Some(by),
+                    granted_at: None,
+                    note: None,
+                    expires_at: None,
+                }
+            } else {
+                ahma_common::session_grants::as_persistent_scopes(&[
+                    ahma_common::session_grants::SessionGrant {
+                        path: repo.clone(),
+                        access: ScopeAccess::Rw,
+                        workspace: ws.clone(),
+                        owner_pid: std::process::id(),
+                        granted_at: 1,
+                        granted_by: Some(by),
+                    },
+                ])
+                .remove(0)
+            };
             let mut dialog = crate::shell::cli::AppConfig::default();
-            dialog.persistent_scopes.push(PersistentScope {
-                path: repo.clone(),
-                access: ScopeAccess::Rw,
-                workspace: Some(ws.clone()),
-                granted_by: Some(by.into()),
-                granted_at: None,
-                note: None,
-                expires_at: None,
-            });
+            dialog.persistent_scopes.push(scope);
             let cmd = format!("cd {} && ls", repo.display());
             assert!(
                 matches!(decide_with(&cmd, &dialog), HooksDecision::AskGrant { .. }),
-                "a grant marked {by:?} still asks"
+                "a {kind} grant the dialog made still asks"
             );
         }
     }
@@ -1540,7 +1557,7 @@ mod tests {
     #[test]
     fn the_escape_dialog_is_plain() {
         let refusal = harness_asks::EscapeRefusal {
-            command_digest: "d".into(),
+            command_digest: CommandDigest::of("d"),
             why: crate::sandbox::mach::blocked_line("com.google.Chrome.MachPortRendezvousServer"),
             at: 0,
             harness_pid: None,

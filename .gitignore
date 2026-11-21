@@ -55,6 +55,10 @@ ahma-release-new.pem
 # Local session files
 .ahma/session.toml
 
+# This checkout's own settings (`ahma settings set --project`): one
+# developer's choices, not the project's.
+.ahma/settings.toml
+
 # Local Ahma exports
 .ahma/exports/
 

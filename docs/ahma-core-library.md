@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let sandbox = Arc::new(Sandbox::new(vec![], SandboxMode::Strict, false, false, false)?);
+    let sandbox = Arc::new(Sandbox::new(vec![], SandboxMode::Strict, Default::default())?);
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
         Duration::from_secs(300),
     )));

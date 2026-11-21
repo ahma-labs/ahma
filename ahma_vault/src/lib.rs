@@ -37,7 +37,7 @@ pub mod trash;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 use rand::RngExt as _;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,7 +156,7 @@ impl TaskVault {
     }
 
     fn generate_name(slug: &str) -> String {
-        let now = Utc::now().format("%Y%m%dT%H%M%SZ");
+        let now = name_stamp(Timestamp::now());
         let id: u64 = rand::rng().random();
         // Sanitize slug: keep alphanumeric / hyphen / underscore; truncate to 32 chars.
         let sanitized: String = slug
@@ -166,6 +166,12 @@ impl TaskVault {
             .collect();
         format!("{}-{}-{:016x}", now, sanitized, id)
     }
+}
+
+/// The `<utc-timestamp>` prefix of a vault directory name: UTC, whole seconds
+/// (`20261121T090503Z`), the spelling every earlier version wrote (R-TIME.1).
+fn name_stamp(now: Timestamp) -> String {
+    now.strftime("%Y%m%dT%H%M%SZ").to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,6 +288,12 @@ mod tests {
         assert_eq!(&ts[15..16], "Z");
         assert!(ts[..8].chars().all(|c| c.is_ascii_digit()));
         assert!(ts[9..15].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn name_stamp_is_utc_whole_seconds() {
+        let ts = Timestamp::new(1_795_251_903, 999_999_999).unwrap();
+        assert_eq!(name_stamp(ts), "20261121T090503Z");
     }
 
     #[test]

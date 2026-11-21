@@ -831,9 +831,11 @@ fn create_sandbox_instance(
     let s = sandbox::Sandbox::new(
         scopes.clone(),
         policy.mode,
-        cfg.no_temp_files,
-        cfg.log_monitor,
-        policy.tmp_access,
+        sandbox::SandboxOptions {
+            no_temp_files: cfg.no_temp_files,
+            livelog: cfg.log_monitor,
+            tmp_access: policy.tmp_access,
+        },
     )
     .context("Failed to initialize sandbox")?
     .with_explicit_scopes(explicit_scopes)
@@ -1936,6 +1938,7 @@ pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
     let mut cli_overrides: Vec<(&'static str, String)> = Vec::new();
     collect_boolean_flag_overrides(cli, &mut cli_overrides);
     collect_option_overrides(cli, &mut cli_overrides);
+    collect_more_setting_overrides(cli, &mut cli_overrides);
     SettingsOriginCtx {
         no_settings: cli.no_settings,
         settings_path: cli.settings_path.clone(),
@@ -2038,6 +2041,89 @@ fn collect_option_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
     push_quoted_override(out, "instance.label", cli.instance_label.as_deref());
 }
 
+/// The other flags that override a setting (R-CFG5.1), each value rendered
+/// as the provenance row renders the field (`{:?}` of its type), so a flag
+/// that restates the default compares equal to it.
+fn collect_more_setting_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
+    let mut push = |key: &'static str, value: Option<String>| {
+        if let Some(v) = value {
+            out.push((key, v));
+        }
+    };
+    let flag = |on: bool, value: bool| on.then(|| format!("{value:?}"));
+    push(
+        "tools.await_timeout_secs",
+        cli.await_timeout.map(|v| format!("{v:?}")),
+    );
+    push(
+        "tools.request_budget_override_secs",
+        cli.request_budget_secs.map(|v| format!("{:?}", Some(v))),
+    );
+    push(
+        "tools.force_progress_notifications",
+        flag(cli.force_progress_notifications, true),
+    );
+    push("tools.minimize_tokens", flag(cli.minimize_tokens, true));
+    push(
+        "tools.small_model_harness",
+        flag(cli.small_model_harness, true),
+    );
+    push(
+        "tools.tools_dir",
+        cli.tools_dir.as_ref().map(|d| format!("{:?}", Some(d))),
+    );
+    push(
+        "tools.tool_bundles",
+        (!cli.tool_bundles.is_empty()).then(|| format!("{:?}", cli.tool_bundles)),
+    );
+    push(
+        "sandbox.scopes",
+        (!cli.sandbox_scopes.is_empty()).then(|| format!("{:?}", cli.sandbox_scopes)),
+    );
+    push(
+        "sandbox.working_dirs",
+        (!cli.working_dirs.is_empty()).then(|| format!("{:?}", cli.working_dirs)),
+    );
+    push(
+        "sandbox.task_vault",
+        cli.task_vault.as_ref().map(|d| format!("{:?}", Some(d))),
+    );
+    push(
+        "sandbox.package_cache_write",
+        flag(cli.no_package_cache_write, false),
+    );
+    push(
+        "sandbox.allow_keychain",
+        if cli.no_allow_keychain {
+            flag(true, false)
+        } else {
+            flag(cli.allow_keychain, true)
+        },
+    );
+    push("sandbox.allow_git_hooks", flag(cli.allow_git_hooks, true));
+    push(
+        "sandbox.allow_project_tool_config",
+        flag(cli.allow_project_tool_config, true),
+    );
+    push("network.restrict", flag(cli.restrict_network, true));
+    push(
+        "auth.require_token",
+        cli.require_token.as_ref().map(|t| format!("{:?}", Some(t))),
+    );
+    push(
+        "http.unix_socket_path",
+        cli.unix_socket_path
+            .as_ref()
+            .map(|p| format!("{:?}", Some(p))),
+    );
+    push(
+        "logging.dir",
+        cli.log_dir
+            .as_ref()
+            .map(|d| format!("{:?}", d.display().to_string())),
+    );
+}
+
 // ── sandbox scope grants ─────────────────────────────────────────────────────
 
 /// Arguments for `ahma sandbox`.
@@ -2090,8 +2176,8 @@ pub enum SandboxCommand {
         /// Record what asked for this scope (e.g. a tool name), for auditing.
         #[arg(long = "by", value_name = "WHO")]
         by: Option<String>,
-        /// Free-form note explaining why this scope exists.
-        #[arg(long = "note", value_name = "TEXT")]
+        /// Free-form note explaining why this scope exists. Not with `--session`, which writes nothing down.
+        #[arg(long = "note", value_name = "TEXT", conflicts_with = "session")]
         note: Option<String>,
         /// Grant it as a lease that stops applying after this long (`30m`, `8h`, `7d`, `2w`): the right tier for anything outside the project you need for a task, not forever. `ahma sandbox list` shows when it ends and `ahma sandbox renew` extends it.
         #[arg(long = "for", value_name = "DURATION", conflicts_with = "session")]
@@ -5364,6 +5450,100 @@ mod tests {
 
     /// R-CFG1.4: each flag overrides either settings value — the old
     /// `cli.sync || settings.force_sync` could never be turned off.
+    /// R-CFG5.1: a flag that overrides a setting is reported as its source. With
+    /// every setting in the report, these 18 would otherwise be credited to a
+    /// settings file or the default while a flag set them.
+    #[test]
+    fn every_settings_flag_is_recorded_for_provenance() {
+        let cli = Cli::parse_from([
+            "ahma",
+            "--await-timeout",
+            "90",
+            "--request-budget-secs",
+            "30",
+            "--force-progress-notifications",
+            "--minimize-tokens",
+            "--small-model-harness",
+            "--tools-dir",
+            "/t/tools",
+            "--tools",
+            "rust",
+            "--sandbox-scope",
+            "/t/ws",
+            "--working-dir",
+            "/t/wd",
+            "--task-vault",
+            "/t/vault",
+            "--no-package-cache-write",
+            "--allow-keychain",
+            "--allow-git-hooks",
+            "--allow-project-tool-config",
+            "--restrict-network",
+            "--require-token",
+            "secret",
+            "--unix-socket-path",
+            "/t/sock",
+            "--log-dir",
+            "/t/logs",
+            "serve",
+            "stdio",
+        ]);
+        let recorded: std::collections::BTreeSet<&str> = settings_origin_ctx(&cli)
+            .cli_overrides
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        for key in [
+            "tools.await_timeout_secs",
+            "tools.request_budget_override_secs",
+            "tools.force_progress_notifications",
+            "tools.minimize_tokens",
+            "tools.small_model_harness",
+            "tools.tools_dir",
+            "tools.tool_bundles",
+            "sandbox.scopes",
+            "sandbox.working_dirs",
+            "sandbox.task_vault",
+            "sandbox.package_cache_write",
+            "sandbox.allow_keychain",
+            "sandbox.allow_git_hooks",
+            "sandbox.allow_project_tool_config",
+            "network.restrict",
+            "auth.require_token",
+            "http.unix_socket_path",
+            "logging.dir",
+        ] {
+            assert!(
+                recorded.contains(key),
+                "{key} is not recorded: {recorded:?}"
+            );
+        }
+    }
+
+    /// A session grant records no note (it is never written down), so asking
+    /// for one is refused rather than silently dropped.
+    #[test]
+    fn a_session_grant_with_a_note_is_refused() {
+        let err = Cli::try_parse_from([
+            "ahma",
+            "sandbox",
+            "grant",
+            "/tmp/x",
+            "--session",
+            "--note",
+            "why",
+        ])
+        .expect_err("--session --note is refused");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{err}"
+        );
+        assert!(
+            Cli::try_parse_from(["ahma", "sandbox", "grant", "/tmp/x", "--note", "why"]).is_ok()
+        );
+    }
+
     #[test]
     fn execution_mode_flags_override_settings_both_ways() {
         use ahma_common::config::ExecutionPolicy;

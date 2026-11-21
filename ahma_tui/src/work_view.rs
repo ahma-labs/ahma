@@ -15,7 +15,7 @@ use crate::task_tree::{
     GroupCounts, LOCAL_GROUP, RowKind, TreeOptions, TreeRow, emit_group_ops, scope_matches_project,
     short_path,
 };
-use ahma_common::hub::InstanceInfo;
+use ahma_common::hub::{InstanceInfo, InstanceMode};
 use std::collections::{HashMap, HashSet};
 
 /// What a section represents. Ordering of the variants is display order.
@@ -145,7 +145,7 @@ fn bucket_ops_by_section(
     let hook_instances: HashSet<&str> = opts
         .instances
         .iter()
-        .filter(|i| i.mode == "hook")
+        .filter(|i| i.kind() == InstanceMode::Hook)
         .map(|i| i.id.as_str())
         .collect();
 
@@ -217,7 +217,7 @@ fn assemble_sections(
         .iter()
         .filter(|i| instance_visible(i, opts) && !is_agent_tool_session(i))
     {
-        let key = if info.mode == "hook" {
+        let key = if info.kind() == InstanceMode::Hook {
             HOOKS_KEY.to_string()
         } else {
             info.id.clone()
@@ -308,7 +308,7 @@ fn kind_for(key: &str, info: Option<&InstanceInfo>) -> SectionKind {
     }
     match info {
         Some(i) if i.ended_epoch_ms.is_some() => SectionKind::Ended,
-        Some(i) if i.mode == "tui" => SectionKind::Local,
+        Some(i) if i.kind() == InstanceMode::Tui => SectionKind::Local,
         Some(_) => SectionKind::Client,
         // Work whose instance is gone from the list entirely.
         None => SectionKind::Ended,
@@ -323,7 +323,7 @@ fn client_name(key: &str, info: Option<&InstanceInfo>) -> String {
         return "this terminal (you)".to_string();
     }
     match info {
-        Some(i) if i.mode == "tui" => tui_client_name(i),
+        Some(i) if i.kind() == InstanceMode::Tui => tui_client_name(i),
         Some(i) => external_client_name(i),
         None => "ended session".to_string(),
     }
@@ -383,8 +383,8 @@ fn latest_activity(ops: &[Operation], members: &[usize]) -> (Option<String>, Opt
     let newest_running = members
         .iter()
         .filter(|&&i| matches!(ops[i].status, OpStatus::Running))
-        .max_by_key(|&&i| ops[i].started_time);
-    let pick = newest_running.or_else(|| members.iter().max_by_key(|&&i| ops[i].started_time));
+        .max_by_key(|&&i| &ops[i].started_time);
+    let pick = newest_running.or_else(|| members.iter().max_by_key(|&&i| &ops[i].started_time));
     match pick {
         Some(&i) => (Some(ops[i].display_name()), Some(ops[i].status.clone())),
         None => (None, None),
@@ -768,7 +768,7 @@ mod tests {
         let collapsed = HashSet::new();
 
         let mut older = op("1", Some("a"), OpStatus::Running);
-        older.started_time -= chrono::Duration::seconds(60);
+        older.started_time -= jiff::SignedDuration::from_secs(60);
         let newest_done = op("2", Some("a"), OpStatus::Succeeded);
         let sections = build_sections(&[older, newest_done], &opts(&instances, &collapsed, None));
         assert_eq!(

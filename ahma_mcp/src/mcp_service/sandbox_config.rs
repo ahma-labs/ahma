@@ -494,7 +494,7 @@ impl AhmaMcpService {
         // root — which also bypassed the R5.2.8 working-directory refusal for
         // exactly the empty-roots clients (Antigravity) that need it.
         if !new_scopes.is_empty() {
-            self.adapter.sandbox().set_roots_received(true);
+            self.adapter.sandbox().mark_roots_received();
         }
 
         // Remember the first client root so we can look for `<root>/.ahma`
@@ -1015,9 +1015,7 @@ mod tests {
             Sandbox::new(
                 vec![scope_dir.to_path_buf()],
                 SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );

@@ -854,7 +854,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         crate::hub_reporter::set_initial_identity(config.session_id.clone(), config.client_pid);
         crate::hub_reporter::spawn_reporter(
             operation_monitor.clone(),
-            "stdio",
+            ahma_common::hub::InstanceMode::Worker.as_str(),
             scope_str,
             label,
             Some(crate::hub_reporter::GrantReporting {
@@ -1158,9 +1158,7 @@ mod tests {
         sandbox::Sandbox::new(
             vec![scope.to_path_buf()],
             sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
     }
@@ -1178,9 +1176,7 @@ mod tests {
         let sb = sandbox::Sandbox::new(
             vec![tmp.path().to_path_buf()],
             sandbox::SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let name = sandbox_mode_name(&sb);

@@ -39,9 +39,7 @@ fn test_is_test_mode_on_sandbox_instance() {
     let sandbox = Sandbox::new(
         vec![temp_test.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert!(sandbox.is_test_mode());
@@ -50,9 +48,7 @@ fn test_is_test_mode_on_sandbox_instance() {
     let sandbox_strict = Sandbox::new(
         vec![temp.path().to_path_buf()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert!(!sandbox_strict.is_test_mode());
@@ -64,9 +60,10 @@ fn test_is_no_temp_files_on_sandbox_instance() {
     let sandbox = Sandbox::new(
         vec![temp.path().to_path_buf()],
         SandboxMode::Strict,
-        true,
-        false,
-        false,
+        ahma_mcp::sandbox::SandboxOptions {
+            no_temp_files: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
     )
     .unwrap();
     assert!(sandbox.is_no_temp_files());
@@ -75,9 +72,7 @@ fn test_is_no_temp_files_on_sandbox_instance() {
     let sandbox_default = Sandbox::new(
         vec![temp2.path().to_path_buf()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert!(!sandbox_default.is_no_temp_files());
@@ -89,14 +84,8 @@ fn test_is_no_temp_files_on_sandbox_instance() {
 fn test_path_validation_in_scope() {
     let temp = tempdir().unwrap();
     let scope = temp.path().to_path_buf();
-    let sandbox = Sandbox::new(
-        vec![scope.clone()],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let sandbox =
+        Sandbox::new(vec![scope.clone()], SandboxMode::Strict, Default::default()).unwrap();
 
     let valid_path = scope.join("test.txt");
     assert!(sandbox.validate_path(&valid_path).is_ok());
@@ -106,7 +95,7 @@ fn test_path_validation_in_scope() {
 fn test_path_validation_outside_scope() {
     let temp = tempdir().unwrap();
     let scope = temp.path().to_path_buf();
-    let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, false, false, false).unwrap();
+    let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, Default::default()).unwrap();
 
     let outside_path = PathBuf::from("/etc/passwd");
     assert!(sandbox.validate_path(&outside_path).is_err());
@@ -125,9 +114,7 @@ fn test_path_validation_accepts_symlink_alias_scope_for_nonexistent_nested_path(
     let sandbox = Sandbox::new(
         vec![alias_root.clone()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 
@@ -152,9 +139,7 @@ fn test_update_scopes_preserves_sandbox_dir() {
     let sandbox = Sandbox::new(
         vec![sandbox_dir.clone()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap()
     .with_scratch_dir(Some(sandbox_dir.clone()));
@@ -190,9 +175,7 @@ fn test_commit_latch_is_one_shot() {
     let sandbox = Sandbox::new(
         vec![tmp.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 
@@ -232,9 +215,7 @@ fn test_committed_scope_cannot_be_replaced() {
     let sandbox = Sandbox::new(
         vec![first.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 
@@ -263,9 +244,7 @@ fn test_commit_latch_survives_clone() {
     let sandbox = Sandbox::new(
         vec![tmp.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 
@@ -298,9 +277,7 @@ fn test_update_scopes_no_sandbox_dir_replaces() {
     let sandbox = Sandbox::new(
         vec![old_scope.clone()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     // No sandbox_dir set.
@@ -337,9 +314,10 @@ fn test_update_scopes_preserves_sandbox_dir_but_not_a_tmp_request() {
     let sandbox = Sandbox::new(
         vec![sandbox_dir.clone()],
         SandboxMode::Test,
-        false,
-        false,
-        true, // tmp_access = true
+        ahma_mcp::sandbox::SandboxOptions {
+            tmp_access: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
     )
     .unwrap()
     .with_scratch_dir(Some(sandbox_dir.clone()));
@@ -373,13 +351,13 @@ fn test_sandbox_dir_accessor() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
 
-    let sandbox = Sandbox::new(vec![dir.clone()], SandboxMode::Test, false, false, false)
+    let sandbox = Sandbox::new(vec![dir.clone()], SandboxMode::Test, Default::default())
         .unwrap()
         .with_scratch_dir(Some(dir.clone()));
 
     assert_eq!(sandbox.scratch_dir(), Some(&dir));
 
     let sandbox_no_dir =
-        Sandbox::new(vec![dir.clone()], SandboxMode::Test, false, false, false).unwrap();
+        Sandbox::new(vec![dir.clone()], SandboxMode::Test, Default::default()).unwrap();
     assert_eq!(sandbox_no_dir.scratch_dir(), None);
 }

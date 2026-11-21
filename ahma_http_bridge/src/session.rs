@@ -50,7 +50,6 @@ use ahma_common::mcp_methods::{
 };
 use ahma_common::sandbox_state::{SandboxState, SandboxStateMachine};
 use ahma_common::state_machine::{FsmState, StateMachine};
-use chrono::Local;
 use dashmap::DashMap;
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
@@ -885,7 +884,10 @@ fn fail_pending_requests(
             let _ = sender.send(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.to_value(),
-                "error": { "code": -32603, "message": message }
+                "error": {
+                    "code": ahma_common::mcp_methods::RpcErrorCode::Internal,
+                    "message": message
+                }
             }));
         }
     }
@@ -1055,7 +1057,13 @@ fn json_id_key(id: &Value) -> RpcId {
 
 /// Timestamp prefix shared by the colored frame echoes.
 fn echo_timestamp() -> String {
-    format!("[{}]", Local::now().format("%H:%M:%S%.3f"))
+    echo_timestamp_at(&ahma_common::timestamp::local_now())
+}
+
+/// [`echo_timestamp`] at a given instant: `[HH:MM:SS.mmm]`, milliseconds always
+/// three digits (`.000` included).
+fn echo_timestamp_at(now: &jiff::Zoned) -> String {
+    format!("[{}]", now.strftime("%H:%M:%S%.3f"))
 }
 
 /// Render one frame for the colored echo: pretty-printed when it parses as
@@ -2396,6 +2404,20 @@ mod session_logic_tests {
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    #[test]
+    fn echo_timestamp_is_local_time_with_three_digit_millis() {
+        use jiff::tz::{TimeZone, offset};
+        let at = |ns| jiff::Timestamp::new(1_795_251_903, ns).unwrap();
+        let z = at(0).to_zoned(TimeZone::fixed(offset(1)));
+        assert_eq!(echo_timestamp_at(&z), "[10:05:03.000]");
+        let z = at(7_999_999).to_zoned(TimeZone::fixed(offset(1)));
+        assert_eq!(
+            echo_timestamp_at(&z),
+            "[10:05:03.007]",
+            "truncated, not rounded"
+        );
+    }
 
     /// Build a bare `Session` for pure-logic unit tests, bypassing the
     /// subprocess spawn entirely. The returned `mpsc::Receiver` is the

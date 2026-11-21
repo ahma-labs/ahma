@@ -117,8 +117,6 @@ const ASYNC_KEYWORDS: &[&str] = &[
     r"\bbackground\b",
 ];
 
-const VALID_OPTION_TYPES: &[&str] = &["string", "boolean", "integer", "array"];
-
 fn type_alias_suggestion(option_type: &str) -> Option<String> {
     match option_type {
         "bool" => Some("Use 'boolean' instead of 'bool'".to_string()),
@@ -129,7 +127,7 @@ fn type_alias_suggestion(option_type: &str) -> Option<String> {
 }
 
 fn validate_option_type(option_type: &str, path: &str, errors: &mut Vec<SchemaValidationError>) {
-    if VALID_OPTION_TYPES.contains(&option_type) {
+    if crate::config::OptionType::CANONICAL.contains(&option_type) {
         return;
     }
 
@@ -157,7 +155,7 @@ fn invalid_option_type_message(option_type: &str) -> String {
     format!(
         "Invalid option type '{}'. Must be one of: {}",
         option_type,
-        VALID_OPTION_TYPES.join(", ")
+        crate::config::OptionType::CANONICAL.join(", ")
     )
 }
 
@@ -630,6 +628,24 @@ fn indexed_path(prefix: &str, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every type the tool schema gives a client, the validator accepts as
+    /// written: the two read the `type` text one way. `number` reached the
+    /// schema as a JSON number and was rejected by `ahma tool validate`.
+    #[test]
+    fn the_validator_accepts_every_type_the_schema_gives() {
+        for spelling in ["string", "boolean", "integer", "number", "array"] {
+            let mut errors = Vec::new();
+            validate_option_type(spelling, "subcommand[0].options[0]", &mut errors);
+            assert!(errors.is_empty(), "`{spelling}` rejected: {errors:?}");
+        }
+        let mut errors = Vec::new();
+        validate_option_type("bool", "subcommand[0].options[0]", &mut errors);
+        assert_eq!(
+            errors[0].suggestion.as_deref(),
+            Some("Use 'boolean' instead of 'bool'")
+        );
+    }
 
     #[test]
     fn test_validator_creation() {

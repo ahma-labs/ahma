@@ -463,7 +463,7 @@ pub fn log(state: &AppState) -> Log {
             .iter()
             .skip(skip)
             .map(|line| LogLine {
-                ts: line.timestamp.format("%H:%M:%S").to_string(),
+                ts: line.timestamp.strftime("%H:%M:%S").to_string(),
                 level: match line.level {
                     LogLevel::Error => "error",
                     LogLevel::Warn => "warn",

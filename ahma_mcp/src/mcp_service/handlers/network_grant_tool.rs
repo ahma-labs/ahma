@@ -33,7 +33,7 @@ use crate::egress::net_prompt::{NetApprovalForm, parse_answer};
 use crate::mcp_service::schema;
 use ahma_common::config::settings_path;
 use ahma_common::net_approval::{NetApprovalDecision, persist_net_allow};
-use ahma_common::permissions::{AuditAction, GrantKind, GrantTier, append_audit, audit_entry};
+use ahma_common::permissions::{AuditAction, AuditEntry, GrantKind, GrantTier, append_audit};
 use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::path::Path;
@@ -273,15 +273,16 @@ impl AhmaMcpService {
         // (`persist_net_allow`). A session answer is never written, so it is
         // audited here.
         if tier == GrantTier::Session {
-            append_audit(&audit_entry(
-                chrono::Local::now().to_rfc3339(),
-                AuditAction::Grant,
-                GrantKind::NetHost,
-                &host,
-                None,
-                tier,
-                Some("mcp:network_grant".to_string()),
-            ));
+            append_audit(
+                &AuditEntry::new(
+                    ahma_common::timestamp::rfc3339_local_now(),
+                    AuditAction::Grant,
+                    GrantKind::NetHost,
+                    &host,
+                    tier,
+                )
+                .with_surface("mcp:network_grant"),
+            );
         }
         let _ = note;
 

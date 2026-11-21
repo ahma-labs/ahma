@@ -274,7 +274,7 @@ async fn boolean_option_uses_alias_when_true() {
 }
 
 /// The tool schema advertises an option typed `"bool"` as boolean
-/// (`schema::normalize_option_type`), so a client sends it as one, often as
+/// (`config::OptionType::read`), so a client sends it as one, often as
 /// the string `"true"`. The argument processor recognised only `"boolean"`,
 /// and passed `--flag true` for the same option. Every spelling the schema
 /// accepts as boolean is one here too.

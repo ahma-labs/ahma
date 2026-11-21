@@ -119,9 +119,7 @@ fn test_adapter(scope: &Path) -> Adapter {
         Sandbox::new(
             vec![scope.to_path_buf(), std::env::temp_dir()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("test sandbox"),
     );
@@ -329,9 +327,7 @@ async fn a_mutex_gate_that_gives_up_is_audited_as_the_operation_ended() {
         Sandbox::new(
             vec![scope.to_path_buf(), std::env::temp_dir()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("test sandbox"),
     );

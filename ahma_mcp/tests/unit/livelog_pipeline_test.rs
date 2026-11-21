@@ -103,9 +103,7 @@ fn make_sandbox(temp_dir: &std::path::Path) -> Arc<Sandbox> {
         Sandbox::new(
             vec![temp_dir.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     )

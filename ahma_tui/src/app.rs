@@ -380,7 +380,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
     let (level, message) = try_approve_log_link(state, &active_file, &info);
     set_footer_hint(state, message.clone());
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level,
         message,
     });
@@ -1135,12 +1135,12 @@ pub(crate) fn resolve_approval_always(state: &mut crate::state::AppState) {
         };
         match ahma_core::approvals::remember_tool_approval(&workspace, &tool) {
             Ok(()) => state.push_log(LogEntry {
-                timestamp: chrono::Local::now(),
+                timestamp: ahma_common::timestamp::local_now(),
                 level: LogLevel::Info,
                 message: format!("Always allowing tool '{tool}' in this workspace"),
             }),
             Err(e) => state.push_log(LogEntry {
-                timestamp: chrono::Local::now(),
+                timestamp: ahma_common::timestamp::local_now(),
                 level: LogLevel::Warn,
                 message: format!("Could not persist always-allow for '{tool}': {e}"),
             }),
@@ -1189,7 +1189,7 @@ fn reraise_grant_for(state: &mut crate::state::AppState, op: crate::state::Opera
     use crate::state::{LogEntry, LogLevel, OpStatus};
     let Some((path, access)) = op.denial.clone().filter(|_| op.status == OpStatus::Denied) else {
         state.push_log(LogEntry {
-            timestamp: chrono::Local::now(),
+            timestamp: ahma_common::timestamp::local_now(),
             level: LogLevel::Info,
             message: "[a] asks for sandbox access — select a denied operation first.".to_string(),
         });
@@ -1202,7 +1202,7 @@ fn reraise_grant_for(state: &mut crate::state::AppState, op: crate::state::Opera
         target_instance_id: op.instance_id.clone(),
     });
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level: LogLevel::Info,
         message: format!("Asking again for {} access to {path}…", access.short()),
     });
@@ -1256,7 +1256,7 @@ pub(crate) fn resolve_approval(state: &mut crate::state::AppState, approved: boo
     };
 
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level,
         message: format!("{verb} gate: {}", gate.op_id),
     });
@@ -1298,7 +1298,7 @@ fn request_cancel_selected_op(state: &mut crate::state::AppState) {
 pub(crate) fn cancel_op(state: &mut crate::state::AppState, key: crate::state::OpKey) {
     use crate::state::{LogEntry, LogLevel};
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level: LogLevel::Info,
         message: format!("Cancel requested: {}", key.id),
     });
@@ -1420,7 +1420,7 @@ fn maybe_decompose_goal(
             return true;
         }
         state.push_log(LogEntry {
-            timestamp: chrono::Local::now(),
+            timestamp: ahma_common::timestamp::local_now(),
             level: LogLevel::Info,
             message: format!("Decomposing goal: {}", goal),
         });
@@ -1470,7 +1470,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
     use crate::state::{LogEntry, LogLevel, TuiWindow};
 
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level: LogLevel::Warn,
         message: format!("UNSANDBOXED command (human-authorized via !): {cmd_str}"),
     });
@@ -2608,7 +2608,7 @@ fn handle_trust_key(key: crossterm::event::KeyEvent, state: &mut crate::state::A
     };
     set_footer_hint(state, message.clone());
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level,
         message,
     });
@@ -2869,7 +2869,7 @@ pub(crate) fn resolve_scope_grant(
     // A question read from the terminal-hook records has no instance behind
     // it: the TUI applies the answer itself (SPEC R-PERM.10(e)).
     if let Some(ask) = &gate.harness {
-        let (level, message) = match crate::harness_asks::answer(ask, decision) {
+        let (level, message) = match crate::harness_asks::answer(ask, decision, state.surface) {
             Ok(line) => (
                 if decision.within_offer(gate.reason) == GrantDecision::Deny {
                     LogLevel::Warn
@@ -2884,7 +2884,7 @@ pub(crate) fn resolve_scope_grant(
             ),
         };
         state.push_log(LogEntry {
-            timestamp: chrono::Local::now(),
+            timestamp: ahma_common::timestamp::local_now(),
             level,
             message,
         });
@@ -2979,7 +2979,7 @@ pub(crate) fn resolve_scope_grant(
         ),
     };
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level,
         message,
     });
@@ -3082,7 +3082,7 @@ pub(crate) fn resolve_web_approval(
         ),
     };
     state.push_log(LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level,
         message,
     });
@@ -3428,7 +3428,7 @@ fn invoke_skill(
     }
 
     state.push_log(crate::state::LogEntry {
-        timestamp: chrono::Local::now(),
+        timestamp: ahma_common::timestamp::local_now(),
         level: crate::state::LogLevel::Info,
         message: format!(
             "Skill '{}' loaded from {} ({} lines)",
@@ -3529,7 +3529,7 @@ fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
 
     let saved = ahma_common::config::AhmaSettings::update_audited(
         "tui",
-        &chrono::Local::now().to_rfc3339(),
+        &ahma_common::timestamp::rfc3339_local_now(),
         |s| s.tools.minimize_tokens = desired,
     );
     let status = if desired { "on" } else { "off" };
@@ -3559,7 +3559,7 @@ fn set_execution_mode(
 ) {
     match ahma_common::config::AhmaSettings::update_audited(
         "tui",
-        &chrono::Local::now().to_rfc3339(),
+        &ahma_common::timestamp::rfc3339_local_now(),
         |s| s.tools.execution_mode = mode,
     ) {
         Ok(_) => {
@@ -4008,7 +4008,7 @@ fn handle_doctor_confirm_key(
         return false;
     };
     let message = if apply {
-        match fix.apply(&chrono::Local::now().to_rfc3339()) {
+        match fix.apply(&ahma_common::timestamp::rfc3339_local_now()) {
             Ok(done) => format!("{done}."),
             Err(e) => format!("Could not apply the fix: {e:#}"),
         }
@@ -4436,7 +4436,7 @@ fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
     let _ = std::fs::create_dir_all(&out_dir);
     let file = out_dir.join(format!(
         "chat-{}.md",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ahma_common::timestamp::local_now().strftime("%Y%m%d-%H%M%S")
     ));
 
     let md = chat_to_markdown(&state.chat);
@@ -4901,7 +4901,7 @@ pub(crate) fn drain_startup_notices(state: &mut crate::state::AppState) {
 
     for notice in crate::startup_notices::drain() {
         state.push_log(crate::state::LogEntry {
-            timestamp: chrono::Local::now(),
+            timestamp: ahma_common::timestamp::local_now(),
             level: match notice.level {
                 Level::Info => crate::state::LogLevel::Info,
                 Level::Warn => crate::state::LogLevel::Warn,
@@ -5071,7 +5071,7 @@ fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url:
 fn virtual_provider_for_instance(
     inst: &ahma_common::hub::InstanceInfo,
 ) -> Option<ahma_llm_monitor::LocalProvider> {
-    if !inst.sampling || inst.mode == "hook" || inst.mode == "tui" {
+    if !inst.sampling || inst.kind() != ahma_common::hub::InstanceMode::Worker {
         return None;
     }
     let who = inst.client.as_deref().unwrap_or(&inst.label);
@@ -5720,7 +5720,7 @@ fn format_generic_args_summary(obj: &serde_json::Map<String, serde_json::Value>)
 }
 
 fn format_friendly_start(op: &crate::state::Operation) -> String {
-    let time_str = op.started_time.format("%H:%M:%S").to_string();
+    let time_str = op.started_time.strftime("%H:%M:%S").to_string();
     // When the wire carried the real command it is already shown in the
     // window's `$` header — a bare timestamp is enough here. The parsed args
     // summary is only a fallback for pre-R24.7 servers.
@@ -6120,7 +6120,7 @@ fn handle_source_sandbox_event(
             state.sandbox_status = crate::state::SandboxAuthority::Failed;
             state.sandbox_failed_reason = Some(error.clone());
             state.push_log(crate::state::LogEntry {
-                timestamp: chrono::Local::now(),
+                timestamp: ahma_common::timestamp::local_now(),
                 level: crate::state::LogLevel::Error,
                 message: format!(
                     "Sandbox configuration FAILED: {error} — tool calls are refused until a \
@@ -6303,7 +6303,7 @@ fn append_profile_transcript(state: &crate::state::AppState) {
         && let Ok(cwd) = std::env::current_dir()
     {
         let payload = serde_json::json!({
-            "timestamp": chrono::Local::now().to_rfc3339(),
+            "timestamp": ahma_common::timestamp::rfc3339_local_now(),
             "chat_entries": state.chat.entries().len(),
             "model": state.selected_model(),
         });
@@ -6312,8 +6312,7 @@ fn append_profile_transcript(state: &crate::state::AppState) {
         // the blocking pool; best-effort, as before.
         let profile = profile.clone();
         tokio::task::spawn_blocking(move || {
-            let _ =
-                crate::agent_config::append_transcript_entry(&cwd, &profile, &payload.to_string());
+            let _ = crate::agent_config::append_transcript_entry(&cwd, &profile, &payload);
         });
     }
 }
@@ -10954,12 +10953,13 @@ mod tests {
 
         op.command = None;
         op.title = Some("cargo build".into());
+        op.started_time = jiff::civil::date(2026, 11, 21)
+            .at(9, 5, 7, 123_456_789)
+            .to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(2)))
+            .unwrap();
         assert_eq!(
             super::format_friendly_start(&op),
-            format!(
-                "Starting cargo build at {}",
-                op.started_time.format("%H:%M:%S")
-            )
+            "Starting cargo build at 09:05:07"
         );
     }
 

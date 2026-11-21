@@ -3,8 +3,7 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use std::path::Path;
 
-use super::core::Sandbox;
-use super::types::SandboxMode;
+use super::core::{Enforcement, Sandbox};
 
 /// Operator-configured passthrough allowlist (`[sandbox] env_allow`): variable
 /// names preserved in tool subprocess environments despite matching a secret
@@ -312,11 +311,24 @@ impl Sandbox {
         args: &[String],
         working_dir: &Path,
     ) -> Result<tokio::process::Command> {
-        if self.mode == SandboxMode::Test {
-            return Ok(self.base_command(program, args, working_dir));
+        match self.enforcement() {
+            Enforcement::Off => Ok(self.base_command(program, args, working_dir)),
+            // SPEC R7.6: this process is itself inside a Seatbelt profile that
+            // refuses nesting, so `sandbox-exec` would only fail with an opaque
+            // `sandbox_apply: Operation not permitted`. Run the command bare —
+            // still inside the outer kernel boundary, which every child of a
+            // confined process inherits — as disclosed at construction.
+            Enforcement::DeferredTo(host) => {
+                tracing::debug!(
+                    outer = host.label(),
+                    "Spawning without sandbox-exec: deferring to the outer Seatbelt sandbox (SPEC R7.6)"
+                );
+                Ok(self.base_command(program, args, working_dir))
+            }
+            Enforcement::Kernel => {
+                self.create_platform_sandboxed_command(program, args, working_dir)
+            }
         }
-
-        self.create_platform_sandboxed_command(program, args, working_dir)
     }
 
     pub(super) fn base_command(
@@ -352,7 +364,7 @@ impl Sandbox {
         // it must defer to, instead of reporting "an outer sandbox". Only set
         // when this sandbox is really the one confining the child; a deferring
         // sandbox passes the outer marker through untouched.
-        if self.outer_sandbox.is_none() {
+        if !matches!(self.enforcement(), Enforcement::DeferredTo(_)) {
             cmd.env(
                 super::host_detect::OUTER_SANDBOX_PID_ENV,
                 std::process::id().to_string(),
@@ -456,19 +468,6 @@ impl Sandbox {
 
         #[cfg(target_os = "macos")]
         {
-            // SPEC R7.6: this process is itself inside a Seatbelt profile that
-            // refuses nesting, so `sandbox-exec` would only fail with an opaque
-            // `sandbox_apply: Operation not permitted`. Run the command bare —
-            // still inside the outer kernel boundary, which every child of a
-            // confined process inherits — as disclosed at construction.
-            if let Some(host) = self.outer_sandbox {
-                tracing::debug!(
-                    outer = host.label(),
-                    "Spawning without sandbox-exec: deferring to the outer Seatbelt sandbox (SPEC R7.6)"
-                );
-                return Ok(self.base_command(program, args, working_dir));
-            }
-
             // On macOS, wrap each command with sandbox-exec
             let mut full_command = vec![program.to_string()];
             full_command.extend(args.iter().cloned());
@@ -548,7 +547,7 @@ impl Sandbox {
     /// in-process embedders, which fall back to application-level path checks.
     #[cfg(target_os = "linux")]
     pub fn spawn_landlock_ruleset_fd(&self) -> Result<Option<std::os::fd::OwnedFd>> {
-        if self.mode == SandboxMode::Test {
+        if self.enforcement() != Enforcement::Kernel {
             return Ok(None);
         }
         let fd =
@@ -575,7 +574,9 @@ impl Sandbox {
         &self,
         working_dir: &Path,
     ) -> Option<super::deny_tier::DenyTierMounts> {
-        if self.mode == SandboxMode::Test || !super::deny_tier::namespace_prevention_active() {
+        if self.enforcement() != Enforcement::Kernel
+            || !super::deny_tier::namespace_prevention_active()
+        {
             return None;
         }
         let mut roots: Vec<std::path::PathBuf> = self.scopes().to_vec();
@@ -619,7 +620,7 @@ impl Sandbox {
     /// does not exist and every command takes the exclusive lane — the queue
     /// never trusts a classifier without a kernel behind it.
     pub fn can_enforce_read_only(&self) -> bool {
-        if self.mode == SandboxMode::Test {
+        if self.enforcement() != Enforcement::Kernel {
             return false;
         }
         #[cfg(target_os = "linux")]
@@ -639,7 +640,7 @@ impl Sandbox {
         }
         #[cfg(target_os = "macos")]
         {
-            self.outer_sandbox.is_none()
+            true
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -728,6 +729,7 @@ impl Sandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::SandboxMode;
     use tempfile::tempdir;
 
     #[test]
@@ -780,9 +782,7 @@ mod tests {
         let sandbox = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_package_cache_write(true);
@@ -799,9 +799,7 @@ mod tests {
         Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
     }
@@ -1245,9 +1243,7 @@ mod tests {
         let sandbox = Sandbox::new(
             vec![td.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let result = sandbox.create_command("echo", &["hi".to_string()], td.path());

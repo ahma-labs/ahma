@@ -76,20 +76,12 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn generate_id(tool_name: &str, command: &str) -> String {
-    let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    crate::utils::operation::generate_id_with_details(id, tool_name, command)
-}
+use crate::utils::operation::mint_id as generate_id;
 
 const MAX_STREAM_COLLECTED_LINES: usize = 5_000;
 const MAX_STREAM_COLLECTED_BYTES: usize = 1_000_000;
@@ -608,6 +600,8 @@ impl Adapter {
         op_id: &str,
         task: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
+        // The task ends the operation, so a cancel asks it to (SPEC R2.7.1).
+        self.monitor.ends_by_task(op_id).await;
         let handles = self.task_handles.clone();
         let id = op_id.to_string();
         let mut registered = self.task_handles.lock().await;
@@ -623,16 +617,15 @@ impl Adapter {
     pub async fn shutdown(&self) {
         tracing::info!("Adapter shutdown initiated: cancelling operations and aborting tasks");
 
-        // 1) Cancel all known operations tracked by this adapter (best-effort)
+        // 1) Cancel all known operations tracked by this adapter (best-effort),
+        //    together: each cancel waits for its task to end the operation.
         {
-            let handles = self.task_handles.lock().await;
-            for op_id in handles.keys() {
-                let reason = Some("Adapter shutdown".to_string());
-                let _ = self
-                    .monitor
-                    .cancel_operation_with_reason(op_id, reason)
-                    .await;
-            }
+            let ids: Vec<String> = self.task_handles.lock().await.keys().cloned().collect();
+            futures::future::join_all(ids.iter().map(|op_id| {
+                self.monitor
+                    .cancel_operation_with_reason(op_id, Some("Adapter shutdown".to_string()))
+            }))
+            .await;
         }
 
         // 2) Drain handles then give each task a grace period before aborting
@@ -1006,13 +999,12 @@ impl Adapter {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let child = match cmd.spawn() {
-            Ok(child) => child,
+        let mut guard = match ProcessGroupGuard::spawn(&mut cmd) {
+            Ok(guard) => guard,
             Err(e) => {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
         };
-        let mut guard = ProcessGroupGuard::of(&cmd, child);
 
         // Read stdout/stderr concurrently with `wait()` (not after `wait()`
         // returns) so a chatty child can't fill the pipe buffer and deadlock —
@@ -1472,7 +1464,7 @@ impl Adapter {
         let display_command = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| command.to_string());
-        self.monitor.add_operation(operation).await;
+        let cancellation_token = self.monitor.register(operation).await;
 
         // Durable provenance, written *before* the task is spawned. Doing it here
         // rather than inside the task is the point: nothing between this line and
@@ -1496,6 +1488,7 @@ impl Adapter {
 
         let run = run_async_operation(AsyncOperationRun {
             op_id,
+            cancellation_token,
             command,
             program: program_with_subcommand,
             args_vec,
@@ -1557,7 +1550,7 @@ impl Adapter {
         operation.cwd = Some(safe_wd.to_string_lossy().into_owned());
         operation.command = Some(command_str.to_string());
         operation.output_file = Some(spill::operation_spill_path(&op_id));
-        self.monitor.add_operation(operation).await;
+        let cancellation_token = self.monitor.register(operation).await;
 
         let audit_argv = [command_str.to_string()];
         audit::record_tool_call(
@@ -1570,11 +1563,6 @@ impl Adapter {
         )
         .await;
 
-        let cancellation_token = match self.monitor.get_operation(&op_id).await {
-            Some(op) => op.cancellation_token.clone(),
-            None => anyhow::bail!("operation {op_id} vanished before start"),
-        };
-
         let limit = command_limit(&self.shell_pool, timeout);
         let monitor = self.monitor.clone();
         let sandbox = self.sandbox.clone();
@@ -1585,6 +1573,15 @@ impl Adapter {
         let credential_brokers = self.credential_brokers.clone();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
         let keep_leftovers = self.is_declared_long_running(&command_str);
+        // Its mutex group (SPEC R2.7.2), keyed like the lease and matched on
+        // the line the caller wrote, as for a piped command.
+        let mutex_registry = self.mutex_registry.clone();
+        let workspace = self.workspace_key_for(&safe_wd);
+        // Drift (SPEC R2.7.6): this command is exclusive, never a service.
+        let drift = DriftProbe {
+            root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
+            lane: workspace_queue::Lane::Exclusive,
+        };
         // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1594,14 +1591,26 @@ impl Adapter {
         );
 
         let task = async move {
-            let mut guards = guards::RunGuards::new(&op_id_task, &tool_task);
-            // Held until the PTY process is gone.
-            match wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await {
-                Ok(lease) => guards.hold_lease(lease),
-                Err(()) => return guards.end(&monitor, cancelled()).await,
-            }
-            // Running from here, not while it waited its turn (SPEC R2.7.1).
-            monitor.start(&op_id_task).await;
+            let Some(guards) = guards::RunGuards::begin(
+                &monitor,
+                &op_id_task,
+                &tool_task,
+                ticket,
+                &cancellation_token,
+            )
+            .await
+            else {
+                return;
+            };
+            // Its mutex group (SPEC R2.7.2), as for a piped command.
+            let Some(mut guards) = guards
+                .gate(&monitor, &mutex_registry, &command_str, &workspace)
+                .await
+            else {
+                return;
+            };
+            // As on the piped path: after the queue and the gate, before the spawn.
+            let started = Instant::now();
             if watch_handoff {
                 guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
             }
@@ -1631,8 +1640,10 @@ impl Adapter {
                 keep_leftovers,
             )
             .await;
-            // A deny-tier write reaches the log and the audit trail, not the
-            // result text.
+            // The PTY process is gone: the result carries the drift and
+            // deny-tier reports, as a piped command's does.
+            let finished =
+                carry_run_reports(finished, &drift, started, &mut guards, &monitor).await;
             guards.end(&monitor, finished).await;
         };
         self.spawn_operation_task(&op_id, task).await;
@@ -1671,7 +1682,7 @@ impl Adapter {
         // observers (TUI task tree) render them as children of the session.
         .with_parent(format!("session:{session_id}"));
         operation.output_file = Some(spill::operation_spill_path(&op_id));
-        self.monitor.add_operation(operation).await;
+        let cancellation_token = self.monitor.register(operation).await;
 
         let audit_argv = [command_str.to_string()];
         audit::record_tool_call(
@@ -1684,11 +1695,6 @@ impl Adapter {
         )
         .await;
 
-        let cancellation_token = match self.monitor.get_operation(&op_id).await {
-            Some(op) => op.cancellation_token.clone(),
-            None => anyhow::bail!("operation {op_id} vanished before start"),
-        };
-
         let timeout_duration = command_limit(&self.shell_pool, timeout);
         let monitor = self.monitor.clone();
         let sandbox = self.sandbox.clone();
@@ -1698,6 +1704,13 @@ impl Adapter {
         let op_id_task = op_id.clone();
         let tool_task = tool_name.to_string();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
+        let mutex_registry = self.mutex_registry.clone();
+        let workspace = self.workspace_key_for(&safe_wd);
+        // Drift (SPEC R2.7.6): this command is exclusive, never a service.
+        let drift = DriftProbe {
+            root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
+            lane: workspace_queue::Lane::Exclusive,
+        };
         // A session command is an arbitrary shell command: exclusive (SPEC R2.7).
         let ticket = self.enqueue_exclusive(
             workspace_queue::Lane::Exclusive,
@@ -1707,14 +1720,26 @@ impl Adapter {
         );
 
         let task = async move {
-            let mut guards = guards::RunGuards::new(&op_id_task, &tool_task);
-            // Held until the session command is done.
-            match wait_for_lease(ticket, &monitor, &op_id_task, &cancellation_token).await {
-                Ok(lease) => guards.hold_lease(lease),
-                Err(()) => return guards.end(&monitor, cancelled()).await,
-            }
-            // Running from here, not while it waited its turn (SPEC R2.7.1).
-            monitor.start(&op_id_task).await;
+            let Some(guards) = guards::RunGuards::begin(
+                &monitor,
+                &op_id_task,
+                &tool_task,
+                ticket,
+                &cancellation_token,
+            )
+            .await
+            else {
+                return;
+            };
+            // Its mutex group (SPEC R2.7.2), as for a piped command.
+            let Some(mut guards) = guards
+                .gate(&monitor, &mutex_registry, &command_str, &workspace)
+                .await
+            else {
+                return;
+            };
+            // As on the piped path: after the queue and the gate, before the spawn.
+            let started = Instant::now();
             if watch_handoff {
                 guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
             }
@@ -1730,7 +1755,9 @@ impl Adapter {
                 &monitor,
             )
             .await;
-            // As for PTY: a deny-tier write reaches the log and the audit trail.
+            // The command has ended (the session's shell lives on): as for PTY.
+            let finished =
+                carry_run_reports(finished, &drift, started, &mut guards, &monitor).await;
             guards.end(&monitor, finished).await;
         };
         self.spawn_operation_task(&op_id, task).await;
@@ -1872,6 +1899,7 @@ fn command_limit(shell_pool: &ShellPoolManager, timeout_secs: Option<u64>) -> Du
 /// Context for a single background async operation task.
 struct AsyncOperationRun {
     op_id: String,
+    cancellation_token: tokio_util::sync::CancellationToken,
     command: String,
     program: String,
     args_vec: Vec<String>,
@@ -1927,6 +1955,7 @@ fn alert_broker_refusals(
 async fn run_async_operation(ctx: AsyncOperationRun) {
     let AsyncOperationRun {
         op_id,
+        cancellation_token,
         command,
         program,
         args_vec,
@@ -1952,60 +1981,28 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     // Timed from the moment the task starts, so queueing behind a command mutex
     // group is visible in the audit record rather than silently excluded.
-    let mut guards = guards::RunGuards::new(&op_id, &command);
-
-    let cancellation_token = match monitor.get_operation(&op_id).await {
-        Some(operation) => operation.cancellation_token.clone(),
-        None => {
-            let why = format!("Could not find operation {op_id} for cancellation token");
-            guards.end(&monitor, failed(why)).await;
-            return;
-        }
-    };
-
     // ── Workspace write queue (SPEC R2.7) ──────────────────────────────────
     // Wait for every exclusive operation that arrived earlier in this
     // workspace — in this process or any other — before starting. The lease is
     // held until the operation ends, i.e. until the process tree is gone.
-    match wait_for_lease(ticket, &monitor, &op_id, &cancellation_token).await {
-        Ok(lease) => guards.hold_lease(lease),
-        Err(()) => {
-            guards.end(&monitor, cancelled()).await;
-            return;
-        }
-    }
-
-    monitor.start(&op_id).await;
+    let Some(guards) =
+        guards::RunGuards::begin(&monitor, &op_id, &command, ticket, &cancellation_token).await
+    else {
+        return;
+    };
 
     // Lifecycle events (Started / terminal) are emitted by the OperationMonitor
     // at each state transition — the single emission point for the unified
     // event stream (SPEC R15).  MCP progress notifications are pushed by the
     // `progress_push` forwarder subscribed to that stream.
 
-    if cancellation_token.is_cancelled() {
-        tracing::info!("Operation {} was cancelled before execution started", op_id);
-        guards.end(&monitor, cancelled()).await;
+    // ── Command mutex group gate (SPEC R2.7.2) ─────────────────────────────
+    // Held by the guards for the whole run and handed on with the lease.
+    let Some(mut guards) = guards
+        .gate(&monitor, &mutex_registry, &display_command, &workspace)
+        .await
+    else {
         return;
-    }
-
-    // ── Command mutex group gate ────────────────────────────────────────────────────
-    // Serialise commands in the same mutex group within the same working
-    // directory.  The permit is held for the entire execution and released
-    // automatically when it drops at the end of this function.
-    let _exclusive_permit = match acquire_mutex_gate(
-        &mutex_registry,
-        &monitor,
-        &op_id,
-        &display_command,
-        &workspace,
-    )
-    .await
-    {
-        Ok(permit) => permit,
-        Err(err) => {
-            guards.end(&monitor, failed(err)).await;
-            return;
-        }
     };
 
     let start_time = Instant::now();
@@ -2498,9 +2495,33 @@ impl DriftProbe {
 
 /// Acquire the command's mutex-group gate, if the command belongs to one.
 ///
-/// Split out of [`run_async_operation`] so its early-return control flow
-/// doesn't nest a match inside an `if let` inside that function's straight
-/// line of guard clauses.
+/// A PTY or session command's ending with what its result owes beyond the
+/// output, as a piped command's result has it: the files that changed in its
+/// workspace while it ran (SPEC R2.7.6). Only an ending that carries output
+/// (`Exited`) has a place for it.
+/// A PTY or session command's ending with what its result owes beyond the
+/// output, as a piped command's result has it, in the same order: the files
+/// that changed in its workspace while it ran (SPEC R2.7.6), then the
+/// deny-tier report and its alert (R6.1.7). Only an ending that carries output
+/// (`Exited`) has a place for them; any other leaves the watch for
+/// `RunGuards::end`, which reports it to the log and the audit trail.
+async fn carry_run_reports(
+    ending: Terminal,
+    drift: &DriftProbe,
+    started: Instant,
+    guards: &mut guards::RunGuards,
+    monitor: &OperationMonitor,
+) -> Terminal {
+    let mut output = match ending {
+        Terminal::Exited(output) => output,
+        other => return other,
+    };
+    output.changed_during_run = drift.report(started.elapsed()).await;
+    guards.report_handoff_in(&mut output, monitor).await;
+    Terminal::Exited(output)
+}
+
+/// The gate every async path waits for, through [`guards::RunGuards::gate`].
 ///
 /// Returns `Ok(None)` when the command isn't gated by any group, `Ok(Some(permit))`
 /// once both the in-memory and filesystem locks are held (or the semaphore was
@@ -2597,6 +2618,9 @@ async fn run_session_operation(
 ) -> Terminal {
     let mut spill_writer = spill::SpillWriter::create(op_id).await;
     let mut collected = BoundedLineCollector::default();
+    // Warned once at 80% of the limit, as a piped command is (SPEC R2.6.6).
+    // The session enforces the limit itself (`ShellSession::execute_streaming`).
+    let mut near_limit = time_limit::NearLimit::starting_now(timeout);
 
     // The session protocol streams lines through a sync callback; forward
     // them over a channel so the async side can append/spill as they arrive.
@@ -2630,6 +2654,10 @@ async fn run_session_operation(
                 sessions.remove_session(session_id).await;
                 spill_writer.finish().await;
                 return Terminal::Cancelled("Operation was cancelled".to_string());
+            }
+
+            _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
+                monitor.append_alert(op_id, near_limit.alert()).await;
             }
 
             line = line_rx.recv() => {
@@ -2674,8 +2702,9 @@ fn finalize_session_result(
             session_id: Some(session_id.to_string()),
             ..collected.merged_output(exit_code, op_id)
         })),
-        Err(e @ crate::shell_session::SessionError::TimedOut(_)) => {
-            Terminal::TimedOut(e.to_string())
+        // Says how to raise the limit, as the piped path does (SPEC R2.6.6).
+        Err(crate::shell_session::SessionError::TimedOut(limit)) => {
+            timed_out(limit.as_millis() as u64)
         }
         Err(e) => Terminal::Failed(e.to_string()),
     }
@@ -2726,8 +2755,8 @@ async fn execute_with_streaming(
     proc_cmd.stdout(std::process::Stdio::piped());
     proc_cmd.stderr(std::process::Stdio::piped());
 
-    let child = match proc_cmd.spawn() {
-        Ok(child) => child,
+    let mut guard = match ProcessGroupGuard::spawn(proc_cmd) {
+        Ok(guard) => guard,
         Err(e) => {
             guards
                 .end(
@@ -2738,7 +2767,6 @@ async fn execute_with_streaming(
             return;
         }
     };
-    let mut guard = ProcessGroupGuard::of(proc_cmd, child);
 
     let stdout = guard.child_mut().stdout.take().expect("stdout piped");
     let stderr = guard.child_mut().stderr.take().expect("stderr piped");
@@ -2759,8 +2787,7 @@ async fn execute_with_streaming(
     let timeout_deadline = tokio::time::Instant::now() + limit;
     // Warn once at 80% of the limit (SPEC R2.6.6), so a healthy job near it
     // is not stopped without notice.
-    let near_limit_at = tokio::time::Instant::now() + limit.mul_f64(0.8);
-    let mut warned_near_limit = false;
+    let mut near_limit = time_limit::NearLimit::starting_now(limit);
 
     let mut still_running_interval = tokio::time::interval(Duration::from_secs(10));
     still_running_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2810,11 +2837,8 @@ async fn execute_with_streaming(
                 return;
             }
 
-            _ = tokio::time::sleep_until(near_limit_at), if !warned_near_limit => {
-                warned_near_limit = true;
-                op_monitor
-                    .append_alert(op_id, time_limit::near_limit(limit.as_millis().div_ceil(1000) as u64))
-                    .await;
+            _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
+                op_monitor.append_alert(op_id, near_limit.alert()).await;
             }
 
             // Timeout
@@ -3265,9 +3289,6 @@ async fn finalize_streaming_operation(
         Some(probe) => probe.report(start_time.elapsed()).await,
         None => None,
     };
-    // The process tree is gone: compare the deny tier with its inventory from
-    // before the spawn (SPEC R6.1.7).
-    let handoff_report = guards.take_handoff_report().await;
 
     let mut output = CommandOutput {
         stdout: stdout_str,
@@ -3285,14 +3306,9 @@ async fn finalize_streaming_operation(
         changed_during_run,
         ..CommandOutput::default()
     };
-    if let Some(report) = handoff_report {
-        let alert = report.render_alert();
-        output.handoff_writes = Some(report.to_json());
-        output.handoff_alert = Some(alert.clone());
-        // Before the terminal transition, while the operation is still active:
-        // the `Alert` event is what the hub and the TUI show.
-        op_monitor.append_alert(op_id, alert).await;
-    }
+    // The process tree is gone: the deny-tier report (SPEC R6.1.7) goes in
+    // the result, and its alert out before the terminal transition.
+    guards.report_handoff_in(&mut output, op_monitor).await;
     // The process tree is gone and the drift probe has looked: the guards
     // hand the workspace on, then publish. The terminal event carries the
     // result to all subscribers (MCP progress push, hub, TUI).
@@ -3763,9 +3779,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -3782,7 +3796,7 @@ mod tests {
         ));
         let td = tempfile::tempdir().unwrap();
         let sandbox = Arc::new(
-            crate::sandbox::Sandbox::new(vec![td.path().to_path_buf()], mode, false, false, false)
+            crate::sandbox::Sandbox::new(vec![td.path().to_path_buf()], mode, Default::default())
                 .unwrap(),
         );
         (Adapter::new(monitor, shell_pool, sandbox).unwrap(), td)
@@ -4189,9 +4203,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![ws.clone(), other.clone(), scratch.clone()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4387,9 +4399,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4412,9 +4422,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );
@@ -4437,9 +4445,7 @@ mod tests {
             crate::sandbox::Sandbox::new(
                 vec![td.path().to_path_buf()],
                 crate::sandbox::SandboxMode::Test,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap(),
         );

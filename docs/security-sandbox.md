@@ -209,7 +209,7 @@ Kernel prevention on Linux needs a private mount namespace per command, which is
 2. **At `warn` in ahma's log**, with the same wording.
 3. **In the execution audit log** as a `handoff_write` record per entry — the durable half, because the hook runs later, when nobody is reading the transcript ([execution-audit-log.md](execution-audit-log.md#handoff_write)).
 
-The hub and the TUI receive the alert as the operation's alert event. A PTY or persistent-session command (`pty: true`, `session_id`) publishes its own result, so for those the alert goes to the log and the audit trail only.
+The hub and the TUI receive the alert as the operation's alert event. This holds whichever way the command ran (piped, `pty: true` or `session_id`). A command stopped by a timeout or a cancel has no result to carry it, so for it the alert goes to the log and the audit trail only.
 
 What this does **not** do, on purpose:
 

@@ -289,15 +289,16 @@ pub fn persist_web_allow(settings_file: &Path, domain: &str, surface: &str) -> R
     settings
         .save_to(settings_file)
         .with_context(|| format!("failed to write {}", settings_file.display()))?;
-    crate::permissions::append_audit(&crate::permissions::audit_entry(
-        crate::config::fmt_utc_datetime(crate::config::unix_now()),
-        crate::permissions::AuditAction::Grant,
-        crate::permissions::GrantKind::WebDomain,
-        domain,
-        None,
-        crate::permissions::GrantTier::Always,
-        Some(surface.to_string()),
-    ));
+    crate::permissions::append_audit(
+        &crate::permissions::AuditEntry::new(
+            crate::config::fmt_utc_datetime(crate::config::unix_now()),
+            crate::permissions::AuditAction::Grant,
+            crate::permissions::GrantKind::WebDomain,
+            domain,
+            crate::permissions::GrantTier::Always,
+        )
+        .with_surface(surface.to_string()),
+    );
     Ok(true)
 }
 

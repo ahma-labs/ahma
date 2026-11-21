@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StagedEntry
@@ -63,27 +63,15 @@ impl TrashManager {
     ///
     /// Returns the [`StagedEntry`] describing where the data was moved.
     pub fn stage(&self, path: &Path) -> Result<StagedEntry> {
-        let original_path = path.display().to_string();
-
-        let filename = path
-            .file_name()
-            .context("Cannot stage a path with no filename component")?
-            .to_string_lossy();
-
-        let ts = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
-        let trash_name = format!("{ts}_{filename}");
-
+        if path.file_name().is_none() {
+            anyhow::bail!("Cannot stage a path with no filename component");
+        }
         std::fs::create_dir_all(&self.trash_dir)
             .with_context(|| format!("Failed to create trash dir: {}", self.trash_dir.display()))?;
-
-        let trash_path = self.trash_dir.join(&trash_name);
-
-        std::fs::rename(path, &trash_path)
-            .with_context(|| format!("Failed to move {path:?} to trash as {trash_name}"))?;
-
+        let trash_path = move_into(path, &self.trash_dir)?;
         Ok(StagedEntry {
             trash_path,
-            original_path,
+            original_path: path.display().to_string(),
         })
     }
 
@@ -157,6 +145,80 @@ impl TrashManager {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The `<utc-timestamp>` prefix of a staged name: UTC, milliseconds, no dot
+/// (`20261121T090503007Z`), the spelling every earlier version wrote (R-TIME.1).
+fn staging_stamp(now: Timestamp) -> String {
+    now.strftime("%Y%m%dT%H%M%S%3fZ").to_string()
+}
+
+/// Move `source` into `trash_dir` as `<utc-timestamp>_<original-filename>`,
+/// returning where it went: the one way anything is staged into a trash
+/// directory. A rename, or, where that fails (another filesystem), a copy then
+/// a delete of the original. `trash_dir` must exist.
+pub(crate) fn move_into(source: &Path, trash_dir: &Path) -> Result<PathBuf> {
+    let filename = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("staged-item");
+    let ts = staging_stamp(Timestamp::now());
+    let dest = trash_dir.join(format!("{ts}_{filename}"));
+
+    if let Err(rename_err) = std::fs::rename(source, &dest) {
+        tracing::debug!(
+            "Rename failed: {}. Falling back to copy-and-delete for '{}' to '{}'",
+            rename_err,
+            source.display(),
+            dest.display()
+        );
+        if source.is_dir() {
+            copy_dir_all(source, &dest).with_context(|| {
+                format!(
+                    "Failed to copy directory '{}' to '{}' during staging fallback",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+            std::fs::remove_dir_all(source).with_context(|| {
+                format!(
+                    "Failed to remove source directory '{}' after staging fallback copy",
+                    source.display()
+                )
+            })?;
+        } else {
+            std::fs::copy(source, &dest).with_context(|| {
+                format!(
+                    "Failed to copy file '{}' to '{}' during staging fallback",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+            std::fs::remove_file(source).with_context(|| {
+                format!(
+                    "Failed to remove source file '{}' after staging fallback copy",
+                    source.display()
+                )
+            })?;
+        }
+    }
+    Ok(dest)
+}
+
+pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +227,16 @@ mod tests {
 
     fn make_manager(tmp: &TempDir) -> TrashManager {
         TrashManager::new(tmp.path().join("trash"))
+    }
+
+    /// The staged-name prefix keeps the spelling earlier versions wrote:
+    /// milliseconds, truncated, no dot, `Z` (R-TIME.1).
+    #[test]
+    fn staging_stamp_is_utc_millis_truncated() {
+        let at = |ns| Timestamp::new(1_795_251_903, ns).unwrap();
+        assert_eq!(staging_stamp(at(7_000_000)), "20261121T090503007Z");
+        assert_eq!(staging_stamp(at(0)), "20261121T090503000Z");
+        assert_eq!(staging_stamp(at(999_999_999)), "20261121T090503999Z");
     }
 
     #[test]

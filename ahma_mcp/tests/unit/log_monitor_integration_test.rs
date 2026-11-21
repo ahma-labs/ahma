@@ -24,9 +24,7 @@ async fn create_test_adapter() -> (Adapter, Arc<OperationMonitor>) {
         Sandbox::new(
             vec![std::env::temp_dir()],
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

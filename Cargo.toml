@@ -65,13 +65,19 @@ version = "0.22.18"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1.92"
-chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
 dirs = "6.0"
 dunce = "1.0"
 futures = "0.3.34"
 hmac = "0.13.0"
+# Date/time, through `ahma_common::timestamp` (R-TIME.1, R-TIME.2). Default
+# features are the ones needed: `tz-system` finds the local zone,
+# `tzdb-zoneinfo` resolves `TZ=Area/City` and `/etc/localtime` on Unix, and
+# `tzdb-bundle-platform` embeds the tz database only where the OS has none
+# (Windows) — without it local time on Windows would be UTC. No `serde`: no
+# jiff type is serialized; persisted times are strings.
+jiff = "0.2.43"
 landlock = "0.4.7"
 opentelemetry = { version = "0.32.0", features = ["trace"] }
 # Locks that cannot be poisoned.

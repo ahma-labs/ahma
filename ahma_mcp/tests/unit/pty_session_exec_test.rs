@@ -16,7 +16,7 @@ fn build_adapter(scope: std::path::PathBuf) -> (Arc<Adapter>, Arc<OperationMonit
     )));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let sandbox =
-        Arc::new(Sandbox::new(vec![scope], SandboxMode::Test, false, false, false).unwrap());
+        Arc::new(Sandbox::new(vec![scope], SandboxMode::Test, Default::default()).unwrap());
     (
         Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap()),
         monitor,
@@ -284,19 +284,22 @@ async fn session_echo_round_trip() {
 fn queued_adapter(
     scope: &std::path::Path,
 ) -> (Arc<Adapter>, Arc<OperationMonitor>, std::path::PathBuf) {
+    queued_adapter_with(scope, MonitorConfig::with_timeout(Duration::from_secs(60)))
+}
+
+fn queued_adapter_with(
+    scope: &std::path::Path,
+    config: MonitorConfig,
+) -> (Arc<Adapter>, Arc<OperationMonitor>, std::path::PathBuf) {
     use ahma_mcp::adapter::workspace_queue::WorkspaceQueue;
     use ahma_mcp::sandbox::handoff_watch::HandoffWatchMode;
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(60),
-    )));
+    let monitor = Arc::new(OperationMonitor::new(config));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let sandbox = Arc::new(
         Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -438,4 +441,328 @@ async fn a_piped_command_hands_the_workspace_on_however_it_ends() {
         matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
         "a command stopped at its limit still holds the workspace"
     );
+
+    let cancelled = start("sleep 60", 30).await;
+    ahma_mcp::test_utils::assertions::assert_eventually(
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+        ahma_common::timeouts::TestTimeouts::poll_interval(),
+        "the command is running",
+        || async {
+            monitor
+                .get_operation(&cancelled)
+                .await
+                .is_some_and(|op| op.state == OperationStatus::InProgress)
+        },
+    )
+    .await;
+    assert!(
+        monitor
+            .cancel_operation_with_reason(&cancelled, Some("stopped by the test".into()))
+            .await
+    );
+    let op = wait_done(&monitor, &cancelled).await;
+    assert_eq!(op.state, OperationStatus::Cancelled);
+    assert!(
+        op.result
+            .as_ref()
+            .is_some_and(|r| r.to_string().contains("stopped by the test")),
+        "the cancel's own reason is the result: {:?}",
+        op.result
+    );
+    assert!(
+        matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+        "a cancelled command still holds the workspace"
+    );
+}
+
+/// The monitor's watchdog stops a silent command the same way: the workspace
+/// is free once the command is observed timed out, and the result names the
+/// watchdog's reason. The watchdog published the ending first and signalled
+/// the task second, like `cancel_operation`.
+#[tokio::test]
+async fn a_command_the_watchdog_stops_hands_the_workspace_on_first() {
+    use ahma_mcp::adapter::workspace_queue::LeaseProbe;
+    use ahma_mcp::operation_monitor::OperationStatus;
+    let temp = tempdir().unwrap();
+    let config = MonitorConfig::with_timeout(Duration::from_secs(60))
+        .with_idle_timeout(Some(Duration::from_secs(1)));
+    let (adapter, monitor, key) = queued_adapter_with(temp.path(), config);
+    let id = adapter
+        .execute_async_in_dir(
+            "run_terminal_command",
+            "sleep 60",
+            None,
+            temp.path().to_str().unwrap(),
+            Some(30),
+        )
+        .await
+        .expect("piped command starts");
+    ahma_mcp::test_utils::assertions::assert_eventually(
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+        ahma_common::timeouts::TestTimeouts::poll_interval(),
+        "the watchdog stops the silent command",
+        || async {
+            monitor.check_timeouts().await;
+            monitor.get_operation(&id).await.is_none()
+        },
+    )
+    .await;
+    let op = wait_done(&monitor, &id).await;
+    assert_eq!(op.state, OperationStatus::TimedOut);
+    assert!(
+        matches!(adapter.workspace_queue().probe(&key), LeaseProbe::Free),
+        "a command the watchdog stopped still holds the workspace"
+    );
+    assert!(
+        op.result
+            .as_ref()
+            .is_some_and(|r| r.to_string().contains("no output")),
+        "the watchdog's reason is the result: {:?}",
+        op.result
+    );
+}
+
+// ─── Mutex groups (SPEC R2.7.2) ──────────────────────────────────────────────
+
+/// A `tools.mutex_groups` group gating `echo` and `sleep`, waiting at most
+/// `max_wait_secs` for its turn.
+fn mutex_group(max_wait_secs: u64) -> ahma_common::config::MutexGroupConfig {
+    ahma_common::config::MutexGroupConfig {
+        name: "gated".to_string(),
+        prefixes: vec!["echo".to_string(), "sleep".to_string()],
+        max_wait_secs,
+    }
+}
+
+/// An adapter with that group configured, its rendezvous files in `locks`
+/// (never inside the workspace), and the workspace key the gate is held on.
+fn gated_adapter(
+    scope: &std::path::Path,
+    locks: &std::path::Path,
+    max_wait_secs: u64,
+) -> (Arc<Adapter>, Arc<OperationMonitor>, std::path::PathBuf) {
+    use ahma_mcp::adapter::mutex_groups::CommandMutexRegistry;
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(60),
+    )));
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![scope.to_path_buf()],
+            SandboxMode::Test,
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let registry = Arc::new(CommandMutexRegistry::from_config_with_lock_dir(
+        &[mutex_group(max_wait_secs)],
+        Some(locks.to_path_buf()),
+    ));
+    let adapter =
+        Adapter::new_with_registry(monitor.clone(), shell_pool, sandbox, registry).unwrap();
+    let key = adapter.workspace_key_for(scope);
+    (Arc::new(adapter), monitor, key)
+}
+
+/// A PTY or session command in a `tools.mutex_groups` group waits for the
+/// group's gate as a piped command does, and fails the same way when the
+/// wait gives up (SPEC R2.7.2). Both paths ran straight past the gate.
+#[tokio::test]
+async fn pty_and_session_commands_wait_for_their_mutex_group() {
+    use ahma_mcp::operation_monitor::OperationStatus;
+    let temp = tempdir().unwrap();
+    let locks = tempdir().unwrap();
+    let (adapter, monitor, key) = gated_adapter(temp.path(), locks.path(), 0);
+    let wd = temp.path().to_str().unwrap();
+    // Another `echo` holds the group in this workspace.
+    let held = adapter
+        .mutex_registry
+        .acquire(&mutex_group(0), &key)
+        .await
+        .expect("the group is free");
+
+    let start = |session: &'static str| {
+        let adapter = adapter.clone();
+        async move {
+            let mut ids = vec![(
+                "session",
+                adapter
+                    .execute_session_async("sess", session, "echo gated", wd, Some(15), None)
+                    .await
+                    .expect("session command starts"),
+            )];
+            #[cfg(unix)]
+            if ahma_mcp::adapter::pty_available() {
+                ids.push((
+                    "pty",
+                    adapter
+                        .execute_pty_async("pty_test", "echo gated", wd, Some(15), None)
+                        .await
+                        .expect("pty command starts"),
+                ));
+            }
+            ids
+        }
+    };
+
+    for (path, id) in start("refused").await {
+        let op = wait_done(&monitor, &id).await;
+        assert_eq!(op.state, OperationStatus::Failed, "{path}: {:?}", op.result);
+        let why = op
+            .result
+            .as_ref()
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+        assert!(
+            why.contains("Timed out waiting for 'gated' exclusive lock"),
+            "{path}: the gate's own reason is the result: {why}"
+        );
+    }
+
+    // The gate, and nothing else, refused them: once it is free they run. One
+    // at a time, since each holds the gate while it runs and the group waits 0 s.
+    drop(held);
+    let session = adapter
+        .execute_session_async("sess", "admitted", "echo gated", wd, Some(15), None)
+        .await
+        .expect("session command starts");
+    let mut admitted = vec![("session", session)];
+    #[cfg(unix)]
+    if ahma_mcp::adapter::pty_available() {
+        let op = wait_done(&monitor, &admitted[0].1).await;
+        assert_eq!(
+            op.state,
+            OperationStatus::Completed,
+            "session: {:?}",
+            op.result
+        );
+        admitted.push((
+            "pty",
+            adapter
+                .execute_pty_async("pty_test", "echo gated", wd, Some(15), None)
+                .await
+                .expect("pty command starts"),
+        ));
+    }
+    for (path, id) in admitted {
+        let op = wait_done(&monitor, &id).await;
+        assert_eq!(
+            op.state,
+            OperationStatus::Completed,
+            "{path}: {:?}",
+            op.result
+        );
+        assert!(stdout_of(&op).contains("gated"), "{path}: {:?}", op.result);
+    }
+}
+
+/// The gate is held for the whole run and handed on before the end is
+/// published: while a gated command runs, a probe that will not wait finds
+/// the group busy, and once the command is observed ended it is free. A gate
+/// taken with `let _ = …` would be dropped at once and pass the first test.
+#[tokio::test]
+async fn a_running_pty_or_session_command_holds_its_mutex_group() {
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+    use ahma_mcp::operation_monitor::OperationStatus;
+    let temp = tempdir().unwrap();
+    let locks = tempdir().unwrap();
+    // The commands wait long for the gate, so a probe that catches it free
+    // for an instant cannot fail them; the probe itself never waits.
+    let (adapter, monitor, key) = gated_adapter(temp.path(), locks.path(), 60);
+    let probe = mutex_group(0);
+    let wd = temp.path().to_str().unwrap();
+
+    let mut runs: Vec<&str> = vec!["session"];
+    #[cfg(unix)]
+    if ahma_mcp::adapter::pty_available() {
+        runs.push("pty");
+    }
+    for path in runs {
+        let id = match path {
+            "session" => adapter
+                .execute_session_async("sess", "holds", "sleep 4", wd, Some(30), None)
+                .await
+                .expect("session command starts"),
+            _ => adapter
+                .execute_pty_async("pty_test", "sleep 4", wd, Some(30), None)
+                .await
+                .expect("pty command starts"),
+        };
+        ahma_mcp::test_utils::assertions::assert_eventually(
+            TestTimeouts::get(TimeoutCategory::Quick),
+            TestTimeouts::poll_interval(),
+            "the running command holds its mutex group",
+            || async { adapter.mutex_registry.acquire(&probe, &key).await.is_err() },
+        )
+        .await;
+        let op = wait_done(&monitor, &id).await;
+        assert_eq!(
+            op.state,
+            OperationStatus::Completed,
+            "{path}: {:?}",
+            op.result
+        );
+        assert!(
+            adapter.mutex_registry.acquire(&probe, &key).await.is_ok(),
+            "{path}: a command observed ended still holds its mutex group"
+        );
+    }
+}
+
+// ─── Drift (SPEC R2.7.6) ─────────────────────────────────────────────────────
+
+/// Waits, writes a file in the workspace, and waits again: a run past the
+/// two-second floor whose write falls well inside it, whatever the
+/// filesystem's timestamp resolution.
+fn writes_while_it_runs() -> &'static str {
+    if cfg!(windows) {
+        "Start-Sleep -Seconds 1; Set-Content -Path drift_probe.txt -Value x; Start-Sleep -Seconds 2"
+    } else {
+        "sleep 1; echo x > drift_probe.txt; sleep 2"
+    }
+}
+
+fn changed_during_run(op: &Operation) -> String {
+    op.result
+        .as_ref()
+        .and_then(|r| r.get("changed_during_run"))
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+/// A PTY or session command lists the files that changed in its workspace
+/// while it ran, as a piped command does (SPEC R2.7.6). Neither result had
+/// `changed_during_run`.
+#[tokio::test]
+async fn pty_and_session_commands_report_files_changed_while_they_ran() {
+    let temp = tempdir().unwrap();
+    let (adapter, monitor) = build_adapter(temp.path().to_path_buf());
+    let wd = temp.path().to_str().unwrap();
+
+    let id = adapter
+        .execute_session_async("sess", "drift", writes_while_it_runs(), wd, Some(30), None)
+        .await
+        .expect("session command starts");
+    let op = wait_done(&monitor, &id).await;
+    let changed = changed_during_run(&op);
+    assert!(
+        changed.contains("drift_probe.txt"),
+        "session: {changed:?}, full result: {:?}",
+        op.result
+    );
+
+    #[cfg(unix)]
+    if ahma_mcp::adapter::pty_available() {
+        let id = adapter
+            .execute_pty_async("pty_test", writes_while_it_runs(), wd, Some(30), None)
+            .await
+            .expect("pty command starts");
+        let op = wait_done(&monitor, &id).await;
+        let changed = changed_during_run(&op);
+        assert!(
+            changed.contains("drift_probe.txt"),
+            "pty: {changed:?}, full result: {:?}",
+            op.result
+        );
+    }
 }

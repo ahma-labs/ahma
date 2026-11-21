@@ -1021,7 +1021,7 @@ impl ActivityStatus {
 /// A single entry in the AI Activity ring buffer.
 #[derive(Debug, Clone)]
 pub struct AiActivityEntry {
-    pub timestamp: chrono::DateTime<chrono::Local>,
+    pub timestamp: jiff::Zoned,
     /// MCP method, e.g. `"tools/call"`, `"tools/list"`.
     pub method: String,
     /// Tool name, e.g. `"cargo_test"`.
@@ -1043,7 +1043,7 @@ const EVENT_RING_CAP: usize = 200;
 /// the operation's full-screen detail view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpEvent {
-    pub timestamp: chrono::DateTime<chrono::Local>,
+    pub timestamp: jiff::Zoned,
     pub kind: OpEventKind,
     pub op_id: String,
     /// Human title at the time of the event (`Operation::display_name`).
@@ -1130,7 +1130,7 @@ pub struct Operation {
     pub tool_name: String,
     pub status: OpStatus,
     pub started_at: Option<Instant>,
-    pub started_time: chrono::DateTime<chrono::Local>,
+    pub started_time: jiff::Zoned,
     pub description: String,
     pub cwd: Option<String>,
     pub args: Vec<String>,
@@ -1230,7 +1230,7 @@ impl Operation {
             tool_name: tool_name.into(),
             status,
             started_at: Some(Instant::now()),
-            started_time: chrono::Local::now(),
+            started_time: ahma_common::timestamp::local_now(),
             description: String::new(),
             cwd: None,
             denial: None,
@@ -1391,7 +1391,7 @@ impl LogLevel {
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
-    pub timestamp: chrono::DateTime<chrono::Local>,
+    pub timestamp: jiff::Zoned,
     pub level: LogLevel,
     pub message: String,
 }
@@ -3830,7 +3830,7 @@ impl AppState {
         let was_terminal = existing.status.is_terminal();
         Self::merge_operation(existing, op);
         (!was_terminal && existing.status.is_terminal()).then(|| OpEvent {
-            timestamp: chrono::Local::now(),
+            timestamp: ahma_common::timestamp::local_now(),
             kind: OpEventKind::Finished(existing.status.clone()),
             op_id: existing.id.clone(),
             title: existing.display_name(),
@@ -3844,7 +3844,7 @@ impl AppState {
     /// hub replay) — stamped with the op's own start time, not now.
     fn first_sight_event(op: &Operation) -> OpEvent {
         OpEvent {
-            timestamp: op.started_time,
+            timestamp: op.started_time.clone(),
             kind: if op.status.is_terminal() {
                 OpEventKind::Finished(op.status.clone())
             } else {
@@ -4367,7 +4367,7 @@ mod tests {
         // The ring is bounded.
         for i in 0..300 {
             s.push_op_event(OpEvent {
-                timestamp: chrono::Local::now(),
+                timestamp: ahma_common::timestamp::local_now(),
                 kind: OpEventKind::Started,
                 op_id: format!("op-{i}"),
                 title: "t".into(),
@@ -4610,7 +4610,7 @@ mod tests {
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
         for i in 0..ACTIVITY_RING_CAP + 10 {
             s.push_activity(AiActivityEntry {
-                timestamp: chrono::Local::now(),
+                timestamp: ahma_common::timestamp::local_now(),
                 method: "tools/call".into(),
                 tool: format!("tool_{i}"),
                 status: ActivityStatus::Success,
@@ -5110,7 +5110,7 @@ mod tests {
 
         // Logs must be preserved across a clear.
         s.push_log(LogEntry {
-            timestamp: chrono::Local::now(),
+            timestamp: ahma_common::timestamp::local_now(),
             level: LogLevel::Info,
             message: "keep me".into(),
         });

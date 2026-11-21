@@ -55,7 +55,7 @@ use async_trait::async_trait;
 
 use ahma_common::config::{ScopeAccess, settings_path};
 use ahma_common::permissions::{
-    AuditAction, GrantKind, GrantTier, append_audit, audit_entry, persist_log_target_as,
+    AuditAction, AuditEntry, GrantKind, GrantTier, append_audit, persist_log_target_as,
 };
 use ahma_common::scope_grant::{
     GrantContext, GrantCoordinator, GrantDecision, GrantReason, GrantResolveOutcome, GrantStatus,
@@ -398,15 +398,14 @@ impl PermissionBroker {
                 reason,
             } => {
                 append_audit(
-                    &audit_entry(
-                        chrono::Local::now().to_rfc3339(),
+                    &AuditEntry::new(
+                        ahma_common::timestamp::rfc3339_local_now(),
                         AuditAction::Deny,
                         audit_kind(reason),
                         path.display().to_string(),
-                        None,
                         GrantTier::Session,
-                        Some("harness".to_string()),
                     )
+                    .with_surface("harness")
                     .with_request(
                         &req.decision_id,
                         time_to_decision_ms,
@@ -471,18 +470,18 @@ fn record_scope_grant_persistence(
     live_scopes: &[std::path::PathBuf],
     workspace: Option<&Path>,
 ) -> bool {
-    let granted_at = chrono::Local::now();
+    let granted_at = ahma_common::timestamp::local_now();
     if !ans.tier.is_persistent() {
         append_audit(
-            &audit_entry(
-                granted_at.to_rfc3339(),
+            &AuditEntry::new(
+                ahma_common::timestamp::rfc3339_zoned(&granted_at),
                 AuditAction::Grant,
                 GrantKind::FsScope,
                 ans.path.display().to_string(),
-                Some(if ans.access.is_write() { "rw" } else { "ro" }.to_string()),
                 ans.tier,
-                Some(ans.surface.to_string()),
             )
+            .with_access(if ans.access.is_write() { "rw" } else { "ro" }.to_string())
+            .with_surface(ans.surface.to_string())
             .with_request(ans.decision_id, ans.time_to_decision_ms, ans.risk_class)
             .with_advice(ans.advice.0.clone(), ans.advice.1),
         );
@@ -509,7 +508,7 @@ fn record_scope_grant_persistence(
             path: ans.path,
             access: ans.access,
             granted_by,
-            granted_at: Some(granted_at.format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::date(&granted_at)),
             note: None,
             surface: ans.surface,
             live_scopes,
@@ -635,15 +634,15 @@ pub(crate) fn apply_log_target_answer(
         );
     } else {
         append_audit(
-            &audit_entry(
-                chrono::Local::now().to_rfc3339(),
+            &AuditEntry::new(
+                ahma_common::timestamp::rfc3339_local_now(),
                 AuditAction::Grant,
                 GrantKind::LogTarget,
                 target.display().to_string(),
-                Some("ro".to_string()),
                 GrantTier::Session,
-                Some(surface.to_string()),
             )
+            .with_access("ro")
+            .with_surface(surface.to_string())
             .with_request(decision_id, time_to_decision_ms, None),
         );
         tracing::info!(

@@ -631,10 +631,12 @@ impl HarnessIntent {
     /// `tools.timeout_secs`.
     pub fn limit(&self, cfg: &AppConfig) -> Option<TimeLimit> {
         if self.background {
-            return (cfg.background_timeout_secs > 0).then_some(TimeLimit {
-                secs: cfg.background_timeout_secs,
-                source: "tools.background_timeout_secs",
-            });
+            return ahma_common::config::Limit::from_secs(cfg.background_timeout_secs)
+                .duration()
+                .map(|limit| TimeLimit {
+                    secs: limit.as_secs(),
+                    source: "tools.background_timeout_secs",
+                });
         }
         Some(match self.timeout_ms {
             Some(ms) => TimeLimit {
@@ -1643,7 +1645,7 @@ fn register_hook_with_hub(
     crate::hub_reporter::set_initial_identity(session_id, None);
     Some(crate::hub_reporter::spawn_reporter(
         operation_monitor,
-        "hook",
+        ahma_common::hub::InstanceMode::Hook.as_str(),
         cwd.to_string(),
         "hook",
         None,
@@ -4197,9 +4199,7 @@ mod tests {
         let sandbox = crate::sandbox::Sandbox::new(
             vec![workspace.path().to_path_buf()],
             crate::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_scopes(vec![cache.path().to_path_buf()], vec![]);

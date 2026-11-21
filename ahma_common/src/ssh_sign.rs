@@ -43,7 +43,7 @@ pub struct SshSignGrant {
     /// When it lapses (a lease), Unix seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
-    /// The surface that asked (`"harness dialog"`, `"tui"`, `"cli"`).
+    /// Who made it (`"harness dialog"`, `"tui"`, `"cli"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_by: Option<String>,
     /// For the session tier, the process whose life bounds it.
@@ -143,15 +143,16 @@ pub fn persist(settings_file: &Path, grant: SshSignGrant, surface: &str) -> Resu
     settings
         .save_to(settings_file)
         .with_context(|| format!("failed to write {}", settings_file.display()))?;
-    crate::permissions::append_audit(&crate::permissions::audit_entry(
-        crate::config::fmt_utc_datetime(crate::session_grants::now_secs()),
-        crate::permissions::AuditAction::Grant,
-        crate::permissions::GrantKind::SshSign,
-        subject,
-        None,
-        tier,
-        Some(surface.to_string()),
-    ));
+    crate::permissions::append_audit(
+        &crate::permissions::AuditEntry::new(
+            crate::config::fmt_utc_datetime(crate::session_grants::now_secs()),
+            crate::permissions::AuditAction::Grant,
+            crate::permissions::GrantKind::SshSign,
+            subject,
+            tier,
+        )
+        .with_surface(surface.to_string()),
+    );
     Ok(())
 }
 

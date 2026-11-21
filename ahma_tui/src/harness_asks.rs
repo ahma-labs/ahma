@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use ahma_common::config::{PersistentScope, ScopeAccess};
 use ahma_common::harness_asks::{self, Question, WorkspaceAsks};
+use ahma_common::hub::Surface;
 use ahma_common::permissions::{AuditAction, GrantKind, GrantTier};
 use ahma_common::scope_grant::{
     GrantContext, GrantDecision, GrantEvidence, GrantReason, GrantRequester, ScopeGrantRequest,
@@ -175,13 +176,16 @@ pub fn pending_from(
 
 /// Apply the human's `decision` on `ask` and record it as answered, so the
 /// harness dialog does not ask it too. Returns the line for the TUI's log.
-pub fn answer(ask: &HarnessAsk, decision: GrantDecision) -> Result<String> {
+/// `surface` is where the human answered (`ahma tui`, `ahma web`, `ahma
+/// desktop`): what the audit and the grant record (SPEC R-GUI.7).
+pub fn answer(ask: &HarnessAsk, decision: GrantDecision, surface: Surface) -> Result<String> {
     let dir = harness_asks::default_dir().context("ahma's runtime directory is unknown")?;
     answer_in(
         &dir,
         ahma_common::config::settings_path().as_deref(),
         ask,
         decision,
+        surface,
         ahma_common::session_grants::now_secs(),
     )
 }
@@ -201,6 +205,7 @@ pub fn answer_in(
     settings_file: Option<&Path>,
     ask: &HarnessAsk,
     decision: GrantDecision,
+    surface: Surface,
     now: u64,
 ) -> Result<String> {
     let decision = decision.within_offer(GrantReason::HarnessRefusal);
@@ -208,7 +213,7 @@ pub fn answer_in(
     let path = q.dir.display().to_string();
     let message = match decision.access() {
         None => {
-            audit(ask, AuditAction::Deny, None, GrantTier::Session);
+            audit(ask, AuditAction::Deny, None, GrantTier::Session, surface);
             format!(
                 "Denied sandbox access to {path}; the agent's harness will not ask about it \
                  again this session"
@@ -233,9 +238,9 @@ pub fn answer_in(
                         path: &q.dir,
                         access,
                         granted_by: Some("terminal hook refusal".into()),
-                        granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+                        granted_at: Some(ahma_common::timestamp::local_date_today()),
                         note: None,
-                        surface: "tui",
+                        surface: surface.as_str(),
                         live_scopes: std::slice::from_ref(&ask.workspace),
                         workspace: Some(&ask.workspace),
                         expires_at: (tier == GrantTier::Lease)
@@ -261,9 +266,15 @@ pub fn answer_in(
                     access,
                     Some(&ask.workspace),
                     ask.harness_pid,
-                    "tui",
+                    surface.as_str(),
                 );
-                audit(ask, AuditAction::Grant, Some(access), GrantTier::Session);
+                audit(
+                    ask,
+                    AuditAction::Grant,
+                    Some(access),
+                    GrantTier::Session,
+                    surface,
+                );
                 format!(
                     "Granted {verb} access to {path} until the agent's harness exits (not saved); \
                      its next command has it"
@@ -276,17 +287,23 @@ pub fn answer_in(
 }
 
 /// One audit line for an answer that `persist_grant` does not write itself.
-fn audit(ask: &HarnessAsk, action: AuditAction, access: Option<ScopeAccess>, tier: GrantTier) {
+fn audit(
+    ask: &HarnessAsk,
+    action: AuditAction,
+    access: Option<ScopeAccess>,
+    tier: GrantTier,
+    surface: Surface,
+) {
     ahma_common::permissions::append_audit(
-        &ahma_common::permissions::audit_entry(
-            chrono::Local::now().to_rfc3339(),
+        &ahma_common::permissions::AuditEntry::new(
+            ahma_common::timestamp::rfc3339_local_now(),
             action,
             GrantKind::FsScope,
             ask.question.dir.display().to_string(),
-            access.map(|a| a.short().to_string()),
             tier,
-            Some("tui".to_string()),
         )
+        .with_access_opt(access.map(|a| a.short().to_string()))
+        .with_surface(surface.as_str().to_string())
         .with_request(ask.decision_id(), None, None),
     );
 }
@@ -404,7 +421,7 @@ mod tests {
     fn a_deny_is_recorded_so_the_dialog_does_not_ask() {
         let f = fixture();
         let ask = waiting(&f, &nothing).remove(0);
-        let line = answer_in(&f.dir, None, &ask, GrantDecision::Deny, 201).unwrap();
+        let line = answer_in(&f.dir, None, &ask, GrantDecision::Deny, Surface::Tui, 201).unwrap();
         assert!(line.starts_with("Denied"), "{line}");
         assert!(waiting(&f, &nothing).is_empty());
         let asks = harness_asks::load(&f.dir, &f.ws, 202);
@@ -421,13 +438,45 @@ mod tests {
         );
     }
 
+    /// R-GUI.7: an answer given in the browser is recorded under `web`, not
+    /// `tui`. The browser polls these questions too, and a session or deny
+    /// answer there was recorded as the terminal's.
+    #[test]
+    fn a_session_answer_from_the_browser_is_recorded_as_web() {
+        let f = fixture();
+        let ask = waiting(&f, &nothing).remove(0);
+        answer_in(
+            &f.dir,
+            None,
+            &ask,
+            GrantDecision::GrantRwSession,
+            Surface::Web,
+            201,
+        )
+        .unwrap();
+        let granted = ahma_mcp::sandbox::session_scopes_for(std::slice::from_ref(&f.ws));
+        let g = granted
+            .iter()
+            .find(|g| g.path == f.cache)
+            .expect("session grant");
+        assert_eq!(g.granted_by.as_deref(), Some("web"), "{granted:?}");
+    }
+
     /// A session answer is the same session grant a yes in the dialog makes:
     /// bound to the harness process and the workspace (SPEC R-PERM.4.4).
     #[test]
     fn a_session_answer_is_a_session_grant_for_the_harness() {
         let f = fixture();
         let ask = waiting(&f, &nothing).remove(0);
-        let line = answer_in(&f.dir, None, &ask, GrantDecision::GrantRwSession, 201).unwrap();
+        let line = answer_in(
+            &f.dir,
+            None,
+            &ask,
+            GrantDecision::GrantRwSession,
+            Surface::Tui,
+            201,
+        )
+        .unwrap();
         assert!(line.contains("until the agent's harness exits"), "{line}");
         let granted = ahma_mcp::sandbox::session_scopes_for(std::slice::from_ref(&f.ws));
         assert!(
@@ -445,7 +494,15 @@ mod tests {
         let f = fixture();
         let settings = f.dir.parent().unwrap().join("settings.toml");
         let ask = waiting(&f, &nothing).remove(0);
-        answer_in(&f.dir, Some(&settings), &ask, GrantDecision::GrantRo, 201).unwrap();
+        answer_in(
+            &f.dir,
+            Some(&settings),
+            &ask,
+            GrantDecision::GrantRo,
+            Surface::Tui,
+            201,
+        )
+        .unwrap();
         let saved = ahma_common::config::AhmaSettings::load_from_result(&settings).unwrap();
         let scope = saved
             .sandbox
@@ -464,7 +521,15 @@ mod tests {
     fn a_once_answer_is_a_deny() {
         let f = fixture();
         let ask = waiting(&f, &nothing).remove(0);
-        let line = answer_in(&f.dir, None, &ask, GrantDecision::GrantRwOnce, 201).unwrap();
+        let line = answer_in(
+            &f.dir,
+            None,
+            &ask,
+            GrantDecision::GrantRwOnce,
+            Surface::Tui,
+            201,
+        )
+        .unwrap();
         assert!(line.starts_with("Denied"), "{line}");
     }
 }

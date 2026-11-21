@@ -14,12 +14,10 @@ fn strict_sandbox(scope: &TempDir) -> Sandbox {
     let sandbox = Sandbox::new(
         vec![scope.path().to_path_buf()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .expect("strict sandbox");
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     sandbox
 }
@@ -31,9 +29,7 @@ fn a_test_mode_sandbox_offers_no_read_only_lane() {
     let sandbox = Sandbox::new(
         vec![scope.path().to_path_buf()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert!(!sandbox.can_enforce_read_only());

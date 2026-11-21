@@ -164,7 +164,7 @@ impl PeerFactory for InProcessMcpPeerFactory {
                 scopes
             };
 
-            let sandbox = Sandbox::new(sandbox_scopes, mode, false, false, false)
+            let sandbox = Sandbox::new(sandbox_scopes, mode, Default::default())
                 .context("Sandbox init failed")?;
 
             let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));

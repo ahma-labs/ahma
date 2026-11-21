@@ -42,7 +42,7 @@ pub struct SessionGrant {
     pub owner_pid: u32,
     /// Unix seconds when it was approved.
     pub granted_at: u64,
-    /// The surface or tool that asked (`"tui"`, `"harness"`, `"cli"`, a tool name).
+    /// Who made it (`"tui"`, `"web"`, `"cli"`, `"harness dialog"`, a tool name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_by: Option<String>,
 }
@@ -180,12 +180,9 @@ pub fn as_persistent_scopes(grants: &[SessionGrant]) -> Vec<PersistentScope> {
             path: g.path.clone(),
             access: g.access,
             workspace: Some(g.workspace.clone()),
-            granted_by: Some(
-                g.granted_by
-                    .clone()
-                    .map(|by| format!("session grant ({by})"))
-                    .unwrap_or_else(|| "session grant".to_string()),
-            ),
+            // Who made it, as made: whether a person did is read from this
+            // (`grant::GrantedBy`), and "this session only" is the note's.
+            granted_by: g.granted_by.clone(),
             granted_at: None,
             note: Some(format!("for this session only (owner pid {})", g.owner_pid)),
             expires_at: None,
@@ -325,13 +322,23 @@ mod tests {
         assert!(applying_to(&dir, &[PathBuf::from("/elsewhere")], 1_100, &alive).is_empty());
         let ps = as_persistent_scopes(&[a]);
         assert_eq!(ps[0].workspace.as_deref(), Some(Path::new("/ws/a")));
-        assert!(
-            ps[0]
-                .granted_by
-                .as_deref()
-                .unwrap()
-                .contains("session grant")
+        assert_eq!(ps[0].granted_by.as_deref(), Some("tui"));
+    }
+
+    /// A session grant keeps its maker as it was made. Its records were
+    /// written with `granted_by: "session grant (<maker>)"`, a string that
+    /// `grant::GrantedBy` then had to unwrap again to tell whether a person
+    /// made it; "this session only" is what the note says.
+    #[test]
+    fn a_session_grant_keeps_its_maker_as_made() {
+        let mut g = grant(Path::new("/cache/a"), Path::new("/ws/a"), 7, 1_000);
+        g.granted_by = Some(crate::scope_grant::GRANTED_BY_HARNESS_DIALOG.into());
+        let ps = as_persistent_scopes(&[g]);
+        assert_eq!(
+            crate::grant::GrantedBy::parse(ps[0].granted_by.as_deref()),
+            crate::grant::GrantedBy::HarnessDialog
         );
+        assert!(ps[0].note.as_deref().unwrap().contains("this session only"));
     }
 
     #[test]

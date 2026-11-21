@@ -285,6 +285,16 @@ pub struct Operation {
     /// duration and timeout measure the command, not the wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_ms: Option<u64>,
+    /// A task ends this operation (it holds the workspace, a process tree):
+    /// a cancel or a watchdog stop then only asks, by recording the ending in
+    /// `stop_request` and signalling the token, and the task publishes it once
+    /// it has let go of what it holds (SPEC R2.7.1). See
+    /// [`OperationMonitor::ends_by_task`].
+    #[serde(skip)]
+    pub ended_by_task: bool,
+    /// The ending a cancel or the watchdog asked for, while the task ends.
+    #[serde(skip)]
+    pub stop_request: Option<Terminal>,
 }
 
 /// Default factory for `completion_watch` used during serde deserialisation.
@@ -429,6 +439,8 @@ impl Operation {
             output_file: None,
             last_activity: ActivityStamp::now(),
             queue_wait_ms: None,
+            ended_by_task: false,
+            stop_request: None,
         }
     }
 
@@ -532,12 +544,10 @@ impl MonitorConfig {
 }
 
 /// Build a structured JSON cancellation result for debugging/LLM visibility.
-fn build_cancellation_result(reason: Option<String>) -> Value {
-    let reason = reason.unwrap_or_else(|| "Cancelled by user".to_string());
-    Terminal::Cancelled(reason)
-        .into_result()
-        .unwrap_or(Value::Null)
-}
+/// How long a task is given to end an operation it was asked to stop before
+/// the monitor ends the operation itself, so a task that never notices its
+/// token cannot keep an operation alive.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Operation monitor that tracks and manages cargo operations
 #[derive(Debug, Clone)]
@@ -580,6 +590,15 @@ impl OperationMonitor {
     /// (e.g. the adapter) clone this so all events flow through one stream.
     pub fn event_dispatcher(&self) -> &EventDispatcher {
         &self.events
+    }
+
+    /// Add a new operation, returning its cancellation token: what its task
+    /// watches, handed over here so nothing has to look the operation up again
+    /// (and handle it having vanished) just to get it.
+    pub async fn register(&self, operation: Operation) -> CancellationToken {
+        let token = operation.cancellation_token.clone();
+        self.add_operation(operation).await;
+        token
     }
 
     pub async fn add_operation(&self, operation: Operation) {
@@ -859,24 +878,83 @@ impl OperationMonitor {
     }
 
     async fn timeout_operation(&self, id: &str, reason: String) {
-        let mut ops = self.operations.write().await;
-        let Some(op) = ops.get_mut(id) else {
-            return;
-        };
-        // First terminal writer wins; a concurrent transition already finished.
-        if op.try_transition(OperationStatus::TimedOut).is_err() {
-            return;
-        }
-
         tracing::warn!("Timing out operation: {} - {}", id, reason);
+        // Not waited for: the watchdog sweeps every operation in one pass.
+        if let Some(fallback) = self.stop(id, Terminal::TimedOut(reason)).await {
+            tokio::spawn(fallback);
+        }
+    }
 
+    /// Stop operation `id` with `ending` (a cancel or a timeout). `None` when
+    /// it is unknown or already ended.
+    ///
+    /// An operation no task ends is ended here and now. One a task ends
+    /// ([`Self::ends_by_task`]) is only asked: the ending is recorded, the
+    /// token signalled, and the task publishes the ending once it has killed
+    /// its process tree and handed the workspace on, so a caller woken by the
+    /// ending never finds the workspace still held by it (SPEC R2.7.1). The
+    /// first request is the one published. The returned future is the
+    /// fallback: it waits [`STOP_GRACE`] for the task, then ends the operation
+    /// itself; the caller awaits or spawns it.
+    async fn stop(
+        &self,
+        id: &str,
+        ending: Terminal,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        let mut ops = self.operations.write().await;
+        let op = ops.get_mut(id)?;
+        if op.state.is_terminal() {
+            return None;
+        }
         op.cancellation_token.cancel();
-        op.result = Terminal::TimedOut(reason).into_result();
-
-        let timed_out_op = ops.remove(id);
+        if op.ended_by_task {
+            if op.stop_request.is_none() {
+                op.stop_request = Some(ending.clone());
+            }
+            drop(ops);
+            let monitor = self.clone();
+            let id = id.to_string();
+            return Some(futures::future::Either::Left(async move {
+                let ended = monitor
+                    .wait_for_operation_bounded(&id, Some(STOP_GRACE))
+                    .await
+                    .is_some_and(|op| op.state.is_terminal());
+                if !ended {
+                    tracing::warn!(
+                        "operation {id} did not end within {STOP_GRACE:?} of being asked to; \
+                         ending it"
+                    );
+                    monitor.finish(&id, ending).await;
+                }
+            }));
+        }
+        // First terminal writer wins; a concurrent transition already finished.
+        op.try_transition(ending.status()).ok()?;
+        op.result = ending.into_result();
+        let ended_op = ops.remove(id);
         drop(ops);
+        self.move_to_history_and_notify(id, ended_op).await;
+        Some(futures::future::Either::Right(std::future::ready(())))
+    }
 
-        self.move_to_history_and_notify(id, timed_out_op).await;
+    /// Hand ending operation `id` to the task that runs it: from now on a
+    /// cancel or a watchdog stop asks the task rather than ending the
+    /// operation under it (SPEC R13.3). The task ends with
+    /// [`Self::take_stop_request`] in place of its own `Cancelled`.
+    pub async fn ends_by_task(&self, id: &str) {
+        if let Some(op) = self.operations.write().await.get_mut(id) {
+            op.ended_by_task = true;
+        }
+    }
+
+    /// The ending a cancel or the watchdog asked of operation `id`, if one did.
+    pub async fn take_stop_request(&self, id: &str) -> Option<Terminal> {
+        self.operations
+            .write()
+            .await
+            .get_mut(id)?
+            .stop_request
+            .take()
     }
 
     /// Move a completed operation to history and signal all completion waiters.
@@ -976,43 +1054,26 @@ impl OperationMonitor {
         moved
     }
 
-    /// Cancel an operation by ID with an optional reason string.
-    /// Returns true if the operation was found and cancelled, false if not found.
+    /// Cancel an operation by ID with an optional reason string. Returns
+    /// whether the operation ended cancelled: `false` when it is unknown, had
+    /// already ended, or ended another way while it was being stopped.
+    ///
+    /// Waits for an operation a task ends to be ended (SPEC R13.3), so
+    /// a caller told it is cancelled finds it ended, and its workspace free.
     pub async fn cancel_operation_with_reason(&self, id: &str, reason: Option<String>) -> bool {
-        let mut ops = self.operations.write().await;
-
-        let Some(op) = ops.get_mut(id) else {
-            tracing::warn!("Attempted to cancel non-existent operation: {}", id);
+        let reason = reason.unwrap_or_else(|| "Cancelled by user".to_string());
+        tracing::info!("Cancelling operation: {} ({})", id, reason);
+        let Some(stopping) = self.stop(id, Terminal::Cancelled(reason)).await else {
+            tracing::warn!(
+                "Attempted to cancel unknown or already ended operation: {}",
+                id
+            );
             return false;
         };
-
-        // First terminal writer wins: refuse to cancel an already-terminal op.
-        let from = op.state;
-        if op.try_transition(OperationStatus::Cancelled).is_err() {
-            tracing::warn!("Attempted to cancel already terminal operation: {}", id);
-            return false;
-        }
-
-        tracing::info!("Cancelling operation: {}", id);
-        tracing::debug!(
-            "CANCEL_OPERATION_WITH_REASON: id='{}', reason={:?}, current_state={:?}",
-            id,
-            reason,
-            from
-        );
-
-        op.cancellation_token.cancel();
-        op.result = Some(build_cancellation_result(reason));
-
-        let cancelled_op = op.clone();
-        ops.remove(id);
-        drop(ops);
-
-        tracing::debug!("Moving cancelled operation {} to completion history.", id);
-        self.move_to_history_and_notify(id, Some(cancelled_op))
-            .await;
-
-        true
+        stopping.await;
+        self.check_completion_history_pub(id)
+            .await
+            .is_some_and(|op| op.state == OperationStatus::Cancelled)
     }
 
     /// Backward-compatible helper without explicit reason
@@ -1047,12 +1108,16 @@ impl OperationMonitor {
                 .collect()
         };
 
-        let mut cancelled = Vec::with_capacity(active_ids.len());
-        for id in active_ids {
-            if self.cancel_operation_with_reason(&id, reason.clone()).await {
-                cancelled.push(id);
+        // Together: each waits for its own task to end it (`stop`).
+        let outcomes = futures::future::join_all(active_ids.into_iter().map(|id| {
+            let reason = reason.clone();
+            async move {
+                let cancelled = self.cancel_operation_with_reason(&id, reason).await;
+                cancelled.then_some(id)
             }
-        }
+        }))
+        .await;
+        let cancelled: Vec<String> = outcomes.into_iter().flatten().collect();
         if !cancelled.is_empty() {
             tracing::info!(
                 "cancel_all_operations: cancelled {} operation(s)",

@@ -168,11 +168,8 @@ impl<'a> ServiceBuilder<'a> {
         // goes completely silent for this long is timed out as *stalled*, well
         // before any (much longer) total-runtime budget. Configurable via
         // `tools.idle_timeout_secs` in settings.toml; 0 disables the watchdog.
-        let idle_timeout = if config.tool_idle_timeout_secs == 0 {
-            None
-        } else {
-            Some(Duration::from_secs(config.tool_idle_timeout_secs))
-        };
+        let idle_timeout =
+            ahma_common::config::Limit::from_secs(config.tool_idle_timeout_secs).duration();
         let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(config.timeout_secs))
             .with_idle_timeout(idle_timeout);
         let shutdown_timeout = monitor_config.shutdown_timeout;
@@ -400,7 +397,7 @@ mod tests {
     /// Create a `SandboxMode::Test` sandbox scoped to `scope`.
     fn make_test_sandbox(scope: std::path::PathBuf) -> Arc<Sandbox> {
         Arc::new(
-            Sandbox::new(vec![scope], SandboxMode::Test, false, false, false)
+            Sandbox::new(vec![scope], SandboxMode::Test, Default::default())
                 .expect("test sandbox creation should never fail"),
         )
     }

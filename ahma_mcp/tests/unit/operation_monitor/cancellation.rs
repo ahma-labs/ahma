@@ -38,9 +38,7 @@ async fn test_operation_cancellation_functionality() {
         Sandbox::new(
             scopes,
             ahma_mcp::sandbox::SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

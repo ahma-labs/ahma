@@ -22,9 +22,7 @@ fn adapter(scope: &std::path::Path) -> (Adapter, Arc<OperationMonitor>) {
         Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

@@ -1228,9 +1228,7 @@ mod appcontainer {
         let sandbox = Sandbox::new(
             vec![scope.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("strict sandbox over a temp scope");
 
@@ -1290,9 +1288,7 @@ mod appcontainer {
         let sandbox = Sandbox::new(
             vec![scope.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .expect("strict sandbox over a temp scope");
 
@@ -1331,9 +1327,7 @@ mod appcontainer {
             let sandbox = Sandbox::new(
                 vec![scope.path().to_path_buf()],
                 SandboxMode::Strict,
-                false,
-                false,
-                false,
+                Default::default(),
             )
             .expect("strict sandbox over a temp scope");
             let write = format!(

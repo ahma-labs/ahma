@@ -625,15 +625,41 @@ impl std::fmt::Debug for Sandbox {
     }
 }
 
+/// The optional parts of a [`Sandbox`], each off unless asked for. Named
+/// where three positional `bool`s were passed, `false, false, false` at almost
+/// every call, so a swap was invisible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SandboxOptions {
+    /// `--no-temp-files`: no temp directory is writable.
+    pub no_temp_files: bool,
+    /// Live log monitoring: the targets of `<scope>/.ahma/logs/*.log` links
+    /// become read-only scopes.
+    pub livelog: bool,
+    /// `--tmp`: the system temp directory is a scope (SPEC R5.2.5).
+    pub tmp_access: bool,
+}
+
+/// Who confines what a [`Sandbox`] spawns ([`Sandbox::enforcement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enforcement {
+    /// `--no-sandbox` ([`SandboxMode::Test`]): scopes are resolved, never
+    /// enforced, and a spawn is not wrapped.
+    Off,
+    /// ahma's own kernel sandbox confines every spawn.
+    Kernel,
+    /// The kernel refuses to nest ahma's profile inside an outer one, which
+    /// confines every spawn instead (SPEC R7.6). Paths are still validated.
+    DeferredTo(super::host_detect::HostSandbox),
+}
+
 impl Sandbox {
     /// Create a new Sandbox with the given scopes.
-    pub fn new(
-        scopes: Vec<PathBuf>,
-        mode: SandboxMode,
-        no_temp_files: bool,
-        livelog: bool,
-        tmp_access: bool,
-    ) -> Result<Self> {
+    pub fn new(scopes: Vec<PathBuf>, mode: SandboxMode, options: SandboxOptions) -> Result<Self> {
+        let SandboxOptions {
+            no_temp_files,
+            livelog,
+            tmp_access,
+        } = options;
         let canonicalized = scopes::canonicalize_scopes(
             scopes,
             mode,
@@ -688,10 +714,25 @@ impl Sandbox {
         })
     }
 
+    /// Who confines what this sandbox spawns: the one answer, decided from the
+    /// mode and the nested-Seatbelt verdict, that every spawn and disclosure
+    /// matches on instead of combining the two itself. An outer sandbox comes
+    /// first: in test mode a spawn is not wrapped, but it still inherits it.
+    pub fn enforcement(&self) -> Enforcement {
+        match (self.outer_sandbox, self.mode) {
+            (Some(host), _) => Enforcement::DeferredTo(host),
+            (None, SandboxMode::Test) => Enforcement::Off,
+            (None, SandboxMode::Strict) => Enforcement::Kernel,
+        }
+    }
+
     /// The outer sandbox this instance defers to because the kernel refuses to
     /// nest ahma's own inside it (SPEC R7.6), or `None` when ahma enforces.
     pub fn deferred_to_outer_sandbox(&self) -> Option<super::host_detect::HostSandbox> {
-        self.outer_sandbox
+        match self.enforcement() {
+            Enforcement::DeferredTo(host) => Some(host),
+            Enforcement::Off | Enforcement::Kernel => None,
+        }
     }
 
     /// Which sandbox is actually protecting this instance's spawns (SPEC R5.4,
@@ -699,9 +740,10 @@ impl Sandbox {
     /// confinement probes. Every surface that discloses the sandbox state must
     /// derive it from here so logs, clients, and the TUI agree.
     pub fn active_sandbox(&self) -> ActiveSandbox {
-        match self.outer_sandbox {
-            Some(host) => ActiveSandbox::DeferredToHost(host),
-            None => ActiveSandbox::observe(self.is_enforced()),
+        match self.enforcement() {
+            Enforcement::DeferredTo(host) => ActiveSandbox::DeferredToHost(host),
+            Enforcement::Off => ActiveSandbox::observe(false),
+            Enforcement::Kernel => ActiveSandbox::observe(true),
         }
     }
 
@@ -1158,9 +1200,10 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Set whether roots have been received.
-    pub fn set_roots_received(&self, received: bool) {
-        self.scope_lock.set_roots_received(received);
+    /// Record that the client's roots have been received. One way: nothing
+    /// un-receives them, so there is no `false` to pass by mistake.
+    pub fn mark_roots_received(&self) {
+        self.scope_lock.mark_roots_received();
     }
 
     /// Return true if roots have been received.
@@ -1410,7 +1453,7 @@ impl Sandbox {
     /// Whether kernel enforcement is active. `--no-sandbox` maps to
     /// [`SandboxMode::Test`], in which scope is resolved but never enforced.
     pub fn is_enforced(&self) -> bool {
-        !self.is_test_mode() && self.outer_sandbox.is_none()
+        self.enforcement() == Enforcement::Kernel
     }
 
     /// Canonical human-readable scope summary with provenance (SPEC R5.4).
@@ -1656,9 +1699,7 @@ mod persistent_scope_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_scopes(
@@ -1716,9 +1757,7 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -1761,13 +1800,11 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![allowed.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
-        // Simulate "no roots/list client" — the condition the old auto-add keyed on.
-        sb.set_roots_received(false);
+        // No roots/list client (a new sandbox has received none): the
+        // condition the old auto-add keyed on.
 
         let before = sb.scopes().to_vec();
         let result = sb.validate_path(&outside_file);
@@ -1782,9 +1819,7 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let text = sb.scope_text(ScopeSource::Container);
@@ -1801,9 +1836,10 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![dir.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            true,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
         )
         .unwrap();
         assert!(sb.is_tmp_access(), "the request is recorded");
@@ -1835,7 +1871,15 @@ mod scope_view_tests {
     #[test]
     fn tmp_requested_is_not_in_scope_after_commit() {
         let ws = workspace_outside_temp();
-        let sb = Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, true).unwrap();
+        let sb = Sandbox::new(
+            Vec::new(),
+            SandboxMode::Strict,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             sb.commit_scopes(vec![ws.clone()]).unwrap(),
             ScopeCommit::Applied
@@ -1864,7 +1908,15 @@ mod scope_view_tests {
     #[test]
     fn tmp_live_grant_brings_temp_into_scope() {
         let ws = workspace_outside_temp();
-        let sb = Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, true).unwrap();
+        let sb = Sandbox::new(
+            Vec::new(),
+            SandboxMode::Strict,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
+        )
+        .unwrap();
         let _ = sb.commit_scopes(vec![ws]).unwrap();
         let temp = Sandbox::canonical_temp_dir().unwrap();
 
@@ -1884,7 +1936,15 @@ mod scope_view_tests {
     /// The question is asked at most once a session, whichever path asks.
     #[test]
     fn the_tmp_question_is_claimed_once() {
-        let sb = Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, true).unwrap();
+        let sb = Sandbox::new(
+            Vec::new(),
+            SandboxMode::Strict,
+            SandboxOptions {
+                tmp_access: true,
+                ..SandboxOptions::default()
+            },
+        )
+        .unwrap();
         assert!(!sb.tmp_consent_settled());
         assert!(sb.claim_tmp_consent());
         assert!(!sb.claim_tmp_consent(), "a second claim must not ask again");
@@ -1910,9 +1970,7 @@ mod scope_view_tests {
         let sb = Sandbox::new(
             vec![ws_canon.clone()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
 
@@ -1940,9 +1998,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         let home = ahma_common::config::ahma_home_dir().expect("home dir");
@@ -1990,9 +2046,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_records(vec![
@@ -2040,9 +2094,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_ledger_source(file.clone(), Arc::new(move || Some(source.lock().clone())));
@@ -2106,9 +2158,7 @@ mod live_grant_gate_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap()
         .with_persistent_records(vec![
@@ -2147,9 +2197,7 @@ mod once_grant_tests {
         let sb = Sandbox::new(
             vec![workspace.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap();
         sb.add_once_grant(cache.path(), ScopeAccess::Rw).unwrap();
@@ -2170,5 +2218,34 @@ mod once_grant_tests {
             sb.add_once_grant(&home.join(".ssh"), ScopeAccess::Ro)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod enforcement_tests {
+    use super::*;
+
+    /// One answer for who confines a spawn: test mode never wraps one, and
+    /// `is_enforced`, `deferred_to_outer_sandbox` and the disclosure all read
+    /// that answer rather than combining the mode and the nesting verdict.
+    #[test]
+    fn enforcement_is_one_answer_every_reader_agrees_with() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [SandboxMode::Test, SandboxMode::Strict] {
+            let sb =
+                Sandbox::new(vec![dir.path().to_path_buf()], mode, Default::default()).unwrap();
+            let e = sb.enforcement();
+            if mode == SandboxMode::Test {
+                assert_ne!(e, Enforcement::Kernel, "test mode never wraps a spawn");
+            }
+            assert_eq!(sb.is_enforced(), e == Enforcement::Kernel);
+            assert_eq!(
+                sb.deferred_to_outer_sandbox(),
+                match e {
+                    Enforcement::DeferredTo(host) => Some(host),
+                    _ => None,
+                }
+            );
+        }
     }
 }

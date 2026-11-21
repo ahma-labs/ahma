@@ -321,11 +321,15 @@ fn write_header(report: &mut String, project_name: &str, avg_score: f64) {
         "## Overall Repository Simplicity: **{:.0}%**\n\n",
         avg_score
     ));
-    let now = chrono::Local::now();
     report.push_str(&format!(
         "*Generated on: {}*\n\n",
-        now.format("%Y-%m-%d %H:%M:%S")
+        generated_on(&ahma_common::timestamp::local_now())
     ));
+}
+
+/// The report's `Generated on` stamp: local time, whole seconds.
+fn generated_on(now: &jiff::Zoned) -> String {
+    now.strftime("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn write_executive_summary(report: &mut String, avg_score: f64) {
@@ -716,6 +720,14 @@ fn write_glossary(report: &mut String) {
 mod tests {
     use super::super::models::{AnalysisConfidence, FunctionHotspot};
     use super::*;
+
+    #[test]
+    fn generated_on_is_local_whole_seconds() {
+        use jiff::tz::{TimeZone, offset};
+        let ts = jiff::Timestamp::new(1_795_251_903, 500_000_000).unwrap();
+        let z = ts.to_zoned(TimeZone::fixed(offset(-8)));
+        assert_eq!(generated_on(&z), "2026-11-21 01:05:03");
+    }
 
     fn lens_report(complexity_files: Vec<FileSimplicity>) -> MultiLensReport {
         MultiLensReport {

@@ -17,7 +17,7 @@
 //! | Per-user hub | [`hub`], [`hub_history`] |
 //! | MCP wire | [`mcp_methods`], [`mcp_protocol`], [`session_event`], [`keepalive`], [`sse`], [`peer_factory`] |
 //! | Process and platform | [`exe_identity`], [`test_isolation`], [`process_guard`], [`timeouts`], [`file_uri`], [`hostname`], [`fs_lock`], [`local_socket`], [`local_tls`], [`digest`] |
-//! | Shared definitions | [`harness`], [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`] |
+//! | Shared definitions | [`harness`], [`prompts`], [`skills`], [`simplify_args`], [`state_machine`], [`doctor`], [`observability`], [`shell_words`] |
 //!
 //! ## Design Goal: Workspace Consistency
 //!
@@ -53,6 +53,7 @@ pub mod hostname;
 pub mod http_retry;
 pub mod hub;
 pub mod hub_history;
+pub mod jsonl;
 pub mod keepalive;
 pub mod local_socket;
 pub mod local_tls;
@@ -73,6 +74,7 @@ pub mod session_event;
 pub mod session_grants;
 pub mod settings_origin;
 pub mod setup_detect;
+pub mod shell_words;
 /// clap arguments for `ahma simplify`, shared by the CLI parser (`ahma_mcp`) and
 /// the analysis engine (`ahma_simplify`) so neither depends on the other.
 pub mod simplify_args;
@@ -82,5 +84,6 @@ pub mod ssh_sign;
 pub mod state_machine;
 pub mod test_isolation;
 pub mod timeouts;
+pub mod timestamp;
 pub mod web_approval;
 pub mod web_policy;

@@ -301,13 +301,16 @@ const TERMINAL_OP_RETENTION: Duration = Duration::from_secs(3600);
 
 /// Convert a wire epoch-ms timestamp into a back-dated (`Instant`, local time)
 /// pair. The `Instant` is `None` when the timestamp is in the future (clock
-/// skew) or predates what a monotonic-clock subtraction can represent.
-fn backdate(
-    epoch_ms: Option<u64>,
-) -> Option<(Option<std::time::Instant>, chrono::DateTime<chrono::Local>)> {
+/// skew) or predates what a monotonic-clock subtraction can represent. `None`
+/// overall when the epoch is outside the representable range.
+fn backdate(epoch_ms: Option<u64>) -> Option<(Option<std::time::Instant>, jiff::Zoned)> {
     let ms = epoch_ms?;
-    let sys = std::time::UNIX_EPOCH + Duration::from_millis(ms);
-    let local = chrono::DateTime::<chrono::Local>::from(sys);
+    // Out of range (`SystemTime` on Windows, or jiff after 9999-12-30T22:00Z)
+    // is a garbage wire value: treat it as "no timestamp" rather than panic.
+    let sys = std::time::UNIX_EPOCH.checked_add(Duration::from_millis(ms))?;
+    let local = jiff::Timestamp::try_from(sys)
+        .ok()?
+        .to_zoned(ahma_common::timestamp::local_tz());
     let instant = std::time::SystemTime::now()
         .duration_since(sys)
         .ok()
@@ -653,6 +656,16 @@ mod tests {
             label: label.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A garbage wire epoch is "no timestamp", never a panic: neither past
+    /// `SystemTime`'s range (Windows) nor past jiff's (9999-12-30T22:00Z).
+    #[test]
+    fn backdate_out_of_range_epoch_is_none_not_a_panic() {
+        assert!(backdate(Some(u64::MAX)).is_none());
+        assert!(backdate(Some(300_000_000_000_000)).is_none());
+        let (_, local) = backdate(Some(1_700_000_000_123)).unwrap();
+        assert_eq!(local.timestamp().as_millisecond(), 1_700_000_000_123);
     }
 
     // ── HubState structural mutations ──────────────────────────────────────

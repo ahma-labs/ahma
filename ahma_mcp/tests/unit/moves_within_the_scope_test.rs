@@ -17,12 +17,10 @@ async fn a_file_can_be_linked_into_another_directory_of_the_scope() {
     let sandbox = Sandbox::new(
         vec![scope.path().to_path_buf()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .expect("strict sandbox");
-    sandbox.set_roots_received(true);
+    sandbox.mark_roots_received();
     let _ = sandbox.commit_existing_scopes();
     if !sandbox.can_enforce_read_only() {
         eprintln!("Landlock unavailable on this kernel: nothing to enforce");

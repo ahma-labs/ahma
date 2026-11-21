@@ -93,7 +93,7 @@ pub use command::{
     set_egress_proxy_env, set_secret_env_allow,
 };
 pub use confinement::outer_confinement;
-pub use core::{ContainerNarrowing, Sandbox, ScopeCommit};
+pub use core::{ContainerNarrowing, Enforcement, Sandbox, SandboxOptions, ScopeCommit};
 pub use core::{add_log_exception, approve_log_link, is_target_allowed, load_exceptions};
 pub use credential_reads::{
     default_credential_read_denies, effective_credential_read_denies, keychain_access_allowed,

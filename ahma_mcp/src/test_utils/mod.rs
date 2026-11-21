@@ -78,9 +78,10 @@ pub fn strict_sandbox(scope: &std::path::Path, no_temp_files: bool) -> crate::sa
     crate::sandbox::Sandbox::new(
         vec![scope.to_path_buf()],
         crate::sandbox::SandboxMode::Strict,
-        no_temp_files,
-        false,
-        false,
+        crate::sandbox::SandboxOptions {
+            no_temp_files,
+            ..crate::sandbox::SandboxOptions::default()
+        },
     )
     .expect("build sandbox")
 }

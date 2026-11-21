@@ -502,10 +502,11 @@ fn validate_set(
         risk: setting_risk(key),
         preview: format!(
             "{key}: {} -> {} ({scope} settings)",
-            preview.edit.before, preview.edit.after
+            preview.edit.before_text(),
+            preview.edit.after_text()
         ),
-        undo: undo_command(file, key, &preview.edit.before),
-        already: preview.edit.before == preview.edit.after,
+        undo: undo_command(file, key, preview.edit.before.as_deref()),
+        already: !preview.edit.changed(),
     })
 }
 
@@ -716,17 +717,21 @@ fn write_setting(
 ) -> Result<String> {
     let path = env.file(file).map_err(|r| anyhow::anyhow!("{r}"))?;
     let edit = AhmaSettings::set_in_file_as(file, path, key, raw)?;
-    if edit.before != edit.after {
+    if edit.changed() {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
             now,
             surface,
             file.label(),
             key,
-            &edit.before,
-            &edit.after,
+            edit.before.as_deref(),
+            edit.after.as_deref(),
         ));
     }
-    Ok(format!("{key}: {} -> {}", edit.before, edit.after))
+    Ok(format!(
+        "{key}: {} -> {}",
+        edit.before_text(),
+        edit.after_text()
+    ))
 }
 
 /// Turn a detector's finding into a proposal.
@@ -1275,14 +1280,28 @@ fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
         ),
     ] {
         if on {
+            // Back to the default is `unset`, unless the default is itself on
+            // (the login keychain): then only `false` turns it off.
+            let on_by_default = ahma_common::config::setting_docs()
+                .iter()
+                .any(|d| d.dotted() == key && d.default == "true");
+            let undo = if on_by_default {
+                Change::Set {
+                    file: SettingsFile::User,
+                    key: key.into(),
+                    value: "false".into(),
+                }
+            } else {
+                Change::Unset {
+                    file: SettingsFile::User,
+                    key: key.into(),
+                }
+            };
             out.push(AllowRow {
                 area: "switch",
                 subject: what.into(),
                 detail: key.into(),
-                undo: Undo::Proposal(Change::Unset {
-                    file: SettingsFile::User,
-                    key: key.into(),
-                }),
+                undo: Undo::Proposal(undo),
             });
         }
     }
@@ -1634,7 +1653,7 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
         let mut answer = String::new();
         stdin.lock().read_line(&mut answer)?;
         if answer.trim().eq_ignore_ascii_case("y") {
-            let now = chrono::Local::now().to_rfc3339();
+            let now = ahma_common::timestamp::rfc3339_local_now();
             match apply(&env, &item.proposal, "cli", &now) {
                 Ok(done) => println!("Done: {done}"),
                 Err(e) => println!("Could not apply: {e:#}"),
@@ -1659,6 +1678,28 @@ mod tests {
         _home: tempfile::TempDir,
         ws: tempfile::TempDir,
         env: Env,
+    }
+
+    /// A switch that is on by default (the login keychain) is undone by
+    /// turning it off. Undoing every switch by unsetting it went back to the
+    /// default, which for the keychain is on: the offered undo changed nothing.
+    #[test]
+    fn a_switch_on_by_default_is_undone_by_turning_it_off() {
+        let f = fixture();
+        let rows = allow_rows(&f.env, &AhmaSettings::default());
+        let keychain = rows
+            .iter()
+            .find(|r| r.detail == "sandbox.allow_keychain")
+            .expect("the keychain is allowed by default");
+        assert!(
+            matches!(
+                &keychain.undo,
+                Undo::Proposal(Change::Set { key, value, .. })
+                    if key == "sandbox.allow_keychain" && value == "false"
+            ),
+            "{:?}",
+            keychain.undo
+        );
     }
 
     fn fixture() -> Fixture {

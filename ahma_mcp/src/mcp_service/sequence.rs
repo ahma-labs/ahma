@@ -9,7 +9,6 @@ use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::adapter::Adapter;
@@ -21,8 +20,6 @@ use crate::mcp_service::progress_push::ProgressPushRouter;
 use super::handlers::common;
 use super::subcommand::find_subcommand_config_from_args;
 use super::types::{META_PARAMS, SequenceKind};
-
-static SEQUENCE_ID: AtomicU64 = AtomicU64::new(1);
 
 // ============= Helper Functions =============
 
@@ -93,9 +90,7 @@ fn find_step_subcommand<'a>(
 
 /// Generates a new unique operation ID.
 fn next_id(tool_name: &str, subcommand: Option<&str>) -> String {
-    let counter_val = SEQUENCE_ID.fetch_add(1, Ordering::SeqCst);
-    let command = subcommand.unwrap_or("");
-    crate::utils::operation::generate_id_with_details(counter_val, tool_name, command)
+    crate::utils::operation::mint_id(tool_name, subcommand.unwrap_or(""))
 }
 
 /// Registers the request's progress destination for a step operation id, if

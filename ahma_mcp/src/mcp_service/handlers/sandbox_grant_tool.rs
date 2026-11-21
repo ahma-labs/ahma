@@ -137,7 +137,7 @@ impl AhmaMcpService {
                 "cannot locate ~/.ahma/settings.toml (home directory unknown); set HOME and retry",
             )
         })?;
-        let granted_at = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let granted_at = ahma_common::timestamp::local_date_today();
         let line = render_scope_line(&path, access, "sandbox_grant", &granted_at, note.as_deref());
 
         let risk = classify_grant_risk(&path, home.as_deref(), &scopes);

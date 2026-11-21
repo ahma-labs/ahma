@@ -25,9 +25,7 @@ async fn create_test_adapter() -> Arc<Adapter> {
         Sandbox::new(
             vec![std::env::temp_dir()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -41,7 +39,7 @@ async fn create_adapter_with_root(root: std::path::PathBuf) -> Arc<Adapter> {
     let shell_pool_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
     let sandbox =
-        Arc::new(Sandbox::new(vec![root], SandboxMode::Test, false, false, false).unwrap());
+        Arc::new(Sandbox::new(vec![root], SandboxMode::Test, Default::default()).unwrap());
 
     Arc::new(Adapter::new(monitor, shell_pool, sandbox).unwrap())
 }
@@ -57,9 +55,7 @@ async fn create_monitored_test_adapter() -> (tempfile::TempDir, Arc<OperationMon
         Sandbox::new(
             vec![temp.path().to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );

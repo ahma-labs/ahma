@@ -27,10 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt as _;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AuditEvent
@@ -164,20 +161,11 @@ impl AuditWriter {
     /// This is intentionally simple: no batching, no in-process buffer.
     pub async fn emit(&self, kind: AuditEventKind) -> Result<()> {
         let event = AuditEvent {
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: ahma_common::timestamp::rfc3339_utc_now(),
             trace_id: None,
             kind,
         };
-        let mut line = serde_json::to_string(&event)?;
-        line.push('\n');
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await?;
+        ahma_common::jsonl::append(&self.path, &event).await?;
         Ok(())
     }
 
@@ -258,6 +246,22 @@ impl AuditWriter {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The vault log keeps chrono's UTC spelling: `+00:00`, never `Z` (R-TIME.1).
+    #[tokio::test]
+    async fn timestamp_is_rfc3339_utc_with_numeric_offset() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        AuditWriter::new(&log_path)
+            .vault_created("/vaults/t", "t")
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let ev: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        let ts = ev["timestamp"].as_str().unwrap();
+        assert!(ts.ends_with("+00:00"), "{ts}");
+        assert!(ahma_common::timestamp::parse_rfc3339(ts).is_ok(), "{ts}");
+    }
 
     #[tokio::test]
     async fn emit_creates_and_appends_jsonl() {

@@ -481,17 +481,25 @@ impl SettingsEditor {
     pub fn save(&mut self) {
         let edited = self.settings.clone();
         // Audited (SPEC R-CFG10.5): each key the panel changed gets a record.
-        let saved =
-            AhmaSettings::update_audited("tui", &chrono::Local::now().to_rfc3339(), |on_disk| {
+        let saved = AhmaSettings::update_audited(
+            "tui",
+            &ahma_common::timestamp::rfc3339_local_now(),
+            |on_disk| {
+                // The ledger keys of `[sandbox]` (grants: scopes, SSH
+                // signing; R-CFG10.7) come from disk: written meanwhile by the
+                // command that grants or revokes them, never by this panel.
                 let persistent_scopes = std::mem::take(&mut on_disk.sandbox.persistent_scopes);
+                let ssh_sign = std::mem::take(&mut on_disk.sandbox.ssh_sign);
                 on_disk.tools = edited.tools.clone();
                 on_disk.sandbox = edited.sandbox.clone();
                 on_disk.sandbox.persistent_scopes = persistent_scopes;
+                on_disk.sandbox.ssh_sign = ssh_sign;
                 on_disk.logging = edited.logging.clone();
                 on_disk.http = edited.http.clone();
                 on_disk.auth = edited.auth.clone();
                 on_disk.instance = edited.instance.clone();
-            });
+            },
+        );
         match saved {
             Ok(fresh) => {
                 self.settings = fresh;
@@ -1796,6 +1804,52 @@ mod tests {
                 .is_tool_approved(std::path::Path::new("/ws"), "list_dir"),
             "the grant made while the panel was open survives its save"
         );
+        unsafe {
+            std::env::remove_var("AHMA_TEST_HOME");
+        }
+    }
+
+    /// An SSH signing grant revoked while the panel was open stays revoked
+    /// when the panel saves. The panel wrote back the whole `[sandbox]` table
+    /// it read on opening, keeping only `persistent_scopes` from disk, so a
+    /// revoked `ssh_sign` grant came back (and one approved meanwhile was lost).
+    #[test]
+    fn save_keeps_ssh_signing_grants_as_they_are_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("AHMA_TEST_HOME", dir.path());
+        }
+        let grant = |dest: &str| ahma_common::ssh_sign::SshSignGrant {
+            key: "SHA256:abc".into(),
+            destination: dest.into(),
+            label: String::new(),
+            workspace: std::path::PathBuf::from("/ws"),
+            granted_at: 1,
+            expires_at: None,
+            granted_by: None,
+            owner_pid: None,
+        };
+        AhmaSettings::update(|s| s.sandbox.ssh_sign.push(grant("sshsig:old"))).unwrap();
+        let mut editor = SettingsEditor::default();
+        editor.open();
+
+        // Meanwhile: the old grant is revoked and a new one approved.
+        AhmaSettings::update(|s| s.sandbox.ssh_sign = vec![grant("sshsig:new")]).unwrap();
+
+        editor.item_down();
+        editor.toggle_current();
+        editor.dirty = true;
+        editor.save();
+
+        let kept: Vec<String> = AhmaSettings::load()
+            .sandbox
+            .ssh_sign
+            .into_iter()
+            .map(|g| g.destination)
+            .collect();
+        assert_eq!(kept, vec!["sshsig:new".to_string()]);
         unsafe {
             std::env::remove_var("AHMA_TEST_HOME");
         }

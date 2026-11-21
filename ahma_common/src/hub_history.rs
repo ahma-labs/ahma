@@ -30,7 +30,6 @@
 use crate::hub::{HISTORY_REPLAY_WINDOW, HubEvent, InstanceInfo};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
 /// Rotate once the file passes this size, keeping one predecessor.
@@ -186,20 +185,10 @@ async fn append_record(path: &Path, record: &HistoryRecord) -> std::io::Result<(
         // survives the rotation.
         let _ = tokio::fs::rename(path, previous_path(path)).await;
     }
-    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
-    line.push('\n');
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    file.write_all(line.as_bytes()).await?;
-    // A tokio `File` hands the write to the blocking pool and `write_all` can
-    // return before the bytes reach the OS; without this flush a `Flush` ack
-    // sent right after could overtake the last record, and a reader (the
-    // round-trip test on a busy CI runner) saw two lines where three were
-    // written.
-    file.flush().await?;
+    // Flushed before it returns: a `Flush` ack sent right after must not
+    // overtake the last record (a reader on a busy CI runner saw two lines
+    // where three were written).
+    crate::jsonl::append(path, record).await?;
     // 0600: this file names every command run on the user's behalf.
     #[cfg(unix)]
     {

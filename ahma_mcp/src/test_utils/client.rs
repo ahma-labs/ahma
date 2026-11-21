@@ -368,9 +368,7 @@ pub async fn setup_test_environment() -> (AhmaMcpService, TempDir) {
         Sandbox::new(
             vec![temp_dir.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -404,9 +402,7 @@ pub async fn setup_test_environment_with_io()
         Sandbox::new(
             vec![temp_dir.path().to_path_buf()],
             SandboxMode::Strict,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     );
@@ -441,9 +437,7 @@ pub fn create_test_config(workspace_dir: &Path) -> Result<Arc<Adapter>> {
     let sandbox = Arc::new(Sandbox::new(
         vec![workspace_dir.to_path_buf()],
         SandboxMode::Strict,
-        false,
-        false,
-        false,
+        Default::default(),
     )?);
 
     Adapter::new(operation_monitor, shell_pool_manager, sandbox).map(Arc::new)

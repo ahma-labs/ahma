@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
 use std::path::{Path, PathBuf};
 
 /// Intercepts and redirects file deletion commands to the vault's trash directory.
@@ -71,50 +70,7 @@ impl RmInterceptor {
             return Ok(None);
         }
 
-        let filename = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("staged-item");
-        let ts = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
-        let dest = trash_dir.join(format!("{ts}_{filename}"));
-
-        if let Err(rename_err) = std::fs::rename(&source, &dest) {
-            tracing::debug!(
-                "Rename failed: {}. Falling back to copy-and-delete for '{}' to '{}'",
-                rename_err,
-                source.display(),
-                dest.display()
-            );
-            if source.is_dir() {
-                copy_dir_all(&source, &dest).with_context(|| {
-                    format!(
-                        "Failed to copy directory '{}' to '{}' during staging fallback",
-                        source.display(),
-                        dest.display()
-                    )
-                })?;
-                std::fs::remove_dir_all(&source).with_context(|| {
-                    format!(
-                        "Failed to remove source directory '{}' after staging fallback copy",
-                        source.display()
-                    )
-                })?;
-            } else {
-                std::fs::copy(&source, &dest).with_context(|| {
-                    format!(
-                        "Failed to copy file '{}' to '{}' during staging fallback",
-                        source.display(),
-                        dest.display()
-                    )
-                })?;
-                std::fs::remove_file(&source).with_context(|| {
-                    format!(
-                        "Failed to remove source file '{}' after staging fallback copy",
-                        source.display()
-                    )
-                })?;
-            }
-        }
+        let dest = crate::trash::move_into(&source, trash_dir)?;
 
         Ok(Some((
             source.to_string_lossy().to_string(),
@@ -142,22 +98,6 @@ impl RmInterceptor {
 
         Ok(staged)
     }
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -440,7 +380,7 @@ mod tests {
         std::fs::write(src.join("root.txt"), b"root").unwrap();
         std::fs::write(src.join("subdir/child.txt"), b"child").unwrap();
 
-        copy_dir_all(&src, &dst).unwrap();
+        crate::trash::copy_dir_all(&src, &dst).unwrap();
 
         assert!(dst.join("root.txt").exists());
         assert!(dst.join("subdir/child.txt").exists());

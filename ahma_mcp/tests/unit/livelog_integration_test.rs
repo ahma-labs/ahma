@@ -100,9 +100,7 @@ fn test_sandbox(scope: &std::path::Path) -> Arc<Sandbox> {
         Sandbox::new(
             vec![scope.to_path_buf()],
             SandboxMode::Test,
-            false,
-            false,
-            false,
+            Default::default(),
         )
         .unwrap(),
     )

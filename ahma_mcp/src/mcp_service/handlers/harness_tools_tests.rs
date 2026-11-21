@@ -203,9 +203,7 @@ async fn make_service_with(
     let sandbox = Sandbox::new(
         vec![std::env::current_dir().unwrap()],
         SandboxMode::Test,
-        false,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     let adapter =

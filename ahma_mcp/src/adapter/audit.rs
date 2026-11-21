@@ -60,7 +60,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -367,7 +366,7 @@ impl AuditLog {
     /// be able to fail a command.
     pub async fn emit(&self, kind: AuditEventKind) -> Result<()> {
         let event = AuditEvent {
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: ahma_common::timestamp::rfc3339_utc_now(),
             trace_id: None,
             kind,
         };
@@ -670,6 +669,28 @@ mod tests {
                 .is_some_and(|s| !s.is_empty()),
             "every event is timestamped"
         );
+    }
+
+    /// The execution audit log keeps chrono's UTC spelling: `+00:00`, never `Z`
+    /// (R-TIME.1).
+    #[tokio::test]
+    async fn timestamp_is_rfc3339_utc_with_numeric_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::at(tmp.path().join("audit.jsonl"));
+        log.emit(AuditEventKind::ToolComplete {
+            operation_id: "op_1".into(),
+            success: true,
+            duration_ms: 1,
+            exit_code: Some(0),
+            outcome: Some("completed".into()),
+        })
+        .await
+        .unwrap();
+        let contents = tokio::fs::read_to_string(log.path()).await.unwrap();
+        let events = parse_lines(&contents);
+        let ts = events[0]["timestamp"].as_str().unwrap();
+        assert!(ts.ends_with("+00:00"), "{ts}");
+        assert!(ahma_common::timestamp::parse_rfc3339(ts).is_ok(), "{ts}");
     }
 
     /// The whole reason this module reuses the vault's shape rather than

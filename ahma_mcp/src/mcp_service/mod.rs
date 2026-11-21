@@ -55,7 +55,6 @@ pub use types::{
     register_global_prompt_runner,
 };
 
-use chrono::Utc;
 use parking_lot::RwLock;
 use rmcp::{
     handler::server::ServerHandler,
@@ -68,10 +67,7 @@ use rmcp::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 use tracing;
 use tracing::Instrument as _;
 
@@ -85,8 +81,6 @@ use crate::{
     operation_monitor::Operation,
 };
 use serde_json::Value;
-
-pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How long a `tools/call` waits for an in-flight sandbox configuration to
 /// settle before proceeding anyway (SPEC R5.1.2).
@@ -703,23 +697,10 @@ impl AhmaMcpService {
         audit_log_path: &Path,
         payload: serde_json::Value,
     ) -> Result<(), anyhow::Error> {
-        use tokio::fs::OpenOptions;
-        use tokio::io::AsyncWriteExt as _;
-
         if let Some(parent) = audit_log_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-
-        let mut line = serde_json::to_string(&payload)?;
-        line.push('\n');
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(audit_log_path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await?;
+        ahma_common::jsonl::append(audit_log_path, &payload).await?;
         Ok(())
     }
 
@@ -732,7 +713,7 @@ impl AhmaMcpService {
         Self::append_audit_line(
             audit_log_path,
             serde_json::json!({
-                "timestamp": Utc::now().to_rfc3339(),
+                "timestamp": ahma_common::timestamp::rfc3339_utc_now(),
                 "type": "tool_call",
                 "operation_id": operation_id,
                 "tool_name": tool_name,
@@ -751,7 +732,7 @@ impl AhmaMcpService {
         Self::append_audit_line(
             audit_log_path,
             serde_json::json!({
-                "timestamp": Utc::now().to_rfc3339(),
+                "timestamp": ahma_common::timestamp::rfc3339_utc_now(),
                 "type": "tool_complete",
                 "operation_id": operation_id,
                 "success": success,
@@ -812,7 +793,7 @@ impl AhmaMcpService {
         if let Err(e) = Self::append_audit_line(
             &audit_log_path,
             serde_json::json!({
-                "timestamp": Utc::now().to_rfc3339(),
+                "timestamp": ahma_common::timestamp::rfc3339_utc_now(),
                 "type": "file_staged",
                 "original_path": original_path,
                 "trash_path": trash_path,
@@ -2152,7 +2133,7 @@ impl AhmaMcpService {
         };
         tracing::warn!("{}", error_message);
         Err(McpError::new(
-            rmcp::model::ErrorCode(-32001),
+            rmcp::model::ErrorCode(ahma_common::mcp_methods::RpcErrorCode::SandboxNotReady.code()),
             error_message,
             Some(serde_json::json!({
                 "kind": if scopes_pending { "sandbox_scope_uncommitted" }
@@ -2471,9 +2452,7 @@ impl AhmaMcpService {
         context: RequestContext<RoleServer>,
         execution_mode: crate::adapter::ExecutionMode,
     ) -> Result<CallToolResult, McpError> {
-        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id =
-            crate::utils::operation::generate_id_with_details(counter_val, tool_name, base_command);
+        let id = crate::utils::operation::mint_id(tool_name, base_command);
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
 
@@ -2612,7 +2591,10 @@ impl AhmaMcpService {
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let params_map = params.arguments.clone().unwrap_or_default();
-        let op_id = format!("livelog_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        let op_id = format!(
+            "livelog_{}",
+            crate::utils::operation::next_operation_number()
+        );
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         self.register_progress_if_requested(
@@ -3889,7 +3871,7 @@ mod tests {
         assert_eq!(wd.path, "/explicit/path");
 
         // No arg + a client-reported scope -> substitute the first scope, and say so.
-        sandbox.set_roots_received(true);
+        sandbox.mark_roots_received();
         let wd = handlers::working_directory::resolve(sandbox, "cargo", &serde_json::Map::new())
             .unwrap();
         let scope = sandbox
@@ -4159,6 +4141,21 @@ mod tests {
         assert!(content.contains("\"type\":\"tool_complete\""));
         assert!(content.contains("\"success\":true"));
         assert!(content.contains("\"duration_ms\":42"));
+    }
+
+    /// The task-vault log keeps chrono's UTC spelling: `+00:00`, never `Z`
+    /// (R-TIME.1).
+    #[tokio::test]
+    async fn vault_audit_timestamps_are_rfc3339_utc_with_numeric_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        AhmaMcpService::append_tool_call_event(&path, "op1", "t", "a")
+            .await
+            .unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let ev: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let ts = ev["timestamp"].as_str().unwrap();
+        assert!(ts.ends_with("+00:00"), "{ts}");
     }
 
     // ==================== vault emit (task_vault wired via AppConfig) ====================

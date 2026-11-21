@@ -9,7 +9,7 @@
 
 use super::broker::{Broker, Decision, Destination, KeySources, SignConsent, SignRequest};
 use super::host::{BrokerLease, agent_dir};
-use ahma_common::harness_asks::{self, SshRefusal};
+use ahma_common::harness_asks::{self, CommandDigest, SshRefusal};
 use ahma_common::ssh_sign::{self, HOST_PREFIX, SSHSIG_PREFIX};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -105,7 +105,7 @@ pub struct RecordedConsent {
     harness_pid: Option<u32>,
     /// Digest of the command this consent answers for, when one is known: the
     /// dialog asks about its refusals only when it runs again (R-PERM.10).
-    command_digest: Option<String>,
+    command_digest: Option<CommandDigest>,
 }
 
 impl RecordedConsent {
@@ -124,7 +124,7 @@ impl RecordedConsent {
 
     /// Answer for `command`: a refusal is asked about when it runs again.
     pub fn for_command(mut self, command: &str) -> Self {
-        self.command_digest = Some(ahma_common::harness_asks::command_digest(command));
+        self.command_digest = Some(CommandDigest::of(command));
         self
     }
 

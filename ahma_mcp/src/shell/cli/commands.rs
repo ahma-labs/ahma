@@ -44,7 +44,8 @@ fn render_settings_origin(
     // Precedence order, highest first (R-CFG1.1): cli > project > user >
     // default — resolved by the same function the startup report uses.
     for o in resolve_origins(rows, &ctx.provenance_inputs(file_path, file_toml)) {
-        let _ = writeln!(out, "{:<45} = {}  # {}", o.key, o.value, o.source);
+        let value = ahma_common::settings_origin::shown_value(o.key, &o.value);
+        let _ = writeln!(out, "{:<45} = {}  # {}", o.key, value, o.source);
     }
     out
 }
@@ -162,7 +163,8 @@ fn print_settings_row(row: &SettingRow, section: &mut &str) {
     } else {
         "[default]"
     };
-    println!("{:<45} = {}  # {}", key, row.value, source);
+    let value = ahma_common::settings_origin::shown_value(row.key, &row.value);
+    println!("{:<45} = {}  # {}", key, value, source);
 }
 
 fn print_settings_file_footer(file_path: Option<&std::path::Path>) {
@@ -324,14 +326,14 @@ fn run_settings_set(
             SettingsReach::of(&target, named_with_path)
         )
     );
-    if edit.before != edit.after {
+    if edit.changed() {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
-            &chrono::Local::now().to_rfc3339(),
+            &ahma_common::timestamp::rfc3339_local_now(),
             "cli",
             SettingsFile::for_path(&target).label(),
             key,
-            &edit.before,
-            &edit.after,
+            edit.before.as_deref(),
+            edit.after.as_deref(),
         ));
     }
     Ok(())
@@ -476,7 +478,7 @@ fn handle_prompts_update() -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
-    use ahma_common::config::settings_path;
+    use ahma_common::config::{ScopeAccess, settings_path};
 
     let file = settings_path()
         .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
@@ -494,7 +496,23 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         } => {
             let lease_secs = lease.as_deref().map(parse_lease_arg).transpose()?;
             run_sandbox_grant(
-                &file, dir, read_only, workspace, global, session, by, note, lease_secs,
+                &file,
+                GrantRequest {
+                    dir,
+                    access: if read_only {
+                        ScopeAccess::Ro
+                    } else {
+                        ScopeAccess::Rw
+                    },
+                    workspace: resolve_cli_workspace(workspace, global)?,
+                    lifetime: if session {
+                        GrantLifetime::Session
+                    } else {
+                        GrantLifetime::Persistent { lease_secs }
+                    },
+                    by,
+                    note,
+                },
             )
         }
         SandboxCommand::Renew {
@@ -649,7 +667,7 @@ fn run_sandbox_renew(
             path: &existing.path,
             access: existing.access,
             granted_by: existing.granted_by.clone(),
-            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::local_date_today()),
             note: existing.note.clone(),
             surface: "cli",
             live_scopes: &[],
@@ -668,26 +686,42 @@ fn run_sandbox_renew(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_sandbox_grant(
-    file: &std::path::Path,
+/// What `ahma sandbox grant` was asked for, its flags already resolved — one
+/// named value in place of nine positional parameters, three of them `bool`s
+/// and two of them adjacent `Option<String>`s a swap would still compile.
+struct GrantRequest {
+    /// The directory to grant, as typed (`~` not yet expanded).
     dir: PathBuf,
-    read_only: bool,
+    access: ahma_common::config::ScopeAccess,
+    /// The workspace the grant is bound to (SPEC R5.4.11); `None` is the
+    /// legacy global record (`--global`).
     workspace: Option<PathBuf>,
-    global: bool,
-    session: bool,
+    lifetime: GrantLifetime,
+    /// What asked for it (`--by`).
     by: Option<String>,
+    /// Why it exists (`--note`). A session grant does not record it.
     note: Option<String>,
-    lease_secs: Option<u64>,
-) -> Result<()> {
-    use ahma_common::config::{GrantOutcome, ScopeAccess};
+}
 
-    let access = if read_only {
-        ScopeAccess::Ro
-    } else {
-        ScopeAccess::Rw
-    };
-    let workspace = resolve_cli_workspace(workspace, global)?;
+/// How long a CLI grant lasts.
+enum GrantLifetime {
+    /// `--session`: this terminal session only, nothing written (SPEC R-PERM.4.4).
+    Session,
+    /// Written to settings.toml; a lease of `lease_secs` when `--for` was given.
+    Persistent { lease_secs: Option<u64> },
+}
+
+fn run_sandbox_grant(file: &std::path::Path, req: GrantRequest) -> Result<()> {
+    use ahma_common::config::GrantOutcome;
+
+    let GrantRequest {
+        dir,
+        access,
+        workspace,
+        lifetime,
+        by,
+        note,
+    } = req;
     let settings = load_sandbox_settings(file)?;
 
     // Surface the elevated-risk warnings before writing; the hard denylist
@@ -702,9 +736,15 @@ fn run_sandbox_grant(
     warn_elevated_risk_grant(&dir, &live_scopes);
     drop(settings);
 
-    if session {
-        return run_sandbox_grant_session(dir, access, workspace, by);
-    }
+    let lease_secs = match lifetime {
+        GrantLifetime::Session => {
+            return run_sandbox_grant_session(dir, access, workspace, by);
+        }
+        GrantLifetime::Persistent { lease_secs } => lease_secs,
+    };
+    // One instant for what is stored and what is printed: computing it twice
+    // could show an end a second off the one saved.
+    let expires_at = lease_secs.map(|secs| ahma_common::config::unix_now() + secs);
 
     let outcome = ahma_common::scope_grant::persist_grant(
         file,
@@ -712,12 +752,12 @@ fn run_sandbox_grant(
             path: &dir,
             access,
             granted_by: by,
-            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::local_date_today()),
             note,
             surface: "cli",
             live_scopes: &live_scopes,
             workspace: workspace.as_deref(),
-            expires_at: lease_secs.map(|secs| ahma_common::config::unix_now() + secs),
+            expires_at,
         },
     )?;
 
@@ -739,7 +779,7 @@ fn run_sandbox_grant(
         Some(ws) => println!("Bound to workspace: {}", ws.display()),
         None => println!("GLOBAL: applies to every workspace on this machine."),
     }
-    if let Some(line) = lease_line(lease_secs.map(|s| ahma_common::config::unix_now() + s)) {
+    if let Some(line) = lease_line(expires_at) {
         println!("{line}");
     }
     println!("Recorded in: {}", file.display());
@@ -798,15 +838,17 @@ fn run_sandbox_grant_session(
         granted_by: Some(by.unwrap_or_else(|| "cli".to_string())),
     };
     ahma_common::session_grants::record(&store, &grant)?;
-    ahma_common::permissions::append_audit(&ahma_common::permissions::audit_entry(
-        chrono::Local::now().to_rfc3339(),
-        ahma_common::permissions::AuditAction::Grant,
-        ahma_common::permissions::GrantKind::FsScope,
-        canonical.display().to_string(),
-        Some(access.short().to_string()),
-        ahma_common::permissions::GrantTier::Session,
-        Some("cli".to_string()),
-    ));
+    ahma_common::permissions::append_audit(
+        &ahma_common::permissions::AuditEntry::new(
+            ahma_common::timestamp::rfc3339_local_now(),
+            ahma_common::permissions::AuditAction::Grant,
+            ahma_common::permissions::GrantKind::FsScope,
+            canonical.display().to_string(),
+            ahma_common::permissions::GrantTier::Session,
+        )
+        .with_access(access.short().to_string())
+        .with_surface("cli"),
+    );
     println!(
         "✓ Granted {} access to {} for this terminal session (workspace {}).",
         access.label(),
@@ -975,22 +1017,24 @@ fn run_sandbox_revoke(
 // ─────────────────────────────────────────────────────────────────────────────
 
 use ahma_common::permissions::{
-    AuditAction, GrantKind, GrantTier, append_audit, audit_entry, records, workspace_key,
+    AuditAction, AuditEntry, GrantKind, GrantTier, append_audit, records, workspace_key,
 };
 
 /// Record a ledger change in the audit trail. Never fails the operation it is
 /// recording: the grant was already confirmed by a human and is safely written;
 /// losing the *record* of it is the lesser harm.
 fn audit(action: AuditAction, kind: GrantKind, subject: String, access: Option<String>) {
-    append_audit(&audit_entry(
-        chrono::Local::now().to_rfc3339(),
-        action,
-        kind,
-        subject,
-        access,
-        GrantTier::Always,
-        Some("cli".to_string()),
-    ));
+    append_audit(
+        &AuditEntry::new(
+            ahma_common::timestamp::rfc3339_local_now(),
+            action,
+            kind,
+            subject,
+            GrantTier::Always,
+        )
+        .with_access_opt(access)
+        .with_surface("cli"),
+    );
 }
 
 /// Print the elevated-risk warnings for a grant the CLI is about to write
@@ -2435,7 +2479,7 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
         let mut answer = String::new();
         stdin.lock().read_line(&mut answer)?;
         if answer.trim().eq_ignore_ascii_case("y") {
-            let now = chrono::Local::now().to_rfc3339();
+            let now = ahma_common::timestamp::rfc3339_local_now();
             match fix.apply(&now) {
                 Ok(done) => println!("{done}."),
                 Err(e) => println!("Could not apply: {e:#}"),
@@ -2747,6 +2791,26 @@ mod tests {
         let rows = setting_rows(&s, &d);
         let file_toml: toml::Value = toml::from_str(file_text).unwrap();
         (rows, file_toml, d)
+    }
+
+    /// A secret setting never reaches the report: the bearer token is a row
+    /// now that every setting is one (R-CFG5.1), and the report is printed to
+    /// a terminal and pasted into issues.
+    #[test]
+    fn the_origin_report_redacts_the_bearer_token() {
+        let (rows, file_toml, _) = origin_fixtures("[auth]\nrequire_token = \"hunter2\"\n");
+        let out = render_settings_origin(
+            &rows,
+            Some(std::path::Path::new("settings.toml")),
+            Some(&file_toml),
+            &SettingsOriginCtx::default(),
+        );
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("auth.require_token") && l.contains("<redacted>")),
+            "{out}"
+        );
     }
 
     #[test]
