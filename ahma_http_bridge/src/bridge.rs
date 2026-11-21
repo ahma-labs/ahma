@@ -30,6 +30,7 @@ use crate::session::{
     DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, DEFAULT_REQUEST_TIMEOUT_SECS,
     DEFAULT_TOOL_CALL_TIMEOUT_SECS, SessionManager, SessionManagerConfig,
 };
+use ahma_common::hub::RestartMode;
 pub use ahma_common::hub_history::StopReason;
 use arc_swap::ArcSwapOption;
 use axum::{
@@ -1482,17 +1483,6 @@ async fn health_check(State(state): State<Arc<BridgeState>>) -> impl IntoRespons
 /// process exits regardless. See [`handle_restart`].
 const RESTART_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// `?mode=drain` is what an upgrading client asks for: stop accepting new
-/// sessions and go when the live ones end. The old unconditional restart
-/// tore down every attached editor's session mid-command to install a new
-/// binary for one of them (SPEC R-HUB.5).
-fn drain_requested(request: &axum::extract::Request) -> bool {
-    request
-        .uri()
-        .query()
-        .is_some_and(|q| q.split('&').any(|kv| kv == "mode=drain"))
-}
-
 /// Build the `{"status": <status>, "version": ...}` response shared by every
 /// `/restart` outcome (`"draining"` / `"restarting"`).
 fn restart_status_response(status: &str) -> Response {
@@ -1624,7 +1614,9 @@ async fn handle_restart(
             .into_response();
     }
     if let Some(exit) = state.exit.clone() {
-        if drain_requested(&request) {
+        // The old unconditional restart tore down every attached editor's
+        // session mid-command to install a new binary for one of them.
+        if RestartMode::from_query(request.uri().query()) == RestartMode::Drain {
             info!("Drain requested: finishing live sessions, accepting no new ones.");
             exit.request_drain();
             return restart_status_response("draining");

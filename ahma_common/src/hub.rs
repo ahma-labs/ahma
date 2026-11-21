@@ -1124,6 +1124,40 @@ pub async fn hub_token_for(socket: &Path) -> Option<String> {
     fresh.or_else(|| PRELOADED_TOKENS.lock().get(socket).cloned())
 }
 
+/// What `POST /restart` asks a bridge to do (SPEC R-HUB.5). The client builds
+/// its request from [`Self::path`] and the bridge reads it back with
+/// [`Self::from_query`], so the two cannot spell the mode differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestartMode {
+    /// End every session now and restart.
+    #[default]
+    Now,
+    /// What an upgrading client asks for: accept no new sessions and go when
+    /// the live ones end, so a version handoff for one window does not end
+    /// another window's session mid-command.
+    Drain,
+}
+
+impl RestartMode {
+    /// The request path that asks for this mode.
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Now => "/restart",
+            Self::Drain => "/restart?mode=drain",
+        }
+    }
+
+    /// The mode a `/restart` request's query asks for. Only an exact
+    /// `mode=drain` drains; anything else is the plain restart.
+    pub fn from_query(query: Option<&str>) -> Self {
+        if query.is_some_and(|q| q.split('&').any(|kv| kv == "mode=drain")) {
+            Self::Drain
+        } else {
+            Self::Now
+        }
+    }
+}
+
 /// The human-facing surface a session runs on (SPEC R-GUI.7, R-GUI.9): what
 /// the session may do. Who an answer given there is attributed to is the
 /// [`crate::approver::ApproverSurface`] it converts into: a separate type,
@@ -3460,6 +3494,36 @@ fn local_instance_id() -> String {
 #[cfg(test)]
 mod tests {
     use crate::timeouts::TestTimeouts;
+
+    // ── `/restart` modes (R-HUB.5) ───────────────────────────────────────────
+
+    /// What the bridge reads from a `/restart` query: only `mode=drain` drains,
+    /// wherever it sits; anything else is the restart it always was.
+    #[test]
+    fn a_restart_query_drains_only_when_it_says_drain() {
+        use super::RestartMode::{Drain, Now};
+        for (query, want) in [
+            (Some("mode=drain"), Drain),
+            (Some("a=1&mode=drain"), Drain),
+            (Some("mode=drain2"), Now),
+            (Some("mode=Drain"), Now),
+            (Some(""), Now),
+            (None, Now),
+        ] {
+            assert_eq!(super::RestartMode::from_query(query), want, "{query:?}");
+        }
+    }
+
+    /// What a client sends is what the bridge reads back.
+    #[test]
+    fn a_restart_mode_survives_the_wire() {
+        for mode in [super::RestartMode::Now, super::RestartMode::Drain] {
+            let path = mode.path();
+            let query = path.split_once('?').map(|(_, q)| q);
+            assert!(path.starts_with("/restart"), "{path}");
+            assert_eq!(super::RestartMode::from_query(query), mode, "{path}");
+        }
+    }
 
     // ── Wire compatibility for the R24.7 identity fields ─────────────────────
 
