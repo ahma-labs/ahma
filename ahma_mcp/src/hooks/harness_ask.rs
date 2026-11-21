@@ -428,6 +428,92 @@ pub(super) fn ssh_ask_reason(refusal: &harness_asks::SshRefusal) -> String {
     )
 }
 
+/// The refused link to ask about before `command` runs in `cwd`, with the
+/// token that approves it (SPEC R-LINK.6): one the link broker refused this
+/// command, or a command opening the same site, when it last ran here; that
+/// no saved grant covers now (for a local site or one off the egress allow
+/// list, only a grant naming it, R-LINK.4, R-LINK.5); and that this harness
+/// session has not declined.
+pub(super) fn next_link_ask(
+    cwd: &Path,
+    session_id: &str,
+    command: &str,
+    settings_file: Option<&Path>,
+) -> Option<(harness_asks::LinkRefusal, String)> {
+    use crate::egress::HostPattern;
+    let dir = harness_asks::default_dir()?;
+    let workspace = workspace_for(cwd);
+    let now = ahma_common::session_grants::now_secs();
+    let asks = harness_asks::load(&dir, &workspace, now);
+    if asks.link_refusals.is_empty() {
+        return None;
+    }
+    let saved = settings_file
+        .and_then(|f| ahma_common::config::AhmaSettings::load_from_result(f).ok())
+        .map(|s| s.open_url)
+        .unwrap_or_default();
+    let grants =
+        crate::links::policy::LinkGrants::from_settings(&saved, &workspace, Vec::new(), Vec::new());
+    // As `policy::decide` reads a grant: "any site" never covers a local
+    // site or one off the egress allow list.
+    let covered = |r: &harness_asks::LinkRefusal| {
+        grants.always.iter().any(|p| match p {
+            HostPattern::Any => !r.local && !r.outside_egress,
+            named => named.matches(&r.host),
+        })
+    };
+    let refusal = harness_asks::next_link_question(
+        &asks,
+        session_id,
+        command,
+        &crate::links::policy::link_open_host,
+        &covered,
+    )?;
+    let pid = harness_pid().or(refusal.harness_pid)?;
+    let token = harness_asks::mark_link_asked(
+        &dir,
+        &workspace,
+        session_id,
+        &refusal,
+        command,
+        Some(pid),
+        now,
+    )
+    .ok()?;
+    Some((refusal, token))
+}
+
+/// The dialog text for a refused link (SPEC R-LINK.6, R-LINK.7): that the
+/// command was refused a link when it last ran, the question every surface
+/// shows ([`LinkQuestion::text`], ending with the guidance), and every answer
+/// in order — no is deny, yes is this time, and the lasting answers are the
+/// grants a human runs.
+///
+/// [`LinkQuestion::text`]: crate::links::policy::LinkQuestion::text
+pub(super) fn link_ask_reason(refusal: &harness_asks::LinkRefusal, workspace: &Path) -> String {
+    let question = link_question(refusal);
+    let answers: String = crate::links::policy::harness_dialog_answers(&question, workspace)
+        .iter()
+        .map(|a| format!("\n- {a}"))
+        .collect();
+    format!(
+        "ahma: when this command last ran, it was refused a link, because no grant allowed the \
+         site.\n\n{}\n\nYour answers:{answers}",
+        question.text()
+    )
+}
+
+/// The question a recorded refusal asks, as every surface words it.
+fn link_question(refusal: &harness_asks::LinkRefusal) -> crate::links::policy::LinkQuestion {
+    crate::links::policy::LinkQuestion {
+        host: refusal.host.clone(),
+        shown: refusal.shown.clone(),
+        local: refusal.local,
+        outside_egress: refusal.outside_egress,
+        internationalised: refusal.host.split('.').any(|l| l.starts_with("xn--")),
+    }
+}
+
 /// Remember that `command` in `cwd` was refused something no grant or setting
 /// allows (SPEC R-ESCAPE.1), so the harness dialog can offer to run exactly
 /// it once outside the sandbox when it is run again.
@@ -498,6 +584,9 @@ pub(super) fn take_escape(
 pub(super) struct Approval {
     pub line: String,
     pub trial: Option<Trial>,
+    /// The site whose links this run may open: a yes, "this time", to a
+    /// refused link (SPEC R-LINK.6).
+    pub link_this_run: Option<String>,
 }
 
 /// A folder grant on trial for one run: in force as a session grant now,
@@ -563,11 +652,19 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
     let dir = harness_asks::default_dir()?;
     let workspace = workspace_for(cwd);
     let now = ahma_common::session_grants::now_secs();
-    let line_only = |line: String| Approval { line, trial: None };
+    let line_only = |line: String| Approval {
+        line,
+        trial: None,
+        link_this_run: None,
+    };
     let Some(asked) = harness_asks::take_approved(&dir, &workspace, token, command, now) else {
         if let Some(asked) = harness_asks::take_ssh_approved(&dir, &workspace, token, command, now)
         {
             return Some(line_only(apply_ssh_approval(&asked, &workspace, now)));
+        }
+        if let Some(asked) = harness_asks::take_link_approved(&dir, &workspace, token, command, now)
+        {
+            return Some(apply_link_approval(&asked, now));
         }
         if let Some(asked) = harness_asks::take_repo_approved(&dir, &workspace, token, command, now)
         {
@@ -616,6 +713,7 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
             workspace,
             session_file,
         }),
+        link_this_run: None,
     })
 }
 
@@ -725,6 +823,31 @@ fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Res
         settings.save_to(&file)?;
     }
     Ok(binding)
+}
+
+/// What a yes to a link question gives (SPEC R-LINK.6): "this time" — the
+/// approved run may open the site's links, and nothing is remembered. It is
+/// a grant of the once tier all the same, so it is audited (R-LINK.9).
+fn apply_link_approval(asked: &harness_asks::AskedLink, now: u64) -> Approval {
+    let host = asked.refusal.host.to_ascii_lowercase();
+    ahma_common::permissions::append_audit(
+        &ahma_common::permissions::AuditEntry::new(
+            ahma_common::config::fmt_utc_datetime(now),
+            ahma_common::permissions::AuditAction::Grant,
+            ahma_common::permissions::GrantKind::OpenUrl,
+            host.clone(),
+            ahma_common::permissions::GrantTier::Once,
+        )
+        .with_surface(&ahma_common::approver::ApproverSurface::Harness),
+    );
+    Approval {
+        line: format!(
+            "ahma: approved — this run may open {host} links. To stop asking, a human runs \
+             `ahma permissions grant open-url {host}`."
+        ),
+        trial: None,
+        link_this_run: Some(host),
+    }
 }
 
 /// Record the session grant a yes to an SSH-signature question gives.
@@ -849,6 +972,93 @@ mod tests {
         assert!(approval.line.contains("approved"), "{}", approval.line);
         assert!(approval.trial.is_none(), "a signature is no folder grant");
         assert_eq!(consent.decide(&request).await, Decision::Allow);
+    }
+
+    /// SPEC R-LINK.6, R-LINK.7, the whole loop at the hook: the link broker
+    /// refuses a link no grant allows and remembers it; before the same
+    /// command, or an open of the same site, runs again the dialog asks, with
+    /// the question, the guidance and every answer in order; the approved
+    /// command's token opens that site in that run only; a no is not asked
+    /// again this session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_yes_to_a_link_question_opens_that_site_in_the_approved_run() {
+        use crate::links::consent::{LinkAnswer, LinkConsent, RecordedLinkConsent};
+        use crate::links::policy::LinkTarget;
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", tmp.path()) };
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let workspace = workspace_for(&ws);
+        let cmd = "gh pr view 12 --web";
+        let link = LinkTarget::parse("https://github.com/o/r/pull/12").unwrap();
+        let refused = RecordedLinkConsent::new(workspace.clone(), None, None).for_harness(
+            cmd,
+            Some(std::process::id()),
+            Some("session-1".into()),
+        );
+        assert!(matches!(
+            refused.decide(&link, false).await,
+            LinkAnswer::Refuse(_)
+        ));
+
+        assert!(
+            next_link_ask(&ws, "session-1", "cargo build", None).is_none(),
+            "an unrelated command is not held for it"
+        );
+        let (refusal, token) =
+            next_link_ask(&ws, "session-1", "ahma open-url https://github.com/x", None)
+                .expect("an open of the same site asks");
+        let reason = link_ask_reason(&refusal, &workspace);
+        for must in [
+            "Site: github.com",
+            "Address: https://github.com/o/r/pull/12",
+            ahma_common::open_url::GUIDANCE,
+            "No — deny",
+            "Yes — this time",
+            "`ahma permissions grant open-url github.com`",
+        ] {
+            assert!(reason.contains(must), "missing {must:?} in:\n{reason}");
+        }
+        let at = |s: &str| {
+            reason
+                .find(s)
+                .unwrap_or_else(|| panic!("missing {s:?} in:\n{reason}"))
+        };
+        let order = [
+            "No — deny",
+            "Yes — this time",
+            "Always for this site — all repos",
+            "Always for this site — this repo only",
+            "Always (any site)",
+        ];
+        assert!(
+            order.windows(2).all(|w| at(w[0]) < at(w[1])),
+            "deny, this time, all repos, this repo, any site:\n{reason}"
+        );
+
+        let approval =
+            apply_approval(&token, &ws, "ahma open-url https://github.com/x").expect("a line");
+        assert!(approval.line.contains("approved"), "{}", approval.line);
+        assert!(approval.trial.is_none(), "a link is no folder grant");
+        assert_eq!(approval.link_this_run.as_deref(), Some("github.com"));
+        let approved_run = RecordedLinkConsent::new(workspace.clone(), None, None)
+            .allowing_this_run(approval.link_this_run.as_deref());
+        assert_eq!(approved_run.decide(&link, false).await, LinkAnswer::Open);
+
+        // The next refusal is asked again: the yes was for that run only.
+        assert!(matches!(
+            refused.decide(&link, false).await,
+            LinkAnswer::Refuse(_)
+        ));
+        // Asked again after a yes, and answered no: its token is never spent.
+        next_link_ask(&ws, "session-1", cmd, None).expect("asked again after a yes");
+        assert!(
+            next_link_ask(&ws, "session-1", cmd, None).is_none(),
+            "a no is remembered for the session"
+        );
     }
 
     /// SPEC R-ESCAPE: what nothing allows is offered, when this exact command

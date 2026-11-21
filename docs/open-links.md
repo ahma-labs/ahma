@@ -36,6 +36,7 @@ ahma permissions grant open-url github.com --this-repo --yes
 # Inside any hooked command, these now open in your browser:
 gh pr view 12 --web
 "$BROWSER" https://github.com/ahma-labs/ahma
+open https://github.com/ahma-labs/ahma        # runs as `ahma open-url`, and says so
 
 # See and undo:
 ahma permissions list --kind open-url
@@ -43,9 +44,28 @@ ahma permissions revoke open-url github.com --yes
 ahma permissions revoke open-url --yes        # every site
 ```
 
-A link to a site you have not allowed is not opened: the command fails with one line that
-names the exact `ahma permissions grant open-url <site>` to run, and the address, so the agent
-can show it to you.
+A link to a site you have not allowed is not opened: the command fails at once with one line
+that names the exact `ahma permissions grant open-url <site>` and the address, so the agent can
+show it to you. A hooked command is never paused to ask.
+
+## Asked in Claude Code
+
+When the agent runs the refused command again — or any `ahma open-url`, `"$BROWSER"` or
+whole-line `open` of a link to the same site — Claude Code's own dialog asks you first. It
+shows the site on its own line, the address (up to 300 characters), a note for a local site or
+one outside your network allow list, and the guidance above. That dialog has only yes and no,
+so it names every answer, in this order:
+
+| Answer | How you give it | What it does |
+|---|---|---|
+| Deny | No | Not opened. ahma does not ask about that site again in this Claude Code session. |
+| This time | Yes | The approved run may open that site's links. Nothing is remembered; the next refusal asks again. |
+| Always for this site — all repos (the usual lasting answer) | `ahma permissions grant open-url <site>` | Saved for every repo. |
+| Always for this site — this repo only | `ahma permissions grant open-url <site> --workspace '<repo>'` | Saved for this repo. |
+| Always (any site) | `ahma permissions grant open-url` | Any public site; never a local one, and with network restriction on only sites on your allow list. Offered only where it would cover the link. |
+
+Each yes is recorded in `permissions-audit.jsonl` as a one-time `open-url` grant from the
+harness dialog.
 
 ## How it works
 
@@ -56,8 +76,15 @@ can show it to you.
    or `https`, a real host, no `user@` before the host, no spaces or backslashes, at most
    8 KB. It opens what it checked, in its plain ASCII form, never the text the command passed.
 3. If you allowed the site, it runs `open` (macOS) or `xdg-open` (Linux) with the address.
-   If not, the command gets the line above.
-4. `ahma open-url <URL>…` is the same helper by name.
+   If not, the command gets the line above, and the refusal is remembered for Claude Code's
+   dialog.
+4. `ahma open-url <URL>…` is the same helper by name. A command line that is exactly `open`
+   or `xdg-open` and one `http`/`https` address (bare, or quoted as a literal) runs as it, and
+   the result's first line says so. Any other form (`open -a …`, two addresses, an unquoted
+   `&`) runs as written; if the sandbox refuses it, ahma names the exact `ahma open-url '<URL>'`
+   to run instead, and does not offer to run it outside the sandbox.
+5. Only a command that has a link broker may reach the broker's socket directory; another
+   command run by the same ahma process gets no such access.
 
 ## Local addresses
 
@@ -90,10 +117,9 @@ lengths of its query and fragment.
 ## Limits
 
 - At most 5 links per command, each at most 8 KB.
-- Not yet asked: a link to a site you have not allowed is refused, never asked about. Asking
-  in Claude Code's dialog and in MCP clients is in progress (SPEC R-LINK.6).
-- `open https://…` itself is still refused by the sandbox on macOS; use `"$BROWSER" <URL>` or
-  `ahma open-url <URL>`.
+- Asked only in Claude Code, and only when the command runs again. MCP clients, the TUI and
+  other harnesses do not ask yet (SPEC R-LINK.6): there a link to a site you have not allowed
+  is refused with the grant line.
 - A site you allow can forward your browser elsewhere (an open redirect); allow sites you trust.
 - A name that resolves to a public address when ahma checks it and to a local one later (DNS
   rebinding) is not caught: the browser looks the name up again.

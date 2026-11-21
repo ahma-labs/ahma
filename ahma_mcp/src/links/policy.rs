@@ -362,6 +362,12 @@ pub enum Surface {
     /// `ahma web`, `ahma desktop`: an answer there may not write settings or
     /// outlive the session (R-GUI.9), so deny, this time, this session only.
     Browser,
+    /// Claude Code's own dialog, before a hooked command whose link was
+    /// refused runs again. Its contract is yes or no: no is deny, yes is
+    /// "this time" (the approved run may open the site's links), and the
+    /// lasting answers are named as the grants a human runs
+    /// ([`harness_dialog_answers`]).
+    HarnessDialog,
 }
 
 /// A question about one link.
@@ -383,7 +389,7 @@ impl LinkQuestion {
     pub fn choices(&self, surface: Surface) -> Vec<LinkChoice> {
         let any = !self.local && !self.outside_egress;
         let all = match surface {
-            Surface::Live => vec![
+            Surface::Live | Surface::HarnessDialog => vec![
                 LinkChoice::Deny,
                 LinkChoice::Once,
                 LinkChoice::AlwaysSiteAllRepos,
@@ -497,6 +503,69 @@ pub fn effect(choice: LinkChoice, host: &str, workspace: &Path) -> Effect {
     }
 }
 
+/// The `ahma permissions grant open-url` line that saves what `choice`
+/// would (SPEC R-LINK.11): `None` for an answer that saves nothing.
+pub fn grant_command(choice: LinkChoice, host: &str, workspace: &Path) -> Option<String> {
+    let Effect::Persist(pattern, binding) = effect(choice, host, workspace) else {
+        return None;
+    };
+    let mut line = String::from("ahma permissions grant open-url");
+    if let HostPattern::Exact(site) = &pattern {
+        line.push(' ');
+        line.push_str(site);
+    }
+    if let OpenUrlBinding::Repo(repo) = &binding {
+        line.push_str(" --workspace ");
+        line.push_str(&sh_single_quote(&repo.to_string_lossy()));
+    }
+    Some(line)
+}
+
+/// Every answer to `question` in Claude Code's dialog ([`Surface::HarnessDialog`]),
+/// one line each, in the order [`LinkQuestion::choices`] gives (SPEC R-LINK.6):
+/// how the human gives it there. Its yes/no answers deny and this time; a
+/// lasting one is the grant a human runs, then re-runs the command.
+/// `workspace` is the repo the question was asked from.
+pub fn harness_dialog_answers(question: &LinkQuestion, workspace: &Path) -> Vec<String> {
+    let host = &question.host;
+    question
+        .choices(Surface::HarnessDialog)
+        .into_iter()
+        .filter_map(|choice| {
+            let label = choice.label();
+            Some(match choice {
+                LinkChoice::Deny => format!(
+                    "No — {label}: ahma does not ask about {host} again in this Claude Code \
+                     session."
+                ),
+                LinkChoice::Once => format!(
+                    "Yes — {label}: this run of the command may open {host} links; nothing is \
+                     remembered."
+                ),
+                // The dialog keeps nothing for the session (its yes is "this time").
+                LinkChoice::Session => return None,
+                lasting => {
+                    let usual = if lasting == LinkChoice::AlwaysSiteAllRepos {
+                        " (the usual lasting answer)"
+                    } else {
+                        ""
+                    };
+                    let grant = grant_command(lasting, host, workspace)?;
+                    format!("{}{usual}: a human runs `{grant}`.", capitalised(label))
+                }
+            })
+        })
+        .collect()
+}
+
+fn capitalised(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// The one line a refused link leaves in the command's output (SPEC
 /// R-LINK.6, R-PERM.9). `retry_asks`: a hooked command in a harness whose
 /// dialog asks (Claude Code); otherwise a human grants it.
@@ -550,21 +619,52 @@ pub fn exact_open_command(command: &str) -> Option<LinkTarget> {
     ) {
         return None;
     }
-    let arg = rest.trim();
-    let literal = if let Some(inner) = arg.strip_prefix('\'') {
+    LinkTarget::parse(one_literal_word(rest)?).ok()
+}
+
+/// `arg` as the one word a shell passes, when it is a literal: bare without
+/// a shell metacharacter, or single- or double-quoted with nothing inside
+/// that the shell would expand or end the quote with. `None` for anything
+/// else (two words, a variable, an operator).
+fn one_literal_word(arg: &str) -> Option<&str> {
+    let arg = arg.trim();
+    if let Some(inner) = arg.strip_prefix('\'') {
         let inner = inner.strip_suffix('\'')?;
-        (!inner.contains('\'')).then_some(inner)?
+        (!inner.contains('\'')).then_some(inner)
     } else if let Some(inner) = arg.strip_prefix('"') {
         let inner = inner.strip_suffix('"')?;
-        (!inner.contains(['"', '$', '`', '\\'])).then_some(inner)?
+        (!inner.contains(['"', '$', '`', '\\'])).then_some(inner)
     } else {
         const SHELL: &[char] = &[
             ';', '&', '|', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', '*', '?', '[', ']', '{',
             '}', '~', '#', '!', ' ', '\t', '\n',
         ];
-        (!arg.contains(SHELL)).then_some(arg)?
+        (!arg.contains(SHELL)).then_some(arg)
+    }
+}
+
+/// The site a command line opens a link to, when the whole line opens one
+/// literal http/https link: a whole-line `open` ([`exact_open_command`]),
+/// `ahma open-url <URL>`, or `$BROWSER` / `$GH_BROWSER` (quoted or not) with
+/// one URL. What lets the harness dialog ask about a refused site before a
+/// command that opens it again, and never before an unrelated one (SPEC
+/// R-LINK.6).
+pub fn link_open_host(command: &str) -> Option<String> {
+    if let Some(target) = exact_open_command(command) {
+        return Some(target.host().to_string());
+    }
+    let (program, rest) = command.trim().split_once([' ', '\t'])?;
+    let arg = match program {
+        "$BROWSER" | "\"$BROWSER\"" | "$GH_BROWSER" | "\"$GH_BROWSER\"" => rest,
+        _ if Path::new(program).file_name() == Some(std::ffi::OsStr::new("ahma")) => {
+            let (sub, arg) = rest.trim_start().split_once([' ', '\t'])?;
+            (sub == super::helper::SUBCOMMAND).then_some(arg)?
+        }
+        _ => return None,
     };
-    LinkTarget::parse(literal).ok()
+    LinkTarget::parse(one_literal_word(arg)?)
+        .ok()
+        .map(|t| t.host().to_string())
 }
 
 /// `s` as one POSIX shell word, for the helper command an exact `open`
@@ -794,6 +894,104 @@ mod tests {
         );
         // R-GUI.9: a browser surface saves nothing.
         assert_eq!(q.choices(Surface::Browser), [Deny, Once, Session]);
+        // Claude Code's dialog: deny, this time, then the lasting answers.
+        assert_eq!(
+            q.choices(Surface::HarnessDialog),
+            [
+                Deny,
+                Once,
+                AlwaysSiteAllRepos,
+                AlwaysSiteThisRepo,
+                AlwaysAny
+            ]
+        );
+    }
+
+    /// SPEC R-LINK.6, R-LINK.11: Claude Code's dialog is yes or no, so it
+    /// says what each answer is there, in order: no denies, yes is this time,
+    /// and each lasting answer is the exact grant a human runs — all repos
+    /// first, then this repo, then any site only where it would cover the
+    /// link.
+    #[test]
+    fn the_harness_dialog_names_every_answer_in_order() {
+        let ws = Path::new("/w/my repo");
+        let LinkDecision::Ask(q) = decide(
+            &t("https://github.com/o/r/pull/1"),
+            false,
+            &LinkGrants::default(),
+            &Egress::Open,
+        ) else {
+            panic!()
+        };
+        let answers = harness_dialog_answers(&q, ws);
+        assert_eq!(answers.len(), 5, "{answers:#?}");
+        assert!(answers[0].starts_with("No — deny"), "{}", answers[0]);
+        assert!(answers[1].starts_with("Yes — this time"), "{}", answers[1]);
+        assert!(
+            answers[2].starts_with("Always for this site — all repos (the usual")
+                && answers[2].contains("`ahma permissions grant open-url github.com`"),
+            "{}",
+            answers[2]
+        );
+        assert!(
+            answers[3]
+                .contains("`ahma permissions grant open-url github.com --workspace '/w/my repo'`"),
+            "{}",
+            answers[3]
+        );
+        assert!(
+            answers[4].starts_with("Always (any site)")
+                && answers[4].contains("`ahma permissions grant open-url`"),
+            "{}",
+            answers[4]
+        );
+        let LinkDecision::Ask(local) = decide(
+            &t("http://localhost:3000/"),
+            false,
+            &LinkGrants::default(),
+            &Egress::Open,
+        ) else {
+            panic!()
+        };
+        let answers = harness_dialog_answers(&local, ws);
+        assert_eq!(answers.len(), 4, "no any-site answer for a local host");
+        assert!(
+            answers[2].contains("grant open-url localhost`"),
+            "{answers:#?}"
+        );
+        assert_eq!(grant_command(LinkChoice::Once, "github.com", ws), None);
+    }
+
+    /// SPEC R-LINK.6: the dialog asks about a refused site before a command
+    /// that opens it again — a whole-line `open`, `ahma open-url`, or
+    /// `$BROWSER` / `$GH_BROWSER` of one literal link — and names no site for
+    /// anything else.
+    #[test]
+    fn a_helper_command_names_the_host_it_opens() {
+        for (line, host) in [
+            ("open https://github.com/o/r/pull/1", "github.com"),
+            ("ahma open-url 'https://GitHub.com/x?a=1&b=2'", "github.com"),
+            (
+                "/usr/local/bin/ahma open-url https://docs.rs/url",
+                "docs.rs",
+            ),
+            ("\"$BROWSER\" 'https://example.com/x'", "example.com"),
+            ("$GH_BROWSER https://github.com/login/device", "github.com"),
+        ] {
+            assert_eq!(link_open_host(line).as_deref(), Some(host), "{line}");
+        }
+        for line in [
+            "gh pr view --web",
+            "ahma open-url https://a.example/ https://b.example/",
+            "ahma open-url \"$URL\"",
+            "\"$BROWSER\" https://x.example/?a=1&b=2",
+            "\"$BROWSER\" /w/a/target/doc/index.html",
+            "ahma permissions grant open-url github.com",
+            "echo https://github.com/",
+            "notahma open-url https://github.com/",
+        ] {
+            assert_eq!(link_open_host(line), None, "{line}");
+        }
     }
 
     #[test]
@@ -814,7 +1012,12 @@ mod tests {
             else {
                 panic!("{link}")
             };
-            for surface in [Surface::Live, Surface::TuiForHarness, Surface::Browser] {
+            for surface in [
+                Surface::Live,
+                Surface::TuiForHarness,
+                Surface::Browser,
+                Surface::HarnessDialog,
+            ] {
                 let c = q.choices(surface);
                 assert_eq!(c.first(), Some(&LinkChoice::Deny), "{link} {surface:?}");
                 let at = |want| c.iter().position(|x| *x == want);
