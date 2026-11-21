@@ -706,7 +706,7 @@ fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Res
             granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string()),
             granted_at: Some(ahma_common::timestamp::local_date_today()),
             note: None,
-            surface: "harness",
+            surface: &ahma_common::approver::ApproverSurface::Harness,
             // Never above the workspace it was approved in (R-PERM.4.3).
             live_scopes: &[workspace.to_path_buf()],
             workspace: Some(&binding),
@@ -756,7 +756,7 @@ fn apply_ssh_approval(asked: &harness_asks::AskedSsh, workspace: &Path, now: u64
                 )
                 // The surface, as every other harness-dialog record has it;
                 // "harness dialog" is the grant's maker (`granted_by`).
-                .with_surface("harness"),
+                .with_surface(&ahma_common::approver::ApproverSurface::Harness),
             );
             format!(
                 "ahma: approved — commands in this workspace may sign with {} for {} for this \

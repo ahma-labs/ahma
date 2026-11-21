@@ -687,6 +687,9 @@ pub enum HubMsg {
         advice: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advice_followed: Option<bool>,
+        /// Who answered, read with [`answer_surface`]: absent for the TUI, and
+        /// `harness` on a copy settled by an answer given in another session's
+        /// own prompt (SPEC R-GUI.7, R-PERM.3.8).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<String>,
     },
@@ -1121,8 +1124,10 @@ pub async fn hub_token_for(socket: &Path) -> Option<String> {
     fresh.or_else(|| PRELOADED_TOKENS.lock().get(socket).cloned())
 }
 
-/// The human-facing surface a session runs on (SPEC R-GUI.7): who an answer
-/// or a setting change is attributed to.
+/// The human-facing surface a session runs on (SPEC R-GUI.7, R-GUI.9): what
+/// the session may do. Who an answer given there is attributed to is the
+/// [`crate::approver::ApproverSurface`] it converts into: a separate type,
+/// because not every approver is a session (the harness, the CLI, `doctor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Surface {
     /// `ahma tui`.
@@ -1135,7 +1140,8 @@ pub enum Surface {
 }
 
 impl Surface {
-    /// The name an audit record carries.
+    /// Its name: on the hub wire ([`Self::on_wire`]), and as the approver it
+    /// is in an audit record.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tui => "tui",
@@ -1154,19 +1160,23 @@ impl Surface {
     }
 }
 
-/// The audit surface an answer to a question came from (SPEC R-CFG10.5).
+/// Who gave an answer that arrived over the hub wire (SPEC R-GUI.7, R-CFG10.5).
 ///
 /// An answer with no surface came from the TUI, the only one that existed
-/// before the field. A surface this build does not know is recorded as
-/// `"unknown"`: the wire is authenticated (R-HUB.13), but an audit record is
-/// not the place to trust an arbitrary string.
-pub fn answer_surface(wire: Option<&str>) -> &'static str {
+/// before the field. `harness` is an answer given in the agent's own prompt,
+/// carried by the hub to the copies it settles (R-PERM.3.8). A surface this
+/// build does not know is recorded as `unknown`: the wire is authenticated
+/// (R-HUB.13), but an audit record is not the place to trust an arbitrary
+/// string.
+pub fn answer_surface(wire: Option<&str>) -> crate::approver::ApproverSurface {
+    use crate::approver::ApproverSurface;
     match wire {
-        None | Some("tui") => "tui",
+        None | Some("tui") => ApproverSurface::Tui,
         // `gui` is what `ahma web` sent while it was called `ahma gui`.
-        Some("web") | Some("gui") => "web",
-        Some("desktop") => "desktop",
-        Some(_) => "unknown",
+        Some("web") | Some("gui") => ApproverSurface::Web,
+        Some("desktop") => ApproverSurface::Desktop,
+        Some("harness") => ApproverSurface::Harness,
+        Some(_) => ApproverSurface::Unknown,
     }
 }
 
@@ -7225,6 +7235,7 @@ mod relay_wire_compat {
 #[cfg(test)]
 mod answer_surface_tests {
     use super::*;
+    use crate::approver::ApproverSurface;
     use crate::scope_grant::GrantDecision;
     use crate::web_approval::WebApprovalDecision;
     use serde_json::json;
@@ -7297,16 +7308,27 @@ mod answer_surface_tests {
     /// build does not know is recorded as unknown rather than trusted.
     #[test]
     fn only_a_known_surface_is_recorded_and_none_means_the_tui() {
-        assert_eq!(answer_surface(None), "tui");
-        assert_eq!(answer_surface(Some("tui")), "tui");
-        assert_eq!(answer_surface(Some("web")), "web");
-        assert_eq!(answer_surface(Some("desktop")), "desktop");
+        assert_eq!(answer_surface(None), ApproverSurface::Tui);
+        assert_eq!(answer_surface(Some("tui")), ApproverSurface::Tui);
+        assert_eq!(answer_surface(Some("web")), ApproverSurface::Web);
+        assert_eq!(answer_surface(Some("desktop")), ApproverSurface::Desktop);
         // `ahma web` was `ahma gui` until 0.22.19: an answer from that build
         // came from the browser surface.
-        assert_eq!(answer_surface(Some("gui")), "web");
-        assert_eq!(answer_surface(Some("harness")), "unknown");
-        assert_eq!(answer_surface(Some("<script>")), "unknown");
-        assert_eq!(answer_surface(Some("")), "unknown");
+        assert_eq!(answer_surface(Some("gui")), ApproverSurface::Web);
+        assert_eq!(answer_surface(Some("harness")), ApproverSurface::Harness);
+        // Only a surface that answers over the hub is read from it.
+        assert_eq!(answer_surface(Some("cli")), ApproverSurface::Unknown);
+        assert_eq!(answer_surface(Some("<script>")), ApproverSurface::Unknown);
+        assert_eq!(answer_surface(Some("")), ApproverSurface::Unknown);
+    }
+
+    /// SPEC R-GUI.7: an answer given in the agent's own prompt settles the
+    /// copies waiting in other sessions, and each copy is recorded as the
+    /// harness's answer: the hub carries `harness`, and the receiver must not
+    /// turn it into `unknown` (nor, sent as nothing, into `tui`).
+    #[test]
+    fn an_answer_from_the_harness_is_recorded_as_harness() {
+        assert_eq!(answer_surface(Some("harness")).to_string(), "harness");
     }
 
     #[test]
@@ -7316,12 +7338,12 @@ mod answer_surface_tests {
         assert_eq!(Surface::Desktop.as_str(), "desktop");
         assert_eq!(Surface::Tui.on_wire(), None);
         assert_eq!(Surface::Web.on_wire().as_deref(), Some("web"));
-        assert_eq!(answer_surface(Surface::Web.on_wire().as_deref()), "web");
-        assert_eq!(
-            answer_surface(Surface::Desktop.on_wire().as_deref()),
-            "desktop"
-        );
-        assert_eq!(answer_surface(Surface::Tui.on_wire().as_deref()), "tui");
+        for surface in [Surface::Tui, Surface::Web, Surface::Desktop] {
+            assert_eq!(
+                answer_surface(surface.on_wire().as_deref()),
+                ApproverSurface::from(surface)
+            );
+        }
     }
 
     /// The hub hands the surface on to the instance that raised the question.

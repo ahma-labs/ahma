@@ -58,7 +58,7 @@ fn a_grant_is_in_effect_for_the_next_hooked_command_with_no_restart() {
             granted_by: Some("hook".into()),
             granted_at: Some("2026-07-12".into()),
             note: None,
-            surface: "tui",
+            surface: &ahma_common::approver::ApproverSurface::Tui,
             live_scopes: &[],
             workspace: None,
             expires_at: None,

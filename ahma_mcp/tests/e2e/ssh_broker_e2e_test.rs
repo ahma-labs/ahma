@@ -78,7 +78,7 @@ fn a_hooked_command_signs_through_the_broker_only_once_allowed() {
             granted_by: Some("e2e".into()),
             owner_pid: None,
         },
-        "e2e",
+        &ahma_common::approver::ApproverSurface::Cli,
     )
     .unwrap();
 

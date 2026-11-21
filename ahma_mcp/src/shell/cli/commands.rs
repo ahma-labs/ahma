@@ -11,6 +11,7 @@ use super::{
     SandboxCommand, SettingsArgs, SettingsCommand, SettingsOriginCtx,
 };
 use crate::shell::{list_tools, resolution};
+use ahma_common::approver::ApproverSurface;
 // The settings row model and its provenance resolution live in `ahma_common`:
 // the startup settings report (R-CFG5.2) is built from the same rows, so the
 // `--origin` report and the startup log cannot disagree about a value's source.
@@ -329,7 +330,7 @@ fn run_settings_set(
     if edit.changed() {
         ahma_common::permissions::append_audit(&ahma_common::permissions::setting_audit_entry(
             &ahma_common::timestamp::rfc3339_local_now(),
-            "cli",
+            &ApproverSurface::Cli,
             SettingsFile::for_path(&target).label(),
             key,
             edit.before.as_deref(),
@@ -669,7 +670,7 @@ fn run_sandbox_renew(
             granted_by: existing.granted_by.clone(),
             granted_at: Some(ahma_common::timestamp::local_date_today()),
             note: existing.note.clone(),
-            surface: "cli",
+            surface: &ApproverSurface::Cli,
             live_scopes: &[],
             workspace: workspace.as_deref(),
             expires_at: Some(expires_at),
@@ -754,7 +755,7 @@ fn run_sandbox_grant(file: &std::path::Path, req: GrantRequest) -> Result<()> {
             granted_by: by,
             granted_at: Some(ahma_common::timestamp::local_date_today()),
             note,
-            surface: "cli",
+            surface: &ApproverSurface::Cli,
             live_scopes: &live_scopes,
             workspace: workspace.as_deref(),
             expires_at,
@@ -847,7 +848,7 @@ fn run_sandbox_grant_session(
             ahma_common::permissions::GrantTier::Session,
         )
         .with_access(access.short().to_string())
-        .with_surface("cli"),
+        .with_surface(&ApproverSurface::Cli),
     );
     println!(
         "✓ Granted {} access to {} for this terminal session (workspace {}).",
@@ -1033,7 +1034,7 @@ fn audit(action: AuditAction, kind: GrantKind, subject: String, access: Option<S
             GrantTier::Always,
         )
         .with_access_opt(access)
-        .with_surface("cli"),
+        .with_surface(&ApproverSurface::Cli),
     );
 }
 
@@ -1169,7 +1170,7 @@ fn grant_permission(
         println!("Nothing was changed. Re-run with --yes to apply.");
         return Ok(());
     }
-    ahma_common::ssh_sign::persist(file, grant, "cli")?;
+    ahma_common::ssh_sign::persist(file, grant, &ApproverSurface::Cli)?;
     println!("✓ Granted: {line}");
     println!();
     println!(
@@ -1974,7 +1975,8 @@ fn network_command_at(file: &std::path::Path, command: NetworkCommand) -> Result
             let _ = HostPattern::parse(&host)
                 .map_err(|e| anyhow::anyhow!("invalid host pattern '{host}': {e}"))?;
 
-            let newly_added = ahma_common::net_approval::persist_net_allow(file, &host, "cli")?;
+            let newly_added =
+                ahma_common::net_approval::persist_net_allow(file, &host, &ApproverSurface::Cli)?;
             if newly_added {
                 println!("✓ Added `{host}` to [network].allow");
             } else {
@@ -4149,7 +4151,13 @@ mod tests {
         let target = target_dir.path().join("sys.log");
         std::fs::write(&target, "x").unwrap();
         let canonical = dunce::canonicalize(&target).unwrap();
-        ahma_common::permissions::persist_log_target(&file, ws.path(), &canonical, "test").unwrap();
+        ahma_common::permissions::persist_log_target(
+            &file,
+            ws.path(),
+            &canonical,
+            &ApproverSurface::McpTool("logs_approve"),
+        )
+        .unwrap();
         let key = workspace_key(ws.path());
 
         let revoke = |yes: bool| {

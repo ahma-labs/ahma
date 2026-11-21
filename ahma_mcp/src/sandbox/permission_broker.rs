@@ -53,6 +53,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use ahma_common::approver::ApproverSurface;
 use ahma_common::config::{ScopeAccess, settings_path};
 use ahma_common::permissions::{
     AuditAction, AuditEntry, GrantKind, GrantTier, append_audit, persist_log_target_as,
@@ -338,7 +339,12 @@ impl PermissionBroker {
     /// session — R5.1). A decline resolves too, which is what stops the same
     /// question coming back for the rest of the session.
     fn apply(&self, req: &ScopeGrantRequest, decision: GrantDecision) {
-        let outcome = self.coordinator.resolve(&req.decision_id, decision);
+        // The answer came from the agent's own prompt: the harness answered,
+        // here and in every copy this answer settles (SPEC R-GUI.7).
+        let surface = ApproverSurface::Harness;
+        let outcome = self
+            .coordinator
+            .resolve(&req.decision_id, decision, &surface);
         self.emit_grant_decided(&req.decision_id, &outcome);
         match outcome {
             // `logs_approve`'s question: the answer is a `log-target` grant,
@@ -358,7 +364,7 @@ impl PermissionBroker {
                     &path,
                     tier,
                     tool.as_deref(),
-                    "harness",
+                    &surface,
                     &req.decision_id,
                     time_to_decision_ms,
                 ) {
@@ -385,7 +391,7 @@ impl PermissionBroker {
                     tier,
                     tool,
                     default_granted_by: "permission prompt",
-                    surface: "harness",
+                    surface: &surface,
                     decision_id: &req.decision_id,
                     time_to_decision_ms,
                     risk_class: risk_class.as_deref(),
@@ -405,7 +411,7 @@ impl PermissionBroker {
                         path.display().to_string(),
                         GrantTier::Session,
                     )
-                    .with_surface("harness")
+                    .with_surface(&surface)
                     .with_request(
                         &req.decision_id,
                         time_to_decision_ms,
@@ -433,7 +439,7 @@ pub(crate) struct ScopeGrantAnswer<'a> {
     pub tier: GrantTier,
     pub tool: Option<String>,
     pub default_granted_by: &'a str,
-    pub surface: &'a str,
+    pub surface: &'a ApproverSurface,
     pub decision_id: &'a str,
     pub time_to_decision_ms: Option<u64>,
     pub risk_class: Option<&'a str>,
@@ -481,7 +487,7 @@ fn record_scope_grant_persistence(
                 ans.tier,
             )
             .with_access(if ans.access.is_write() { "rw" } else { "ro" }.to_string())
-            .with_surface(ans.surface.to_string())
+            .with_surface(ans.surface)
             .with_request(ans.decision_id, ans.time_to_decision_ms, ans.risk_class)
             .with_advice(ans.advice.0.clone(), ans.advice.1),
         );
@@ -545,7 +551,7 @@ fn apply_live_scope_grant(
     access: ScopeAccess,
     tier: GrantTier,
     workspace: Option<&Path>,
-    surface: &str,
+    surface: &ApproverSurface,
 ) {
     // R5.4.6: a human-approved grant takes effect in the live session —
     // after the live gate (R-PERM.4.3), which is the only denylist the
@@ -565,7 +571,7 @@ fn apply_live_scope_grant(
                     access,
                     workspace,
                     std::process::id(),
-                    surface,
+                    &surface.to_string(),
                 );
             }
         }
@@ -607,7 +613,7 @@ pub(crate) fn apply_log_target_answer(
     target: &Path,
     tier: GrantTier,
     granted_by: Option<&str>,
-    surface: &str,
+    surface: &ApproverSurface,
     decision_id: &str,
     time_to_decision_ms: Option<u64>,
 ) -> Result<(), String> {
@@ -642,7 +648,7 @@ pub(crate) fn apply_log_target_answer(
                 GrantTier::Session,
             )
             .with_access("ro")
-            .with_surface(surface.to_string())
+            .with_surface(surface)
             .with_request(decision_id, time_to_decision_ms, None),
         );
         tracing::info!(
@@ -1067,6 +1073,22 @@ mod tests {
             "a harness that answered must not also raise a TUI modal — one question, \
              one place"
         );
+    }
+
+    /// SPEC R-GUI.7, R-PERM.3.8: an answer given in the agent's own prompt is
+    /// passed to the hub as the harness's, so the copies it settles in other
+    /// sessions are recorded as `harness` — not, carrying no surface, as the
+    /// TUI's.
+    #[tokio::test]
+    async fn a_harness_answer_is_passed_to_the_hub_as_the_harness() {
+        let h = ScriptedHarness::new(vec![ElicitOutcome::Answered(GrantDecision::Deny)]);
+        let (broker, _rx) = broker_with(Some(h.clone()), true);
+
+        violate(&broker, "/opt/cache").await;
+
+        let answered = broker.coordinator.drain_answered();
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(answered[0].surface.as_deref(), Some("harness"));
     }
 
     #[tokio::test]

@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::approver::ApproverSurface;
 use crate::config::{AhmaSettings, GrantOutcome, PersistentScope, ScopeAccess, expand_home};
 
 /// Why a scope grant is being requested — carried to the surface for context and
@@ -468,8 +469,9 @@ pub struct AnsweredQuestion {
     pub request: ScopeGrantRequest,
     /// The answer, already held to what the question offered.
     pub decision: GrantDecision,
-    /// The surface that gave it, so the copies it settles are audited under
-    /// the same one (SPEC R-CFG10.5). Absent: the TUI.
+    /// Who gave it ([`ApproverSurface`]), so the copies it settles are audited
+    /// under the same one (SPEC R-GUI.7, R-CFG10.5): `harness` for an answer
+    /// in the agent's own prompt. Absent (from an older instance): the TUI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
 }
@@ -718,7 +720,16 @@ impl GrantCoordinator {
     /// ([`GrantDecision::within_offer`]): every surface resolves through here,
     /// so a saved tier given to a session-only question (`--tmp`) is applied
     /// for the session, whichever surface sent it.
-    pub fn resolve(&self, decision_id: &str, decision: GrantDecision) -> GrantResolveOutcome {
+    ///
+    /// `surface` is who answered. It travels with the answer to the hub, so
+    /// the copies it settles in other sessions are recorded under the same
+    /// name (SPEC R-GUI.7, R-PERM.3.8).
+    pub fn resolve(
+        &self,
+        decision_id: &str,
+        decision: GrantDecision,
+        surface: &ApproverSurface,
+    ) -> GrantResolveOutcome {
         let mut inner = self.inner.lock();
         if inner.resolved.contains(decision_id) {
             return GrantResolveOutcome::AlreadyResolved;
@@ -741,7 +752,7 @@ impl GrantCoordinator {
         inner.answered.push_back(AnsweredQuestion {
             request: req.clone(),
             decision,
-            surface: None,
+            surface: Some(surface.to_string()),
         });
         self.answered_signal.notify_one();
 
@@ -1392,10 +1403,10 @@ pub struct NewGrant<'a> {
     /// `YYYY-MM-DD`, stamped by the caller ([`crate::timestamp::local_date_today`]).
     pub granted_at: Option<String>,
     pub note: Option<String>,
-    /// Which human surface answered: `cli`, `tui`, `harness` (an MCP
-    /// elicitation). Recorded in the audit log; a grant with no human surface
-    /// has no business here.
-    pub surface: &'a str,
+    /// Which human surface answered ([`ApproverSurface`]): `cli`, `tui`,
+    /// `harness` (an MCP elicitation or the hook dialog), … Recorded in the
+    /// audit log; a grant with no human surface has no business here.
+    pub surface: &'a ApproverSurface,
     /// The session's live sandbox scopes, so a grant that would widen the
     /// sandbox *above* the workspace is refused (`[]` when unknown — the
     /// remaining denylist rules still hold).
@@ -1534,7 +1545,7 @@ pub fn persist_grant(settings_file: &Path, grant: NewGrant<'_>) -> Result<GrantO
             crate::permissions::GrantTier::for_expiry(grant.expires_at),
         )
         .with_access(if grant.access.is_write() { "rw" } else { "ro" }.to_string())
-        .with_surface(grant.surface.to_string()),
+        .with_surface(grant.surface),
     );
     Ok(outcome)
 }
@@ -1817,7 +1828,7 @@ mod tests {
                             granted_by: None,
                             granted_at: None,
                             note: None,
-                            surface: "test",
+                            surface: &ApproverSurface::Cli,
                             live_scopes: &[],
                             workspace: None,
                             expires_at: None,
@@ -1957,7 +1968,7 @@ mod tests {
             c.is_waiting(p, ScopeAccess::Ro),
             "a waiting write covers a read"
         );
-        c.resolve(&req.decision_id, GrantDecision::Deny);
+        c.resolve(&req.decision_id, GrantDecision::Deny, &ApproverSurface::Tui);
         assert!(
             !c.is_waiting(p, ScopeAccess::Rw),
             "answered, so no longer waiting"
@@ -1970,6 +1981,32 @@ mod tests {
             "a waiting read covers no write"
         );
         c.cancel(&ro.decision_id);
+    }
+
+    /// SPEC R-GUI.7, R-PERM.3.8: the answer passed on to the hub names who
+    /// gave it, so the copies it settles in other sessions are recorded under
+    /// the same one: an answer in the agent's own prompt is the harness's,
+    /// never the TUI's.
+    #[test]
+    fn an_answer_is_passed_on_with_who_gave_it() {
+        let c = coord();
+        let dir = tempdir().unwrap();
+        let req = c
+            .begin(
+                dir.path(),
+                ScopeAccess::Rw,
+                GrantReason::PreExecViolation,
+                None,
+            )
+            .unwrap();
+        c.resolve(
+            &req.decision_id,
+            GrantDecision::Deny,
+            &ApproverSurface::Harness,
+        );
+        let answered = c.drain_answered();
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(answered[0].surface.as_deref(), Some("harness"));
     }
 
     #[test]
@@ -1999,7 +2036,7 @@ mod tests {
             let req = c
                 .begin(p, access, GrantReason::PreExecViolation, None)
                 .expect("asked");
-            c.resolve(&req.decision_id, decision);
+            c.resolve(&req.decision_id, decision, &ApproverSurface::Tui);
         };
 
         let c = coord();
@@ -2100,7 +2137,7 @@ mod tests {
         let req = c
             .begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
             .unwrap();
-        let out = c.resolve(&req.decision_id, GrantDecision::Deny);
+        let out = c.resolve(&req.decision_id, GrantDecision::Deny, &ApproverSurface::Tui);
         assert!(matches!(out, GrantResolveOutcome::Denied { .. }));
         // Same (path, access) is now dismissed → no re-ask.
         assert!(
@@ -2122,7 +2159,11 @@ mod tests {
                 Some("sccache".into()),
             )
             .unwrap();
-        let out = c.resolve(&req.decision_id, GrantDecision::GrantRw);
+        let out = c.resolve(
+            &req.decision_id,
+            GrantDecision::GrantRw,
+            &ApproverSurface::Tui,
+        );
         match out {
             GrantResolveOutcome::Persist {
                 path,
@@ -2157,7 +2198,11 @@ mod tests {
         let req = c
             .begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
             .unwrap();
-        let first = c.resolve(&req.decision_id, GrantDecision::GrantRo);
+        let first = c.resolve(
+            &req.decision_id,
+            GrantDecision::GrantRo,
+            &ApproverSurface::Tui,
+        );
         assert!(matches!(
             first,
             GrantResolveOutcome::Persist {
@@ -2166,7 +2211,11 @@ mod tests {
             }
         ));
         // A twin surface answering later is a no-op — the rw answer cannot override.
-        let second = c.resolve(&req.decision_id, GrantDecision::GrantRw);
+        let second = c.resolve(
+            &req.decision_id,
+            GrantDecision::GrantRw,
+            &ApproverSurface::Tui,
+        );
         assert_eq!(second, GrantResolveOutcome::AlreadyResolved);
     }
 
@@ -2174,7 +2223,11 @@ mod tests {
     fn resolve_unknown_decision_id_is_ignored() {
         let c = coord();
         assert_eq!(
-            c.resolve("never-issued", GrantDecision::GrantRw),
+            c.resolve(
+                "never-issued",
+                GrantDecision::GrantRw,
+                &ApproverSurface::Tui
+            ),
             GrantResolveOutcome::Unknown
         );
     }
@@ -2194,7 +2247,11 @@ mod tests {
         );
         // Late answer after cancel no-ops.
         assert_eq!(
-            c.resolve(&req.decision_id, GrantDecision::GrantRw),
+            c.resolve(
+                &req.decision_id,
+                GrantDecision::GrantRw,
+                &ApproverSurface::Tui
+            ),
             GrantResolveOutcome::AlreadyResolved
         );
         // Not dismissed: a fresh trip may legitimately re-ask.
@@ -2217,7 +2274,7 @@ mod tests {
         let req = c
             .begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
             .expect("first ask");
-        c.resolve(&req.decision_id, GrantDecision::Deny);
+        c.resolve(&req.decision_id, GrantDecision::Deny, &ApproverSurface::Tui);
 
         // The memo holds against an automatic re-ask …
         assert!(
@@ -2262,7 +2319,7 @@ mod tests {
         assert_eq!(c.pending_count(), 1);
         assert_eq!(c.pending()[0].decision_id, req.decision_id);
         // Any resolution (here: deny) empties the pending set.
-        c.resolve(&req.decision_id, GrantDecision::Deny);
+        c.resolve(&req.decision_id, GrantDecision::Deny, &ApproverSurface::Tui);
         assert_eq!(c.pending_count(), 0);
         assert!(c.pending().is_empty());
     }
@@ -2297,7 +2354,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let out = c.resolve(&req.decision_id, GrantDecision::Deny);
+        let out = c.resolve(&req.decision_id, GrantDecision::Deny, &ApproverSurface::Tui);
         assert!(matches!(out, GrantResolveOutcome::Denied { .. }));
         assert!(
             !file.exists(),
@@ -2320,7 +2377,7 @@ mod tests {
                 granted_by: Some("sccache".into()),
                 granted_at: Some("2026-06-22".into()),
                 note: None,
-                surface: "test",
+                surface: &ApproverSurface::Cli,
                 live_scopes: &[],
                 workspace: None,
                 expires_at: None,
@@ -2347,7 +2404,7 @@ mod tests {
                 granted_by: None,
                 granted_at: Some("2026-06-22".into()),
                 note: None,
-                surface: "test",
+                surface: &ApproverSurface::Cli,
                 live_scopes: &[],
                 workspace: None,
                 expires_at: None,
@@ -2384,7 +2441,7 @@ mod tests {
                 granted_by: None,
                 granted_at: None,
                 note: None,
-                surface: "test",
+                surface: &ApproverSurface::Cli,
                 live_scopes: &[],
                 workspace: None,
                 expires_at: None,
@@ -2409,7 +2466,7 @@ mod tests {
             granted_by: Some("test".into()),
             granted_at: Some("2026-10-02".into()),
             note: None,
-            surface: "test",
+            surface: &ApproverSurface::Cli,
             live_scopes: scopes,
             workspace: None,
             expires_at: None,
@@ -2529,7 +2586,7 @@ mod tests {
         let target = home.path().join("cache");
         std::fs::create_dir_all(&target).unwrap();
         let mut g = grant(&target, &[]);
-        g.surface = "tui";
+        g.surface = &ApproverSurface::Tui;
         persist_grant(&file, g).unwrap();
         let audit =
             std::fs::read_to_string(home.path().join(".ahma").join("permissions-audit.jsonl"))
@@ -2824,7 +2881,11 @@ mod request_context_tests {
             .unwrap();
         assert_eq!(first.context.times_asked, 1);
         assert!(first.context.first_asked_at.is_some());
-        c.resolve(&first.decision_id, GrantDecision::Deny);
+        c.resolve(
+            &first.decision_id,
+            GrantDecision::Deny,
+            &ApproverSurface::Tui,
+        );
         let again = c
             .reopen(
                 dir.path(),
@@ -3170,7 +3231,7 @@ mod startup_flag_tests {
                     Some("--tmp".into()),
                 )
                 .expect("the temp dir is askable");
-            let outcome = c.resolve(&req.decision_id, answer);
+            let outcome = c.resolve(&req.decision_id, answer, &ApproverSurface::Tui);
             assert_eq!(
                 c.status(&req.decision_id),
                 GrantStatus::Decided(held),
@@ -3202,7 +3263,11 @@ mod startup_flag_tests {
                 None,
             )
             .unwrap();
-        match c.resolve(&req.decision_id, GrantDecision::GrantRw) {
+        match c.resolve(
+            &req.decision_id,
+            GrantDecision::GrantRw,
+            &ApproverSurface::Tui,
+        ) {
             GrantResolveOutcome::Persist { tier, .. } => {
                 assert_eq!(tier, crate::permissions::GrantTier::Always)
             }
@@ -3283,7 +3348,7 @@ mod startup_flag_tests {
                     Some("logs_approve".into()),
                 )
                 .expect("an ordinary file is askable");
-            let outcome = c.resolve(&req.decision_id, answer);
+            let outcome = c.resolve(&req.decision_id, answer, &ApproverSurface::Tui);
             assert_eq!(
                 c.status(&req.decision_id),
                 GrantStatus::Decided(held),

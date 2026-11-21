@@ -28,6 +28,9 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   `ahma settings show --origin` and the startup log resolve sources through it (R-CFG5.1).
 - `permissions`: the unified permission ledger — filesystem grants, web domains, tool
   approvals — stored under `~/.ahma`, outside every sandbox scope (R-PERM.1, R-PERM.2).
+- `approver`: `ApproverSurface`, who approved — the one type every audit-record writer
+  takes for its `surface`, rendered to the names the audit file has always held (R-GUI.7).
+  Distinct from `hub::Surface`, the interface a session runs on.
 - `scope_grant`, `sandbox_state`: the grant coordinator (ask once per path, R-PERM.3) and
   the sandbox lifecycle state machine.
 - `hook_consent`, `net_approval`, `web_approval`, `web_policy`: the terminal-hook fall-open

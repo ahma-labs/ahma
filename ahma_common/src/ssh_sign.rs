@@ -121,7 +121,11 @@ pub fn active_sessions(dir: &Path, now: u64, pid_alive: &dyn Fn(u32) -> bool) ->
 }
 
 /// Save an `always` or lease grant to the settings file, and audit it.
-pub fn persist(settings_file: &Path, grant: SshSignGrant, surface: &str) -> Result<()> {
+pub fn persist(
+    settings_file: &Path,
+    grant: SshSignGrant,
+    surface: &crate::approver::ApproverSurface,
+) -> Result<()> {
     let _settings_lock = crate::config::lock_settings_for_write(settings_file)?;
     let mut settings = crate::config::AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!(e))
@@ -151,7 +155,7 @@ pub fn persist(settings_file: &Path, grant: SshSignGrant, surface: &str) -> Resu
             subject,
             tier,
         )
-        .with_surface(surface.to_string()),
+        .with_surface(surface),
     );
     Ok(())
 }
@@ -363,8 +367,18 @@ mod tests {
     fn a_persisted_grant_replaces_its_earlier_self_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.toml");
-        persist(&file, grant(None, Some(5_000)), "test").unwrap();
-        persist(&file, grant(None, None), "test").unwrap();
+        persist(
+            &file,
+            grant(None, Some(5_000)),
+            &crate::approver::ApproverSurface::Cli,
+        )
+        .unwrap();
+        persist(
+            &file,
+            grant(None, None),
+            &crate::approver::ApproverSurface::Cli,
+        )
+        .unwrap();
         let settings = crate::config::AhmaSettings::load_from_result(&file).unwrap();
         assert_eq!(settings.sandbox.ssh_sign, vec![grant(None, None)]);
     }

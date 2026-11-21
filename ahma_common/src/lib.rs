@@ -11,7 +11,7 @@
 //! | Area | Modules |
 //! |------|---------|
 //! | Configuration | [`config`] (settings schema, trust tiers, provider registry, retired-env handling), [`settings_origin`] (per-key provenance and the startup settings report) |
-//! | Permissions and scope | [`permissions`], [`scope_grant`], [`sandbox_state`], [`hook_consent`] |
+//! | Permissions and scope | [`permissions`], [`approver`], [`scope_grant`], [`sandbox_state`], [`hook_consent`] |
 //! | Network policy and outbound HTTP | [`web_policy`], [`web_approval`], [`net_approval`], [`http_retry`] |
 //! | Operations | [`event_dispatcher`], [`op_identity`] |
 //! | Per-user hub | [`hub`], [`hub_history`] |
@@ -33,6 +33,8 @@
 /// is insufficient to distinguish a fresh binary from a stale bridge hub).
 pub const BUILD_ID: &str = env!("AHMA_BUILD_ID");
 
+/// Who approved: the surface every permission audit record names (SPEC R-GUI.7).
+pub mod approver;
 pub mod config;
 /// SHA-256 hex digests, one encoder for every `SHA256SUMS`-style surface.
 pub mod digest;

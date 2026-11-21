@@ -45,13 +45,14 @@ pub fn add_log_exception(primary_root: &Path, target: &Path) -> std::io::Result<
         &settings_file,
         primary_root,
         target,
-        LOGS_APPROVE_SURFACE,
+        &LOGS_APPROVE_SURFACE,
     )
     .map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
 
 /// The surface a `logs_approve` grant is recorded as coming from.
-const LOGS_APPROVE_SURFACE: &str = "mcp:logs_approve";
+const LOGS_APPROVE_SURFACE: ahma_common::approver::ApproverSurface =
+    ahma_common::approver::ApproverSurface::McpTool("logs_approve");
 
 /// Record the target of the `.ahma/logs` symlink `link` as a `log-target`
 /// grant for `workspace`, because a **human** chose to at an unsandboxed ahma
@@ -76,7 +77,7 @@ pub fn approve_log_link(
     link: &Path,
     shown_target: Option<&Path>,
     granted_by: &str,
-    surface: &str,
+    surface: &ahma_common::approver::ApproverSurface,
 ) -> std::result::Result<(PathBuf, bool), String> {
     let meta = std::fs::symlink_metadata(link)
         .map_err(|e| format!("cannot read {}: {e}", link.display()))?;

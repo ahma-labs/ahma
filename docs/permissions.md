@@ -515,10 +515,23 @@ ahma egress list
 ```
 
 Every grant and revoke is appended to `~/.ahma/permissions-audit.jsonl`, with the
-surface that answered (`cli`, `tui`, `gui`, `harness`). Filesystem grants are written through
+surface that answered. Filesystem grants are written through
 one function — the CLI, the TUI modal and an elicitation answer all share it — and that
 function applies the denylist above and writes the audit record, so no surface can skip
 either.
+
+A record's `surface` is one of these names (SPEC R-GUI.7):
+
+| `surface` | Who answered |
+|---|---|
+| `tui` | `ahma tui` |
+| `web` | `ahma web` (a record written before 0.22.19 may say `gui`) |
+| `desktop` | `ahma desktop` |
+| `harness` | the agent's own prompt: an MCP elicitation, or the dialog a terminal hook raises. A yes there that also settles the same question waiting in another session is recorded as `harness` there too |
+| `cli` | a command typed at a terminal: `ahma sandbox grant`, `ahma settings set`, `ahma setup --plan --apply`, … |
+| `doctor`, `doctor: <detail>` | a fix `ahma doctor` applied with your consent |
+| `egress-proxy`, `fetch_webpage`, `mcp:<tool>` | an approval asked for in the agent's own prompt, recorded under what asked: the subprocess egress proxy, `fetch_webpage`, or an MCP tool (`mcp:network_grant`; `mcp:logs_approve` on a log target recorded without a question) |
+| `unknown` | an answer relayed by the hub from a surface this ahma does not know |
 
 The same log also records a change to an ordinary setting (`ahma settings set`, the TUI
 settings panel) as `kind: setting`, so a security-tier switch such as `sandbox.allow_gpu`

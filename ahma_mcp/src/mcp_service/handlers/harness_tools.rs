@@ -311,7 +311,7 @@ impl AhmaMcpService {
                             match ahma_common::web_approval::persist_web_allow(
                                 &file,
                                 &domain,
-                                "fetch_webpage",
+                                &ahma_common::approver::ApproverSurface::FetchWebpage,
                             ) {
                                 Ok(true) => tracing::info!(
                                     domain = %domain,
