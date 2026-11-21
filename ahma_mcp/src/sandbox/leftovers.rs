@@ -127,33 +127,8 @@ fn run_service(tag: &str) -> String {
 /// both.
 #[cfg(target_os = "macos")]
 fn runs_under(pid: u32, tag: &str) -> bool {
-    const SANDBOX_FILTER_GLOBAL_NAME: libc::c_int = 2;
-    unsafe extern "C" {
-        // libsystem_sandbox: answer without logging a violation.
-        static SANDBOX_CHECK_NO_REPORT: libc::c_int;
-        fn sandbox_check(
-            pid: libc::pid_t,
-            operation: *const libc::c_char,
-            type_: libc::c_int,
-            ...
-        ) -> libc::c_int;
-    }
-    let may_register = |name: String| {
-        let Ok(name) = std::ffi::CString::new(name) else {
-            return false;
-        };
-        // SAFETY: a query about `pid` with NUL-terminated strings that outlive
-        // the call; nothing is retained. 0 is "allowed".
-        unsafe {
-            sandbox_check(
-                pid as libc::pid_t,
-                c"mach-register".as_ptr(),
-                SANDBOX_FILTER_GLOBAL_NAME | SANDBOX_CHECK_NO_REPORT,
-                name.as_ptr(),
-            ) == 0
-        }
-    };
-    may_register(run_service(tag)) && !may_register(run_service("none"))
+    use ahma_common::seatbelt::pid_may_register_mach_name as may_register;
+    may_register(pid, &run_service(tag)) && !may_register(pid, &run_service("none"))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

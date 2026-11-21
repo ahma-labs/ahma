@@ -78,6 +78,10 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
 - `file_uri`, `hostname`, `fs_lock`, `local_tls`, `digest`: `file://` parsing and encoding,
   host naming, a cross-process advisory lock, local TLS certificates, and the one SHA-256
   hex encoder.
+- `git`, `seatbelt`: the one reader of a `.git` pointer file (`gitdir: <path>`: git's own grammar for
+  grants, and every reading for the exec-config deny rules, R-HANDOFF.2.1),
+  and the one declaration of macOS `sandbox_check` with its flags (is a process sandboxed;
+  may it register a Mach name).
 - `BUILD_ID`: the git hash of the build, used to detect a stale same-version bridge.
 
 **Shared definitions**

@@ -977,22 +977,15 @@ fn auto_execution_warning(path: &Path, home: Option<&Path>) -> Option<String> {
 /// names `<main>`. Any other pointer names nothing. The `.git` file lies in the
 /// workspace, where anything can write it, so a pointer to an arbitrary folder
 /// must not make that folder's ancestor pass for the workspace's own
-/// repository (a grant of it would then look like no widening).
+/// repository (a grant of it would then look like no widening). The file is
+/// read as git reads it ([`crate::git::parse_gitdir_pointer`]): one git would
+/// refuse names nothing either.
 pub fn resolve_worktree_main_repo(dir: &Path, git_file: &Path) -> Option<PathBuf> {
     if !git_file.is_file() {
         return None;
     }
     let content = std::fs::read_to_string(git_file).ok()?;
-    let line = content
-        .lines()
-        .find(|l| l.trim_start().starts_with("gitdir:"))?;
-    let raw_gitdir = line.trim_start()["gitdir:".len()..].trim();
-    let gitdir_path = Path::new(raw_gitdir);
-    let resolved = if gitdir_path.is_relative() {
-        dir.join(gitdir_path)
-    } else {
-        gitdir_path.to_path_buf()
-    };
+    let resolved = crate::git::parse_gitdir_pointer(&content, dir)?;
     let canon_gitdir = dunce::canonicalize(&resolved).unwrap_or(resolved);
     let worktrees = canon_gitdir.parent()?;
     let dot_git = worktrees.parent()?;
@@ -1696,6 +1689,45 @@ mod tests {
         assert!(
             !is_enclosing_git_repo(&evil, root.path()),
             "a pointer that is not <repo>/.git/worktrees/<name> names no main repository"
+        );
+    }
+
+    /// A `.git` file git itself would refuse names no main repository, however
+    /// worktree-shaped the path in it. An empty pointer used to resolve to the
+    /// file's own folder, so a `.git` file planted inside
+    /// `<main>/.git/worktrees/<name>` named `<main>`.
+    #[test]
+    fn a_pointer_git_would_refuse_names_no_main_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let admin = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        let wt = root.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let shown = admin.display();
+        std::fs::write(wt.join(".git"), format!("gitdir: {shown}\n")).unwrap();
+        assert_eq!(
+            resolve_worktree_main_repo(&wt, &wt.join(".git")),
+            Some(dunce::canonicalize(&main).unwrap()),
+            "the pointer git writes"
+        );
+        for refused in [
+            format!("  gitdir: {shown}\n"),
+            format!("gitdir:{shown}\n"),
+            format!("# moved\ngitdir: {shown}\n"),
+        ] {
+            std::fs::write(wt.join(".git"), &refused).unwrap();
+            assert_eq!(
+                resolve_worktree_main_repo(&wt, &wt.join(".git")),
+                None,
+                "{refused:?}"
+            );
+        }
+        std::fs::write(admin.join(".git"), "gitdir: \n").unwrap();
+        assert_eq!(
+            resolve_worktree_main_repo(&admin, &admin.join(".git")),
+            None,
+            "an empty pointer names no directory, not the file's own"
         );
     }
 

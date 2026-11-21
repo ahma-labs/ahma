@@ -85,6 +85,7 @@
 //! refused immediately there. `deny_write_globs_reflects_a_repository_created_after_the_previous_resolution`
 //! pins the behaviour.
 
+use ahma_common::git::gitdir_pointer_deny_candidates;
 use parking_lot::RwLock;
 use std::path::{Component, Path, PathBuf};
 
@@ -384,7 +385,8 @@ pub fn deny_write_globs_with(
 /// * a plain `.git` directory;
 /// * a `.git` *file* containing `gitdir: <path>` — produced by
 ///   `git worktree add` and by `git init --separate-git-dir`, with either a
-///   relative or an absolute target;
+///   relative or an absolute target, followed under every reading
+///   ([`ahma_common::git::gitdir_pointer_deny_candidates`]);
 /// * nested repositories one level below the root (monorepos, vendored checkouts).
 ///
 /// For a worktree the pointed-at directory is `<main>/.git/worktrees/<name>`,
@@ -504,16 +506,15 @@ async fn collect_git_dir_async(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(contents) = tokio::fs::read_to_string(&dot_git).await else {
         return;
     };
-    let Some(target) = parse_gitdir_pointer(&contents, dir) else {
-        return;
-    };
-    let target = canonical_or_async(&target).await;
-    if let Ok(common) = tokio::fs::read_to_string(target.join("commondir")).await
-        && let Some(resolved) = resolve_relative(common.trim(), &target)
-    {
-        push_unique_path(out, canonical_or_async(&resolved).await);
+    for target in gitdir_pointer_deny_candidates(&contents, dir) {
+        let target = canonical_or_async(&target).await;
+        if let Ok(common) = tokio::fs::read_to_string(target.join("commondir")).await
+            && let Some(resolved) = resolve_relative(common.trim(), &target)
+        {
+            push_unique_path(out, canonical_or_async(&resolved).await);
+        }
+        push_unique_path(out, target);
     }
-    push_unique_path(out, target);
 }
 
 async fn canonical_or_async(p: &Path) -> PathBuf {
@@ -918,43 +919,32 @@ fn collect_git_dir(dir: &Path, out: &mut Vec<ResolvedGitDir>) {
     let Ok(contents) = std::fs::read_to_string(&dot_git) else {
         return;
     };
-    let Some(target) = parse_gitdir_pointer(&contents, dir) else {
-        return;
-    };
     let dot_git = canonical_or(&dot_git);
-    let target = canonical_or(&target);
-    // A worktree's gitdir names `<main>/.git/worktrees/<name>`; the hooks live in
-    // the common dir it points at, so defend both.
-    if let Ok(common) = std::fs::read_to_string(target.join("commondir"))
-        && let Some(resolved) = resolve_relative(common.trim(), &target)
-    {
+    // Every reading of the pointer is defended; the grant side still verifies
+    // each one against its back-reference before widening anything.
+    for target in gitdir_pointer_deny_candidates(&contents, dir) {
+        let target = canonical_or(&target);
+        // A worktree's gitdir names `<main>/.git/worktrees/<name>`; the hooks live
+        // in the common dir it points at, so defend both.
+        if let Ok(common) = std::fs::read_to_string(target.join("commondir"))
+            && let Some(resolved) = resolve_relative(common.trim(), &target)
+        {
+            push_unique(
+                out,
+                canonical_or(&resolved),
+                GitDirOrigin::CommonDir {
+                    via: target.clone(),
+                },
+            );
+        }
         push_unique(
             out,
-            canonical_or(&resolved),
-            GitDirOrigin::CommonDir {
-                via: target.clone(),
+            target,
+            GitDirOrigin::Pointer {
+                dot_git_file: dot_git.clone(),
             },
         );
     }
-    push_unique(
-        out,
-        target,
-        GitDirOrigin::Pointer {
-            dot_git_file: dot_git,
-        },
-    );
-}
-
-/// Parse the body of a `.git` pointer file. Pure — split out so the pointer
-/// grammar is testable without touching the filesystem.
-fn parse_gitdir_pointer(contents: &str, git_file_parent: &Path) -> Option<PathBuf> {
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("gitdir:") {
-            return resolve_relative(rest.trim(), git_file_parent);
-        }
-    }
-    None
 }
 
 /// Resolve a possibly-relative git pointer target against `base`.
@@ -1453,20 +1443,39 @@ mod tests {
         assert!(globs.contains(&ws().join(".ahma")), "{globs:?}");
     }
 
+    /// The deny side follows every reading of a pointer (SPEC R-HANDOFF.2.1):
+    /// spellings git refuses are still defended, and so is the directory git
+    /// really follows when the pointer keeps trailing spaces.
     #[test]
-    fn gitdir_pointer_parses_absolute_and_relative_targets() {
-        let base = test_abs(&["work", "repo"]);
-        let abs_target = test_abs(&["elsewhere", "git-alt"]);
-        let parsed = parse_gitdir_pointer(&format!("gitdir: {}\n", abs_target.display()), &base)
-            .expect("absolute pointer parses");
-        assert_eq!(parsed, abs_target);
-
-        let rel = parse_gitdir_pointer("gitdir: ../shared/.git\n", &base)
-            .expect("relative pointer parses");
-        assert_eq!(rel, test_abs(&["work", "shared", ".git"]));
-
-        assert_eq!(parse_gitdir_pointer("not a pointer", &base), None);
-        assert_eq!(parse_gitdir_pointer("gitdir:", &base), None);
+    fn resolve_git_dirs_follows_every_reading_of_a_pointer() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("git-alt/hooks")).unwrap();
+        let alt = dunce::canonicalize(root.join("git-alt")).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: git-alt\n").unwrap();
+        assert!(
+            resolve_git_dirs(root).contains(&alt),
+            "the pointer git writes"
+        );
+        for refused in [
+            "  gitdir: git-alt\n",
+            "gitdir:git-alt\n",
+            "# moved\ngitdir: git-alt\n",
+        ] {
+            std::fs::write(root.join(".git"), refused).unwrap();
+            let dirs = resolve_git_dirs(root);
+            assert!(dirs.contains(&alt), "{refused:?}: {dirs:?}");
+        }
+        // Windows refuses a directory name ending in spaces, so there no pointer
+        // can name one.
+        #[cfg(not(windows))]
+        {
+            std::fs::create_dir_all(root.join("git-alt  /hooks")).unwrap();
+            let spaced = dunce::canonicalize(root.join("git-alt  ")).unwrap();
+            std::fs::write(root.join(".git"), "gitdir: git-alt  \n").unwrap();
+            let dirs = resolve_git_dirs(root);
+            assert!(dirs.contains(&spaced) && dirs.contains(&alt), "{dirs:?}");
+        }
     }
 
     #[test]
