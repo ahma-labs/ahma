@@ -502,7 +502,9 @@ pub fn refusal_line(target: &LinkTarget, retry_asks: bool) -> String {
 /// the agent can hand its path to the human.
 pub fn not_a_link_line(raw: &str, why: &NotALink) -> String {
     let shown: String = raw.chars().take(200).collect();
-    let tail = if std::path::Path::new(raw).is_absolute() || raw.starts_with("file:") {
+    // `has_root`, not `is_absolute`: on Windows `/Users/x` has a root but no drive, and
+    // is still a file the human can open.
+    let tail = if std::path::Path::new(raw).has_root() || raw.starts_with("file:") {
         " It is a local file: tell the human its path, and they can open it."
     } else {
         " A file or an app is the human's to open."
