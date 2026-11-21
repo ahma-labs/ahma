@@ -373,7 +373,7 @@ async fn resolve_egress_approval(
                 Some(file) => match ahma_common::net_approval::persist_net_allow(
                     &file,
                     &domain,
-                    "egress-proxy",
+                    &ahma_common::approver::ApproverSurface::EgressProxy,
                 ) {
                     Ok(true) => info!(
                         domain = %domain,

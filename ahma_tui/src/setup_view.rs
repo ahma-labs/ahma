@@ -525,13 +525,15 @@ impl SetupView {
         let Some(env) = self.env.clone() else { return };
         let items = self.plan.items.clone();
         let now = ahma_common::timestamp::rfc3339_local_now();
+        // Applying a proposal is the terminal's alone (SPEC R-GUI.9).
+        let surface = ahma_common::approver::ApproverSurface::Tui;
         let mut outcomes = Vec::new();
         let mut declined: Vec<&Proposal> = Vec::new();
         for item in &items {
             let title = item.proposal.title.clone();
             match self.answer_of(&item.proposal.change.identity()) {
                 Some(Answer::Yes) => {
-                    outcomes.push(match apply(&env, &item.proposal, "tui", &now) {
+                    outcomes.push(match apply(&env, &item.proposal, &surface, &now) {
                         Ok(done) => Outcome::Applied {
                             title,
                             done,

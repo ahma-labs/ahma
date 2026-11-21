@@ -2526,13 +2526,19 @@ impl AhmaSettings {
     }
 
     /// [`Self::update`], then one audit record per setting the change altered
-    /// (SPEC R-CFG10.5). `surface` names who changed it (`tui`, `setup`) and `at`
-    /// is the caller's RFC 3339 timestamp, as for every audit entry.
+    /// (SPEC R-CFG10.5). `surface` names who changed it ([`ApproverSurface::Tui`])
+    /// and `at` is the caller's RFC 3339 timestamp, as for every audit entry.
+    ///
+    /// [`ApproverSurface::Tui`]: crate::approver::ApproverSurface::Tui
     ///
     /// Ledger keys are skipped: each has a dedicated writer that audits it with
     /// the richer record (path, access, tier, risk), and a second line here
     /// would only double it.
-    pub fn update_audited(surface: &str, at: &str, change: impl FnOnce(&mut Self)) -> Result<Self> {
+    pub fn update_audited(
+        surface: &crate::approver::ApproverSurface,
+        at: &str,
+        change: impl FnOnce(&mut Self),
+    ) -> Result<Self> {
         let mut before = None;
         let after = Self::update(|s| {
             before = Some(s.clone());

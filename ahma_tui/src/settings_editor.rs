@@ -482,7 +482,7 @@ impl SettingsEditor {
         let edited = self.settings.clone();
         // Audited (SPEC R-CFG10.5): each key the panel changed gets a record.
         let saved = AhmaSettings::update_audited(
-            "tui",
+            &ahma_common::approver::ApproverSurface::Tui,
             &ahma_common::timestamp::rfc3339_local_now(),
             |on_disk| {
                 // The ledger keys of `[sandbox]` (grants: scopes, SSH

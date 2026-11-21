@@ -419,7 +419,7 @@ mod tests {
                 granted_by: Some("test".into()),
                 owner_pid: None,
             },
-            "test",
+            &ahma_common::approver::ApproverSurface::Cli,
         )
         .unwrap();
         assert_eq!(consent.decide(&request(github())).await, Decision::Allow);

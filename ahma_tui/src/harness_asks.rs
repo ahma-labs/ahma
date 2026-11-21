@@ -20,9 +20,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use ahma_common::approver::ApproverSurface;
 use ahma_common::config::{PersistentScope, ScopeAccess};
 use ahma_common::harness_asks::{self, Question, WorkspaceAsks};
-use ahma_common::hub::Surface;
 use ahma_common::permissions::{AuditAction, GrantKind, GrantTier};
 use ahma_common::scope_grant::{
     GrantContext, GrantDecision, GrantEvidence, GrantReason, GrantRequester, ScopeGrantRequest,
@@ -178,7 +178,11 @@ pub fn pending_from(
 /// harness dialog does not ask it too. Returns the line for the TUI's log.
 /// `surface` is where the human answered (`ahma tui`, `ahma web`, `ahma
 /// desktop`): what the audit and the grant record (SPEC R-GUI.7).
-pub fn answer(ask: &HarnessAsk, decision: GrantDecision, surface: Surface) -> Result<String> {
+pub fn answer(
+    ask: &HarnessAsk,
+    decision: GrantDecision,
+    surface: &ApproverSurface,
+) -> Result<String> {
     let dir = harness_asks::default_dir().context("ahma's runtime directory is unknown")?;
     answer_in(
         &dir,
@@ -205,7 +209,7 @@ pub fn answer_in(
     settings_file: Option<&Path>,
     ask: &HarnessAsk,
     decision: GrantDecision,
-    surface: Surface,
+    surface: &ApproverSurface,
     now: u64,
 ) -> Result<String> {
     let decision = decision.within_offer(GrantReason::HarnessRefusal);
@@ -240,7 +244,7 @@ pub fn answer_in(
                         granted_by: Some("terminal hook refusal".into()),
                         granted_at: Some(ahma_common::timestamp::local_date_today()),
                         note: None,
-                        surface: surface.as_str(),
+                        surface,
                         live_scopes: std::slice::from_ref(&ask.workspace),
                         workspace: Some(&ask.workspace),
                         expires_at: (tier == GrantTier::Lease)
@@ -266,7 +270,7 @@ pub fn answer_in(
                     access,
                     Some(&ask.workspace),
                     ask.harness_pid,
-                    surface.as_str(),
+                    &surface.to_string(),
                 );
                 audit(
                     ask,
@@ -292,7 +296,7 @@ fn audit(
     action: AuditAction,
     access: Option<ScopeAccess>,
     tier: GrantTier,
-    surface: Surface,
+    surface: &ApproverSurface,
 ) {
     ahma_common::permissions::append_audit(
         &ahma_common::permissions::AuditEntry::new(
@@ -303,7 +307,7 @@ fn audit(
             tier,
         )
         .with_access_opt(access.map(|a| a.short().to_string()))
-        .with_surface(surface.as_str().to_string())
+        .with_surface(surface)
         .with_request(ask.decision_id(), None, None),
     );
 }
@@ -421,7 +425,15 @@ mod tests {
     fn a_deny_is_recorded_so_the_dialog_does_not_ask() {
         let f = fixture();
         let ask = waiting(&f, &nothing).remove(0);
-        let line = answer_in(&f.dir, None, &ask, GrantDecision::Deny, Surface::Tui, 201).unwrap();
+        let line = answer_in(
+            &f.dir,
+            None,
+            &ask,
+            GrantDecision::Deny,
+            &ApproverSurface::Tui,
+            201,
+        )
+        .unwrap();
         assert!(line.starts_with("Denied"), "{line}");
         assert!(waiting(&f, &nothing).is_empty());
         let asks = harness_asks::load(&f.dir, &f.ws, 202);
@@ -450,7 +462,7 @@ mod tests {
             None,
             &ask,
             GrantDecision::GrantRwSession,
-            Surface::Web,
+            &ApproverSurface::Web,
             201,
         )
         .unwrap();
@@ -473,7 +485,7 @@ mod tests {
             None,
             &ask,
             GrantDecision::GrantRwSession,
-            Surface::Tui,
+            &ApproverSurface::Tui,
             201,
         )
         .unwrap();
@@ -499,7 +511,7 @@ mod tests {
             Some(&settings),
             &ask,
             GrantDecision::GrantRo,
-            Surface::Tui,
+            &ApproverSurface::Tui,
             201,
         )
         .unwrap();
@@ -526,7 +538,7 @@ mod tests {
             None,
             &ask,
             GrantDecision::GrantRwOnce,
-            Surface::Tui,
+            &ApproverSurface::Tui,
             201,
         )
         .unwrap();

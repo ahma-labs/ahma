@@ -38,6 +38,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::approver::ApproverSurface;
 use crate::config::AhmaSettings;
 
 /// A request to approve outbound subprocess egress to `domain`.
@@ -235,9 +236,13 @@ impl NetApprovalCoordinator {
 /// save. The settings file lives outside every sandbox scope, so a sandboxed
 /// subprocess cannot reach it. Returns `true` if the domain was newly added,
 /// `false` if it was already present.
-/// Every entry this adds is audited here, with the `surface` that asked
+/// Every entry this adds is audited here, with the `surface` that answered
 /// (SPEC R-PERM.2.1), so no caller can write the allow list unrecorded.
-pub fn persist_net_allow(settings_file: &Path, domain: &str, surface: &str) -> Result<bool> {
+pub fn persist_net_allow(
+    settings_file: &Path,
+    domain: &str,
+    surface: &ApproverSurface,
+) -> Result<bool> {
     let domain = norm(domain);
     let _settings_lock = crate::config::lock_settings_for_write(settings_file)?;
     let mut settings = AhmaSettings::load_from_result(settings_file)
@@ -268,7 +273,7 @@ pub fn persist_net_allow(settings_file: &Path, domain: &str, surface: &str) -> R
             domain,
             crate::permissions::GrantTier::Always,
         )
-        .with_surface(surface.to_string()),
+        .with_surface(surface),
     );
     Ok(true)
 }
@@ -394,8 +399,8 @@ mod tests {
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
         let file = home.path().join(".ahma").join("settings.toml");
-        assert!(persist_net_allow(&file, "example.org", "egress-proxy").unwrap());
-        assert!(!persist_net_allow(&file, "example.org", "cli").unwrap());
+        assert!(persist_net_allow(&file, "example.org", &ApproverSurface::EgressProxy).unwrap());
+        assert!(!persist_net_allow(&file, "example.org", &ApproverSurface::Cli).unwrap());
         let audit =
             std::fs::read_to_string(home.path().join(".ahma").join("permissions-audit.jsonl"))
                 .expect("the grant is audited");
@@ -415,11 +420,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let file = home.path().join(".ahma").join("settings.toml");
 
-        assert!(persist_net_allow(&file, "Crates.IO", "test").unwrap());
+        assert!(persist_net_allow(&file, "Crates.IO", &ApproverSurface::Cli).unwrap());
         let reloaded = AhmaSettings::load_from_result(&file).unwrap();
         assert_eq!(reloaded.network.allow, vec!["crates.io".to_string()]);
 
-        assert!(!persist_net_allow(&file, "crates.io", "test").unwrap());
+        assert!(!persist_net_allow(&file, "crates.io", &ApproverSurface::Cli).unwrap());
         let reloaded = AhmaSettings::load_from_result(&file).unwrap();
         assert_eq!(
             reloaded.network.allow.len(),
@@ -436,7 +441,7 @@ mod tests {
         let file = dir.join("settings.toml");
         std::fs::write(&file, "this is : not valid toml [[[").unwrap();
         assert!(
-            persist_net_allow(&file, "crates.io", "test").is_err(),
+            persist_net_allow(&file, "crates.io", &ApproverSurface::Cli).is_err(),
             "a corrupt settings file must not be silently overwritten"
         );
         assert!(

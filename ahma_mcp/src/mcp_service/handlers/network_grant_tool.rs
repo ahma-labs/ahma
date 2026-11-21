@@ -31,6 +31,7 @@ use crate::AhmaMcpService;
 use crate::egress::host_pattern::{HostPattern, HostPatternError};
 use crate::egress::net_prompt::{NetApprovalForm, parse_answer};
 use crate::mcp_service::schema;
+use ahma_common::approver::ApproverSurface;
 use ahma_common::config::settings_path;
 use ahma_common::net_approval::{NetApprovalDecision, persist_net_allow};
 use ahma_common::permissions::{AuditAction, AuditEntry, GrantKind, GrantTier, append_audit};
@@ -38,6 +39,9 @@ use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::path::Path;
 use std::sync::Arc;
+
+/// Who an answer to `network_grant`'s own question is recorded as (SPEC R-GUI.7).
+const NETWORK_GRANT_SURFACE: ApproverSurface = ApproverSurface::McpTool("network_grant");
 
 /// The risk tier of a proposed network egress grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,7 +261,7 @@ impl AhmaMcpService {
         // Only an `always` answer is written (SPEC R-PERM.2); every allow
         // applies to the live session now.
         let newly_added = if tier == GrantTier::Always {
-            persist_net_allow(&settings_file, &host, "mcp:network_grant").map_err(|e| {
+            persist_net_allow(&settings_file, &host, &NETWORK_GRANT_SURFACE).map_err(|e| {
                 common::mcp_internal(format!(
                     "failed to persist network grant to {}: {e:#}",
                     settings_file.display()
@@ -281,7 +285,7 @@ impl AhmaMcpService {
                     &host,
                     tier,
                 )
-                .with_surface("mcp:network_grant"),
+                .with_surface(&NETWORK_GRANT_SURFACE),
             );
         }
         let _ = note;

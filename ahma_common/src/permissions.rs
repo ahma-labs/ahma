@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::approver::ApproverSurface;
 use crate::config::{AhmaSettings, ahma_home_dir};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -660,17 +661,21 @@ impl LogTargetSettings {
 /// does not parse is refused rather than overwritten, the write is atomic, and
 /// grants another surface recorded since this process started are kept.
 /// `target` should be canonical — the live-log check compares by equality.
-/// `surface` names who asked (`mcp:logs_approve`); its part after `mcp:` is
-/// recorded as `granted_by`. Returns `true` when the target was newly added; a
-/// re-approval refreshes provenance and is not audited twice.
+/// `surface` names who asked (`mcp:logs_approve`); the tool an
+/// [`ApproverSurface::McpTool`] names is recorded as `granted_by`. Returns
+/// `true` when the target was newly added; a re-approval refreshes provenance
+/// and is not audited twice.
 pub fn persist_log_target(
     settings_file: &Path,
     workspace: &Path,
     target: &Path,
-    surface: &str,
+    surface: &ApproverSurface,
 ) -> anyhow::Result<bool> {
-    let granted_by = surface.strip_prefix("mcp:").unwrap_or(surface);
-    persist_log_target_as(settings_file, workspace, target, granted_by, surface)
+    let granted_by = match surface {
+        ApproverSurface::McpTool(tool) => (*tool).to_string(),
+        other => other.to_string(),
+    };
+    persist_log_target_as(settings_file, workspace, target, &granted_by, surface)
 }
 
 /// [`persist_log_target`] with the provenance spelled out: `granted_by` is the
@@ -687,7 +692,7 @@ pub fn persist_log_target_as(
     workspace: &Path,
     target: &Path,
     granted_by: &str,
-    surface: &str,
+    surface: &ApproverSurface,
 ) -> anyhow::Result<bool> {
     if let Some(why) = crate::scope_grant::refusal_reason(target) {
         anyhow::bail!(
@@ -720,7 +725,7 @@ pub fn persist_log_target_as(
                 GrantTier::Always,
             )
             .with_access("ro")
-            .with_surface(surface.to_string()),
+            .with_surface(surface),
         );
     }
     Ok(added)
@@ -1311,9 +1316,10 @@ impl AuditEntry {
         self
     }
 
-    /// The surface the answer came from (`cli`, `tui`, `harness`, …).
-    pub fn with_surface(mut self, surface: impl Into<String>) -> Self {
-        self.surface = Some(surface.into());
+    /// Who gave the answer ([`ApproverSurface`], SPEC R-GUI.7): the only way a
+    /// writer names one, so a record never carries a name outside that set.
+    pub fn with_surface(mut self, surface: &ApproverSurface) -> Self {
+        self.surface = Some(surface.to_string());
         self
     }
 
@@ -1380,12 +1386,13 @@ pub fn append_audit(entry: &AuditEntry) {
 
 /// The audit entry for one setting changed (SPEC R-CFG10.5): `subject` is the
 /// dotted key, `access` reads `<file>: <before> -> <after>` with a secret key's
-/// values redacted and long values cut, and `surface` is who changed it (`cli`,
-/// `tui`, `setup`). An unset (back to the default) is a `Revoke`, any other
-/// change a `Grant`; the `setting` kind says which it really is.
+/// values redacted and long values cut, and `surface` is who changed it
+/// ([`ApproverSurface::Cli`], [`ApproverSurface::Tui`]). An unset (back to the
+/// default) is a `Revoke`, any other change a `Grant`; the `setting` kind says
+/// which it really is.
 pub fn setting_audit_entry(
     at: &str,
-    surface: &str,
+    surface: &ApproverSurface,
     file: &str,
     key: &str,
     before: Option<&str>,
@@ -1412,7 +1419,7 @@ pub fn setting_audit_entry(
             shown(key, &text(before)),
             shown(key, &text(after))
         ))
-        .with_surface(surface.to_string())
+        .with_surface(surface)
 }
 
 #[cfg(test)]
@@ -1431,7 +1438,7 @@ mod tests {
             GrantTier::Session,
         )
         .with_access("rw")
-        .with_surface("cli");
+        .with_surface(&ApproverSurface::Cli);
         assert_eq!(
             serde_json::to_string(&full).unwrap(),
             r#"{"at":"t","action":"grant","kind":"fs-scope","subject":"/x","access":"rw","tier":"session","surface":"cli"}"#
@@ -1444,7 +1451,7 @@ mod tests {
             GrantTier::Always,
         )
         .with_access_opt(None::<String>)
-        .with_surface("doctor");
+        .with_surface(&ApproverSurface::DOCTOR);
         assert_eq!(
             serde_json::to_string(&bare).unwrap(),
             r#"{"at":"t","action":"revoke","kind":"tool","subject":"*","tier":"always","surface":"doctor"}"#
@@ -1482,7 +1489,7 @@ mod tests {
     fn a_setting_change_is_audited_redacted_and_never_listed_as_a_grant() {
         let e = setting_audit_entry(
             "2026-11-01T12:00:00+00:00",
-            "cli",
+            &ApproverSurface::Cli,
             "project",
             "tools.timeout_secs",
             Some("1800"),
@@ -1500,7 +1507,7 @@ mod tests {
 
         let unset = setting_audit_entry(
             "t",
-            "tui",
+            &ApproverSurface::Tui,
             "user",
             "tools.context_length",
             Some("8192"),
@@ -1510,7 +1517,7 @@ mod tests {
 
         let secret = setting_audit_entry(
             "t",
-            "cli",
+            &ApproverSurface::Cli,
             "user",
             "auth.require_token",
             Some("\"hunter2\""),
@@ -1523,7 +1530,14 @@ mod tests {
         );
 
         let long = "x".repeat(500);
-        let cut = setting_audit_entry("t", "cli", "user", "instance.label", Some("a"), Some(&long));
+        let cut = setting_audit_entry(
+            "t",
+            &ApproverSurface::Cli,
+            "user",
+            "instance.label",
+            Some("a"),
+            Some(&long),
+        );
         assert!(cut.access.unwrap().chars().count() < 200);
 
         assert!(!GrantKind::Setting.is_persisted());
@@ -1904,9 +1918,23 @@ mod tests {
         seeded.network.allow.push("crates.io".into());
         seeded.save_to(&settings_file).unwrap();
 
-        assert!(persist_log_target(&settings_file, &ws, &target, "mcp:logs_approve").unwrap());
         assert!(
-            !persist_log_target(&settings_file, &ws, &target, "mcp:logs_approve").unwrap(),
+            persist_log_target(
+                &settings_file,
+                &ws,
+                &target,
+                &ApproverSurface::McpTool("logs_approve"),
+            )
+            .unwrap()
+        );
+        assert!(
+            !persist_log_target(
+                &settings_file,
+                &ws,
+                &target,
+                &ApproverSurface::McpTool("logs_approve"),
+            )
+            .unwrap(),
             "approving the same target twice is a no-op"
         );
 
@@ -1944,7 +1972,7 @@ mod tests {
             home.path(),
             &key_file,
             "logs_approve",
-            "harness",
+            &ApproverSurface::Harness,
         );
         unsafe { std::env::remove_var("AHMA_TEST_HOME") };
         assert!(result.is_err(), "a credential file is never a log target");
@@ -1964,7 +1992,14 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let target = home.path().join("outside.log");
         assert!(
-            persist_log_target_as(&settings_file, &ws, &target, "logs_approve", "harness").unwrap()
+            persist_log_target_as(
+                &settings_file,
+                &ws,
+                &target,
+                "logs_approve",
+                &ApproverSurface::Harness,
+            )
+            .unwrap()
         );
         let s = AhmaSettings::load_from_result(&settings_file).unwrap();
         let entry = &s.log_targets.approvals[0];
@@ -1979,7 +2014,13 @@ mod tests {
         std::fs::write(&settings_file, "[permissions\nbroken").unwrap();
 
         assert!(
-            persist_log_target(&settings_file, home.path(), Path::new("/x.log"), "mcp:t").is_err()
+            persist_log_target(
+                &settings_file,
+                home.path(),
+                Path::new("/x.log"),
+                &ApproverSurface::McpTool("t"),
+            )
+            .is_err()
         );
         assert_eq!(
             std::fs::read_to_string(&settings_file).unwrap(),
@@ -2025,7 +2066,7 @@ mod tests {
             GrantTier::Always,
         )
         .with_access("ro")
-        .with_surface("mcp:logs_approve");
+        .with_surface(&ApproverSurface::McpTool("logs_approve"));
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"kind\":\"log-target\""), "{json}");
         let back: AuditEntry = serde_json::from_str(&json).unwrap();
@@ -2047,7 +2088,7 @@ mod tests {
                 GrantTier::Always,
             )
             .with_access("rw")
-            .with_surface("cli"),
+            .with_surface(&ApproverSurface::Cli),
         )
         .unwrap();
         append_audit_at(
@@ -2059,7 +2100,7 @@ mod tests {
                 "cargo_build",
                 GrantTier::Always,
             )
-            .with_surface("tui"),
+            .with_surface(&ApproverSurface::Tui),
         )
         .unwrap();
 
@@ -2145,7 +2186,7 @@ mod audit_context_tests {
             GrantTier::Session,
         )
         .with_access("rw")
-        .with_surface("tui")
+        .with_surface(&ApproverSurface::Tui)
         .with_request("d1", Some(1_700), Some("high"));
         assert_eq!(e.request_id.as_deref(), Some("d1"));
         assert_eq!(e.time_to_decision_ms, Some(1_700));

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::approver::ApproverSurface;
 use crate::config::{AhmaSettings, settings_path};
 use crate::permissions::{
     AuditAction, AuditEntry, GrantKind, GrantTier, TRUSTED_WORKSPACE_TOOL, append_audit,
@@ -197,7 +198,7 @@ fn apply_remove_missing_scopes(paths: &[PathBuf], now: &str) -> anyhow::Result<S
                 path.display().to_string(),
                 GrantTier::Always,
             )
-            .with_surface("doctor"),
+            .with_surface(&ApproverSurface::DOCTOR),
         );
     }
     Ok(format!("Removed {} granted folder(s)", paths.len()))
@@ -227,7 +228,9 @@ fn apply_revoke_scopes(keys: &[(PathBuf, PathBuf)], now: &str) -> anyhow::Result
                 path.display().to_string(),
                 GrantTier::Always,
             )
-            .with_surface(format!("doctor: from {}", workspace.display())),
+            .with_surface(&ApproverSurface::Doctor {
+                detail: Some(format!("from {}", workspace.display())),
+            }),
         );
     }
     Ok(format!(
@@ -251,7 +254,9 @@ fn apply_forget_missing_workspaces(paths: &[PathBuf], now: &str) -> anyhow::Resu
                 "*",
                 GrantTier::Always,
             )
-            .with_surface(format!("doctor: {}", path.display())),
+            .with_surface(&ApproverSurface::Doctor {
+                detail: Some(path.display().to_string()),
+            }),
         );
     }
     Ok(format!("Forgot approvals for {} folder(s)", paths.len()))
@@ -285,7 +290,7 @@ fn apply_repair_antigravity_permissions(
             "antigravity-permissions",
             GrantTier::Always,
         )
-        .with_surface("doctor"),
+        .with_surface(&ApproverSurface::DOCTOR),
     );
     Ok(format!(
         "Cleaned Antigravity permissions in {files_cleaned} file(s)"
@@ -3181,7 +3186,7 @@ mod decision_habit_tests {
             GrantTier::Session,
         )
         .with_access("rw")
-        .with_surface("tui")
+        .with_surface(&ApproverSurface::Tui)
         .with_request("d", Some(ms), None)
         .with_advice(followed.map(|_| "advisor: session".into()), followed)
     }

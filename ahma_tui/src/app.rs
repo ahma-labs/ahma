@@ -407,7 +407,7 @@ fn try_approve_log_link(
         std::path::Path::new(&info.path),
         info.symlink_target.as_deref().map(std::path::Path::new),
         "ahma tui",
-        "tui",
+        &ahma_common::approver::ApproverSurface::Tui,
     ) {
         Ok((target, _newly)) => {
             if let Some(pos) = state.log_files.iter().position(|f| f.name == active_file) {
@@ -2869,7 +2869,8 @@ pub(crate) fn resolve_scope_grant(
     // A question read from the terminal-hook records has no instance behind
     // it: the TUI applies the answer itself (SPEC R-PERM.10(e)).
     if let Some(ask) = &gate.harness {
-        let (level, message) = match crate::harness_asks::answer(ask, decision, state.surface) {
+        let surface = ahma_common::approver::ApproverSurface::from(state.surface);
+        let (level, message) = match crate::harness_asks::answer(ask, decision, &surface) {
             Ok(line) => (
                 if decision.within_offer(gate.reason) == GrantDecision::Deny {
                     LogLevel::Warn
@@ -3528,7 +3529,7 @@ fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
     state.token_prefs.minimize_tokens = Some(desired);
 
     let saved = ahma_common::config::AhmaSettings::update_audited(
-        "tui",
+        &ahma_common::approver::ApproverSurface::Tui,
         &ahma_common::timestamp::rfc3339_local_now(),
         |s| s.tools.minimize_tokens = desired,
     );
@@ -3558,7 +3559,7 @@ fn set_execution_mode(
     mode: ahma_common::config::ExecutionPolicy,
 ) {
     match ahma_common::config::AhmaSettings::update_audited(
-        "tui",
+        &ahma_common::approver::ApproverSurface::Tui,
         &ahma_common::timestamp::rfc3339_local_now(),
         |s| s.tools.execution_mode = mode,
     ) {

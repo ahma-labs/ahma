@@ -15,6 +15,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use ahma_common::approver::ApproverSurface;
 use ahma_common::config::{
     AhmaSettings, ScopeAccess, SettingsFile, SettingsTier, ledger_key_command, settings_tier,
     undo_command,
@@ -646,8 +647,14 @@ fn validate_grant(
 /// Apply one proposal. Validates again first (the files may have changed since
 /// the plan was shown), then writes through the existing audited writer and
 /// returns a one-line report. Call only after the human's `y` for **this**
-/// proposal. `surface` is who asked (`cli`, `tui`); `now` is RFC 3339.
-pub fn apply(env: &Env, proposal: &Proposal, surface: &str, now: &str) -> Result<String> {
+/// proposal. `surface` is who answered ([`ApproverSurface::Cli`],
+/// [`ApproverSurface::Tui`]); `now` is RFC 3339.
+pub fn apply(
+    env: &Env,
+    proposal: &Proposal,
+    surface: &ApproverSurface,
+    now: &str,
+) -> Result<String> {
     let v = validate(env, proposal).map_err(|r| anyhow::anyhow!("{r}"))?;
     if v.already {
         return Ok(format!("already in effect: {}", v.preview));
@@ -712,7 +719,7 @@ fn write_setting(
     file: SettingsFile,
     key: &str,
     raw: Option<&str>,
-    surface: &str,
+    surface: &ApproverSurface,
     now: &str,
 ) -> Result<String> {
     let path = env.file(file).map_err(|r| anyhow::anyhow!("{r}"))?;
@@ -1654,7 +1661,7 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
         stdin.lock().read_line(&mut answer)?;
         if answer.trim().eq_ignore_ascii_case("y") {
             let now = ahma_common::timestamp::rfc3339_local_now();
-            match apply(&env, &item.proposal, "cli", &now) {
+            match apply(&env, &item.proposal, &ApproverSurface::Cli, &now) {
                 Ok(done) => println!("Done: {done}"),
                 Err(e) => println!("Could not apply: {e:#}"),
             }
@@ -1804,13 +1811,25 @@ mod tests {
         let b = add("scripts/b.sh");
         assert!(!validate(&f.env, &a).unwrap().already);
         assert!(!validate(&f.env, &b).unwrap().already);
-        apply(&f.env, &a, "cli", "2026-11-01T00:00:00+00:00").unwrap();
-        apply(&f.env, &b, "cli", "2026-11-01T00:00:00+00:00").unwrap();
+        apply(
+            &f.env,
+            &a,
+            &ApproverSurface::Cli,
+            "2026-11-01T00:00:00+00:00",
+        )
+        .unwrap();
+        apply(
+            &f.env,
+            &b,
+            &ApproverSurface::Cli,
+            "2026-11-01T00:00:00+00:00",
+        )
+        .unwrap();
         let got = AhmaSettings::load_from_checked(&f.env.user_file).unwrap();
         assert_eq!(got.tools.source_readers, ["scripts/a.sh", "scripts/b.sh"]);
         // Applying again is a no-op, and a plan of the same proposals is empty.
         assert!(
-            apply(&f.env, &a, "cli", "t")
+            apply(&f.env, &a, &ApproverSurface::Cli, "t")
                 .unwrap()
                 .contains("already in effect")
         );
@@ -1970,7 +1989,13 @@ mod tests {
         });
         let v = validate(&f.env, &p).unwrap();
         assert!(v.preview.contains("read-only"), "{}", v.preview);
-        apply(&f.env, &p, "cli", "2026-11-01T00:00:00+00:00").unwrap();
+        apply(
+            &f.env,
+            &p,
+            &ApproverSurface::Cli,
+            "2026-11-01T00:00:00+00:00",
+        )
+        .unwrap();
         let got = AhmaSettings::load_from_checked(&f.env.user_file).unwrap();
         let scope = got.sandbox.persistent_scopes.first().expect("a grant");
         assert_eq!(scope.access, ScopeAccess::Ro);
@@ -2022,7 +2047,13 @@ mod tests {
         assert!(text.contains("undo:"), "{text}");
 
         let item = plan.items[0].proposal.clone();
-        apply(&f.env, &item, "cli", "2026-11-01T00:00:00+00:00").unwrap();
+        apply(
+            &f.env,
+            &item,
+            &ApproverSurface::Cli,
+            "2026-11-01T00:00:00+00:00",
+        )
+        .unwrap();
         let again = build_plan(&f.env, Vec::new(), false);
         assert!(again.is_empty(), "{}", render_plan(&again));
         assert_eq!(
@@ -2275,7 +2306,13 @@ mod tests {
             path: granted.path().to_path_buf(),
             read_only: true,
         });
-        apply(&f.env, &p, "cli", "2026-11-01T00:00:00+00:00").unwrap();
+        apply(
+            &f.env,
+            &p,
+            &ApproverSurface::Cli,
+            "2026-11-01T00:00:00+00:00",
+        )
+        .unwrap();
         let snap = snapshot(&f.env);
         let row = snap
             .allow

@@ -12,6 +12,7 @@
 
 use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
+use ahma_common::approver::ApproverSurface;
 use ahma_common::config::settings_path;
 use ahma_common::hub::{
     ClientMsg, HubChatMessage, HubEvent, HubMsg, HubRelay, HubStream, OpStatus as WireStatus,
@@ -349,7 +350,7 @@ async fn recv_optional_web(
 /// Persist an approved `always` domain to `~/.ahma/settings.toml`. The session
 /// grant was already applied in-memory by [`WebApprovalCoordinator::resolve`]; this
 /// makes it survive restarts. Best-effort: a write failure is logged, not fatal.
-fn persist_resolved_web_allow(domain: &str, surface: &str) {
+fn persist_resolved_web_allow(domain: &str, surface: &ApproverSurface) {
     match settings_path() {
         Some(file) => match persist_web_allow(&file, domain, surface) {
             Ok(true) => info!(domain, "web approval persisted to [web].always_allow"),
@@ -991,7 +992,7 @@ async fn resolve_scope_grant(
     grant_coordinator: Option<&Arc<GrantCoordinator>>,
     sandbox: Option<&Arc<crate::sandbox::Sandbox>>,
     advice: (Option<String>, Option<bool>),
-    surface: &'static str,
+    surface: ApproverSurface,
 ) {
     debug!(
         "hub_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?} \
@@ -1000,7 +1001,7 @@ async fn resolve_scope_grant(
     let Some(coord) = grant_coordinator else {
         return;
     };
-    match coord.resolve(&decision_id, decision) {
+    match coord.resolve(&decision_id, decision, &surface) {
         // `logs_approve`'s question: a `log-target` grant, never an `fs-scope`
         // one — the same write path the harness answer takes (SPEC R9.2).
         GrantResolveOutcome::Persist {
@@ -1016,7 +1017,7 @@ async fn resolve_scope_grant(
                 &path,
                 tier,
                 tool.as_deref(),
-                surface,
+                &surface,
                 &decision_id,
                 time_to_decision_ms,
             ) {
@@ -1041,7 +1042,7 @@ async fn resolve_scope_grant(
                 tier,
                 tool,
                 default_granted_by: "scope-grant prompt",
-                surface,
+                surface: &surface,
                 decision_id: &decision_id,
                 time_to_decision_ms,
                 risk_class: None,
@@ -1061,7 +1062,7 @@ async fn resolve_scope_grant(
                     path.display().to_string(),
                     ahma_common::permissions::GrantTier::Session,
                 )
-                .with_surface(surface.to_string())
+                .with_surface(&surface)
                 .with_request(&decision_id, time_to_decision_ms, None)
                 .with_advice(advice.0.clone(), advice.1),
             );
@@ -1069,11 +1070,9 @@ async fn resolve_scope_grant(
         GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => return,
     }
     // The answer travels with it, so the hub can settle every other waiting
-    // copy of this question (SPEC R-PERM.3.8).
-    let answer = coord.take_answered(&decision_id).map(|mut answered| {
-        answered.surface = Some(surface.to_string());
-        answered
-    });
+    // copy of this question (SPEC R-PERM.3.8); `resolve` recorded who gave
+    // it, so each copy is audited under the same surface (R-GUI.7).
+    let answer = coord.take_answered(&decision_id);
     let _ = send_msg(
         writer,
         &ClientMsg::ScopeGrantResolved {
@@ -1128,7 +1127,7 @@ async fn resolve_web_approval(
     decision: WebApprovalDecision,
     writer: &mut tokio::io::WriteHalf<HubStream>,
     web_coordinator: Option<&Arc<WebApprovalCoordinator>>,
-    surface: &'static str,
+    surface: ApproverSurface,
 ) {
     debug!(
         "hub_reporter: received SubmitWebApproval id={decision_id} decision={decision:?} \
@@ -1138,7 +1137,7 @@ async fn resolve_web_approval(
         return;
     };
     match coord.resolve(&decision_id, decision) {
-        WebResolveOutcome::Persist { domain } => persist_resolved_web_allow(&domain, surface),
+        WebResolveOutcome::Persist { domain } => persist_resolved_web_allow(&domain, &surface),
         WebResolveOutcome::AllowOnce { .. }
         | WebResolveOutcome::AllowSession { .. }
         | WebResolveOutcome::Denied { .. } => {}
@@ -2109,7 +2108,7 @@ mod tests {
                     tier: ahma_common::permissions::GrantTier::Always,
                     tool: Some("sccache".to_string()),
                     default_granted_by: "scope-grant prompt",
-                    surface: "tui",
+                    surface: &ApproverSurface::Tui,
                     decision_id: "test-decision",
                     time_to_decision_ms: None,
                     risk_class: None,
@@ -2147,7 +2146,7 @@ mod tests {
                     tier: ahma_common::permissions::GrantTier::Always,
                     tool: None,
                     default_granted_by: "scope-grant prompt",
-                    surface: "tui",
+                    surface: &ApproverSurface::Tui,
                     decision_id: "test-decision",
                     time_to_decision_ms: None,
                     risk_class: None,
@@ -2187,7 +2186,7 @@ mod tests {
                     tier: ahma_common::permissions::GrantTier::Always,
                     tool: Some("t".to_string()),
                     default_granted_by: "scope-grant prompt",
-                    surface: "tui",
+                    surface: &ApproverSurface::Tui,
                     decision_id: "test-decision",
                     time_to_decision_ms: None,
                     risk_class: None,
@@ -2799,6 +2798,36 @@ mod tests {
             other => panic!("expected ScopeGrantResolved, got {other:?}"),
         }
 
+        // ── 6c. A copy settled by an answer given in another session's own
+        //        prompt is the harness's answer, here too (SPEC R-GUI.7). ───
+        let harness_dir = tempfile::tempdir().unwrap();
+        let req = coord
+            .begin(
+                harness_dir.path(),
+                ScopeAccess::Ro,
+                GrantReason::PreExecViolation,
+                Some("cargo".into()),
+            )
+            .expect("begin should mint an in-flight request");
+        send_msg(
+            &mut server_writer,
+            &HubMsg::SubmitScopeGrant {
+                decision_id: req.decision_id.clone(),
+                decision: GrantDecision::Deny,
+                advice: None,
+                advice_followed: None,
+                surface: Some("harness".into()),
+            },
+        )
+        .await
+        .expect("send harness SubmitScopeGrant");
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::ScopeGrantResolved { answer, .. } => {
+                assert_eq!(answer.and_then(|a| a.surface).as_deref(), Some("harness"));
+            }
+            other => panic!("expected ScopeGrantResolved, got {other:?}"),
+        }
+
         // ── 7. Emit a Progress event → hub_event_for None → continue. ─────────
         monitor.note_progress("act-1", "tick".into());
         ping_pong(&mut server_writer, &mut server_reader, 15).await;
@@ -2927,7 +2956,11 @@ mod tests {
 
         // One is answered at another surface, then the hub goes.
         assert!(matches!(
-            coord.resolve(&answered.decision_id, GrantDecision::Deny),
+            coord.resolve(
+                &answered.decision_id,
+                GrantDecision::Deny,
+                &ApproverSurface::Tui
+            ),
             ahma_common::scope_grant::GrantResolveOutcome::Denied { .. }
         ));
         drop(w1);

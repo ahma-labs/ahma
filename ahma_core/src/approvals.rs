@@ -32,6 +32,7 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+use ahma_common::approver::ApproverSurface;
 use ahma_common::config::{AhmaSettings, settings_path};
 use ahma_common::permissions::{
     AuditAction, AuditEntry, GrantKind, GrantTier, PermissionSettings, TRUSTED_WORKSPACE_TOOL,
@@ -325,7 +326,7 @@ fn revoke_workspace_tools(
                 tool,
                 GrantTier::Always,
             )
-            .with_surface("tui"),
+            .with_surface(&ApproverSurface::Tui),
         );
     }
     Ok(removed.len())
@@ -360,7 +361,7 @@ fn persist_workspace_grant(
         &mut settings.permissions,
         &key,
         Some(ahma_common::timestamp::date(&now)),
-        Some("tui".to_string()),
+        Some(ApproverSurface::Tui.to_string()),
     );
 
     settings
@@ -376,7 +377,7 @@ fn persist_workspace_grant(
                 subject,
                 GrantTier::Always,
             )
-            .with_surface("tui"),
+            .with_surface(&ApproverSurface::Tui),
         );
     }
     Ok(())

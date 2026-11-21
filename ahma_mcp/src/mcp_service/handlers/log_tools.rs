@@ -1858,9 +1858,14 @@ mod tests {
         let link = f.log_dir.join("sys.log");
         let shown = std::fs::read_link(&link).unwrap();
 
-        let (target, added) =
-            crate::sandbox::approve_log_link(&f.workspace, &link, Some(&shown), "ahma tui", "tui")
-                .unwrap();
+        let (target, added) = crate::sandbox::approve_log_link(
+            &f.workspace,
+            &link,
+            Some(&shown),
+            "ahma tui",
+            &ahma_common::approver::ApproverSurface::Tui,
+        )
+        .unwrap();
         assert!(added);
         assert_eq!(target, f.target);
         assert_eq!(f.approved(), vec![f.target.clone()]);
@@ -1886,7 +1891,7 @@ mod tests {
             &swapped,
             Some(&shown),
             "ahma tui",
-            "tui",
+            &ahma_common::approver::ApproverSurface::Tui,
         )
         .unwrap_err();
         assert!(err.contains("nothing was recorded"), "{err}");
