@@ -1801,10 +1801,9 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     }
     let mut hook_scopes = resolve_hook_sandbox_scopes(Path::new(&payload.cwd));
     // Session-tier grants a human approved at the TUI or a harness prompt apply
-    // to hooked commands in the same workspace (SPEC R-PERM.4.4); they arrive as
-    // workspace-bound persistent records so the same filter applies.
-    let mut persistent_scopes = cfg.persistent_scopes.clone();
-    persistent_scopes.extend(crate::sandbox::session_scopes_for(&hook_scopes));
+    // to hooked commands in the same workspace (SPEC R-PERM.4.4), bound to it
+    // like a saved grant and kept apart from the settings file's.
+    let session_grants = crate::sandbox::session_grants_for(&hook_scopes);
     // SPEC R5.5.7: the harness's own working set (Claude Code plan files, its
     // per-session scratchpad) is writable without a grant.
     hook_scopes.extend(edit_guard::harness_owned_dirs_for_this_user());
@@ -1829,7 +1828,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // or worktree root, plus cwd). This ensures intra-repo builds, target dirs,
         // and shared worktree dependencies do not hit false sandbox denials (SPEC R5.2.1).
         sandbox_scopes: hook_scopes.clone(),
-        persistent_scopes,
+        session_grants,
         use_scratch_dir: false,
         ..cfg
     };

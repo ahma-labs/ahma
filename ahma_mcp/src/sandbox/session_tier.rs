@@ -2,12 +2,13 @@
 //!
 //! `ahma_common::session_grants` owns the on-disk form; this module supplies
 //! what only this crate can: the pid-liveness probe, the recording call every
-//! approving surface makes, and the projection into the `PersistentScope`
-//! list that hooks and the edit guard already filter by workspace.
+//! approving surface makes, and the session grants in force for a command, as
+//! [`ResolvedGrant`]s whose life says they are for the session.
 
 use std::path::{Path, PathBuf};
 
-use ahma_common::config::{PersistentScope, ScopeAccess};
+use ahma_common::config::ScopeAccess;
+use ahma_common::grant::ResolvedGrant;
 use ahma_common::session_grants::{self, SessionGrant};
 
 /// Whether `pid` is alive. `kill(pid, 0)` on Unix: success or `EPERM` (alive,
@@ -74,14 +75,14 @@ pub fn record_session_grant(
 }
 
 /// The session grants in force for a command whose sandbox scopes are
-/// `scopes`, as persistent-scope records (workspace-bound), ready to append to
-/// `AppConfig::persistent_scopes`.
-pub fn session_scopes_for(scopes: &[PathBuf]) -> Vec<PersistentScope> {
+/// `scopes`, each bound to its workspace, for the hooked command's sandbox
+/// (`AppConfig::session_grants`), the edit guard and the harness-ask checks.
+pub fn session_grants_for(scopes: &[PathBuf]) -> Vec<ResolvedGrant> {
     let Some(dir) = session_grants::default_dir() else {
         return Vec::new();
     };
     let grants = session_grants::applying_to(&dir, scopes, session_grants::now_secs(), &pid_alive);
-    session_grants::as_persistent_scopes(&grants)
+    grants.iter().map(ResolvedGrant::session).collect()
 }
 
 /// Every session grant alive on this machine, for `ahma sandbox list`.

@@ -39,6 +39,7 @@ use super::{
     ensure_root_object, remove_managed_hook_entries, shell_quote_posix,
 };
 use crate::adapter::workspace_queue::WorkspaceQueue;
+use ahma_common::grant::ResolvedGrant;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::io::Read;
@@ -317,22 +318,15 @@ fn scope_refusal(path: &Path, allowed: &[PathBuf]) -> String {
 }
 
 /// The directories a native edit may touch: the hook sandbox scope for `cwd`
-/// (the enclosing repository, SPEC R5.2.1), every persistent `rw` grant that
-/// applies to that scope (R5.4.11), and the temp directory — the same set a
-/// hooked shell command may write.
-pub fn allowed_edit_scopes(
-    cwd: &Path,
-    persistent: &[ahma_common::config::PersistentScope],
-) -> Vec<PathBuf> {
+/// (the enclosing repository, SPEC R5.2.1), every `rw` grant in `granted`
+/// (saved, or for the session) that applies to that scope (R5.4.11), and the
+/// temp directory — the same set a hooked shell command may write.
+pub fn allowed_edit_scopes(cwd: &Path, granted: &[ResolvedGrant]) -> Vec<PathBuf> {
     let mut allowed = super::resolve_hook_sandbox_scopes(cwd);
-    let applies = |scope: &ahma_common::config::PersistentScope| {
-        ahma_common::scope_grant::grant_applies(scope.workspace.as_deref(), &allowed)
-    };
-    let granted: Vec<&ahma_common::config::PersistentScope> =
-        persistent.iter().filter(|s| applies(s)).collect();
+    let applying: Vec<&ResolvedGrant> = granted.iter().filter(|g| g.applies_to(&allowed)).collect();
     // SPEC R5.5.7: the harness's own working set needs no grant.
     allowed.extend(harness_owned_dirs_for_this_user());
-    for scope in granted {
+    for scope in applying {
         if scope.access.is_write() {
             let raw = ahma_common::config::expand_home(&scope.path);
             allowed.push(dunce::canonicalize(&raw).unwrap_or(raw));
@@ -498,11 +492,15 @@ pub fn run(args: &HooksEditGuardArgs, cfg: &crate::shell::cli::AppConfig) -> Res
             .unwrap_or_else(|| PathBuf::from("."));
         // Session-tier answers given at the TUI or a harness prompt apply to
         // native edits too (SPEC R-PERM.4.4).
-        let mut persistent = cfg.persistent_scopes.clone();
-        persistent.extend(crate::sandbox::session_scopes_for(
+        let mut granted: Vec<ResolvedGrant> = cfg
+            .persistent_scopes
+            .iter()
+            .map(ResolvedGrant::saved)
+            .collect();
+        granted.extend(crate::sandbox::session_grants_for(
             &super::resolve_hook_sandbox_scopes(&cwd),
         ));
-        allowed_edit_scopes(&cwd, &persistent)
+        allowed_edit_scopes(&cwd, &granted)
     });
     if let Some(decision) = decide(args.platform, &payload, &queue, allowed.as_deref()) {
         use std::io::Write;
@@ -1155,7 +1153,7 @@ mod scope_tests {
             "without the grant the cache is out of scope"
         );
         let allowed: Vec<PathBuf> = vec![repo.clone(), cache.clone()];
-        let computed = allowed_edit_scopes(&repo, &[grant]);
+        let computed = allowed_edit_scopes(&repo, &[ResolvedGrant::saved(&grant)]);
         assert!(
             computed.contains(&cache),
             "an rw grant is in the allowed set: {computed:?}"
@@ -1180,7 +1178,7 @@ mod scope_tests {
             note: None,
             expires_at: None,
         };
-        let ro_allowed = allowed_edit_scopes(&repo, &[ro]);
+        let ro_allowed = allowed_edit_scopes(&repo, &[ResolvedGrant::saved(&ro)]);
         assert!(
             !ro_allowed.contains(&cache),
             "an ro grant is not writable: {ro_allowed:?}"
@@ -1217,12 +1215,12 @@ mod scope_tests {
             note: None,
             expires_at: None,
         };
-        let in_theirs = allowed_edit_scopes(&theirs, std::slice::from_ref(&grant));
+        let in_theirs = allowed_edit_scopes(&theirs, &[ResolvedGrant::saved(&grant)]);
         assert!(
             in_theirs.contains(&cache),
             "the grant admits edits in the workspace it was made for: {in_theirs:?}"
         );
-        let in_mine = allowed_edit_scopes(&mine, &[grant]);
+        let in_mine = allowed_edit_scopes(&mine, &[ResolvedGrant::saved(&grant)]);
         assert!(
             !in_mine.contains(&cache),
             "a grant bound to another workspace admits nothing here: {in_mine:?}"

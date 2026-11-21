@@ -449,10 +449,11 @@ impl ContainerNarrowing {
 /// The persistent-grant ledger as a sandbox last read it (SPEC R5.4).
 #[derive(Debug, Clone, Default)]
 pub(super) struct Ledger {
-    /// Every persistent grant on this machine, canonicalized, with the
-    /// workspace it was made for (SPEC R5.4.11), as admitted by
-    /// [`admit_records`].
-    pub(super) records: Vec<ahma_common::config::PersistentScope>,
+    /// Every grant on this machine, canonicalized, with the workspace it was
+    /// made for (SPEC R5.4.11), as admitted by [`admit_records`]: the settings
+    /// file's, and the session grants a hooked command carries (R-PERM.4.4),
+    /// which a reload of the file keeps.
+    pub(super) records: Vec<ahma_common::grant::ResolvedGrant>,
     /// The writable grants that apply to the scopes in force.
     pub(super) write: Vec<PathBuf>,
     /// The read-only grants that apply to the scopes in force.
@@ -464,12 +465,13 @@ pub(super) struct Ledger {
 
 /// Reads the ledger's records afresh: the settings file's
 /// `[sandbox].persistent_scopes`, canonicalized the way startup does it.
+/// Saved grants and leases only: the file holds no session grant.
 /// `None` when the file cannot be read or parsed right now (a write in
 /// progress, a hand edit with a typo): the sandbox keeps the grants it has
 /// and tries again at the next command, rather than reading a broken file
 /// as "every grant revoked".
 pub type LedgerLoader =
-    std::sync::Arc<dyn Fn() -> Option<Vec<ahma_common::config::PersistentScope>> + Send + Sync>;
+    std::sync::Arc<dyn Fn() -> Option<Vec<ahma_common::grant::ResolvedGrant>> + Send + Sync>;
 
 /// The file a running sandbox watches for ledger changes, and how to read it.
 pub struct LedgerSource {
@@ -501,8 +503,8 @@ fn ledger_stamp(file: &Path) -> Option<(std::time::SystemTime, u64)> {
 /// same as allowed. A lease already expired is not applied, and is said so
 /// (SPEC R-PERM.2.3); the settings file keeps it until renewed or revoked.
 fn admit_records(
-    records: Vec<ahma_common::config::PersistentScope>,
-) -> Vec<ahma_common::config::PersistentScope> {
+    records: Vec<ahma_common::grant::ResolvedGrant>,
+) -> Vec<ahma_common::grant::ResolvedGrant> {
     let now = ahma_common::config::unix_now();
     records
         .into_iter()
@@ -514,8 +516,7 @@ fn admit_records(
                      revoke {}{}`.",
                         rec.path.display(),
                         rec.path.display(),
-                        rec.workspace
-                            .as_deref()
+                        rec.workspace()
                             .map(|w| format!(" --workspace {}", w.display()))
                             .unwrap_or_else(|| " --global".to_string()),
                     );
@@ -532,7 +533,7 @@ fn admit_records(
                 "Persistent grant {} is a lease that expired on {}; not applied. Renew it \
                  with `ahma sandbox renew {}`.",
                 rec.path.display(),
-                rec.expires_at
+                rec.expires_at()
                     .map(ahma_common::config::fmt_utc_datetime)
                     .unwrap_or_default(),
                 rec.path.display()
@@ -545,7 +546,7 @@ fn admit_records(
 /// The grants among `records` that apply to a session scoped to `scopes`
 /// (SPEC R5.4.11), as `(writable, read-only)` path lists.
 fn applicable_records(
-    records: &[ahma_common::config::PersistentScope],
+    records: &[ahma_common::grant::ResolvedGrant],
     scopes: &[PathBuf],
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut write = Vec::new();
@@ -555,13 +556,12 @@ fn applicable_records(
         if !rec.applies_at(now) {
             continue;
         }
-        if !ahma_common::scope_grant::grant_applies(rec.workspace.as_deref(), scopes) {
+        if !rec.applies_to(scopes) {
             tracing::info!(
                 "Persistent grant {} is bound to workspace {} and does not apply to this \
                  session (scopes {:?})",
                 rec.path.display(),
-                rec.workspace
-                    .as_deref()
+                rec.workspace()
                     .map(|w| w.display().to_string())
                     .unwrap_or_default(),
                 scopes
@@ -808,33 +808,31 @@ impl Sandbox {
     /// canonicalized by the caller.
     #[must_use]
     pub fn with_persistent_scopes(self, write: Vec<PathBuf>, read: Vec<PathBuf>) -> Self {
-        use ahma_common::config::{PersistentScope, ScopeAccess};
-        let global = |path: PathBuf, access| PersistentScope {
+        use ahma_common::config::ScopeAccess;
+        use ahma_common::grant::{Binding, GrantLife, GrantedBy, ResolvedGrant};
+        let global = |path: PathBuf, access| ResolvedGrant {
             path,
             access,
-            workspace: None,
-            granted_by: None,
-            granted_at: None,
-            note: None,
-            expires_at: None,
+            binding: Binding::Global,
+            by: GrantedBy::Unmarked,
+            life: GrantLife::Saved,
         };
         let records = write
             .into_iter()
             .map(|p| global(p, ScopeAccess::Rw))
             .chain(read.into_iter().map(|p| global(p, ScopeAccess::Ro)))
             .collect();
-        self.with_persistent_records(records)
+        self.with_grants(records)
     }
 
-    /// Install the machine's persistent grants (paths already canonicalized by
-    /// the caller) and fold in the ones that apply to the scopes in force now.
-    /// The same filter runs again at every scope commit, so a grant bound to
-    /// another workspace never leaks into this session (SPEC R5.4.11).
+    /// Install the machine's grants (paths already canonicalized by the
+    /// caller): the settings file's saved grants and leases, and for a hooked
+    /// command the session grants of its workspace (SPEC R-PERM.4.4). Fold in
+    /// the ones that apply to the scopes in force now. The same filter runs
+    /// again at every scope commit, so a grant bound to another workspace never
+    /// leaks into this session (SPEC R5.4.11).
     #[must_use]
-    pub fn with_persistent_records(
-        self,
-        records: Vec<ahma_common::config::PersistentScope>,
-    ) -> Self {
+    pub fn with_grants(self, records: Vec<ahma_common::grant::ResolvedGrant>) -> Self {
         let records = admit_records(records);
         let (write, read) = applicable_records(&records, &self.scopes.read());
         if !write.is_empty() {
@@ -888,7 +886,19 @@ impl Sandbox {
             return;
         };
         *source.seen.lock() = stamp;
-        let records = admit_records(loaded);
+        // The file holds saved grants and leases. The session grants this
+        // sandbox was built with live in their own store, so a reload of the
+        // file keeps them (SPEC R-PERM.4.4).
+        let sessions: Vec<_> = self
+            .ledger
+            .read()
+            .records
+            .iter()
+            .filter(|r| r.is_session())
+            .cloned()
+            .collect();
+        let mut records = admit_records(loaded);
+        records.extend(sessions);
         let live = self.scopes.read().clone();
         let (write, read) = applicable_records(&records, &live);
         let now = ahma_common::config::unix_now();
@@ -935,25 +945,22 @@ impl Sandbox {
         applicable_records(&self.ledger.read().records, scopes)
     }
 
-    /// The persistent grants in force for this session, with provenance, for
+    /// The grants in force for this session, with provenance and life, for
     /// the surfaces that show the scope (SPEC R5.4).
-    pub fn persistent_grants_in_effect(&self) -> Vec<ahma_common::config::PersistentScope> {
-        self.persistent_grants_in_effect_at(ahma_common::config::unix_now())
+    pub fn grants_in_effect(&self) -> Vec<ahma_common::grant::ResolvedGrant> {
+        self.grants_in_effect_at(ahma_common::config::unix_now())
     }
 
-    /// [`Self::persistent_grants_in_effect`] at `now` (Unix seconds): an
-    /// expired lease is not in effect.
-    pub fn persistent_grants_in_effect_at(
-        &self,
-        now: u64,
-    ) -> Vec<ahma_common::config::PersistentScope> {
+    /// [`Self::grants_in_effect`] at `now` (Unix seconds): an expired lease is
+    /// not in effect.
+    pub fn grants_in_effect_at(&self, now: u64) -> Vec<ahma_common::grant::ResolvedGrant> {
         let scopes = self.scopes.read().clone();
         self.ledger
             .read()
             .records
             .iter()
             .filter(|r| r.applies_at(now))
-            .filter(|r| ahma_common::scope_grant::grant_applies(r.workspace.as_deref(), &scopes))
+            .filter(|r| r.applies_to(&scopes))
             .cloned()
             .collect()
     }
@@ -1988,6 +1995,7 @@ mod scope_view_tests {
 mod live_grant_gate_tests {
     use super::*;
     use ahma_common::config::ScopeAccess;
+    use ahma_common::grant::ResolvedGrant;
     use tempfile::tempdir;
 
     /// SPEC R-PERM.4.3: a `session`-tier answer applies live without ever
@@ -2050,9 +2058,9 @@ mod live_grant_gate_tests {
             Default::default(),
         )
         .unwrap()
-        .with_persistent_records(vec![
-            lease(canon(active.path()), now + 3_600),
-            lease(canon(stale.path()), now - 60),
+        .with_grants(vec![
+            ResolvedGrant::saved(&lease(canon(active.path()), now + 3_600)),
+            ResolvedGrant::saved(&lease(canon(stale.path()), now - 60)),
         ]);
         let in_scope = |p: &std::path::Path| sb.scopes().iter().any(|s| p.starts_with(s));
         assert!(in_scope(&canon(active.path())), "an active lease applies");
@@ -2060,13 +2068,13 @@ mod live_grant_gate_tests {
             !in_scope(&canon(stale.path())),
             "a lease expired at startup never applies"
         );
-        assert_eq!(sb.persistent_grants_in_effect().len(), 1);
+        assert_eq!(sb.grants_in_effect().len(), 1);
 
         // An hour later, the next command starts without it.
         let retired = sb.retire_expired_leases(now + 3_601);
         assert_eq!(retired, vec![canon(active.path())]);
         assert!(!in_scope(&canon(active.path())));
-        assert!(sb.persistent_grants_in_effect_at(now + 3_601).is_empty());
+        assert!(sb.grants_in_effect_at(now + 3_601).is_empty());
         assert!(
             sb.retire_expired_leases(now + 7_200).is_empty(),
             "a lease is retired once"
@@ -2098,7 +2106,10 @@ mod live_grant_gate_tests {
             Default::default(),
         )
         .unwrap()
-        .with_ledger_source(file.clone(), Arc::new(move || Some(source.lock().clone())));
+        .with_ledger_source(
+            file.clone(),
+            Arc::new(move || Some(source.lock().iter().map(ResolvedGrant::saved).collect())),
+        );
         let in_scope = |p: &std::path::Path| sb.scopes().iter().any(|s| p.starts_with(s));
         let base = std::time::SystemTime::now();
         let write_ledger = |records: Vec<PersistentScope>, step: u64| {
@@ -2123,12 +2134,12 @@ mod live_grant_gate_tests {
         write_ledger(vec![record(None)], 1);
         sb.begin_command();
         assert!(in_scope(&ext), "a grant written while running applies");
-        assert_eq!(sb.persistent_grants_in_effect().len(), 1);
+        assert_eq!(sb.grants_in_effect().len(), 1);
 
         write_ledger(vec![], 2);
         sb.begin_command();
         assert!(!in_scope(&ext), "a revoke reaches the running sandbox");
-        assert!(sb.persistent_grants_in_effect().is_empty());
+        assert!(sb.grants_in_effect().is_empty());
 
         let now = ahma_common::config::unix_now();
         write_ledger(vec![record(Some(now + 60))], 3);
@@ -2162,9 +2173,9 @@ mod live_grant_gate_tests {
             Default::default(),
         )
         .unwrap()
-        .with_persistent_records(vec![
-            record(home.join(".ssh").join("id_ed25519")),
-            record(dunce::canonicalize(cache.path()).unwrap()),
+        .with_grants(vec![
+            ResolvedGrant::saved(&record(home.join(".ssh").join("id_ed25519"))),
+            ResolvedGrant::saved(&record(dunce::canonicalize(cache.path()).unwrap())),
         ]);
         let in_scope = |p: &std::path::Path| sb.scopes().iter().any(|s| p.starts_with(s));
         assert!(
@@ -2176,7 +2187,7 @@ mod live_grant_gate_tests {
             "an ordinary record still applies"
         );
         assert_eq!(
-            sb.persistent_grants_in_effect().len(),
+            sb.grants_in_effect().len(),
             1,
             "a skipped record is not reported as in force"
         );
@@ -2248,5 +2259,190 @@ mod enforcement_tests {
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod grant_life_tests {
+    use super::*;
+    use ahma_common::config::{PersistentScope, ScopeAccess};
+    use ahma_common::grant::ResolvedGrant;
+    use ahma_common::session_grants::SessionGrant;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn canon(p: &Path) -> PathBuf {
+        dunce::canonicalize(p).unwrap()
+    }
+
+    fn saved(path: &Path, access: ScopeAccess, workspace: Option<&Path>) -> PersistentScope {
+        PersistentScope {
+            path: canon(path),
+            access,
+            workspace: workspace.map(canon),
+            granted_by: Some("cli".into()),
+            granted_at: Some("2026-11-20".into()),
+            note: None,
+            expires_at: None,
+        }
+    }
+
+    fn session(path: &Path, access: ScopeAccess, workspace: &Path) -> SessionGrant {
+        SessionGrant {
+            path: canon(path),
+            access,
+            workspace: canon(workspace),
+            owner_pid: std::process::id(),
+            granted_at: ahma_common::session_grants::now_secs(),
+            granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.into()),
+        }
+    }
+
+    /// A saved, a leased and a session grant, plus one of each bound to another
+    /// workspace: what the sandbox applies, and what it reports in force.
+    /// Pins today's behaviour across the move from note text to `GrantLife`.
+    #[test]
+    fn saved_leased_and_session_grants_apply_as_before() {
+        let root = tempdir().unwrap();
+        let dir = |name: &str| {
+            let p = root.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            canon(&p)
+        };
+        let (ws, other) = (dir("ws"), dir("other"));
+        let (kept, shared, leased, ro_session, rw_session, elsewhere) = (
+            dir("kept"),
+            dir("shared"),
+            dir("leased"),
+            dir("ro-session"),
+            dir("rw-session"),
+            dir("elsewhere"),
+        );
+        let now = ahma_common::config::unix_now();
+        let mut lease = saved(&leased, ScopeAccess::Rw, Some(&ws));
+        lease.expires_at = Some(now + 3_600);
+        let mut global = saved(&shared, ScopeAccess::Ro, None);
+        global.granted_by = None;
+        let records = [
+            saved(&kept, ScopeAccess::Rw, Some(&ws)),
+            global,
+            lease,
+            saved(&elsewhere, ScopeAccess::Rw, Some(&other)),
+        ];
+        let sessions = [
+            session(&ro_session, ScopeAccess::Ro, &ws),
+            session(&rw_session, ScopeAccess::Rw, &ws),
+            session(&elsewhere, ScopeAccess::Ro, &other),
+        ];
+        let sb = build(&ws, &records, &sessions);
+
+        let mut write: Vec<PathBuf> = sb.scopes().iter().filter(|p| *p != &ws).cloned().collect();
+        write.sort();
+        let mut read = sb.read_scopes();
+        read.sort();
+        let mut want_write = vec![kept.clone(), leased.clone(), rw_session.clone()];
+        want_write.sort();
+        let mut want_read = vec![shared.clone(), ro_session.clone()];
+        want_read.sort();
+        assert_eq!(write, want_write);
+        assert_eq!(read, want_read);
+
+        let mut in_effect = in_effect(&sb);
+        in_effect.sort();
+        let dialog = Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string());
+        let mut want = vec![
+            (kept, "rw", Some(ws.clone()), Some("cli".to_string())),
+            (shared, "ro", None, None),
+            (leased, "rw", Some(ws.clone()), Some("cli".to_string())),
+            (ro_session, "ro", Some(ws.clone()), dialog.clone()),
+            (rw_session, "rw", Some(ws.clone()), dialog),
+        ];
+        want.sort();
+        assert_eq!(in_effect, want);
+    }
+
+    /// A session grant lives in the session-grant store, not in the settings
+    /// file, so a reload of the file must leave it applied. A hooked command
+    /// carried its session grants as records of the file's own kind, and the
+    /// reload a changed file triggers at the next command (another hook's yes
+    /// being saved, `ahma sandbox grant`) replaced them all with the file's.
+    #[test]
+    fn a_session_grant_survives_a_ledger_reload() {
+        let ws = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let settings = tempdir().unwrap();
+        let file = settings.path().join("settings.toml");
+        std::fs::write(&file, "").unwrap();
+        let sb = build(
+            ws.path(),
+            &[],
+            &[session(cache.path(), ScopeAccess::Rw, ws.path())],
+        )
+        .with_ledger_source(file.clone(), Arc::new(|| Some(Vec::new())));
+        let in_scope = |p: &Path| sb.scopes().iter().any(|s| p.starts_with(s));
+        assert!(in_scope(&canon(cache.path())), "applied at startup");
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&file).unwrap();
+        f.set_modified(later).unwrap();
+        sb.begin_command();
+        assert!(
+            in_scope(&canon(cache.path())),
+            "a reload of the settings file dropped a session grant"
+        );
+        assert_eq!(in_effect(&sb).len(), 1);
+    }
+
+    /// Whether a grant is for the session is what it is, never what its note
+    /// says: a saved grant whose note happens to read "for this session only"
+    /// follows the file like any other saved grant.
+    #[test]
+    fn a_saved_grant_follows_the_file_whatever_its_note_says() {
+        let ws = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let settings = tempdir().unwrap();
+        let file = settings.path().join("settings.toml");
+        std::fs::write(&file, "").unwrap();
+        let mut record = saved(cache.path(), ScopeAccess::Rw, Some(ws.path()));
+        record.note = Some(format!(
+            "for this session only (owner pid {})",
+            std::process::id()
+        ));
+        let sb = build(ws.path(), &[record], &[])
+            .with_ledger_source(file.clone(), Arc::new(|| Some(Vec::new())));
+        let in_scope = |p: &Path| sb.scopes().iter().any(|s| p.starts_with(s));
+        assert!(in_scope(&canon(cache.path())));
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&file).unwrap();
+        f.set_modified(later).unwrap();
+        sb.begin_command();
+        assert!(
+            !in_scope(&canon(cache.path())),
+            "revoked from the file, a saved grant stops applying"
+        );
+    }
+
+    // ── the API under test (the only lines the refactor changes) ──
+
+    fn build(ws: &Path, records: &[PersistentScope], sessions: &[SessionGrant]) -> Sandbox {
+        let all = records
+            .iter()
+            .map(ResolvedGrant::saved)
+            .chain(sessions.iter().map(ResolvedGrant::session))
+            .collect();
+        Sandbox::new(vec![canon(ws)], SandboxMode::Test, Default::default())
+            .unwrap()
+            .with_grants(all)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn in_effect(sb: &Sandbox) -> Vec<(PathBuf, &'static str, Option<PathBuf>, Option<String>)> {
+        sb.grants_in_effect()
+            .into_iter()
+            .map(|g| {
+                let workspace = g.workspace().map(Path::to_path_buf);
+                (g.path, g.access.short(), workspace, g.by.label())
+            })
+            .collect()
     }
 }

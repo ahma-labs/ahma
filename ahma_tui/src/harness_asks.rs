@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahma_common::approver::ApproverSurface;
-use ahma_common::config::{PersistentScope, ScopeAccess};
+use ahma_common::config::ScopeAccess;
+use ahma_common::grant::ResolvedGrant;
 use ahma_common::harness_asks::LinkRefusal;
 use ahma_common::harness_asks::{self, Question, WorkspaceAsks};
 use ahma_common::open_url::{OpenUrlBinding, OpenUrlSessionGrant};
@@ -132,15 +133,16 @@ pub fn pending() -> Vec<HarnessAsk> {
     if all.iter().all(|a| a.refusals.is_empty()) {
         return Vec::new();
     }
-    let persistent: Vec<PersistentScope> = ahma_common::config::AhmaSettings::load()
+    let persistent: Vec<ResolvedGrant> = ahma_common::config::AhmaSettings::load()
         .sandbox
         .persistent_scopes
-        .into_iter()
+        .iter()
         .filter(|p| p.applies_at(now))
+        .map(ResolvedGrant::saved)
         .collect();
     let granted = |workspace: &Path| {
         let mut g = persistent.clone();
-        g.extend(ahma_mcp::sandbox::session_scopes_for(&[
+        g.extend(ahma_mcp::sandbox::session_grants_for(&[
             workspace.to_path_buf()
         ]));
         g
@@ -163,7 +165,7 @@ pub fn pending() -> Vec<HarnessAsk> {
 pub fn pending_from(
     all: &[WorkspaceAsks],
     home: Option<&Path>,
-    granted: &dyn Fn(&Path) -> Vec<PersistentScope>,
+    granted: &dyn Fn(&Path) -> Vec<ResolvedGrant>,
     alive: &dyn Fn(u32) -> bool,
 ) -> Vec<HarnessAsk> {
     let mut out = Vec::new();
@@ -625,7 +627,7 @@ mod tests {
         }
     }
 
-    fn waiting(f: &Fixture, granted: &dyn Fn(&Path) -> Vec<PersistentScope>) -> Vec<HarnessAsk> {
+    fn waiting(f: &Fixture, granted: &dyn Fn(&Path) -> Vec<ResolvedGrant>) -> Vec<HarnessAsk> {
         pending_from(
             &harness_asks::load_all(&f.dir, 200),
             None,
@@ -634,7 +636,7 @@ mod tests {
         )
     }
 
-    fn nothing(_: &Path) -> Vec<PersistentScope> {
+    fn nothing(_: &Path) -> Vec<ResolvedGrant> {
         Vec::new()
     }
 
@@ -674,15 +676,17 @@ mod tests {
         let f = fixture();
         let cache = f.cache.clone();
         let granted = move |_: &Path| {
-            vec![PersistentScope {
-                path: cache.clone(),
-                access: ScopeAccess::Rw,
-                workspace: None,
-                granted_by: None,
-                granted_at: None,
-                note: None,
-                expires_at: None,
-            }]
+            vec![ResolvedGrant::saved(
+                &ahma_common::config::PersistentScope {
+                    path: cache.clone(),
+                    access: ScopeAccess::Rw,
+                    workspace: None,
+                    granted_by: None,
+                    granted_at: None,
+                    note: None,
+                    expires_at: None,
+                },
+            )]
         };
         assert!(waiting(&f, &granted).is_empty());
     }
@@ -711,7 +715,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            !ahma_mcp::sandbox::session_scopes_for(std::slice::from_ref(&f.ws))
+            !ahma_mcp::sandbox::session_grants_for(std::slice::from_ref(&f.ws))
                 .iter()
                 .any(|g| g.path == f.cache),
             "a deny grants nothing"
@@ -734,12 +738,12 @@ mod tests {
             201,
         )
         .unwrap();
-        let granted = ahma_mcp::sandbox::session_scopes_for(std::slice::from_ref(&f.ws));
+        let granted = ahma_mcp::sandbox::session_grants_for(std::slice::from_ref(&f.ws));
         let g = granted
             .iter()
             .find(|g| g.path == f.cache)
             .expect("session grant");
-        assert_eq!(g.granted_by.as_deref(), Some("web"), "{granted:?}");
+        assert_eq!(g.by.label().as_deref(), Some("web"), "{granted:?}");
     }
 
     /// A session answer is the same session grant a yes in the dialog makes:
@@ -758,7 +762,7 @@ mod tests {
         )
         .unwrap();
         assert!(line.contains("until the agent's harness exits"), "{line}");
-        let granted = ahma_mcp::sandbox::session_scopes_for(std::slice::from_ref(&f.ws));
+        let granted = ahma_mcp::sandbox::session_grants_for(std::slice::from_ref(&f.ws));
         assert!(
             granted
                 .iter()

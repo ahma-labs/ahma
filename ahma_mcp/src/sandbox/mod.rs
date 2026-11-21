@@ -125,7 +125,7 @@ pub use prerequisites::{
 };
 pub use scope_lock::ScopeLockState;
 pub use scopes::{normalize_path_lexically, preflight_scope_candidate};
-pub use session_tier::{pid_alive, record_session_grant, session_scopes_for};
+pub use session_tier::{pid_alive, record_session_grant, session_grants_for};
 pub use setuid::setuid_denial_note;
 pub use signals::{set_signal_other_processes, signal_denial_note, signal_other_processes_allowed};
 pub use ssh_agent::{

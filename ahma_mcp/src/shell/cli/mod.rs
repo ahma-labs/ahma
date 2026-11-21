@@ -27,6 +27,7 @@ use super::{list_tools, modes, resolution};
 
 use crate::sandbox;
 use ahma_common::config::MutexGroupConfig;
+use ahma_common::grant::ResolvedGrant;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use dunce;
@@ -199,6 +200,12 @@ pub struct AppConfig {
     /// survive `roots/list` replacement — the persistence behind `ahma sandbox
     /// grant`. Resolved into the sandbox's writable/read-only scope sets.
     pub persistent_scopes: Vec<ahma_common::config::PersistentScope>,
+    /// The session grants in force for this command's workspace (SPEC
+    /// R-PERM.4.4), set by `ahma hooks run-shell` from the session-grant store
+    /// ([`crate::sandbox::session_grants_for`]); empty everywhere else. Never
+    /// read from or written to the settings file, and kept apart from
+    /// `persistent_scopes` so a reload of that file leaves them applied.
+    pub session_grants: Vec<ahma_common::grant::ResolvedGrant>,
 
     // ── HTTP serve mode ─────────────────────────────────────────────────────
     /// Bind host for HTTP mode (default 127.0.0.1).
@@ -320,6 +327,7 @@ impl Default for AppConfig {
             monitor_rate_limit_secs: 60,
             package_cache_write: true,
             persistent_scopes: vec![],
+            session_grants: vec![],
             http_host: "127.0.0.1".to_string(),
             http_port: 3000,
             no_quic: false,
@@ -673,54 +681,55 @@ fn resolve_persistent_scopes(cfg: &AppConfig) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (write, read)
 }
 
-/// Every persistent grant, with its path canonicalized (and created, for `rw`)
-/// and its workspace binding kept, for the sandbox to filter per session
-/// (SPEC R5.4.11).
-fn resolve_persistent_records(cfg: &AppConfig) -> Vec<ahma_common::config::PersistentScope> {
-    resolve_persistent_records_from(&cfg.persistent_scopes)
+/// Every grant, with its path canonicalized (and created, for `rw`) and its
+/// workspace binding kept, for the sandbox to filter per session (SPEC
+/// R5.4.11): the settings file's, then the session grants a hooked command
+/// carries (SPEC R-PERM.4.4).
+fn resolve_persistent_records(cfg: &AppConfig) -> Vec<ResolvedGrant> {
+    let mut grants = resolve_grants(cfg.persistent_scopes.iter().map(ResolvedGrant::saved));
+    grants.extend(resolve_grants(cfg.session_grants.iter().cloned()));
+    grants
 }
 
-/// [`resolve_persistent_records`] over a list read from the settings file —
-/// at startup, and again by a running sandbox whenever the file changes.
-fn resolve_persistent_records_from(
-    scopes: &[ahma_common::config::PersistentScope],
-) -> Vec<ahma_common::config::PersistentScope> {
+/// Resolve `grants` of one store — the settings file's at startup and again
+/// whenever a running sandbox sees the file change, or a command's session
+/// grants — skipping one that repeats an earlier grant's folder, access and
+/// binding.
+fn resolve_grants(grants: impl IntoIterator<Item = ResolvedGrant>) -> Vec<ResolvedGrant> {
     use ahma_common::config::ScopeAccess;
-    let mut out: Vec<ahma_common::config::PersistentScope> = Vec::new();
-    for scope in scopes {
+    let mut out: Vec<ResolvedGrant> = Vec::new();
+    for grant in grants {
         let mut paths = Vec::new();
-        match scope.access {
-            ScopeAccess::Rw => grant_persistent_write_scope(scope, &mut paths),
-            ScopeAccess::Ro => grant_persistent_read_scope(scope, &mut paths),
+        match grant.access {
+            ScopeAccess::Rw => grant_persistent_write_scope(&grant, &mut paths),
+            ScopeAccess::Ro => grant_persistent_read_scope(&grant, &mut paths),
         }
         let Some(canonical) = paths.pop() else {
             continue;
         };
-        if out.iter().any(|r| {
-            r.path == canonical && r.access == scope.access && r.workspace == scope.workspace
-        }) {
+        if out
+            .iter()
+            .any(|r| r.path == canonical && r.access == grant.access && r.binding == grant.binding)
+        {
             continue;
         }
-        out.push(ahma_common::config::PersistentScope {
+        out.push(ResolvedGrant {
             path: canonical,
-            ..scope.clone()
+            ..grant
         });
     }
     out
 }
 
 /// Add a `rw` persistent scope, auto-creating the directory if it is missing.
-fn grant_persistent_write_scope(
-    scope: &ahma_common::config::PersistentScope,
-    write: &mut Vec<PathBuf>,
-) {
+fn grant_persistent_write_scope(scope: &ResolvedGrant, write: &mut Vec<PathBuf>) {
     match ahma_common::config::ensure_sandbox_directory(&scope.path) {
         Ok(canonical) => {
             if !write.contains(&canonical) {
                 tracing::info!(
                     "Granted persistent scope (read+write): {} [{}]",
                     canonical.display(),
-                    scope.granted_by.as_deref().unwrap_or("user")
+                    scope.by.label().as_deref().unwrap_or("user")
                 );
                 write.push(canonical);
             }
@@ -734,10 +743,7 @@ fn grant_persistent_write_scope(
 
 /// Add a `ro` persistent scope. Never auto-created — a missing directory is
 /// logged and skipped rather than silently materialised.
-fn grant_persistent_read_scope(
-    scope: &ahma_common::config::PersistentScope,
-    read: &mut Vec<PathBuf>,
-) {
+fn grant_persistent_read_scope(scope: &ResolvedGrant, read: &mut Vec<PathBuf>) {
     let raw = ahma_common::config::expand_home(&scope.path);
     match dunce::canonicalize(&raw) {
         Ok(canonical) => {
@@ -745,7 +751,7 @@ fn grant_persistent_read_scope(
                 tracing::info!(
                     "Granted persistent scope (read-only): {} [{}]",
                     canonical.display(),
-                    scope.granted_by.as_deref().unwrap_or("user")
+                    scope.by.label().as_deref().unwrap_or("user")
                 );
                 read.push(canonical);
             }
@@ -822,8 +828,9 @@ fn create_sandbox_instance(
         .and_then(|root| ahma_common::config::ensure_sandbox_directory(root).ok())
         .filter(|root| scopes.contains(root));
 
-    // User-granted persistent scopes (e.g. an sccache cache outside the workspace).
-    // Handed to the sandbox with their workspace binding: it folds in the ones that
+    // User-granted persistent scopes (e.g. an sccache cache outside the workspace),
+    // and a hooked command's session grants. Handed to the sandbox with their
+    // workspace binding and their life: it folds in the ones that
     // apply now and re-decides at every roots/list commit, so a grant made for
     // another project never reaches this session (SPEC R5.4.11).
     let persistent_records = resolve_persistent_records(cfg);
@@ -841,7 +848,7 @@ fn create_sandbox_instance(
     .with_explicit_scopes(explicit_scopes)
     .with_container_root(container_root)
     .with_scratch_dir(scratch_dir)
-    .with_persistent_records(persistent_records)
+    .with_grants(persistent_records)
     .with_package_cache_write(cfg.package_cache_write);
     // A running server follows the ledger: `ahma sandbox grant`, `revoke`,
     // `renew` and a prompt's `always` or lease answer apply from its next
@@ -855,7 +862,13 @@ fn create_sandbox_instance(
                     ahma_common::config::AhmaSettings::load_from_result(&path)
                         .ok()
                         .map(|settings| {
-                            resolve_persistent_records_from(&settings.sandbox.persistent_scopes)
+                            resolve_grants(
+                                settings
+                                    .sandbox
+                                    .persistent_scopes
+                                    .iter()
+                                    .map(ResolvedGrant::saved),
+                            )
                         })
                 }),
             )
@@ -3851,6 +3864,7 @@ pub fn build_app_config_with_settings(
                 .cloned()
                 .collect()
         },
+        session_grants: vec![],
         http_host: serve.http_host,
         http_port: serve.http_port,
         no_quic: http.no_quic,

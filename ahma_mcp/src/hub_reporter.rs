@@ -202,13 +202,13 @@ pub fn publish_committed_scope(sandbox: &crate::sandbox::Sandbox) {
         .map(|p| p.display().to_string())
         .collect();
     let grants: Vec<ahma_common::hub::GrantSummary> = sandbox
-        .persistent_grants_in_effect()
+        .grants_in_effect()
         .into_iter()
         .map(|g| ahma_common::hub::GrantSummary {
             path: g.path.display().to_string(),
             access: g.access.short().to_string(),
-            workspace: g.workspace.as_deref().map(|w| w.display().to_string()),
-            granted_by: g.granted_by,
+            workspace: g.workspace().map(|w| w.display().to_string()),
+            granted_by: g.by.label(),
         })
         .collect();
     let enforcement = Some(sandbox.active_sandbox().token().to_string());
