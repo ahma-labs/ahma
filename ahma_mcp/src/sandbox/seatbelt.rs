@@ -159,7 +159,7 @@ impl Sandbox {
             socket_connect_denies = socket_connect_denies,
             hub_denies = hub_denies,
             agent_connect_denies = agent_connect_denies,
-            broker_rules = broker_rules(),
+            broker_rules = broker_rules(brokers_served()),
             pasteboard_denies = pasteboard_denies(),
             // The mark this run's processes are found by when it ends (SPEC R-PROC.5).
             run_rule = super::leftovers::seatbelt_rule(&tag),
@@ -680,12 +680,22 @@ fn hub_rendezvous_denies_for(runtime_dir: Option<&Path>, socket: &Path) -> Strin
     rules
 }
 
-/// The SSH key broker's sockets (SPEC R-CRED.1): a command may reach a
-/// socket in the agent directory and do nothing else there — read it and
-/// write data to it, never create, remove or rename an entry. Emitted last,
-/// after the deny on ahma's own runtime directory it sits inside. Which
-/// socket a command may *use* is the broker's check, by process group.
-fn broker_rules() -> String {
+/// Whether this process serves its commands any broker on a socket in the
+/// agent directory. Today the SSH key broker is the only one, served in
+/// `[sandbox] ssh_agent = "broker"` mode (SPEC R-CRED.11); a broker added
+/// later is one more term here, not another mode check in the profile.
+fn brokers_served() -> bool {
+    super::ssh_agent::serves_ssh_broker()
+}
+
+/// Every broker's sockets (SPEC R-CRED.1): a command may reach a socket in
+/// the agent directory and do nothing else there — read it and write data to
+/// it, never create, remove or rename an entry. The `connect(2)` itself is
+/// allowed only when `served`: with no broker, nothing in the directory is
+/// meant for a command. Emitted last, after the deny on ahma's own runtime
+/// directory it sits inside. Which socket a command may *use* is the
+/// socket's own check, by process group (`credentials::host::SocketLease`).
+fn broker_rules(served: bool) -> String {
     let Some(dir) = ahma_common::hub::runtime_dir().map(|d| d.join("agent")) else {
         return String::new();
     };
@@ -703,10 +713,17 @@ fn broker_rules() -> String {
     spellings
         .iter()
         .map(|dir| {
+            let connect = if served {
+                format!(
+                    "(allow network-outbound (remote unix-socket (subpath \"{}\")))\n",
+                    dir.display()
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "(allow file-read* file-write-data (subpath \"{}\"))\n{}",
-                dir.display(),
-                super::ssh_agent::seatbelt_broker_connect_allow(dir)
+                "(allow file-read* file-write-data (subpath \"{}\"))\n{connect}",
+                dir.display()
             )
         })
         .collect()
@@ -1441,6 +1458,42 @@ mod tests {
         );
         set_ssh_agent_mode(SshAgentMode::Broker);
         set_upstream_agent(None).unwrap();
+    }
+
+    /// The broker directory's connect allow is keyed on a broker being
+    /// served, not on `[sandbox] ssh_agent`: a broker other than the SSH key
+    /// broker is reachable under `"off"` and `"passthrough"` too. Today the
+    /// SSH key broker is the only one, so what is served — and the profile —
+    /// is unchanged (`off_denies_the_agent_and_lets_no_broker_in`,
+    /// `passthrough_emits_no_agent_rules`); with none served, nothing in the
+    /// directory is connectable whatever the mode.
+    #[test]
+    fn the_broker_dir_is_reachable_without_the_ssh_broker() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode};
+        let allow = broker_connect_allow().expect("a runtime dir");
+        for mode in [SshAgentMode::Off, SshAgentMode::Passthrough] {
+            set_ssh_agent_mode(mode);
+            assert!(
+                !super::brokers_served(),
+                "{mode:?}: the SSH key broker is the only broker today"
+            );
+            let rules = super::broker_rules(true);
+            assert!(
+                rules.contains(&allow),
+                "{mode:?}, a broker served:\n{rules}"
+            );
+        }
+        set_ssh_agent_mode(SshAgentMode::Broker);
+        assert!(super::brokers_served());
+        let rules = super::broker_rules(false);
+        assert!(
+            !rules.contains("(allow network-outbound"),
+            "no broker served:\n{rules}"
+        );
+        assert!(
+            rules.contains("(allow file-read* file-write-data (subpath"),
+            "{rules}"
+        );
     }
 
     /// `~/.ssh` is denied as a whole, and the client files that hold no secret

@@ -653,10 +653,11 @@ fn test_a_sandboxed_command_cannot_reach_the_hub() {
 #[tokio::test]
 async fn test_a_sandboxed_command_reaches_its_ssh_broker() {
     skip_if_nested_sandbox!();
+    use ahma_mcp::credentials::host::agent_dir;
     use ahma_mcp::credentials::ssh_agent::broker::{
         Broker, Decision, KeySources, SignConsent, SignRequest,
     };
-    use ahma_mcp::credentials::ssh_agent::host::{BrokerLease, agent_dir};
+    use ahma_mcp::credentials::ssh_agent::host::BrokerLease;
     use std::sync::Arc;
 
     struct Deny;
@@ -718,8 +719,8 @@ UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
 #[test]
 fn test_a_sandboxed_command_reaches_the_broker_and_not_the_humans_agent() {
     skip_if_nested_sandbox!();
+    use ahma_mcp::credentials::host::agent_dir;
     use ahma_mcp::credentials::ssh_agent::consent::adopt_upstream;
-    use ahma_mcp::credentials::ssh_agent::host::agent_dir;
     use ahma_mcp::sandbox::{SshAgentMode, set_ssh_agent_mode};
     use std::os::unix::net::UnixListener;
 

@@ -219,7 +219,7 @@ impl<'a> ServiceBuilder<'a> {
             .filter(|_| crate::sandbox::ssh_agent_mode() == crate::sandbox::SshAgentMode::Broker)
         {
             Some(home) => {
-                crate::credentials::ssh_agent::host::start();
+                crate::credentials::host::start();
                 let factory = crate::credentials::ssh_agent::consent::RecordedBrokers::new(
                     home,
                     crate::sandbox::upstream_agent(),

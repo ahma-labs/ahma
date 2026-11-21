@@ -130,7 +130,8 @@ fn profile_safe(path: &Path) -> bool {
 /// The connect denies for the human's agent (SPEC R-CRED.11): none under
 /// `"passthrough"`; otherwise the adopted upstream by canonical path and
 /// launchd's listener by pattern. Emitted after the network rules, since SBPL
-/// is last-match-wins; [`seatbelt_broker_connect_allow`] comes after these.
+/// is last-match-wins; the broker directory's connect allow (Seatbelt's
+/// `broker_rules`) comes after these.
 pub fn seatbelt_agent_connect_denies() -> String {
     if ssh_agent_mode() == SshAgentMode::Passthrough {
         return String::new();
@@ -148,16 +149,12 @@ pub fn seatbelt_agent_connect_denies() -> String {
     rules
 }
 
-/// The broker's sockets, let back in after the agent denies: only in
-/// `"broker"` mode, the only one with a broker to reach.
-pub fn seatbelt_broker_connect_allow(agent_dir: &Path) -> String {
-    if ssh_agent_mode() != SshAgentMode::Broker {
-        return String::new();
-    }
-    format!(
-        "(allow network-outbound (remote unix-socket (subpath \"{}\")))\n",
-        agent_dir.display()
-    )
+/// Whether commands are served the SSH key broker: only in `"broker"` mode.
+/// One of the inputs to whether the profile lets a command reach the broker
+/// directory at all; that allow is keyed on *any* broker being served, not
+/// on this mode alone.
+pub fn serves_ssh_broker() -> bool {
+    ssh_agent_mode() == SshAgentMode::Broker
 }
 
 #[cfg(test)]
@@ -240,25 +237,22 @@ mod tests {
     }
 
     /// `"passthrough"` emits nothing; `"off"` denies but has no broker to let
-    /// back in; `"broker"` does both.
+    /// back in; `"broker"` does both. (The allow itself is Seatbelt's, keyed
+    /// on any broker being served: `seatbelt::tests`.)
     #[test]
     fn each_mode_emits_its_own_rules() {
-        let agent_dir = Path::new("/private/var/run/ahma/agent");
         set_upstream_agent(None).unwrap();
 
         set_ssh_agent_mode(SshAgentMode::Passthrough);
         assert_eq!(seatbelt_agent_connect_denies(), "");
-        assert_eq!(seatbelt_broker_connect_allow(agent_dir), "");
+        assert!(!serves_ssh_broker());
 
         set_ssh_agent_mode(SshAgentMode::Off);
         assert!(seatbelt_agent_connect_denies().contains(LAUNCHD_AGENT_REGEX));
-        assert_eq!(seatbelt_broker_connect_allow(agent_dir), "");
+        assert!(!serves_ssh_broker());
 
         set_ssh_agent_mode(SshAgentMode::Broker);
         assert!(seatbelt_agent_connect_denies().contains(LAUNCHD_AGENT_REGEX));
-        assert_eq!(
-            seatbelt_broker_connect_allow(agent_dir),
-            "(allow network-outbound (remote unix-socket (subpath \"/private/var/run/ahma/agent\")))\n"
-        );
+        assert!(serves_ssh_broker());
     }
 }
