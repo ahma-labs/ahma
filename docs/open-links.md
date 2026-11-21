@@ -112,7 +112,21 @@ answers are there, deny first:
 `a`, `r` and `*` first show the exact line they add, and a second press saves it. Whatever you
 answer, Claude Code's dialog does not ask the same question; the agent re-runs the command and
 it opens, or is refused naming the grant. Every answer is recorded in `permissions-audit.jsonl`
-with the surface `tui`. `ahma web` and `ahma desktop` do not show these questions yet.
+with the surface `tui`.
+
+### In `ahma web` and `ahma desktop`
+
+The browser page and ahma's own window show the same question, with the same guidance and the
+same answers in the same order. Neither may save anything (a browser is trusted with less than
+the terminal), so only two of the answers can be given there:
+
+- **Deny (default)**: as in the TUI; Enter and Esc deny too.
+- **This site, this session**: as in the TUI, until Claude Code exits and never saved.
+
+The lasting answers are shown but disabled, each with the `ahma permissions grant open-url`
+line that gives it; run it in a terminal, or answer in `ahma tui`. As for every question
+there, an answer that allows is taken only after the question has been on screen in a focused
+tab for a moment. Answers are recorded with the surface `web` or `desktop`.
 
 ## How it works
 
@@ -164,10 +178,10 @@ lengths of its query and fragment.
 ## Limits
 
 - At most 5 links per command, each at most 8 KB.
-- Asked in Claude Code's dialog when a hooked command runs again, in `ahma tui` as soon as a
-  hooked command is refused, and in the MCP client's prompt while an MCP command waits. The TUI
-  does not answer an MCP command's question yet, and `ahma web` and `ahma desktop` ask nothing
-  yet (SPEC R-LINK.6): a client that cannot show questions gets the grant line.
+- Asked in Claude Code's dialog when a hooked command runs again, in `ahma tui`, `ahma web`
+  or `ahma desktop` as soon as a hooked command is refused, and in the MCP client's prompt while
+  an MCP command waits. None of the three answers an MCP command's question yet (SPEC
+  R-LINK.6): a client that cannot show questions gets the grant line.
 - Commands in a persistent shell session (`session_id`) share one long-lived shell, so they get
   no link broker of their own; a browser launch there fails as before.
 - A site you allow can forward your browser elsewhere (an open redirect); allow sites you trust.
@@ -183,6 +197,6 @@ lengths of its query and fragment.
 
 [security-sandbox.md](security-sandbox.md) (LaunchServices, R6.2.10) ·
 [ssh-agent-broker.md](ssh-agent-broker.md) (the same broker shape for SSH keys) ·
-[tui.md](tui.md) (approval gates) ·
+[tui.md](tui.md) (approval gates) · [web.md](web.md) ·
 [network-egress.md](network-egress.md) · [permissions.md](permissions.md) ·
 [environment-variables.md](environment-variables.md) · [SPEC R-LINK](../SPEC.md)

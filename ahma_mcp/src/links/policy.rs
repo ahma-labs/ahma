@@ -406,6 +406,9 @@ pub enum Surface {
     TuiForHarness,
     /// `ahma web`, `ahma desktop`: an answer there may not write settings or
     /// outlive the session (R-GUI.9), so deny, this time, this session only.
+    /// For a link a hooked command was refused, which nothing waits on, that
+    /// leaves deny and this session: what both this and [`Self::TuiForHarness`]
+    /// offer (`ahma_tui::harness_asks::HarnessLinkAsk::unsaved_choices`).
     Browser,
     /// Claude Code's own dialog, before a hooked command whose link was
     /// refused runs again. Its contract is yes or no: no is deny, yes is

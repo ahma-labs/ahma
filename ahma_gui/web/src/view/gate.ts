@@ -10,15 +10,16 @@
 //    assistive-technology users can grant as well as deny.
 //  - Deny answers are always enabled, visually primary, and Enter/Escape inside
 //    the panel (not on a granting button) choose the first of them.
-//  - A scope/web question tells the server whether it is being *read*: visible,
-//    focused document. Hidden is reported the moment that stops being true.
+//  - A scope, web or link question tells the server whether it is being
+//    *read*: visible, focused document. Hidden is reported the moment that stops being true.
 //  - The question stays until the server's view no longer has it.
 
-import { postReport } from "../api.ts";
 import { send } from "../act.ts";
+import { intentFor } from "../answer.ts";
+import { postReport } from "../api.ts";
 import { el, setHidden, setText } from "../dom.ts";
 import type { Mounted } from "../dom.ts";
-import type { Gate, GateOption, Gates, WireIntent, WireReport, WireToolAnswer, WireWebAnswer } from "../wire.ts";
+import type { Gate, GateOption, Gates, WireReport } from "../wire.ts";
 
 /** A click this soon after the question (re)drew is not a considered one. */
 const SETTLE_MS = 500;
@@ -43,17 +44,6 @@ function structureOf(gate: Gate): string {
   });
 }
 
-function intentFor(gate: Gate, option: GateOption): WireIntent {
-  switch (gate.kind) {
-    case "scope":
-      return { type: "answer_scope_grant", decision_id: gate.decision_id, option: option.value };
-    case "web":
-      return { type: "answer_web_approval", decision_id: gate.decision_id, answer: option.value as WireWebAnswer };
-    case "tool":
-      return { type: "answer_tool_approval", op_id: gate.op_id, answer: option.value as WireToolAnswer };
-  }
-}
-
 function section(heading: string | null, body: string, mono = false): HTMLElement {
   return el(
     "div",
@@ -74,6 +64,8 @@ function bodyFor(g: Gate): HTMLElement[] {
         return [...g.sections.map((s) => section(s.heading, s.body)), advice(g.advice)];
       case "web":
         return [section("URL", g.url, true), g.tool === null ? null : section("Requested by", g.tool, true)];
+      case "link":
+        return [section("Refused in", g.workspace, true), section(null, g.text), advice(g.note)];
       case "tool":
         return [section(null, g.description), advice(g.note)];
     }
@@ -82,11 +74,20 @@ function bodyFor(g: Gate): HTMLElement[] {
 }
 
 function kickerFor(g: Gate): string {
-  return { scope: "Sandbox access", web: "Network request", tool: "Tool approval" }[g.kind];
+  return { scope: "Sandbox access", web: "Network request", link: "Open a web link", tool: "Tool approval" }[g.kind];
 }
 
 function titleFor(g: Gate): string {
-  return g.kind === "scope" ? g.title : g.kind === "web" ? g.domain : g.tool;
+  switch (g.kind) {
+    case "scope":
+      return g.title;
+    case "web":
+      return g.domain;
+    case "link":
+      return g.site;
+    case "tool":
+      return g.tool;
+  }
 }
 
 function makeOption(option: GateOption, onClick: (event: MouseEvent, option: GateOption) => void): OptionEls {
@@ -100,12 +101,12 @@ function makeOption(option: GateOption, onClick: (event: MouseEvent, option: Gat
 }
 
 /**
- * Read-before-grant reporting: tells the server whether the scope/web question
- * on screen is being *read* (visible, focused document), in order, so a late
+ * Read-before-grant reporting: tells the server whether the scope, web or link
+ * question on screen is being *read* (visible, focused document), in order, so a late
  * "visible" can never overtake a "hidden".
  */
 interface ReadReporter {
-  /** The scope/web question now on screen, or null when there is none. */
+  /** The scope, web or link question now on screen, or null when there is none. */
   show(id: string | null): void;
   /** The stream (re)connected: say again what the server was last told. */
   resync(): void;
@@ -113,7 +114,7 @@ interface ReadReporter {
 }
 
 function createReadReporter(): ReadReporter {
-  let reportId: string | null = null; // the scope/web question on screen, if any
+  let reportId: string | null = null; // the scope, web or link question on screen, if any
   let reported: string | null = null; // the one the server was last told is visible
   let queue: Promise<void> = Promise.resolve();
 
@@ -195,9 +196,11 @@ export function mount(root: HTMLElement): GateView {
 
   async function answer(g: Gate, option: GateOption): Promise<void> {
     if (answering) return; // one request at a time; the server's view decides what happens next
+    const intent = intentFor(g, option);
+    if (intent === null) return; // not this surface's to send; the button says where it is
     answering = true;
     try {
-      await send(intentFor(g, option));
+      await send(intent);
     } finally {
       answering = false;
     }

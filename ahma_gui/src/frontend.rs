@@ -10,9 +10,9 @@
 //! looking at a question, and whether anyone is looking at all.
 
 use crate::auth::TabId;
-use crate::dto::{WireIntent, WireReport, WireToolAnswer, WireWebAnswer};
+use crate::dto::{WireIntent, WireLinkAnswer, WireReport, WireToolAnswer, WireWebAnswer};
 use crate::project;
-use ahma_tui::controller::{self, Intent, Refused, Report, ToolAnswer, WebAnswer};
+use ahma_tui::controller::{self, Intent, LinkChoice, Refused, Report, ToolAnswer, WebAnswer};
 use ahma_tui::session::{Frontend, Session};
 use ahma_tui::state::{AppState, GRANT_ARMING_DELAY, OpKey};
 use anyhow::Result;
@@ -162,6 +162,8 @@ impl WebFrontend {
                     .iter()
                     .map(|g| g.decision_id.as_str()),
             )
+            .chain(state.link_ask.iter().map(|g| g.decision_id.as_str()))
+            .chain(state.link_ask_queue.iter().map(|g| g.decision_id.as_str()))
             .collect();
         for tab in self.tabs.values_mut() {
             tab.visible_since
@@ -232,6 +234,10 @@ impl WebFrontend {
                 decision_id,
                 answer,
             } if *answer != WireWebAnswer::Deny => self.require_read(tab, decision_id)?,
+            WireIntent::AnswerLinkAsk {
+                decision_id,
+                answer,
+            } if *answer != WireLinkAnswer::Deny => self.require_read(tab, decision_id)?,
             _ => {}
         }
         controller::apply(&mut session.state, to_intent(intent)).map_err(IntentError::from)
@@ -295,6 +301,16 @@ pub fn to_intent(wire: WireIntent) -> Intent {
                 WireWebAnswer::Deny => WebAnswer::Deny,
                 WireWebAnswer::Once => WebAnswer::Once,
                 WireWebAnswer::Session => WebAnswer::Session,
+            },
+        },
+        WireIntent::AnswerLinkAsk {
+            decision_id,
+            answer,
+        } => Intent::AnswerLinkAsk {
+            decision_id,
+            choice: match answer {
+                WireLinkAnswer::Deny => LinkChoice::Deny,
+                WireLinkAnswer::Session => LinkChoice::Session,
             },
         },
         WireIntent::AnswerToolApproval { op_id, answer } => Intent::AnswerToolApproval {
@@ -703,6 +719,164 @@ mod tests {
         let (result, ()) = tokio::join!(run_session(&mut session, &mut frontend), drive);
         result.unwrap();
         assert!(session.state.scope_grant.is_some());
+    }
+
+    // ── a link a hooked command was refused ─────────────────────────────────
+
+    /// A browser session over a private test home where a hooked command run by
+    /// this (live) process, standing in for the harness, was refused a
+    /// github.com link: the question is on screen, unshown, read from the
+    /// records as a connected session reads them. Returns the home and the
+    /// question's id.
+    fn session_with_a_link_question() -> (tempfile::TempDir, Session, String) {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        ahma_common::harness_asks::record_link_refusal(
+            &ahma_common::harness_asks::default_dir().unwrap(),
+            &home.path().join("ws"),
+            ahma_common::harness_asks::LinkRefusal {
+                host: "github.com".into(),
+                shown: "https://github.com/o/r/pull/12".into(),
+                local: false,
+                outside_egress: false,
+                at: ahma_common::session_grants::now_secs(),
+                harness_pid: Some(std::process::id()),
+                command_digest: Some(ahma_common::harness_asks::CommandDigest::of(
+                    "gh pr view 12 --web",
+                )),
+            },
+        )
+        .unwrap();
+        let mut asks = ahma_tui::harness_asks::pending_links();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        let mut gate = ahma_tui::state::LinkAskGate::from_ask(asks.remove(0));
+        gate.restart_arming(true);
+        let id = gate.decision_id.clone();
+        let mut session = session_with_a_question();
+        session.state.scope_grant = None;
+        session.state.link_ask = Some(gate);
+        (home, session, id)
+    }
+
+    fn link_answer(id: &str, answer: WireLinkAnswer) -> WireIntent {
+        WireIntent::AnswerLinkAsk {
+            decision_id: id.into(),
+            answer,
+        }
+    }
+
+    /// The session's own arming delay has passed (the tab's is set to none).
+    fn long_shown(session: &mut Session) {
+        session.state.link_ask.as_mut().unwrap().shown_at = Instant::now() - GRANT_ARMING_DELAY * 2;
+    }
+
+    /// SPEC R-LINK.4, R-LINK.6, R-GUI.6, R-GUI.7: a tab that has had the link
+    /// question in front of it — across the publishing of the view that drew
+    /// it — can allow the site for this session: the hook-side session grant,
+    /// given by `web`, and the refusal settled so neither this surface nor the
+    /// harness dialog asks it again.
+    #[test]
+    fn a_tab_that_has_read_a_link_question_can_allow_its_site_for_this_session() {
+        use ahma_common::permissions::{AuditAction, GrantKind, GrantTier};
+        let (home, mut session, id) = session_with_a_link_question();
+        let (mut frontend, _handles) = WebFrontend::new();
+        frontend.arming = Duration::ZERO;
+        frontend.tabs.entry(TAB_A).or_default();
+        let session_answer = || link_answer(&id, WireLinkAnswer::Session);
+        assert_eq!(
+            frontend.intent(TAB_A, session_answer(), &mut session),
+            Err(IntentError::NotArmed),
+            "never shown to this tab"
+        );
+        frontend.report(
+            TAB_A,
+            WireReport::GateVisible {
+                decision_id: id.clone(),
+            },
+            &mut session,
+        );
+        // The view is published between the report and the answer.
+        frontend.flush(&session.state);
+        long_shown(&mut session);
+        assert_eq!(
+            frontend.intent(TAB_A, session_answer(), &mut session),
+            Ok(())
+        );
+        assert!(session.state.link_ask.is_none(), "answered");
+        assert!(
+            ahma_tui::harness_asks::pending_links().is_empty(),
+            "settled: not asked again here or in the harness dialog"
+        );
+        let grants = ahma_common::open_url::active_sessions(
+            &ahma_common::open_url::session_dir().unwrap(),
+            ahma_common::session_grants::now_secs(),
+            &|pid| pid == std::process::id(),
+        );
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert!(grants[0].covers("github.com", &home.path().join("ws")));
+        assert_eq!(grants[0].granted_by.as_deref(), Some("web"));
+        let audited: Vec<_> = ahma_common::permissions::read_audit_entries(
+            &home.path().join(".ahma").join("permissions-audit.jsonl"),
+        )
+        .into_iter()
+        .filter(|e| e.kind == GrantKind::OpenUrl)
+        .map(|e| (e.action, e.tier, e.surface))
+        .collect();
+        assert_eq!(
+            audited,
+            [(AuditAction::Grant, GrantTier::Session, Some("web".into()))]
+        );
+    }
+
+    /// SPEC R-GUI.6: reading a link question is per tab, as for every
+    /// question — one that never showed it cannot allow it because another
+    /// did — and denying never waits; a deny is remembered for the harness's
+    /// session (R-LINK.6).
+    #[test]
+    fn a_tab_that_never_showed_a_link_question_cannot_allow_it_but_can_deny_it() {
+        let (_home, mut session, id) = session_with_a_link_question();
+        let (mut frontend, _handles) = WebFrontend::new();
+        frontend.arming = Duration::ZERO;
+        frontend.tabs.entry(TAB_A).or_default();
+        frontend.tabs.entry(TAB_B).or_default();
+        frontend.report(
+            TAB_A,
+            WireReport::GateVisible {
+                decision_id: id.clone(),
+            },
+            &mut session,
+        );
+        frontend.flush(&session.state);
+        long_shown(&mut session);
+        assert_eq!(
+            frontend.intent(
+                TAB_B,
+                link_answer(&id, WireLinkAnswer::Session),
+                &mut session
+            ),
+            Err(IntentError::NotArmed),
+            "B never showed it"
+        );
+        assert!(session.state.link_ask.is_some());
+        assert_eq!(
+            frontend.intent(TAB_B, link_answer(&id, WireLinkAnswer::Deny), &mut session),
+            Ok(())
+        );
+        assert!(session.state.link_ask.is_none());
+        let asks = ahma_common::harness_asks::load_all(
+            &ahma_common::harness_asks::default_dir().unwrap(),
+            ahma_common::session_grants::now_secs(),
+        );
+        assert!(
+            asks.iter()
+                .any(|a| ahma_common::harness_asks::link_denied_for(
+                    a,
+                    Some(std::process::id()),
+                    "github.com"
+                )),
+            "denied for the harness's session"
+        );
     }
 
     /// Text typed into chat reaches the controller, which refuses what this

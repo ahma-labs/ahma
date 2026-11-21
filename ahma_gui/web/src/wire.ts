@@ -166,6 +166,18 @@ export type Gate =
       options: GateOption[];
     }
   | {
+      kind: "link";
+      decision_id: string;
+      /** The site, on a line of its own. */
+      site: string;
+      /** The repo the refused command ran in. */
+      workspace: string;
+      /** The question every surface shows, ending with the guidance. */
+      text: string;
+      note: string;
+      options: GateOption[];
+    }
+  | {
       kind: "tool";
       op_id: string;
       tool: string;
@@ -190,6 +202,8 @@ export interface GateOption {
 // ── Page → server ──
 
 export type WireWebAnswer = "deny" | "once" | "session";
+/** A hooked command's refused link: nothing saved, and nothing waits for "this time". */
+export type WireLinkAnswer = "deny" | "session";
 export type WireToolAnswer = "reject" | "once";
 
 export type WireIntent =
@@ -198,6 +212,7 @@ export type WireIntent =
   | { type: "answer_scope_grant"; decision_id: string; option: string }
   | { type: "toggle_scope_grant_detail"; decision_id: string }
   | { type: "answer_web_approval"; decision_id: string; answer: WireWebAnswer }
+  | { type: "answer_link_ask"; decision_id: string; answer: WireLinkAnswer }
   | { type: "answer_tool_approval"; op_id: string; answer: WireToolAnswer }
   | { type: "cancel_op"; id: string; instance?: string | null }
   | { type: "re_raise_grant"; id: string; instance?: string | null }

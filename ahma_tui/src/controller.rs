@@ -17,7 +17,9 @@
 use crate::state::{AppState, GateView, OpKey};
 use ahma_common::scope_grant::GrantDecision;
 use ahma_common::web_approval::WebApprovalDecision;
-use ahma_mcp::links::policy::LinkChoice;
+/// The answer a link question takes ([`Intent::AnswerLinkAsk`]), for a surface
+/// that sends one.
+pub use ahma_mcp::links::policy::LinkChoice;
 
 /// An answer to a web-egress question. `Always` writes a setting, so it needs a
 /// session that may ([`crate::state::Capabilities::persistent_answers`]) and a

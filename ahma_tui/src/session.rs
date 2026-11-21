@@ -70,8 +70,8 @@ pub struct Session {
     /// session, nothing for a detached one.
     harness_asks: fn() -> Vec<crate::harness_asks::HarnessAsk>,
     /// Where the links refused terminal-hook commands left are read (SPEC
-    /// R-LINK.6): the terminal only, for now. Web and desktop do not render a
-    /// link question yet, and one they could not show must not wait unseen.
+    /// R-LINK.6): this machine's records for a connected session on any
+    /// surface ([`harness_link_source`]), nothing for a detached one.
     harness_link_asks: fn() -> Vec<crate::harness_asks::HarnessLinkAsk>,
 }
 
@@ -82,6 +82,21 @@ impl Drop for Session {
         if let Some(task) = self.hub_source.take() {
             task.abort();
         }
+    }
+}
+
+/// Where a connected session on `surface` reads the links refused
+/// terminal-hook commands left (SPEC R-LINK.6): this machine's records, on
+/// every surface, since every one draws the question — the terminal with its
+/// keys, the browser and ahma's own window with the answers a surface that
+/// may not save can give (R-GUI.9). A question is read only where it can be
+/// drawn: one waiting unseen would hold the gate. A new surface decides here.
+fn harness_link_source(
+    surface: ahma_common::hub::Surface,
+) -> fn() -> Vec<crate::harness_asks::HarnessLinkAsk> {
+    use ahma_common::hub::Surface;
+    match surface {
+        Surface::Tui | Surface::Web | Surface::Desktop => crate::harness_asks::pending_links,
     }
 }
 
@@ -221,11 +236,7 @@ impl Session {
             last_discovery: Instant::now(),
             last_harness_ask_poll: None,
             harness_asks: crate::harness_asks::pending,
-            harness_link_asks: if surface == ahma_common::hub::Surface::Tui {
-                crate::harness_asks::pending_links
-            } else {
-                Vec::new
-            },
+            harness_link_asks: harness_link_source(surface),
         }
     }
 
@@ -672,6 +683,38 @@ mod tests {
             fed.state.scope_grant.is_some(),
             "showed what its source held"
         );
+    }
+
+    /// SPEC R-LINK.6, R-GUI.9: every surface draws the question about a link
+    /// a hooked command was refused — the terminal, the browser and ahma's own
+    /// window — so a connected session on any of them reads this machine's
+    /// records, and a refusal waiting for a live harness reaches it.
+    #[test]
+    fn every_surface_reads_the_links_hooked_commands_were_refused() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let dir = ahma_common::harness_asks::default_dir().unwrap();
+        ahma_common::harness_asks::record_link_refusal(
+            &dir,
+            &home.path().join("ws"),
+            ahma_common::harness_asks::LinkRefusal {
+                host: "github.com".into(),
+                shown: "https://github.com/o/r/pull/1".into(),
+                local: false,
+                outside_egress: false,
+                at: ahma_common::session_grants::now_secs(),
+                harness_pid: Some(std::process::id()),
+                command_digest: None,
+            },
+        )
+        .unwrap();
+        use ahma_common::hub::Surface;
+        for surface in [Surface::Tui, Surface::Web, Surface::Desktop] {
+            let asks = harness_link_source(surface)();
+            assert_eq!(asks.len(), 1, "{surface:?}: {asks:?}");
+            assert_eq!(asks[0].refusal.host, "github.com", "{surface:?}");
+        }
     }
 
     /// Quiet is time: a tick reaches the surface, so what only it animates

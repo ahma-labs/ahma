@@ -38,6 +38,14 @@ Criteria in the root SPEC are cited by id, not restated.
   characters are escaped in the server; the wire takes an allow-listed intent set.
 - **Gate safety (R-GUI.6, R-PERM.3.5)**: a grant waits until the tab reports the question
   visible and focused and the arming delay has passed; a saving answer is not offered.
+- **A hooked command's refused link (root R-LINK.6)**: the session reads it as the terminal
+  does, and `project::gates` draws it as `Gate::Link` — behind a scope or web question, as in
+  the terminal — with the question and guidance every surface shows, the line that nothing
+  waits, and every answer the TUI offers in its order. Only deny and this site for this session
+  are enabled (`HarnessLinkAsk::unsaved_choices`); each saving answer is shown disabled with the
+  `ahma permissions grant open-url` line that gives it. The page can send only those two
+  (`WireLinkAnswer`); the session answer counts only from a tab that has read the question
+  (R-GUI.6), and is the hook-side session grant, audited as `web` or `desktop` (R-GUI.7).
 - **Its own audit name (R-GUI.7)**, **subscribes only while watched (R-GUI.8)**,
   **no host commands (R-GUI.9)**.
 - **First-party page, committed build (R-GUI.10)**.
@@ -90,8 +98,8 @@ attached too (root SPEC R-HUB.6).
   without a socket and again over a real loopback socket (`listen.rs`); a route inventory test
   asserts every `/api` route but `/pair` answers 401 without a token.
 - **Page**: `npm test` (Node's built-in runner, no test dependency) covers the pure modules:
-  the SSE parser, the reducer and the formatters. The DOM layer has no automated test; no
-  browser driver is a dependency (Out of Scope).
+  the SSE parser, the reducer, the formatters and the intent an answer sends (`answer.ts`).
+  The DOM layer has no automated test; no browser driver is a dependency (Out of Scope).
 - **Speed**: the server sends only changed regions; the page updates only regions whose
   revision advanced, batched per animation frame.
 
