@@ -27,14 +27,16 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
     warn_if_running_binary_differs(&install_dir).await;
 
     let outcome = match mode {
-        UpdateMode::LatestRelease | UpdateMode::TaggedRelease { .. } => {
+        UpdateMode::Release(release) => {
             let platform = platform.context(
                 "Prebuilt releases are unavailable on this platform. \
                  Try: ahma update main",
             )?;
-            run_release_update(&args, &platform, &install_dir, &mode).await
+            run_release_update(&args, &platform, &install_dir, &release).await
         }
-        UpdateMode::GitRef { branch } => run_git_update(&branch, &install_dir, args.dry_run).await,
+        UpdateMode::GitRef { branch } => {
+            run_git_update(&branch, &install_dir, args.run_mode()).await
+        }
     }?;
 
     if outcome.binary_changed && !args.dry_run {
@@ -44,8 +46,8 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
         print_post_install_details(
             &outcome.binary_path,
             &install_dir,
-            args.dry_run,
-            outcome.attestation_verified,
+            args.run_mode(),
+            outcome.attestation,
         )
         .await;
     }

@@ -26,7 +26,7 @@ use std::{
 };
 
 pub use install::{cargo_install_root, default_install_dir};
-pub use ref_mode::{UpdateMode, classify_ref};
+pub use ref_mode::{Release, UpdateMode, classify_ref};
 pub use source::build_cargo_install_command;
 
 use install::{install_release_asset, read_installed_version};
@@ -104,12 +104,68 @@ pub struct UpdateArgs {
     pub prefer_musl: bool,
 }
 
+impl UpdateArgs {
+    /// Whether this update writes anything (`--dry-run`).
+    pub fn run_mode(&self) -> RunMode {
+        if self.dry_run {
+            RunMode::DryRun
+        } else {
+            RunMode::Apply
+        }
+    }
+
+    /// Whether a release's attestation is checked (`--insecure-skip-verify`).
+    pub fn verification(&self) -> Verification {
+        if self.insecure_skip_verify {
+            Verification::Skipped
+        } else {
+            Verification::Required
+        }
+    }
+}
+
+/// Whether an update writes anything, or only says what it would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Apply,
+    DryRun,
+}
+
+/// Whether a downloaded release's Sigstore attestation is checked before it
+/// is installed. Named where two adjacent `bool`s (`dry_run`,
+/// `insecure_skip_verify`) were passed positionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verification {
+    Required,
+    /// `--insecure-skip-verify`: for offline use only (SPEC R-CFG2.3).
+    Skipped,
+}
+
+/// What an update can say about the provenance of the binary it installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attestation {
+    /// Its GitHub build-provenance attestation was verified.
+    Verified,
+    /// Verification was skipped (`--insecure-skip-verify`).
+    Skipped,
+    /// A build from a Git ref, which has no attestation.
+    NotApplicable,
+}
+
+impl From<Verification> for Attestation {
+    fn from(v: Verification) -> Self {
+        match v {
+            Verification::Required => Self::Verified,
+            Verification::Skipped => Self::Skipped,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct UpdateOutcome {
     pub binary_path: PathBuf,
     pub binary_changed: bool,
-    /// `Some(true)` = attestation verified, `Some(false)` = verification skipped, `None` = git install (no attestation).
-    pub attestation_verified: Option<bool>,
+    pub attestation: Attestation,
 }
 
 /// Resolve the directory the `ahma` binary is installed into (and removed from).
@@ -138,13 +194,13 @@ pub fn resolve_install_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 pub async fn run_git_update(
     branch: &str,
     install_dir: &Path,
-    dry_run: bool,
+    run: RunMode,
 ) -> Result<UpdateOutcome> {
-    let installed = install_from_git_ref(branch, install_dir, dry_run).await?;
+    let installed = install_from_git_ref(branch, install_dir, run).await?;
     Ok(UpdateOutcome {
         binary_path: installed,
-        binary_changed: !dry_run,
-        attestation_verified: None, // cargo install builds don't have GitHub attestations
+        binary_changed: run == RunMode::Apply,
+        attestation: Attestation::NotApplicable,
     })
 }
 
@@ -152,7 +208,7 @@ pub async fn run_release_update(
     args: &UpdateArgs,
     platform: &platform::Platform,
     install_dir: &Path,
-    mode: &UpdateMode,
+    release: &Release,
 ) -> Result<UpdateOutcome> {
     // Security-tier and retired (R-CFG2.3), stated through the one function that
     // states it (R-CFG1.2.1). Turning off signature or certificate verification is
@@ -165,14 +221,14 @@ pub async fn run_release_update(
              really mean to disable it (R-CFG2.3)."
         );
     }
-    let insecure_skip_verify = args.insecure_skip_verify;
+    let verification = args.verification();
+    let run = args.run_mode();
 
     let client = github::client()?;
 
-    let asset = match mode {
-        UpdateMode::LatestRelease => fetch_latest_asset(&client, platform).await?,
-        UpdateMode::TaggedRelease { tag } => fetch_tagged_asset(&client, tag, platform).await?,
-        UpdateMode::GitRef { .. } => unreachable!("release path only"),
+    let asset = match release {
+        Release::Latest => fetch_latest_asset(&client, platform).await?,
+        Release::Tagged { tag } => fetch_tagged_asset(&client, tag, platform).await?,
     };
 
     let target = install_dir.join(platform.binary_name());
@@ -184,7 +240,7 @@ pub async fn run_release_update(
                 "Ahma {installed} is already installed at {}",
                 target.display()
             );
-            if args.dry_run {
+            if run == RunMode::DryRun {
                 println!("[dry-run] Would reinstall with --force");
             } else {
                 println!("Use --force to reinstall anyway.");
@@ -192,53 +248,44 @@ pub async fn run_release_update(
             return Ok(UpdateOutcome {
                 binary_path: target,
                 binary_changed: false,
-                attestation_verified: Some(!insecure_skip_verify),
+                attestation: verification.into(),
             });
         }
         println!("Upgrading ahma from {installed} to {}...", asset.version);
     }
 
     println!("Installing Ahma {} for {}...", asset.version, platform.id);
-    let installed = install_release_asset(
-        &client,
-        &asset,
-        platform,
-        install_dir,
-        args.dry_run,
-        insecure_skip_verify,
-    )
-    .await?;
+    let installed =
+        install_release_asset(&client, &asset, platform, install_dir, run, verification).await?;
 
     Ok(UpdateOutcome {
         binary_path: installed,
-        binary_changed: !args.dry_run,
-        attestation_verified: Some(!insecure_skip_verify),
+        binary_changed: run == RunMode::Apply,
+        attestation: verification.into(),
     })
 }
 
 pub async fn print_post_install_details(
     installed: &Path,
     install_dir: &Path,
-    dry_run: bool,
-    attestation_verified: Option<bool>,
+    run: RunMode,
+    attestation: Attestation,
 ) {
-    if dry_run {
+    if run == RunMode::DryRun {
         return;
     }
 
     let version = read_installed_version(installed).await;
     println!("{}", format_install_success(installed, version.as_deref()));
 
-    if let Some(verified) = attestation_verified {
-        if verified {
-            println!(
-                "Authenticity verified: GitHub Build Provenance Attestation (Sigstore SLSA Level 3) confirmed."
-            );
-        } else {
-            println!(
-                "WARNING: Sigstore attestation verification was bypassed (--insecure-skip-verify)."
-            );
-        }
+    match attestation {
+        Attestation::Verified => println!(
+            "Authenticity verified: GitHub Build Provenance Attestation (Sigstore SLSA Level 3) confirmed."
+        ),
+        Attestation::Skipped => println!(
+            "WARNING: Sigstore attestation verification was bypassed (--insecure-skip-verify)."
+        ),
+        Attestation::NotApplicable => {}
     }
 
     println!();
@@ -561,34 +608,58 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let binary = temp_dir.path().join("nonexistent_ahma");
         // dry_run=true → function returns at the first guard without touching anything.
-        print_post_install_details(&binary, temp_dir.path(), true, None).await;
+        print_post_install_details(
+            &binary,
+            temp_dir.path(),
+            RunMode::DryRun,
+            Attestation::NotApplicable,
+        )
+        .await;
         // No panic = success.
     }
 
     #[tokio::test]
     async fn test_print_post_install_details_no_attestation() {
-        // dry_run=false, attestation_verified=None (git install path).
+        // Applied, no attestation (git install path).
         // Binary does not exist → read_installed_version returns None → "no version" message.
         let temp_dir = tempfile::tempdir().unwrap();
         let binary = temp_dir.path().join("nonexistent_ahma");
-        print_post_install_details(&binary, temp_dir.path(), false, None).await;
+        print_post_install_details(
+            &binary,
+            temp_dir.path(),
+            RunMode::Apply,
+            Attestation::NotApplicable,
+        )
+        .await;
         // Covers: version read (None), format_install_success(None), print hints.
     }
 
     #[tokio::test]
     async fn test_print_post_install_details_attestation_verified_true() {
-        // attestation_verified=Some(true) → prints the "Authenticity verified" message.
+        // Verified → prints the "Authenticity verified" message.
         let temp_dir = tempfile::tempdir().unwrap();
         let binary = temp_dir.path().join("nonexistent_ahma");
-        print_post_install_details(&binary, temp_dir.path(), false, Some(true)).await;
+        print_post_install_details(
+            &binary,
+            temp_dir.path(),
+            RunMode::Apply,
+            Attestation::Verified,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_print_post_install_details_attestation_bypassed() {
-        // attestation_verified=Some(false) → prints the insecure-skip warning.
+        // Skipped → prints the insecure-skip warning.
         let temp_dir = tempfile::tempdir().unwrap();
         let binary = temp_dir.path().join("nonexistent_ahma");
-        print_post_install_details(&binary, temp_dir.path(), false, Some(false)).await;
+        print_post_install_details(
+            &binary,
+            temp_dir.path(),
+            RunMode::Apply,
+            Attestation::Skipped,
+        )
+        .await;
     }
 
     // ─── run_git_update ─────────────────────────────────────────────────────
@@ -596,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_git_update_dry_run_main_branch() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let result = run_git_update("main", temp_dir.path(), true).await;
+        let result = run_git_update("main", temp_dir.path(), RunMode::DryRun).await;
         assert!(
             result.is_ok(),
             "dry-run git update should succeed: {result:?}"
@@ -607,7 +678,7 @@ mod tests {
             "dry_run → binary_changed must be false"
         );
         assert!(
-            outcome.attestation_verified.is_none(),
+            outcome.attestation == Attestation::NotApplicable,
             "git builds have no attestation"
         );
         // Binary path should be inside install_dir.
@@ -620,11 +691,11 @@ mod tests {
     #[tokio::test]
     async fn test_run_git_update_dry_run_feature_branch() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let result = run_git_update("feature/my-branch", temp_dir.path(), true).await;
+        let result = run_git_update("feature/my-branch", temp_dir.path(), RunMode::DryRun).await;
         assert!(result.is_ok());
         let outcome = result.unwrap();
         assert!(!outcome.binary_changed);
-        assert!(outcome.attestation_verified.is_none());
+        assert_eq!(outcome.attestation, Attestation::NotApplicable);
     }
 
     // ─── Unix-only helpers ───────────────────────────────────────────────────
@@ -923,13 +994,8 @@ mod tests {
                 insecure_skip_verify: true,
                 prefer_musl: false,
             };
-            let outcome = run_release_update(
-                &args,
-                &platform,
-                temp_dir.path(),
-                &UpdateMode::LatestRelease,
-            )
-            .await;
+            let outcome =
+                run_release_update(&args, &platform, temp_dir.path(), &Release::Latest).await;
             if let Err(e) = outcome {
                 // Network / API errors are expected when GitHub is unreachable.
                 // A programming error would show a different pattern.
@@ -950,7 +1016,7 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
     }
 
-    /// Covers the `UpdateMode::TaggedRelease` match arm inside `run_release_update`.
+    /// Covers the `Release::Tagged` match arm inside `run_release_update`.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_run_release_update_tagged_release_match_arm() {
@@ -969,7 +1035,7 @@ mod tests {
                 insecure_skip_verify: true,
                 prefer_musl: false,
             };
-            let mode = UpdateMode::TaggedRelease {
+            let mode = Release::Tagged {
                 tag: "v0.1.0".to_string(),
             };
             // Accept either Ok (network available + dry-run) or Err (network unavailable).

@@ -51,14 +51,14 @@ pub fn required_rustflags() -> String {
 pub async fn install_from_git_ref(
     branch: &str,
     install_dir: &Path,
-    dry_run: bool,
+    run: super::RunMode,
 ) -> Result<PathBuf> {
     let args = build_cargo_install_command(branch, install_dir);
     let display = args.join(" ");
 
     let rustflags = required_rustflags();
 
-    if dry_run {
+    if run == super::RunMode::DryRun {
         println!("[dry-run] Would run: RUSTFLAGS='{rustflags}' {display}");
         return Ok(install_dir.join(super::AHMA_BINARY_NAME));
     }
@@ -203,7 +203,7 @@ mod tests {
     async fn test_install_from_git_ref_dry_run_returns_binary_path() {
         let dir = tempdir().unwrap();
         let install_dir = dir.path();
-        let result = install_from_git_ref("main", install_dir, true).await;
+        let result = install_from_git_ref("main", install_dir, crate::RunMode::DryRun).await;
         assert!(
             result.is_ok(),
             "dry-run should succeed without spawning cargo"
