@@ -2408,6 +2408,7 @@ fn handle_overlay_key(key: crossterm::event::KeyEvent, state: &mut crate::state:
         Overlay::Trust => handle_trust_key(key, state),
         Overlay::ScopeGrant => handle_scope_grant_key(key, state),
         Overlay::WebApproval => handle_web_approval_key(key, state),
+        Overlay::LinkAsk => handle_link_ask_key(key, state),
         Overlay::Setup => handle_setup_key(key, state),
         Overlay::Settings => handle_settings_key(key, state),
         Overlay::Modal => {
@@ -2727,12 +2728,16 @@ fn scroll_grant_body(key: crossterm::event::KeyEvent, state: &mut crate::state::
     if let Some(gate) = state.web_approval.as_mut() {
         return scroll_gate(key, &mut gate.scroll, &gate.view);
     }
+    if let Some(gate) = state.link_ask.as_mut() {
+        return scroll_gate(key, &mut gate.scroll, &gate.view);
+    }
     false
 }
 
 /// Move a grant question's body for a scroll key, from what the last frame
 /// showed. None of these keys answers a question: the answers are
-/// `n o w r y s l L R Y ?` (scope) and `n o s a` (web), and these are the
+/// `n o w r y s l L R Y ?` (scope), `n o s a` (web) and `n s a r *` (link),
+/// and these are the
 /// work view's own scroll keys (`↑↓ j k`, `PgUp PgDn`, `g G`, Home, End).
 fn scroll_gate(
     key: crossterm::event::KeyEvent,
@@ -2816,6 +2821,131 @@ pub(crate) fn sync_harness_asks(
         }
         spawn_grant_advisor(state, request);
     }
+}
+
+/// Bring the link questions in line with the records (SPEC R-LINK.6), as
+/// [`sync_harness_asks`] does for folders: a new one waits its turn, and one no
+/// longer waiting — asked in the harness dialog, covered by a grant, answered
+/// in another TUI, or its harness gone — is withdrawn wherever it is.
+pub(crate) fn sync_harness_link_asks(
+    state: &mut crate::state::AppState,
+    pending: Vec<crate::harness_asks::HarnessLinkAsk>,
+) {
+    let ids: std::collections::HashSet<String> = pending
+        .iter()
+        .map(crate::harness_asks::HarnessLinkAsk::decision_id)
+        .collect();
+    state
+        .link_ask_queue
+        .retain(|g| ids.contains(&g.decision_id));
+    if state
+        .link_ask
+        .as_ref()
+        .is_some_and(|g| !ids.contains(&g.decision_id))
+    {
+        show_next_link_ask(state);
+    }
+    for ask in pending {
+        let id = ask.decision_id();
+        let known = state
+            .link_ask
+            .iter()
+            .chain(state.link_ask_queue.iter())
+            .any(|g| g.decision_id == id);
+        if known {
+            continue;
+        }
+        let mut gate = crate::state::LinkAskGate::from_ask(ask);
+        gate.restart_arming(state.caps.wait_for_presentation);
+        if state.link_ask.is_none() {
+            state.link_ask = Some(gate);
+        } else {
+            state.link_ask_queue.push_back(gate);
+        }
+    }
+}
+
+/// The next waiting link question, if any, takes the screen, unread from this
+/// moment (SPEC R-PERM.3.5).
+fn show_next_link_ask(state: &mut crate::state::AppState) {
+    let wait = state.caps.wait_for_presentation;
+    state.link_ask = state.link_ask_queue.pop_front().map(|mut gate| {
+        gate.restart_arming(wait);
+        gate
+    });
+}
+
+/// Apply `choice` to the open link question and log what it did: nothing
+/// waits on a hooked command, so the TUI writes the answer itself and settles
+/// the refusal so the harness dialog does not ask it too (SPEC R-LINK.6,
+/// R-PERM.3.8). The next one takes the screen.
+pub(crate) fn resolve_link_ask(
+    state: &mut crate::state::AppState,
+    choice: ahma_mcp::links::policy::LinkChoice,
+) {
+    use crate::state::{LogEntry, LogLevel};
+    let Some(gate) = state.link_ask.take() else {
+        return;
+    };
+    show_next_link_ask(state);
+    let surface = ahma_common::approver::ApproverSurface::from(state.surface);
+    let (level, message) = match crate::harness_asks::answer_link(&gate.ask, choice, &surface) {
+        Ok(line) if choice == ahma_mcp::links::policy::LinkChoice::Deny => (LogLevel::Warn, line),
+        Ok(line) => (LogLevel::Info, line),
+        Err(e) => (
+            LogLevel::Warn,
+            format!(
+                "Could not apply the answer for {}: {e:#}",
+                gate.ask.refusal.host
+            ),
+        ),
+    };
+    state.push_log(LogEntry {
+        timestamp: ahma_common::timestamp::local_now(),
+        level,
+        message,
+    });
+}
+
+/// Keys for the open link question (SPEC R-LINK.6), from
+/// [`crate::state::LINK_ASK_KEYS`]: `n`, Enter and Esc deny; `s` this site for
+/// this session; `a` always for this site in all repos, `r` in this repo only,
+/// `*` any site — each only where the question offers it. The rules for taking
+/// an answer are the controller's.
+fn handle_link_ask_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use ahma_mcp::links::policy::LinkChoice;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if state.link_ask.is_none()
+        || state.text_entry_modal_open()
+        || state.log_filter_active
+        || state.typing_in_chat()
+    {
+        return false;
+    }
+    if scroll_grant_body(key, state) {
+        return true;
+    }
+    let Some(id) = state.link_ask.as_ref().map(|g| g.decision_id.clone()) else {
+        return false;
+    };
+    // `*` is typed with Shift on most layouts.
+    let plain = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
+    let choice = match key.code {
+        KeyCode::Esc | KeyCode::Enter => LinkChoice::Deny,
+        KeyCode::Char(c) if plain => {
+            match crate::state::LINK_ASK_KEYS.iter().find(|(k, _)| *k == c) {
+                Some((_, choice)) => *choice,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    let _ = crate::controller::answer_link_ask(state, &id, choice);
+    true
 }
 
 /// Take out of the grant questions every copy that `decision`, given to
@@ -9299,6 +9429,154 @@ mod tests {
         assert!(screen.contains("Allow read+write access to"), "{screen}");
         assert!(screen.contains("terminal hook"), "{screen}");
         assert!(!screen.contains("next command only"), "{screen}");
+    }
+
+    /// A link a hooked command was refused, as the TUI lists it (SPEC R-LINK.6).
+    fn link_ask(root: &std::path::Path, host: &str) -> crate::harness_asks::HarnessLinkAsk {
+        crate::harness_asks::HarnessLinkAsk {
+            workspace: root.join("ws"),
+            refusal: ahma_common::harness_asks::LinkRefusal {
+                host: host.into(),
+                shown: format!("https://{host}/o/r/pull/12"),
+                local: false,
+                outside_egress: false,
+                at: ahma_common::session_grants::now_secs(),
+                harness_pid: Some(std::process::id()),
+                command_digest: Some(ahma_common::harness_asks::CommandDigest::of(
+                    "gh pr view 12 --web",
+                )),
+            },
+            harness_pid: std::process::id(),
+        }
+    }
+
+    fn screen_of(state: &crate::state::AppState) -> String {
+        let theme = crate::theme::Theme::new(true);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).unwrap();
+        terminal
+            .draw(|f| crate::ui::draw(f, state, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    /// SPEC R-LINK.6 with R-PERM.3.5: a link a hooked command was refused
+    /// takes the screen as its own question, waits behind the open one, is
+    /// queued once however often it is read, and is withdrawn wherever it is
+    /// once it stops waiting; the next one is unread.
+    #[test]
+    fn link_questions_from_the_records_wait_their_turn_and_leave_when_answered_elsewhere() {
+        use crate::state::AppState;
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = (
+            link_ask(root.path(), "github.com"),
+            link_ask(root.path(), "docs.rs"),
+        );
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::sync_harness_link_asks(&mut state, vec![a.clone(), b.clone()]);
+        super::sync_harness_link_asks(&mut state, vec![a.clone(), b.clone()]);
+        assert_eq!(state.top_overlay(), Some(crate::state::Overlay::LinkAsk));
+        assert_eq!(
+            state.link_ask.as_ref().unwrap().decision_id,
+            a.decision_id()
+        );
+        assert_eq!(state.link_ask_queue.len(), 1, "each once");
+        super::sync_harness_link_asks(&mut state, vec![b.clone()]);
+        let shown = state.link_ask.as_ref().expect("the next one");
+        assert_eq!(shown.decision_id, b.decision_id());
+        assert!(
+            !shown.armed(),
+            "the question that replaced a withdrawn one is unread"
+        );
+        assert!(state.link_ask_queue.is_empty());
+        super::sync_harness_link_asks(&mut state, vec![]);
+        assert!(state.link_ask.is_none());
+    }
+
+    /// SPEC R-LINK.6, R-LINK.7: the question shows the site on its own line,
+    /// the address, the guidance and the answers in order — deny, this site
+    /// for this session, always for this site in all repos, then this repo,
+    /// then any site — with no "this time"; a saving key shows the exact line
+    /// it writes before a second press saves it; `n` denies and records it,
+    /// so the harness dialog does not ask it too.
+    #[test]
+    fn a_link_question_shows_the_guidance_and_its_answers_and_is_answered_here() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", root.path()) };
+        let ask = link_ask(root.path(), "github.com");
+        let dir = ahma_common::harness_asks::default_dir().expect("a runtime dir under test");
+        ahma_common::harness_asks::record_link_refusal(&dir, &ask.workspace, ask.refusal.clone())
+            .unwrap();
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::sync_harness_link_asks(&mut state, vec![ask.clone()]);
+        state.link_ask.as_mut().unwrap().shown_at =
+            std::time::Instant::now() - crate::state::GRANT_ARMING_DELAY * 2;
+
+        let screen = screen_of(&state);
+        for must in [
+            "Site: github.com",
+            "Address: https://github.com/o/r/pull/12",
+            "sends its whole address",
+            "never files or apps",
+            "Undo with `ahma permissions revoke",
+        ] {
+            assert!(screen.contains(must), "missing {must:?}:\n{screen}");
+        }
+        let at = |s: &str| {
+            screen
+                .find(s)
+                .unwrap_or_else(|| panic!("missing {s:?}:\n{screen}"))
+        };
+        let order = [
+            "[n] Deny",
+            "[s] this site, this session",
+            "[a] always for this site — all repos",
+            "[r] always for this site — this repo only",
+            "[*] always (any site)",
+        ];
+        assert!(
+            order.windows(2).all(|w| at(w[0]) < at(w[1])),
+            "answers in order:\n{screen}"
+        );
+        assert!(!screen.contains("this time"), "{screen}");
+
+        let press = |state: &mut AppState, c: char| {
+            super::handle_link_ask_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), state)
+        };
+        assert!(press(&mut state, 'a'));
+        assert!(state.link_ask.is_some(), "the first press saves nothing");
+        let screen = screen_of(&state);
+        assert!(
+            screen.contains("[a] again adds \"github.com\" to [open_url] allow"),
+            "{screen}"
+        );
+        assert!(!press(&mut state, 'o'), "o (this time) is not offered");
+        assert!(press(&mut state, 'n'));
+        assert!(state.link_ask.is_none());
+        let line = &state.log.back().expect("logged").message;
+        assert!(line.contains("will not ask about it again"), "{line}");
+        let recorded = ahma_common::harness_asks::load(
+            &dir,
+            &ask.workspace,
+            ahma_common::session_grants::now_secs(),
+        );
+        assert!(recorded.link_refusals.is_empty(), "{recorded:?}");
+        assert!(ahma_common::harness_asks::link_denied_for(
+            &recorded,
+            Some(std::process::id()),
+            "github.com"
+        ));
     }
 
     /// `y` widens to read+write, clears the gate, and is consumed even with chat

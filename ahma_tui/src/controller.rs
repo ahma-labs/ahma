@@ -17,6 +17,7 @@
 use crate::state::{AppState, GateView, OpKey};
 use ahma_common::scope_grant::GrantDecision;
 use ahma_common::web_approval::WebApprovalDecision;
+use ahma_mcp::links::policy::LinkChoice;
 
 /// An answer to a web-egress question. `Always` writes a setting, so it needs a
 /// session that may ([`crate::state::Capabilities::persistent_answers`]) and a
@@ -62,6 +63,12 @@ pub enum Intent {
     AnswerWebApproval {
         decision_id: String,
         answer: WebAnswer,
+    },
+    /// Answer the question about a link a hooked command was refused (SPEC
+    /// R-LINK.6) with one of the answers it offers.
+    AnswerLinkAsk {
+        decision_id: String,
+        choice: LinkChoice,
     },
     AnswerToolApproval {
         op_id: String,
@@ -117,7 +124,8 @@ pub enum Refused {
     /// A saving answer: the first press brings the exact line into view; the
     /// answer is taken once that was reported shown (R-PERM.3.5).
     SaveLineNotShown,
-    /// `Always` for a web host: the first step shows the line it would write.
+    /// `Always` for a web host, or a saving answer to a link question: the
+    /// first step shows the line it would write.
     NeedsConfirmation,
     /// The question does not offer that answer.
     NotOffered,
@@ -156,6 +164,10 @@ pub fn apply(state: &mut AppState, intent: Intent) -> Result<(), Refused> {
             decision_id,
             answer,
         } => answer_web_approval(state, &decision_id, answer),
+        Intent::AnswerLinkAsk {
+            decision_id,
+            choice,
+        } => answer_link_ask(state, &decision_id, choice),
         Intent::AnswerToolApproval { op_id, answer } => answer_tool_approval(state, &op_id, answer),
         Intent::CancelOp { op } => {
             if state.find_op(&op).is_none() {
@@ -210,6 +222,13 @@ pub fn report(state: &mut AppState, report: Report) {
             }
             if let Some(gate) = state
                 .web_approval
+                .as_mut()
+                .filter(|g| g.decision_id == decision_id)
+            {
+                gate.presented();
+            }
+            if let Some(gate) = state
+                .link_ask
                 .as_mut()
                 .filter(|g| g.decision_id == decision_id)
             {
@@ -327,6 +346,49 @@ pub fn answer_web_approval(
         }
         WebAnswer::Deny => unreachable!("handled above"),
     }
+    Ok(())
+}
+
+/// Answer the question about a refused link `decision_id` (SPEC R-LINK.6).
+///
+/// The rules every grant question keeps: an answer it does not offer is
+/// refused by name; deny is taken at once; anything else waits until the
+/// question was shown and read (R-PERM.3.5); a saving answer needs a session
+/// that may save (R-GUI.9) and a second press of the same key after the exact
+/// line it writes is on screen (R-PERM.3.5).
+pub fn answer_link_ask(
+    state: &mut AppState,
+    decision_id: &str,
+    choice: LinkChoice,
+) -> Result<(), Refused> {
+    let Some(gate) = state
+        .link_ask
+        .as_ref()
+        .filter(|g| g.decision_id == decision_id)
+    else {
+        return Err(Refused::Stale);
+    };
+    if !gate.choices.contains(&choice) {
+        return Err(Refused::NotOffered);
+    }
+    if choice == LinkChoice::Deny {
+        crate::app::resolve_link_ask(state, choice);
+        return Ok(());
+    }
+    let saving = gate.ask.save_line(choice).is_some();
+    if saving && !state.caps.persistent_answers {
+        return Err(Refused::NotAllowed);
+    }
+    if !gate.armed() {
+        return Err(Refused::NotArmed);
+    }
+    if saving && gate.confirm != Some(choice) {
+        if let Some(gate) = state.link_ask.as_mut() {
+            gate.confirm = Some(choice);
+        }
+        return Err(Refused::NeedsConfirmation);
+    }
+    crate::app::resolve_link_ask(state, choice);
     Ok(())
 }
 
@@ -815,5 +877,126 @@ mod tests {
             Ok(())
         );
         assert!(gui.approval.is_none());
+    }
+
+    fn link_gate(state: &mut AppState, id_host: &str, local: bool) -> String {
+        let ask = crate::harness_asks::HarnessLinkAsk {
+            workspace: std::env::temp_dir().join("ws"),
+            refusal: ahma_common::harness_asks::LinkRefusal {
+                host: id_host.into(),
+                shown: format!("https://{id_host}/x"),
+                local,
+                outside_egress: false,
+                at: 1,
+                harness_pid: Some(std::process::id()),
+                command_digest: None,
+            },
+            harness_pid: std::process::id(),
+        };
+        let mut gate = crate::state::LinkAskGate::from_ask(ask);
+        gate.restart_arming(state.caps.wait_for_presentation);
+        let id = gate.decision_id.clone();
+        state.link_ask = Some(gate);
+        id
+    }
+
+    fn read_link(state: &mut AppState) {
+        let gate = state.link_ask.as_mut().unwrap();
+        gate.awaiting_presentation = false;
+        gate.shown_at = std::time::Instant::now() - GRANT_ARMING_DELAY * 2;
+    }
+
+    fn link(state: &mut AppState, id: &str, choice: LinkChoice) -> Result<(), Refused> {
+        apply(
+            state,
+            Intent::AnswerLinkAsk {
+                decision_id: id.into(),
+                choice,
+            },
+        )
+    }
+
+    /// SPEC R-LINK.6, R-PERM.3.5: a link question takes only an answer it
+    /// offers ("this time" is not one, nor "any site" for a local site), only
+    /// once read, and a saving one only on a second press of the same answer,
+    /// after the exact line it writes is on screen. Deny never waits.
+    #[test]
+    fn a_link_question_takes_only_what_it_offers_once_read_and_confirmed() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let mut state = state(Capabilities::terminal());
+        let id = link_gate(&mut state, "github.com", false);
+        assert_eq!(
+            link(&mut state, "ghost", LinkChoice::Deny),
+            Err(Refused::Stale)
+        );
+        assert_eq!(
+            link(&mut state, &id, LinkChoice::Once),
+            Err(Refused::NotOffered)
+        );
+        assert_eq!(
+            link(&mut state, &id, LinkChoice::Session),
+            Err(Refused::NotArmed)
+        );
+        read_link(&mut state);
+        assert_eq!(
+            link(&mut state, &id, LinkChoice::AlwaysSiteAllRepos),
+            Err(Refused::NeedsConfirmation)
+        );
+        assert_eq!(
+            state.link_ask.as_ref().unwrap().confirm,
+            Some(LinkChoice::AlwaysSiteAllRepos),
+            "the first press shows the line, saves nothing"
+        );
+        assert_eq!(
+            link(&mut state, &id, LinkChoice::AlwaysSiteThisRepo),
+            Err(Refused::NeedsConfirmation),
+            "another saving answer is its own first press"
+        );
+        assert_eq!(
+            link(&mut state, &id, LinkChoice::AlwaysSiteThisRepo),
+            Ok(())
+        );
+        assert!(state.link_ask.is_none(), "answered");
+
+        let id = link_gate(&mut state, "localhost", true);
+        read_link(&mut state);
+        assert_eq!(
+            link(&mut state, &id, LinkChoice::AlwaysAny),
+            Err(Refused::NotOffered),
+            "any site never covers a local site"
+        );
+        assert_eq!(link(&mut state, &id, LinkChoice::Deny), Ok(()));
+        assert!(state.link_ask.is_none());
+    }
+
+    /// SPEC R-GUI.9: a surface that may not save cannot give a lasting link
+    /// answer, however it asks; this site for this session and deny are its.
+    #[test]
+    fn a_browser_surface_cannot_save_a_link_grant() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let mut gui = state(gui_caps());
+        let id = link_gate(&mut gui, "github.com", false);
+        report(
+            &mut gui,
+            Report::GatePresented {
+                decision_id: id.clone(),
+            },
+        );
+        gui.link_ask.as_mut().unwrap().shown_at =
+            std::time::Instant::now() - GRANT_ARMING_DELAY * 2;
+        for saving in [
+            LinkChoice::AlwaysSiteAllRepos,
+            LinkChoice::AlwaysSiteThisRepo,
+            LinkChoice::AlwaysAny,
+        ] {
+            assert_eq!(link(&mut gui, &id, saving), Err(Refused::NotAllowed));
+            assert_eq!(link(&mut gui, &id, saving), Err(Refused::NotAllowed));
+        }
+        assert_eq!(link(&mut gui, &id, LinkChoice::Session), Ok(()));
+        assert!(gui.link_ask.is_none());
     }
 }

@@ -69,6 +69,10 @@ pub struct Session {
     /// Where those questions are read: this machine's records for a connected
     /// session, nothing for a detached one.
     harness_asks: fn() -> Vec<crate::harness_asks::HarnessAsk>,
+    /// Where the links refused terminal-hook commands left are read (SPEC
+    /// R-LINK.6): the terminal only, for now. Web and desktop do not render a
+    /// link question yet, and one they could not show must not wait unseen.
+    harness_link_asks: fn() -> Vec<crate::harness_asks::HarnessLinkAsk>,
 }
 
 impl Drop for Session {
@@ -217,6 +221,11 @@ impl Session {
             last_discovery: Instant::now(),
             last_harness_ask_poll: None,
             harness_asks: crate::harness_asks::pending,
+            harness_link_asks: if surface == ahma_common::hub::Surface::Tui {
+                crate::harness_asks::pending_links
+            } else {
+                Vec::new
+            },
         }
     }
 
@@ -249,6 +258,7 @@ impl Session {
             last_discovery: Instant::now(),
             last_harness_ask_poll: None,
             harness_asks: Vec::new,
+            harness_link_asks: Vec::new,
         }
     }
 
@@ -258,6 +268,15 @@ impl Session {
         source: fn() -> Vec<crate::harness_asks::HarnessAsk>,
     ) -> Self {
         self.harness_asks = source;
+        self
+    }
+
+    /// Read the links terminal hooks left from `source` instead.
+    pub fn with_harness_link_asks(
+        mut self,
+        source: fn() -> Vec<crate::harness_asks::HarnessLinkAsk>,
+    ) -> Self {
+        self.harness_link_asks = source;
         self
     }
 
@@ -346,6 +365,7 @@ impl Session {
         {
             self.last_harness_ask_poll = Some(now);
             crate::app::sync_harness_asks(&mut self.state, (self.harness_asks)());
+            crate::app::sync_harness_link_asks(&mut self.state, (self.harness_link_asks)());
         }
         let mut drained = 0usize;
         while drained < MAX_EVENT_DRAIN_PER_PASS

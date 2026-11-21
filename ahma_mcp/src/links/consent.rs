@@ -4,7 +4,8 @@
 //! already made: `[open_url] allow` for every repo and this repo's
 //! `[open_url] repos` entry, in the user's settings file, read afresh for
 //! every link so a grant made while the command runs applies, and a site the
-//! human allowed for this one run in the harness dialog. Anything else is
+//! human allowed for this one run in the harness dialog or for this session
+//! at another surface (the TUI, [`session_sites`]). Anything else is
 //! refused at once with one line: a hooked command is never paused
 //! (R-LINK.6). The refusal is recorded for the harness dialog, which asks
 //! when the command runs again.
@@ -12,7 +13,48 @@
 use super::policy::{self, Egress, LinkDecision, LinkGrants, LinkQuestion, LinkTarget};
 use crate::egress::{EgressGrants, HostPattern};
 use ahma_common::harness_asks::{self, CommandDigest, LinkRefusal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The grants a hooked command's links are decided by (SPEC R-LINK.4): the
+/// saved ones that apply in `workspace` (`[open_url] allow` and its
+/// `[open_url] repos` entry, read from `settings_file` now), the sites a human
+/// allowed for this run (`this_run`) and the sites allowed for this session
+/// in it ([`session_sites`]). What the broker, the harness dialog and the TUI
+/// all read, so none of them asks about what another would open.
+///
+/// Plain std I/O: this runs on the broker thread, and `tokio::fs` would hand
+/// it to a blocking-pool thread that may be created after the process
+/// restricted itself (SPEC R-CRED.9). Small files, as the SSH key broker's
+/// consent reads them.
+pub fn hook_grants(
+    settings_file: Option<&Path>,
+    workspace: &Path,
+    mut this_run: Vec<HostPattern>,
+) -> LinkGrants {
+    let settings = settings_file
+        .and_then(|f| ahma_common::config::AhmaSettings::load_from_result(f).ok())
+        .map(|s| s.open_url)
+        .unwrap_or_default();
+    this_run.extend(session_sites(workspace));
+    LinkGrants::from_settings(&settings, workspace, this_run, Vec::new())
+}
+
+/// The sites a human allowed "this site, this session" for hooked commands
+/// working in `workspace`: the session grant files
+/// ([`ahma_common::open_url::active_sessions`]) whose harness process still
+/// lives and that were given in this repo (SPEC R-LINK.4).
+pub fn session_sites(workspace: &Path) -> Vec<HostPattern> {
+    let Some(dir) = ahma_common::open_url::session_dir() else {
+        return Vec::new();
+    };
+    let now = ahma_common::session_grants::now_secs();
+    ahma_common::open_url::active_sessions(&dir, now, &crate::sandbox::pid_alive)
+        .into_iter()
+        .filter(|g| workspace.starts_with(&g.workspace))
+        // Always one exact site: a session answer names the site asked about.
+        .map(|g| HostPattern::Exact(g.site.to_ascii_lowercase()))
+        .collect()
+}
 
 /// What the broker does with one link.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,27 +136,17 @@ impl RecordedLinkConsent {
     }
 
     fn grants(&self) -> LinkGrants {
-        // Read with plain std I/O: this runs on the broker thread, and
-        // `tokio::fs` would hand it to a blocking-pool thread that may be
-        // created after the process restricted itself (SPEC R-CRED.9). One
-        // small file, as the SSH key broker's consent reads it.
-        let settings = self
-            .settings_file
-            .as_ref()
-            .and_then(|f| ahma_common::config::AhmaSettings::load_from_result(f).ok())
-            .map(|s| s.open_url)
-            .unwrap_or_default();
-        LinkGrants::from_settings(
-            &settings,
+        hook_grants(
+            self.settings_file.as_deref(),
             &self.workspace,
             self.this_run.clone(),
-            Vec::new(),
         )
     }
 
     /// Record `question` for the harness dialog, and say whether a re-run
     /// will ask: not when there is no command or harness to ask before, and
-    /// not when the human already declined the site in this session.
+    /// not when the human already declined the site in this session, in its
+    /// dialog or at another surface for this harness.
     fn record_for_dialog(&self, question: &LinkQuestion) -> bool {
         if self.command_digest.is_none() && self.harness_pid.is_none() {
             return false;
@@ -136,10 +168,12 @@ impl RecordedLinkConsent {
             tracing::debug!("link refusal not recorded: {e:#}");
             return false;
         }
-        let declined = self.session_id.as_deref().is_some_and(|session| {
-            let asks = harness_asks::load(&dir, &self.workspace, now);
-            harness_asks::link_declined(&asks, session, &question.host)
-        });
+        let asks = harness_asks::load(&dir, &self.workspace, now);
+        let declined = self
+            .session_id
+            .as_deref()
+            .is_some_and(|session| harness_asks::link_declined(&asks, session, &question.host))
+            || harness_asks::link_denied_for(&asks, self.harness_pid, &question.host);
         !declined
     }
 }
@@ -340,6 +374,82 @@ mod tests {
                 .decide(&target("https://github.com/x"), false)
                 .await,
             LinkAnswer::Open
+        );
+    }
+
+    /// SPEC R-LINK.4: "this site, this session", given in the TUI for a
+    /// hooked command's refused link, is a session grant file the hook's
+    /// consent reads: links to that site open for commands in that repo while
+    /// the harness lives, and nowhere else.
+    #[tokio::test]
+    async fn a_session_grant_opens_its_site_for_hooked_commands_in_its_repo() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = home.path().join("ws");
+        let link = target("https://github.com/o/r/pull/1");
+        let consent = RecordedLinkConsent::new(ws.clone(), None, None);
+        assert!(matches!(
+            consent.decide(&link, false).await,
+            LinkAnswer::Refuse(_)
+        ));
+        let grant = ahma_common::open_url::OpenUrlSessionGrant {
+            site: "github.com".into(),
+            workspace: ws.clone(),
+            owner_pid: std::process::id(),
+            granted_at: ahma_common::session_grants::now_secs(),
+            granted_by: Some("tui".into()),
+        };
+        let dir = ahma_common::open_url::session_dir().unwrap();
+        ahma_common::open_url::record_session(&dir, &grant, &ApproverSurface::Tui).unwrap();
+        assert_eq!(consent.decide(&link, false).await, LinkAnswer::Open);
+        assert!(
+            matches!(
+                consent.decide(&target("https://docs.rs/"), false).await,
+                LinkAnswer::Refuse(_)
+            ),
+            "that site only"
+        );
+        let elsewhere = RecordedLinkConsent::new(home.path().join("other"), None, None);
+        assert!(
+            matches!(elsewhere.decide(&link, false).await, LinkAnswer::Refuse(_)),
+            "that repo only"
+        );
+    }
+
+    /// SPEC R-LINK.6: a site denied in the TUI for this harness is not asked
+    /// again in its session, so the refusal line names only the grant.
+    #[tokio::test]
+    async fn a_site_denied_in_the_tui_is_refused_naming_only_the_grant() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = home.path().join("ws");
+        let dir = harness_asks::default_dir().unwrap();
+        let now = ahma_common::session_grants::now_secs();
+        harness_asks::answer_link(&dir, &ws, "github.com", Some(42), true, now).unwrap();
+        let link = target("https://github.com/o/r");
+        let consent = |pid: u32| {
+            RecordedLinkConsent::new(ws.clone(), None, None).for_harness(
+                "gh pr view --web",
+                Some(pid),
+                Some("s1".into()),
+            )
+        };
+        let LinkAnswer::Refuse(line) = consent(42).decide(&link, false).await else {
+            panic!("denied");
+        };
+        assert!(!line.contains("re-run this command"), "{line}");
+        assert!(
+            line.contains("`ahma permissions grant open-url github.com`"),
+            "{line}"
+        );
+        let LinkAnswer::Refuse(line) = consent(43).decide(&link, false).await else {
+            panic!("no grant");
+        };
+        assert!(
+            line.contains("re-run this command"),
+            "another harness's session still asks: {line}"
         );
     }
 }
