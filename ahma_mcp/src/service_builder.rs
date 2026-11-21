@@ -235,6 +235,23 @@ impl<'a> ServiceBuilder<'a> {
             }
             None => adapter,
         };
+        // Every command opens web links through ahma, outside the sandbox,
+        // for a site a human allowed (SPEC R-LINK.1): its `BROWSER` is
+        // ahma's helper, and an ungranted link is asked while the command
+        // waits (R-LINK.6). Set up now, before the process restricts itself
+        // (R-CRED.9); the question reaches the client once one connects.
+        #[cfg(unix)]
+        let live_links = Arc::new(crate::links::live::LiveLinks::new(
+            config.settings_origin.user_settings_file(),
+            sandbox.scopes().to_vec(),
+            crate::links::host::egress_rules(config),
+        ));
+        #[cfg(unix)]
+        let adapter = Arc::new(
+            Arc::try_unwrap(adapter)
+                .map_err(|_| anyhow::anyhow!("the adapter is not shared yet"))?
+                .with_link_brokers(live_links.clone()),
+        );
 
         let raw_configs = load_tool_configs(config, config.tools_dir.as_deref())
             .await
@@ -269,6 +286,17 @@ impl<'a> ServiceBuilder<'a> {
 
         service.monitor_rate_limit_seconds = self.monitor_rate_limit;
         service.set_app_config(std::sync::Arc::new(config.clone()));
+
+        // A link question goes to the client that connects (rung 1, R-PERM.3),
+        // counts the session's network grants as allowed egress (R-LINK.5),
+        // and spends the session's prompt budget (R-PERM.4.5).
+        #[cfg(unix)]
+        live_links.attach(
+            &service,
+            self.permission_broker
+                .as_ref()
+                .map(|broker| broker.coordinator().clone()),
+        );
 
         // Install rung 1 of the question ladder (R-PERM.3). The broker is built
         // *before* the service (the adapter needs it), so it cannot capture the

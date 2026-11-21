@@ -248,6 +248,65 @@ pub async fn create_in_process_mcp_with_broker_and_sandbox<C: ClientHandler>(
     Ok((mcp, broker))
 }
 
+/// An in-process pair whose commands are served the MCP path's link broker
+/// (SPEC R-LINK.1, R-LINK.6), wired as `ahma serve` wires it
+/// ([`LiveLinks::attach`](crate::links::live::LiveLinks::attach)): a link
+/// question goes to `client` through `elicitation/create`. `scope` is a
+/// Test-mode sandbox, so the command runs without kernel enforcement.
+/// Returns once the server holds the client's peer, so a link question can
+/// reach it.
+#[cfg(unix)]
+pub async fn create_in_process_mcp_with_links<C: ClientHandler>(
+    client: C,
+    scope: &Path,
+    links: Arc<crate::links::live::LiveLinks>,
+) -> Result<InProcessMcp<C>> {
+    let sandbox = Sandbox::new(
+        vec![scope.to_path_buf()],
+        SandboxMode::Test,
+        Default::default(),
+    )?;
+    sandbox.mark_roots_received();
+    let _ = sandbox.commit_existing_scopes();
+    let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
+    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+    let adapter = Arc::new(
+        Adapter::new(
+            Arc::clone(&operation_monitor),
+            shell_pool,
+            Arc::new(sandbox),
+        )?
+        .with_link_brokers(links.clone()),
+    );
+    let service = AhmaMcpService::new(
+        adapter,
+        operation_monitor,
+        Arc::new(HashMap::new()),
+        Arc::new(None::<GuidanceConfig>),
+        false, // force_synchronous
+        false, // defer_sandbox
+    )
+    .await?;
+    links.attach(&service, None);
+    let mcp = serve_in_process(client, service).await?;
+    let peer = mcp.service.peer.clone();
+    let ready = super::concurrency::wait_for_condition(
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake),
+        ahma_common::timeouts::TestTimeouts::poll_interval(),
+        || {
+            let peer = peer.clone();
+            async move { peer.read().is_some() }
+        },
+    )
+    .await;
+    anyhow::ensure!(
+        ready,
+        "the server never recorded its MCP peer after initialize"
+    );
+    Ok(mcp)
+}
+
 /// Internal: wire a pre-built `Sandbox` and tool configs into an in-process pair.
 async fn wire_in_process_mcp(
     configs: HashMap<String, ToolConfig>,

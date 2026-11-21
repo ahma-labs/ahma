@@ -39,6 +39,7 @@ mod handoff_watch_test;
 mod harness_tool_client_gating_test;
 mod hooks_readiness_test;
 mod idle_watchdog_liveness_test;
+mod link_broker_mcp_test;
 mod livelog_config_test;
 mod livelog_file_monitor_test;
 mod livelog_integration_test;

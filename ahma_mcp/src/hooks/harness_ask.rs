@@ -830,15 +830,11 @@ fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Res
 /// a grant of the once tier all the same, so it is audited (R-LINK.9).
 fn apply_link_approval(asked: &harness_asks::AskedLink, now: u64) -> Approval {
     let host = asked.refusal.host.to_ascii_lowercase();
-    ahma_common::permissions::append_audit(
-        &ahma_common::permissions::AuditEntry::new(
-            ahma_common::config::fmt_utc_datetime(now),
-            ahma_common::permissions::AuditAction::Grant,
-            ahma_common::permissions::GrantKind::OpenUrl,
-            host.clone(),
-            ahma_common::permissions::GrantTier::Once,
-        )
-        .with_surface(&ahma_common::approver::ApproverSurface::Harness),
+    ahma_common::open_url::audit_unsaved_grant(
+        &host,
+        ahma_common::permissions::GrantTier::Once,
+        &ahma_common::approver::ApproverSurface::Harness,
+        now,
     );
     Approval {
         line: format!(

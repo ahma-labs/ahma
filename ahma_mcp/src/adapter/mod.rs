@@ -260,8 +260,9 @@ pub struct Adapter {
     /// Gives each command a link broker (SPEC R-LINK.1): `BROWSER` and
     /// `GH_BROWSER` name ahma's link helper and `AHMA_LINK_SOCK` its socket,
     /// and what it refused is one line in the result. `None` leaves the
-    /// command's `BROWSER` alone. Served on the synchronous path (the
-    /// terminal hook's) today.
+    /// command's `BROWSER` alone. Served on the synchronous, asynchronous and
+    /// PTY paths, in both lanes; a shell session's commands share one
+    /// long-lived shell, which no per-command lease can reach.
     #[cfg(unix)]
     link_brokers: Option<Arc<dyn crate::links::host::LinkBrokerFactory>>,
     /// Whether the trust-handoff deny tier is inventoried around each command
@@ -1531,9 +1532,32 @@ impl Adapter {
         let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
         let safe_wd_str = safe_wd.to_string_lossy().into_owned();
 
+        // A whole-line `open <URL>` runs as the link helper (SPEC R-LINK.10),
+        // as on the synchronous path: the operation and the audit keep the
+        // line as written, the process runs the helper's line, and the
+        // operation says so in one alert.
+        #[cfg(unix)]
+        let (run_args, link_note) = match shell_command_line(args.as_ref())
+            .and_then(|line| self.link_open_substitute(line))
+        {
+            Some((runs, said)) => {
+                let mut run_args = args.clone();
+                if let Some(map) = run_args.as_mut() {
+                    map.insert("command".to_string(), serde_json::Value::String(runs));
+                }
+                (run_args, Some(said))
+            }
+            None => (args.clone(), None),
+        };
+        #[cfg(not(unix))]
+        let (run_args, link_note): (
+            Option<Map<String, serde_json::Value>>,
+            Option<String>,
+        ) = (args.clone(), None);
+
         // Validate command arguments
         let (program_with_subcommand, args_vec) = self
-            .prepare_command_and_args(command, args.as_ref(), subcommand_config, &safe_wd)
+            .prepare_command_and_args(command, run_args.as_ref(), subcommand_config, &safe_wd)
             .await?;
         let keep_leftovers = shell_command_line(args.as_ref())
             .is_some_and(|line| self.is_declared_long_running(line));
@@ -1576,7 +1600,7 @@ impl Adapter {
         // Workspace write queue (SPEC R2.7): the place in line is taken here,
         // synchronously, before anything is spawned.
         let (lane, queue_reason) =
-            self.resolve_lane_with_reason(args.as_ref(), subcommand_config, &safe_wd);
+            self.resolve_lane_with_reason(run_args.as_ref(), subcommand_config, &safe_wd);
         self.command_starts(lane);
         let workspace = self.workspace_key_for(&safe_wd);
         let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
@@ -1593,6 +1617,9 @@ impl Adapter {
             .map(str::to_string)
             .unwrap_or_else(|| command.to_string());
         let cancellation_token = self.monitor.register(operation).await;
+        if let Some(said) = link_note {
+            self.monitor.append_alert(&op_id, said).await;
+        }
 
         // Durable provenance, written *before* the task is spawned. Doing it here
         // rather than inside the task is the point: nothing between this line and
@@ -1638,6 +1665,8 @@ impl Adapter {
             keep_leftovers,
             #[cfg(unix)]
             credential_brokers: self.credential_brokers.clone(),
+            #[cfg(unix)]
+            link_brokers: self.link_brokers.clone(),
         });
         self.spawn_operation_task(&op_id_clone, run).await;
 
@@ -1662,6 +1691,15 @@ impl Adapter {
         // No lane of its own: it may write.
         self.command_starts(workspace_queue::Lane::Exclusive);
         let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
+        // A whole-line `open <URL>` runs as the link helper (SPEC R-LINK.10);
+        // the operation keeps the line as written.
+        #[cfg(unix)]
+        let (run_line, link_note) = match self.link_open_substitute(command_str) {
+            Some((runs, said)) => (runs, Some(said)),
+            None => (command_str.to_string(), None),
+        };
+        #[cfg(not(unix))]
+        let (run_line, link_note): (String, Option<String>) = (command_str.to_string(), None);
 
         let mut operation = Operation::new_with_timeout(
             op_id.clone(),
@@ -1679,6 +1717,9 @@ impl Adapter {
         operation.command = Some(command_str.to_string());
         operation.output_file = Some(spill::operation_spill_path(&op_id));
         let cancellation_token = self.monitor.register(operation).await;
+        if let Some(said) = link_note {
+            self.monitor.append_alert(&op_id, said).await;
+        }
 
         let audit_argv = [command_str.to_string()];
         audit::record_tool_call(
@@ -1699,6 +1740,8 @@ impl Adapter {
         let tool_task = tool_name.to_string();
         #[cfg(unix)]
         let credential_brokers = self.credential_brokers.clone();
+        #[cfg(unix)]
+        let link_brokers = self.link_brokers.clone();
         let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
         let keep_leftovers = self.is_declared_long_running(&command_str);
         // Its mutex group (SPEC R2.7.2), keyed like the lease and matched on
@@ -1752,19 +1795,38 @@ impl Adapter {
                     .and_then(|f| f.lease_for_command(&safe_wd, Some(&command_str)))
                     .inspect(|broker| alert_broker_refusals(broker, &monitor, &op_id_task)),
             );
+            // And its link broker (SPEC R-LINK.1): what it refuses, and what
+            // it asks a human while the command waits, is an alert on this
+            // operation (R-LINK.6).
             #[cfg(unix)]
-            let broker_socket = guards.broker().map(|b| b.socket().to_path_buf());
-            #[cfg(not(unix))]
-            let broker_socket: Option<std::path::PathBuf> = None;
+            let links = link_brokers
+                .as_ref()
+                .and_then(|f| f.lease_for_command(&safe_wd, Some(&command_str)))
+                .inspect(|links| watch_links(links, &monitor, &op_id_task));
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut brokers = pty_exec::BrokerEnv::default();
+            #[cfg(unix)]
+            {
+                if let Some(broker) = guards.broker() {
+                    brokers.push("SSH_AUTH_SOCK", broker.socket().as_os_str().to_os_string());
+                }
+                if let Some(links) = &links {
+                    brokers.links_served = true;
+                    for (key, value) in links.env() {
+                        brokers.push(key, value);
+                    }
+                }
+                guards.hold_links(links);
+            }
             let finished = pty_exec::run_pty_operation(
                 &sandbox,
-                &command_str,
+                &run_line,
                 &safe_wd,
                 limit,
                 &cancellation_token,
                 &op_id_task,
                 &monitor,
-                broker_socket.as_deref(),
+                &brokers,
                 keep_leftovers,
             )
             .await;
@@ -2060,6 +2122,9 @@ struct AsyncOperationRun {
     /// Gives the command an SSH key broker (SPEC R-CRED.1).
     #[cfg(unix)]
     credential_brokers: Option<Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>>,
+    /// Gives the command a link broker (SPEC R-LINK.1).
+    #[cfg(unix)]
+    link_brokers: Option<Arc<dyn crate::links::host::LinkBrokerFactory>>,
 }
 
 /// Report each signature `broker` refuses as an alert on operation `op_id`
@@ -2077,6 +2142,22 @@ fn alert_broker_refusals(
             let (monitor, op_id, why) = (monitor.clone(), op_id.clone(), why.clone());
             runtime.spawn(async move { monitor.append_alert_unique(&op_id, why).await });
         }
+    }));
+}
+
+/// Tell operation `op_id`, as an alert while it still runs, each line its
+/// link broker refuses with and the question it is waiting on (SPEC R-LINK.6).
+#[cfg(unix)]
+fn watch_links(
+    links: &crate::links::host::LinkLease,
+    monitor: &Arc<OperationMonitor>,
+    op_id: &str,
+) {
+    let (monitor, op_id) = (monitor.clone(), op_id.to_string());
+    let runtime = tokio::runtime::Handle::current();
+    links.watch(Arc::new(move |line: &str| {
+        let (monitor, op_id, line) = (monitor.clone(), op_id.clone(), line.to_string());
+        runtime.spawn(async move { monitor.append_alert_unique(&op_id, line).await });
     }));
 }
 
@@ -2105,6 +2186,8 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         keep_leftovers,
         #[cfg(unix)]
         credential_brokers,
+        #[cfg(unix)]
+        link_brokers,
     } = ctx;
 
     // Timed from the moment the task starts, so queueing behind a command mutex
@@ -2135,17 +2218,30 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     let start_time = Instant::now();
     let wd_path = std::path::PathBuf::from(&working_dir);
-    let built = if lane == workspace_queue::Lane::ReadOnly {
-        command_executor.build_read_only_command(&sandbox, &program, &args_vec, &wd_path)
-    } else {
-        build_sandboxed_command(
-            command_executor.as_ref(),
-            &sandbox,
-            &program,
-            &args_vec,
-            &wd_path,
-        )
-    };
+    // Its link broker (SPEC R-LINK.1), leased before its sandbox is built in
+    // either lane: having one is what lets this command, and no other, reach
+    // the broker directory. Held until the command has ended.
+    #[cfg(unix)]
+    let links = link_brokers
+        .as_ref()
+        .and_then(|f| f.lease_for_command(&wd_path, Some(&display_command)));
+    #[cfg(unix)]
+    let served_links = links.is_some();
+    #[cfg(not(unix))]
+    let served_links = false;
+    let built = build_for_this_command(served_links, || {
+        if lane == workspace_queue::Lane::ReadOnly {
+            command_executor.build_read_only_command(&sandbox, &program, &args_vec, &wd_path)
+        } else {
+            build_sandboxed_command(
+                command_executor.as_ref(),
+                &sandbox,
+                &program,
+                &args_vec,
+                &wd_path,
+            )
+        }
+    });
     let mut proc_cmd = match built {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -2172,6 +2268,15 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
                 alert_broker_refusals(broker, &monitor, &op_id);
             }),
     );
+    // The link broker's helper and socket (SPEC R-LINK.1); what it refuses
+    // and what it asks while the command waits is an alert (R-LINK.6).
+    #[cfg(unix)]
+    guards.hold_links(links.inspect(|links| {
+        for (key, value) in links.env() {
+            proc_cmd.env(key, value);
+        }
+        watch_links(links, &monitor, &op_id);
+    }));
     // The tag the kernel's records of this operation's denials carry
     // (SPEC R-DENY.1), for the failure path to read them back.
     if let Some(tag) = sandbox::kernel_denials::tag_of(proc_cmd.as_std().get_args()) {

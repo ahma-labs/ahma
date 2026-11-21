@@ -338,6 +338,41 @@ pub enum LinkChoice {
 }
 
 impl LinkChoice {
+    /// Every answer, in the order surfaces offer them.
+    pub const ALL: [LinkChoice; 6] = [
+        LinkChoice::Deny,
+        LinkChoice::Once,
+        LinkChoice::Session,
+        LinkChoice::AlwaysSiteAllRepos,
+        LinkChoice::AlwaysSiteThisRepo,
+        LinkChoice::AlwaysAny,
+    ];
+
+    /// The value a form sends for this answer (an elicitation's single
+    /// select, SPEC R-PERM.3.4): stable, never shown.
+    pub fn value(self) -> &'static str {
+        match self {
+            LinkChoice::Deny => "deny",
+            LinkChoice::Once => "once",
+            LinkChoice::Session => "session",
+            LinkChoice::AlwaysSiteAllRepos => "always-site",
+            LinkChoice::AlwaysSiteThisRepo => "always-site-this-repo",
+            LinkChoice::AlwaysAny => "always-any-site",
+        }
+    }
+
+    /// The answer a form sent, when it is one of `offered`; anything else —
+    /// a misspelling, an empty value, an answer this question did not offer —
+    /// is a deny: an answer ahma cannot read is not consent (SPEC R5.3.1).
+    pub fn from_value(raw: &str, offered: &[LinkChoice]) -> LinkChoice {
+        let raw = raw.trim();
+        offered
+            .iter()
+            .copied()
+            .find(|c| c.value().eq_ignore_ascii_case(raw))
+            .unwrap_or(LinkChoice::Deny)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             LinkChoice::Deny => "deny",
@@ -570,6 +605,17 @@ fn capitalised(s: &str) -> String {
 /// R-LINK.6, R-PERM.9). `retry_asks`: a hooked command in a harness whose
 /// dialog asks (Claude Code); otherwise a human grants it.
 pub fn refusal_line(target: &LinkTarget, retry_asks: bool) -> String {
+    refused(target, retry_asks, None)
+}
+
+/// The line for a link nobody could be asked about while the command waited
+/// (SPEC R-LINK.6, rung 3 of R-PERM.3): it names the grant, and says why the
+/// question was not put, so the human knows where it did not go (R-PERM.3.2).
+pub fn unasked_refusal_line(target: &LinkTarget, why: &str) -> String {
+    refused(target, false, Some(why))
+}
+
+fn refused(target: &LinkTarget, retry_asks: bool, unasked: Option<&str>) -> String {
     let host = target.host();
     let grant = format!("`ahma permissions grant open-url {host}`");
     let how = if retry_asks {
@@ -580,9 +626,13 @@ pub fn refusal_line(target: &LinkTarget, retry_asks: bool) -> String {
     } else {
         format!("A human runs {grant}, then re-run.")
     };
+    let unasked = unasked
+        .map(|why| format!(", and could not ask: {why}"))
+        .unwrap_or_default();
     format!(
         "Blocked until a human approves: ahma did not open a link to {host} in the human's \
-         browser. {how} Do not open it another way; you may show the human the address: {}",
+         browser{unasked}. {how} Do not open it another way; you may show the human the \
+         address: {}",
         target.shown()
     )
 }
@@ -1217,6 +1267,48 @@ mod tests {
             assert!(exact_open_command(line).is_none(), "{line}");
         }
         assert_eq!(sh_single_quote("https://x/it's"), r"'https://x/it'\''s'");
+    }
+
+    /// SPEC R-PERM.3.4, R5.3.1: a form's answer is read back only as an
+    /// answer the question offered; anything else is a deny.
+    #[test]
+    fn a_form_value_is_read_only_as_an_offered_answer() {
+        let offered = [LinkChoice::Deny, LinkChoice::Once];
+        for choice in LinkChoice::ALL {
+            let read = LinkChoice::from_value(choice.value(), &LinkChoice::ALL);
+            assert_eq!(read, choice, "{} round-trips", choice.value());
+        }
+        assert_eq!(LinkChoice::from_value(" ONCE ", &offered), LinkChoice::Once);
+        for unread in ["", "yes", "always-any-site", "session", "🤷"] {
+            assert_eq!(
+                LinkChoice::from_value(unread, &offered),
+                LinkChoice::Deny,
+                "'{unread}' is not consent"
+            );
+        }
+    }
+
+    /// SPEC R-LINK.6, R-PERM.3.2: a link nobody could be asked about names
+    /// the grant and says why it was not asked.
+    #[test]
+    fn an_unasked_refusal_says_why_and_names_the_grant() {
+        let line = unasked_refusal_line(
+            &t("https://github.com/o/r"),
+            "the MCP client cannot show questions",
+        );
+        assert!(
+            line.contains("could not ask: the MCP client cannot show questions."),
+            "{line}"
+        );
+        assert!(
+            line.contains("`ahma permissions grant open-url github.com`"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("re-run this command and ahma asks"),
+            "{line}"
+        );
+        assert!(line.ends_with("https://github.com/o/r"), "{line}");
     }
 
     #[test]

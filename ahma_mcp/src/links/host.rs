@@ -112,8 +112,14 @@ impl LinkLease {
         self.broker.refusal_lines()
     }
 
-    pub fn broker(&self) -> &LinkBroker {
+    pub fn broker(&self) -> &Arc<LinkBroker> {
         &self.broker
+    }
+
+    /// Tell `watcher` each line the broker refuses with, and what it asks a
+    /// human while the command waits, as it happens (SPEC R-LINK.6).
+    pub fn watch(&self, watcher: super::broker::LinkWatcher) {
+        self.broker.watch().set(watcher);
     }
 }
 
@@ -152,6 +158,21 @@ pub fn helper_link_in(dir: &Path, exe: &Path) -> std::io::Result<PathBuf> {
         return Err(e);
     }
     Ok(link)
+}
+
+/// The effective egress allow list while network restriction is on, `None`
+/// when it is off. A link is egress and may not get past the egress rules on
+/// any surface, whether or not it runs the egress proxy (SPEC R-LINK.5), so
+/// "any site" covers only what this list allows.
+pub fn egress_rules(cfg: &crate::shell::cli::AppConfig) -> Option<EgressGrants> {
+    cfg.restrict_network.then(|| {
+        EgressGrants::compute(crate::egress::EgressGrantSources {
+            operator_allow: &cfg.network_allow,
+            enabled_profiles: &cfg.sandbox_profiles,
+            profile_hosts: cfg.network_profile_hosts,
+            deny_profile_hosts: &cfg.network_deny_profile_hosts,
+        })
+    })
 }
 
 /// The link broker factory for a terminal hook: consent from saved grants
