@@ -315,7 +315,7 @@ fn revoke_workspace_tools(
         );
     })
     .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-    let now = chrono::Local::now().to_rfc3339();
+    let now = ahma_common::timestamp::rfc3339_local_now();
     for tool in &removed {
         append_audit(
             &AuditEntry::new(
@@ -355,11 +355,11 @@ fn persist_workspace_grant(
     })?;
 
     let key = workspace_key(workspace);
-    let now = chrono::Local::now();
+    let now = ahma_common::timestamp::local_now();
     let added = grant(
         &mut settings.permissions,
         &key,
-        Some(now.format("%Y-%m-%d").to_string()),
+        Some(ahma_common::timestamp::date(&now)),
         Some("tui".to_string()),
     );
 
@@ -370,7 +370,7 @@ fn persist_workspace_grant(
     if added {
         append_audit(
             &AuditEntry::new(
-                now.to_rfc3339(),
+                ahma_common::timestamp::rfc3339_zoned(&now),
                 AuditAction::Grant,
                 GrantKind::Tool,
                 subject,

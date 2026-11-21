@@ -601,6 +601,14 @@ async fn canonicalize_dunce(path: PathBuf) -> std::io::Result<PathBuf> {
         .map_err(std::io::Error::other)?
 }
 
+/// A log file's mtime as `YYYY-MM-DDTHH:MM:SSZ`: UTC, whole seconds, the
+/// `modified` spelling `list_log_sources` has always returned. `None` past
+/// jiff's range (9999-12-30T22:00:00Z), where chrono reached a day further.
+fn modified_utc(secs: u64) -> Option<String> {
+    let ts = jiff::Timestamp::from_second(i64::try_from(secs).ok()?).ok()?;
+    Some(ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
 /// Resolves the symlink target and approval status for a single log-directory
 /// entry already known to be a symlink. Split out of `collect_log_sources` so
 /// the caller's loop body reads as a flat sequence of steps rather than a
@@ -674,12 +682,10 @@ async fn collect_log_sources(
             continue;
         }
 
-        let modified = real_meta.modified().ok().and_then(|t| {
-            let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-            // Format as ISO-8601 UTC using chrono.
-            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)?;
-            Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        });
+        let modified = real_meta
+            .modified()
+            .ok()
+            .and_then(|t| modified_utc(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()));
 
         let Some(name) = path.file_name() else {
             continue;
@@ -818,6 +824,16 @@ async fn search_log_file(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn modified_utc_is_whole_seconds_with_z() {
+        assert_eq!(
+            modified_utc(1_795_251_903).as_deref(),
+            Some("2026-11-21T09:05:03Z")
+        );
+        assert_eq!(modified_utc(0).as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(modified_utc(u64::MAX), None);
+    }
 
     #[tokio::test]
     async fn test_collect_log_sources() {

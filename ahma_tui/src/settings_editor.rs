@@ -481,8 +481,10 @@ impl SettingsEditor {
     pub fn save(&mut self) {
         let edited = self.settings.clone();
         // Audited (SPEC R-CFG10.5): each key the panel changed gets a record.
-        let saved =
-            AhmaSettings::update_audited("tui", &chrono::Local::now().to_rfc3339(), |on_disk| {
+        let saved = AhmaSettings::update_audited(
+            "tui",
+            &ahma_common::timestamp::rfc3339_local_now(),
+            |on_disk| {
                 // The ledger keys of `[sandbox]` (grants: scopes, SSH
                 // signing; R-CFG10.7) come from disk: written meanwhile by the
                 // command that grants or revokes them, never by this panel.
@@ -496,7 +498,8 @@ impl SettingsEditor {
                 on_disk.http = edited.http.clone();
                 on_disk.auth = edited.auth.clone();
                 on_disk.instance = edited.instance.clone();
-            });
+            },
+        );
         match saved {
             Ok(fresh) => {
                 self.settings = fresh;

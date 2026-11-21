@@ -17,7 +17,6 @@ ahma_common = { path = "../ahma_common" }
 ahma_tui = { path = "../ahma_tui" }
 anyhow.workspace = true
 axum = { version = "0.8", features = ["tokio"] }
-chrono = { workspace = true }
 futures.workspace = true
 pulldown-cmark = "0.13"
 serde = { workspace = true, features = ["derive"] }

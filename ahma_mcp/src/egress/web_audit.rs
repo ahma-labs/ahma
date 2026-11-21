@@ -46,7 +46,7 @@ pub struct WebAuditRecord {
 }
 
 /// Build an audit record from a decision. `ts` is supplied by the caller (stamp
-/// with `chrono::Local::now().to_rfc3339()`), keeping this pure.
+/// with [`ahma_common::timestamp::rfc3339_local_now`]), keeping this pure.
 pub fn record(
     tool: &str,
     url: &str,

@@ -1389,7 +1389,7 @@ pub struct NewGrant<'a> {
     pub access: ScopeAccess,
     /// What asked for it (a tool or command name), for `granted_by` provenance.
     pub granted_by: Option<String>,
-    /// `YYYY-MM-DD`, stamped by the caller (this crate carries no date dependency).
+    /// `YYYY-MM-DD`, stamped by the caller ([`crate::timestamp::local_date_today`]).
     pub granted_at: Option<String>,
     pub note: Option<String>,
     /// Which human surface answered: `cli`, `tui`, `harness` (an MCP

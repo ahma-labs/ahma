@@ -1164,7 +1164,7 @@ fn operation_header_lines(op: &crate::state::Operation, theme: &Theme) -> Vec<Li
     }
     lines.push(kv(
         "started",
-        op.started_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+        op.started_time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
         theme.normal(),
     ));
     lines.push(kv("duration", op.elapsed_display(), theme.normal()));
@@ -3798,7 +3798,7 @@ fn get_system_display_lines(
     let mut lines = vec![];
     let max_width = inner_width.saturating_sub(1) as usize;
     for e in filtered {
-        let ts = e.timestamp.format("%H:%M:%S").to_string();
+        let ts = e.timestamp.strftime("%H:%M:%S").to_string();
         let level_label = e.level.label();
         let msg = &e.message;
         let full_line = format!("{} {} {}", ts, level_label, msg);
@@ -3991,7 +3991,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 /// One unwrapped, styled row for a system log entry — the same formatting
 /// [`get_system_display_lines`] applies, for the visible-slice fast path.
 fn system_log_entry_line(e: &crate::state::LogEntry, theme: &Theme) -> Line<'static> {
-    let ts = e.timestamp.format("%H:%M:%S").to_string();
+    let ts = e.timestamp.strftime("%H:%M:%S").to_string();
     let level_label = e.level.label();
     let full_line = format!("{} {} {}", ts, level_label, e.message);
     style_system_log_line(&full_line, &ts, level_label, theme)
@@ -6193,7 +6193,7 @@ mod tests {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         for i in 0..50 {
             state.push_log(crate::state::LogEntry {
-                timestamp: chrono::Local::now(),
+                timestamp: ahma_common::timestamp::local_now(),
                 level: crate::state::LogLevel::Info,
                 message: format!("line-{i}"),
             });

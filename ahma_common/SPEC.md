@@ -36,6 +36,18 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
 - `doctor`: the read-only checks shared by `ahma doctor` and the TUI's `/doctor`
   (R-DOCTOR); fixes are applied by callers, only with consent.
 
+**Time**
+- `timestamp`: the one place timestamps are spelled and the local zone is chosen. Every
+  surface (CLI, MCP server, hooks, TUI, vault) goes through it.
+  - **R-TIME.1**: An RFC 3339 timestamp ahma writes — to an audit log, a settings file,
+    operation JSON — **must** keep the spelling every earlier version wrote: a numeric
+    `±HH:MM` offset (UTC is `+00:00`, never `Z`), and a fraction that is absent when zero
+    and otherwise exactly 3, 6 or 9 digits. Logs mix lines from both sides of an upgrade
+    and are compared as text. Readers **must** accept any RFC 3339 offset, `Z` included.
+  - **R-TIME.2**: Local time is `TZ` when it resolves, else the OS zone (`/etc/localtime`;
+    on Windows the system zone), else UTC. On Unix an unresolvable `TZ` **must not** turn
+    every local time into UTC.
+
 **Operations and the hub**
 - `event_dispatcher`: the single `OperationEvent` stream. Ordering invariant: history
   write → watch signal → event (R15.3 in AGENTS.md).

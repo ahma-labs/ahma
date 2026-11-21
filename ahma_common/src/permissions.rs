@@ -1272,9 +1272,10 @@ impl AuditEntry {
     /// An entry with no access, surface, request or advice attached; add them
     /// with the `with_*` setters, so a value can never land in the wrong slot.
     ///
-    /// `at` is supplied by the caller (stamp it with `chrono::Local::now()`), which
-    /// keeps this crate free of a date dependency — the same convention
-    /// [`crate::scope_grant::persist_grant`] follows for `granted_at`.
+    /// `at` is supplied by the caller (stamp it with
+    /// [`crate::timestamp::rfc3339_local_now`]), which keeps this constructor pure
+    /// — the same convention [`crate::scope_grant::persist_grant`] follows for
+    /// `granted_at`.
     pub fn new(
         at: impl Into<String>,
         action: AuditAction,

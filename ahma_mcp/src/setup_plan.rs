@@ -1653,7 +1653,7 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
         let mut answer = String::new();
         stdin.lock().read_line(&mut answer)?;
         if answer.trim().eq_ignore_ascii_case("y") {
-            let now = chrono::Local::now().to_rfc3339();
+            let now = ahma_common::timestamp::rfc3339_local_now();
             match apply(&env, &item.proposal, "cli", &now) {
                 Ok(done) => println!("Done: {done}"),
                 Err(e) => println!("Could not apply: {e:#}"),

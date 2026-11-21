@@ -304,7 +304,7 @@ async fn mcp_source_task(
                         format!("Server unreachable: {base_url}")
                     };
                     send(&tx, SourceEvent::LogLine(LogEntry {
-                        timestamp: chrono::Local::now(),
+                        timestamp: ahma_common::timestamp::local_now(),
                         level: if healthy { LogLevel::Info } else { LogLevel::Warn },
                         message: msg,
                     })).await;
@@ -615,7 +615,7 @@ async fn handle_notification(value: &Value, tx: &mpsc::Sender<SourceEvent>) {
             send(
                 tx,
                 SourceEvent::LogLine(LogEntry {
-                    timestamp: chrono::Local::now(),
+                    timestamp: ahma_common::timestamp::local_now(),
                     level: LogLevel::Warn,
                     message: text,
                 }),
@@ -751,21 +751,20 @@ fn parse_op_status(op_val: &Value) -> OpStatus {
 }
 
 /// Parse an RFC-3339 timestamp field off `op_val`, converted to local time.
-fn parse_rfc3339_field(op_val: &Value, key: &str) -> Option<chrono::DateTime<chrono::Local>> {
+fn parse_rfc3339_field(op_val: &Value, key: &str) -> Option<jiff::Zoned> {
     let raw = op_val.get(key).and_then(|v| v.as_str())?;
-    let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
-    Some(dt.with_timezone(&chrono::Local))
+    ahma_common::timestamp::parse_rfc3339_local(raw)
 }
 
 fn parse_op_times(op_val: &Value, op: &mut Operation) {
     let Some(s_dt) = parse_rfc3339_field(op_val, "start_time") else {
         return;
     };
-    op.started_time = s_dt;
+    op.started_time = s_dt.clone();
 
-    let now_local = chrono::Local::now();
+    let now_local = ahma_common::timestamp::local_now();
     if now_local >= s_dt {
-        let diff_secs = now_local.signed_duration_since(s_dt).num_seconds().max(0) as u64;
+        let diff_secs = now_local.duration_since(&s_dt).as_secs().max(0) as u64;
         op.started_at = Some(std::time::Instant::now() - Duration::from_secs(diff_secs));
     }
 
@@ -776,7 +775,7 @@ fn parse_op_times(op_val: &Value, op: &mut Operation) {
         return;
     }
 
-    let duration_ms = e_dt.signed_duration_since(s_dt).num_milliseconds().max(0) as u64;
+    let duration_ms = e_dt.duration_since(&s_dt).as_millis().max(0) as u64;
     op.duration_ms = Some(duration_ms);
     if let Some(start_inst) = op.started_at {
         op.completed_at = Some(start_inst + Duration::from_millis(duration_ms));
@@ -1060,11 +1059,11 @@ mod tests {
 
     #[test]
     fn mcp_parse_op_times_start_and_end() {
-        let start = chrono::Local::now() - chrono::Duration::seconds(10);
-        let end = start + chrono::Duration::milliseconds(5000);
+        let start = ahma_common::timestamp::local_now() - jiff::SignedDuration::from_secs(10);
+        let end = &start + jiff::SignedDuration::from_millis(5000);
         let v = json!({
-            "start_time": start.to_rfc3339(),
-            "end_time": end.to_rfc3339(),
+            "start_time": ahma_common::timestamp::rfc3339_zoned(&start),
+            "end_time": ahma_common::timestamp::rfc3339_zoned(&end),
         });
         let mut op = Operation::new("id", "tool", OpStatus::Succeeded);
         parse_op_times(&v, &mut op);
@@ -1075,8 +1074,8 @@ mod tests {
 
     #[test]
     fn mcp_parse_op_times_start_only() {
-        let start = chrono::Local::now() - chrono::Duration::seconds(3);
-        let v = json!({ "start_time": start.to_rfc3339() });
+        let start = ahma_common::timestamp::local_now() - jiff::SignedDuration::from_secs(3);
+        let v = json!({ "start_time": ahma_common::timestamp::rfc3339_zoned(&start) });
         let mut op = Operation::new("id", "tool", OpStatus::Running);
         parse_op_times(&v, &mut op);
         assert!(op.started_at.is_some());
@@ -1092,15 +1091,34 @@ mod tests {
 
     #[test]
     fn mcp_parse_op_times_end_before_start_no_duration() {
-        let start = chrono::Local::now() - chrono::Duration::seconds(3);
-        let end = start - chrono::Duration::seconds(2);
+        let start = ahma_common::timestamp::local_now() - jiff::SignedDuration::from_secs(3);
+        let end = &start - jiff::SignedDuration::from_secs(2);
         let v = json!({
-            "start_time": start.to_rfc3339(),
-            "end_time": end.to_rfc3339(),
+            "start_time": ahma_common::timestamp::rfc3339_zoned(&start),
+            "end_time": ahma_common::timestamp::rfc3339_zoned(&end),
         });
         let mut op = Operation::new("id", "tool", OpStatus::Running);
         parse_op_times(&v, &mut op);
         assert!(op.duration_ms.is_none());
+    }
+
+    /// Earlier servers wrote chrono's `to_rfc3339()`; mixed spellings of the
+    /// same instant (numeric offset vs `Z`) must still yield the exact duration.
+    #[test]
+    fn mcp_parse_op_times_accepts_chrono_spellings() {
+        let v = json!({
+            "start_time": "2026-11-21T10:15:30.123456+02:00",
+            "end_time": "2026-11-21T08:15:35.123456Z",
+        });
+        let mut op = Operation::new("id", "tool", OpStatus::Succeeded);
+        parse_op_times(&v, &mut op);
+        assert_eq!(op.duration_ms, Some(5000));
+        assert_eq!(
+            op.started_time.timestamp(),
+            "2026-11-21T08:15:30.123456Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+        );
     }
 
     #[test]

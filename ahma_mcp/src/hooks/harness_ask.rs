@@ -704,7 +704,7 @@ fn persist_approval(q: &harness_asks::Question, workspace: &Path) -> anyhow::Res
             path: &q.dir,
             access: q.access,
             granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string()),
-            granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            granted_at: Some(ahma_common::timestamp::local_date_today()),
             note: None,
             surface: "harness",
             // Never above the workspace it was approved in (R-PERM.4.3).

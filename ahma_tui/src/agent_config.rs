@@ -76,7 +76,10 @@ pub fn append_transcript_entry(
         // — the same courtesy `ahma logs gitignore` extends to operational logs.
         ignore_self(&dir);
     }
-    let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y-%m-%d")));
+    let path = dir.join(format!(
+        "{}.jsonl",
+        ahma_common::timestamp::local_date_today()
+    ));
     // One write per line (`jsonl`): `writeln!` handed the line and its
     // newline to the file separately.
     ahma_common::jsonl::append_blocking(&path, entry)
@@ -272,6 +275,16 @@ mod tests {
             .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
             .collect();
         assert_eq!(entries.len(), 1, "exactly one dated transcript file");
+        let stem = entries[0].file_stem().unwrap().to_str().unwrap();
+        assert!(
+            stem.len() == 10
+                && stem.char_indices().all(|(i, c)| if i == 4 || i == 7 {
+                    c == '-'
+                } else {
+                    c.is_ascii_digit()
+                }),
+            "transcript file is named YYYY-MM-DD.jsonl, got {stem}"
+        );
 
         let content = fs::read_to_string(&entries[0]).unwrap();
         let lines: Vec<&str> = content.lines().collect();

@@ -56,15 +56,17 @@ ignore = [
     # release exists). "Unmaintained", not a vulnerability: no flaw is reported
     # in the code ahma runs, which formats and compares timestamps.
     #
-    # It reaches ahma two ways. Eight workspace crates use it directly, and it
-    # arrives through oauth2 5.0 (ahma_http_mcp_client) and through
-    # openidconnect -> sigstore (ahma_update), which ahma cannot change. So an
-    # entry here is needed even once ahma's own code has moved to `jiff` or
-    # `time`; that move is the open item in SPEC.md section 11. Drop this entry
-    # when `cargo tree -i chrono` shows nothing, or re-justify it if a
-    # vulnerability advisory for chrono is ever published (this entry covers
-    # only this id, so that one would fail the check by itself).
-    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no vulnerability reported and no fixed version; also pulled in by oauth2 and sigstore, which ahma cannot change; migration of ahma's own use is tracked in SPEC.md section 11" },
+    # ahma's own code no longer uses it: every workspace crate uses `jiff`
+    # through ahma_common::timestamp (R-TIME.1, R-TIME.2). chrono still arrives
+    # through crates ahma cannot change: rmcp (a non-optional dependency, which
+    # also turns on schemars' `chrono04` feature), oauth2 5.0
+    # (ahma_http_mcp_client), and sigstore 0.14 with its openidconnect and tough
+    # (ahma_update). ahma turns on no chrono feature in any of them, so there is
+    # nothing to switch off. Drop this entry when `cargo tree -i chrono` shows
+    # nothing, or re-justify it if a vulnerability advisory for chrono is ever
+    # published (this entry covers only this id, so that one would fail the
+    # check by itself).
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no vulnerability reported and no fixed version; ahma's own code uses jiff, but rmcp, oauth2 and sigstore still pull chrono in" },
 ]
 
 # ---------------------------------------------------------------------------

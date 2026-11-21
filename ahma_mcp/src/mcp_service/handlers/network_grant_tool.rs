@@ -275,7 +275,7 @@ impl AhmaMcpService {
         if tier == GrantTier::Session {
             append_audit(
                 &AuditEntry::new(
-                    chrono::Local::now().to_rfc3339(),
+                    ahma_common::timestamp::rfc3339_local_now(),
                     AuditAction::Grant,
                     GrantKind::NetHost,
                     &host,

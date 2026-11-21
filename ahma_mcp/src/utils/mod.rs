@@ -8,8 +8,8 @@
 //! - **`logging`**: Contains functions for initializing and configuring the application's
 //!   logging infrastructure using the `tracing` crate.
 //!
-//! - **`time`**: Offers functionality for working with time-related tasks, building
-//!   upon the `chrono` crate to provide date and time manipulation features.
+//! - **`time`**: Serde helpers that write a `SystemTime` as RFC 3339 text and read it
+//!   back, in the spelling of [`ahma_common::timestamp`] (R-TIME.1).
 
 /// User-facing cancellation message formatting.
 pub mod cancellation;

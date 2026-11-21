@@ -382,7 +382,7 @@ impl AhmaMcpService {
         let decision = WebDecision::Prompt {
             domain: domain.clone(),
         };
-        let ts = chrono::Local::now().to_rfc3339();
+        let ts = ahma_common::timestamp::rfc3339_local_now();
         web_audit::append(&web_audit::record(
             "fetch_webpage",
             &url,
@@ -433,7 +433,7 @@ impl AhmaMcpService {
             let session_denies = self.web_approval.session_denies();
             let decision = policy.decide(url, &session_grants, &session_denies);
             let domain = url_coordinates(url).map_or_else(|| url.to_string(), |(_, host, _)| host);
-            let ts = chrono::Local::now().to_rfc3339();
+            let ts = ahma_common::timestamp::rfc3339_local_now();
             web_audit::append(&web_audit::record(
                 "fetch_webpage",
                 url,

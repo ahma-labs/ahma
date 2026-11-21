@@ -383,8 +383,8 @@ fn latest_activity(ops: &[Operation], members: &[usize]) -> (Option<String>, Opt
     let newest_running = members
         .iter()
         .filter(|&&i| matches!(ops[i].status, OpStatus::Running))
-        .max_by_key(|&&i| ops[i].started_time);
-    let pick = newest_running.or_else(|| members.iter().max_by_key(|&&i| ops[i].started_time));
+        .max_by_key(|&&i| &ops[i].started_time);
+    let pick = newest_running.or_else(|| members.iter().max_by_key(|&&i| &ops[i].started_time));
     match pick {
         Some(&i) => (Some(ops[i].display_name()), Some(ops[i].status.clone())),
         None => (None, None),
@@ -768,7 +768,7 @@ mod tests {
         let collapsed = HashSet::new();
 
         let mut older = op("1", Some("a"), OpStatus::Running);
-        older.started_time -= chrono::Duration::seconds(60);
+        older.started_time -= jiff::SignedDuration::from_secs(60);
         let newest_done = op("2", Some("a"), OpStatus::Succeeded);
         let sections = build_sections(&[older, newest_done], &opts(&instances, &collapsed, None));
         assert_eq!(

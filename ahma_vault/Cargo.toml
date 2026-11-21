@@ -11,7 +11,7 @@ version.workspace = true
 [dependencies]
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 rand = "0.10.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

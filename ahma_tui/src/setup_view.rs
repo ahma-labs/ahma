@@ -524,7 +524,7 @@ impl SetupView {
     fn finish(&mut self) {
         let Some(env) = self.env.clone() else { return };
         let items = self.plan.items.clone();
-        let now = chrono::Local::now().to_rfc3339();
+        let now = ahma_common::timestamp::rfc3339_local_now();
         let mut outcomes = Vec::new();
         let mut declined: Vec<&Proposal> = Vec::new();
         for item in &items {

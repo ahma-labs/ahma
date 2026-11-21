@@ -17,7 +17,6 @@ bytes = "1.12"
 hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5" }
-chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
 dashmap = "6.2"
 futures.workspace = true
@@ -25,6 +24,7 @@ owo-colors = "4.4.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 hmac.workspace = true
+jiff.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 arc-swap = "1"

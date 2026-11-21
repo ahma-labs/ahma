@@ -1716,12 +1716,17 @@ fn fetch_crate_publish_age_days(name: &str, version: &str) -> Result<i64, String
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing /version/created_at in crates.io response".to_string())?;
 
-    let published: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(created_at)
-        .map_err(|e| format!("date parse error for '{created_at}': {e}"))?
-        .into();
+    publish_age_days(created_at, jiff::Timestamp::now())
+}
 
-    let age = (chrono::Utc::now() - published).num_days();
-    Ok(age)
+/// Whole days from `created_at` (crates.io's RFC 3339, e.g.
+/// `2024-10-01T12:00:00.000000+00:00`) to `now`, truncated toward zero as
+/// chrono's `TimeDelta::num_days` did.
+fn publish_age_days(created_at: &str, now: jiff::Timestamp) -> Result<i64, String> {
+    let published: jiff::Timestamp = created_at
+        .parse()
+        .map_err(|e| format!("date parse error for '{created_at}': {e}"))?;
+    Ok(now.duration_since(published).as_secs() / 86_400)
 }
 
 /// Apply one planned upgrade, returning an [`ApplyResult`] that records whether
@@ -2162,6 +2167,24 @@ mod clean_stale_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn publish_age_days_truncates_like_chrono() {
+        let now: jiff::Timestamp = "2024-10-11T11:59:59Z".parse().unwrap();
+        let created = "2024-10-01T12:00:00.000000+00:00"; // crates.io's spelling
+        assert_eq!(super::publish_age_days(created, now), Ok(9));
+        let now: jiff::Timestamp = "2024-10-11T12:00:00Z".parse().unwrap();
+        assert_eq!(super::publish_age_days(created, now), Ok(10));
+        assert_eq!(
+            super::publish_age_days("2024-10-01T14:00:00+02:00", now),
+            Ok(10)
+        );
+        assert!(
+            super::publish_age_days("not a date", now)
+                .unwrap_err()
+                .starts_with("date parse error for 'not a date'")
+        );
+    }
 
     /// A re-run at the current version must still repair a stale lockfile:
     /// every CI build uses `--locked`, so a stale `Cargo.lock` is exactly the

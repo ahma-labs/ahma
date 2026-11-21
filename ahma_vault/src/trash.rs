@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StagedEntry
@@ -145,6 +145,12 @@ impl TrashManager {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The `<utc-timestamp>` prefix of a staged name: UTC, milliseconds, no dot
+/// (`20261121T090503007Z`), the spelling every earlier version wrote (R-TIME.1).
+fn staging_stamp(now: Timestamp) -> String {
+    now.strftime("%Y%m%dT%H%M%S%3fZ").to_string()
+}
+
 /// Move `source` into `trash_dir` as `<utc-timestamp>_<original-filename>`,
 /// returning where it went: the one way anything is staged into a trash
 /// directory. A rename, or, where that fails (another filesystem), a copy then
@@ -154,7 +160,7 @@ pub(crate) fn move_into(source: &Path, trash_dir: &Path) -> Result<PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("staged-item");
-    let ts = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+    let ts = staging_stamp(Timestamp::now());
     let dest = trash_dir.join(format!("{ts}_{filename}"));
 
     if let Err(rename_err) = std::fs::rename(source, &dest) {
@@ -221,6 +227,16 @@ mod tests {
 
     fn make_manager(tmp: &TempDir) -> TrashManager {
         TrashManager::new(tmp.path().join("trash"))
+    }
+
+    /// The staged-name prefix keeps the spelling earlier versions wrote:
+    /// milliseconds, truncated, no dot, `Z` (R-TIME.1).
+    #[test]
+    fn staging_stamp_is_utc_millis_truncated() {
+        let at = |ns| Timestamp::new(1_795_251_903, ns).unwrap();
+        assert_eq!(staging_stamp(at(7_000_000)), "20261121T090503007Z");
+        assert_eq!(staging_stamp(at(0)), "20261121T090503000Z");
+        assert_eq!(staging_stamp(at(999_999_999)), "20261121T090503999Z");
     }
 
     #[test]

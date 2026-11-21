@@ -238,7 +238,7 @@ pub fn answer_in(
                         path: &q.dir,
                         access,
                         granted_by: Some("terminal hook refusal".into()),
-                        granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+                        granted_at: Some(ahma_common::timestamp::local_date_today()),
                         note: None,
                         surface: surface.as_str(),
                         live_scopes: std::slice::from_ref(&ask.workspace),
@@ -296,7 +296,7 @@ fn audit(
 ) {
     ahma_common::permissions::append_audit(
         &ahma_common::permissions::AuditEntry::new(
-            chrono::Local::now().to_rfc3339(),
+            ahma_common::timestamp::rfc3339_local_now(),
             action,
             GrantKind::FsScope,
             ask.question.dir.display().to_string(),

@@ -34,12 +34,12 @@ async-trait.workspace = true
 # graph (SPEC R-CRED.8): no second implementation of any primitive.
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.22"
-chrono.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 dirs.workspace = true
 dunce.workspace = true
 futures.workspace = true
+jiff.workspace = true
 rand = "0.10.3"
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "http2", "http3"] }

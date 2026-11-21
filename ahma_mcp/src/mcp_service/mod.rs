@@ -55,7 +55,6 @@ pub use types::{
     register_global_prompt_runner,
 };
 
-use chrono::Utc;
 use parking_lot::RwLock;
 use rmcp::{
     handler::server::ServerHandler,
@@ -714,7 +713,7 @@ impl AhmaMcpService {
         Self::append_audit_line(
             audit_log_path,
             serde_json::json!({
-                "timestamp": Utc::now().to_rfc3339(),
+                "timestamp": ahma_common::timestamp::rfc3339_utc_now(),
                 "type": "tool_call",
                 "operation_id": operation_id,
                 "tool_name": tool_name,
@@ -733,7 +732,7 @@ impl AhmaMcpService {
         Self::append_audit_line(
             audit_log_path,
             serde_json::json!({
-                "timestamp": Utc::now().to_rfc3339(),
+                "timestamp": ahma_common::timestamp::rfc3339_utc_now(),
                 "type": "tool_complete",
                 "operation_id": operation_id,
                 "success": success,
@@ -794,7 +793,7 @@ impl AhmaMcpService {
         if let Err(e) = Self::append_audit_line(
             &audit_log_path,
             serde_json::json!({
-                "timestamp": Utc::now().to_rfc3339(),
+                "timestamp": ahma_common::timestamp::rfc3339_utc_now(),
                 "type": "file_staged",
                 "original_path": original_path,
                 "trash_path": trash_path,
@@ -4142,6 +4141,21 @@ mod tests {
         assert!(content.contains("\"type\":\"tool_complete\""));
         assert!(content.contains("\"success\":true"));
         assert!(content.contains("\"duration_ms\":42"));
+    }
+
+    /// The task-vault log keeps chrono's UTC spelling: `+00:00`, never `Z`
+    /// (R-TIME.1).
+    #[tokio::test]
+    async fn vault_audit_timestamps_are_rfc3339_utc_with_numeric_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        AhmaMcpService::append_tool_call_event(&path, "op1", "t", "a")
+            .await
+            .unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let ev: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let ts = ev["timestamp"].as_str().unwrap();
+        assert!(ts.ends_with("+00:00"), "{ts}");
     }
 
     // ==================== vault emit (task_vault wired via AppConfig) ====================
