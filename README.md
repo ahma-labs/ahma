@@ -367,6 +367,15 @@ only for a server the connection proves it is talking to, and only after you all
 for that server in that workspace — once per session in Claude Code's own dialog, or for good
 with `ahma permissions grant ssh-sign`. See [docs/ssh-agent-broker.md](docs/ssh-agent-broker.md).
 
+### Opening web links — `gh … --web` inside the sandbox *(experimental)*
+
+A sandboxed command can't start a browser itself, so ahma opens `http`/`https` links for it,
+outside the sandbox, in your default browser — only for sites you allowed, for every repo or
+one, with `ahma permissions grant open-url github.com`. Each hooked command's `BROWSER` is
+ahma's own helper; a link to any other site is refused with one line naming that grant. A link
+sends its whole address to that site, so allow only sites you trust. See
+[docs/open-links.md](docs/open-links.md).
+
 ### Task Vaults — one directory per task *(experimental)*
 
 ```bash

@@ -218,6 +218,27 @@ fn ipv4_is_local(ip: Ipv4Addr) -> bool {
         || (a == 100 && (b & 0xc0) == 64) // 100.64.0.0/10, shared address space
 }
 
+/// Whether an address a name resolved to is this machine or the local
+/// network (SPEC R-LINK.4): what makes the broker treat a public-looking
+/// name (`127.0.0.1.nip.io`) as local. IPv6 loopback, unspecified,
+/// unique-local and link-local count, and a v4-mapped address is judged as
+/// its IPv4 address.
+pub fn ip_is_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_is_local(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ipv4_is_local(v4);
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00 // fc00::/7, unique local
+                || (first & 0xffc0) == 0xfe80 // fe80::/10, link-local
+        }
+    }
+}
+
 /// Whether a host *name* is local (SPEC R-LINK.4). A public name that
 /// resolves to a local address is caught by the broker, which resolves it
 /// before deciding.
@@ -1006,5 +1027,27 @@ mod tests {
         let file = "/Users/me/p/target/doc/crate/index.html";
         let said = not_a_link_line(file, &LinkTarget::parse(file).unwrap_err());
         assert!(said.contains("local file") && said.contains(file), "{said}");
+    }
+
+    /// SPEC R-LINK.4: an address a name resolves to is local when it is this
+    /// machine or the local network, in either family.
+    #[test]
+    fn a_resolved_address_is_local_when_it_is_this_machine_or_the_lan() {
+        for local in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "169.254.169.254",
+            "100.64.0.1",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(ip_is_local(local.parse().unwrap()), "{local}");
+        }
+        for public in ["140.82.112.3", "2606:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(!ip_is_local(public.parse().unwrap()), "{public}");
+        }
     }
 }

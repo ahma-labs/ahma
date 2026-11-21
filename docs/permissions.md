@@ -185,7 +185,7 @@ same names.
 | `net-host` | a host sandboxed commands may reach under `--restrict-network` | a prompt, `ahma network allow` | `[network].allow` |
 | `tool` | a tool the agent may run in a workspace without asking again | a tool-approval prompt | `[permissions].tool_approvals` |
 | `log-target` | a file outside the workspace that a `.ahma/logs/*.log` symlink points at, readable (never writable) by live-log monitoring | a human's `always` answer to the question `logs_approve` raises, or `a` on the log in `ahma tui` | `[log_targets].approvals` |
-| `open-url` | a site whose http and https links commands ahma runs may open in your default browser, in every repo or in one | `ahma permissions grant open-url [SITE]` (*in progress*: the broker that uses it is not built yet, SPEC R-LINK) | `[open_url]` |
+| `open-url` | a site whose http and https links commands ahma runs may open in your default browser, in every repo or in one | `ahma permissions grant open-url [SITE]` (*experimental*: hooked commands on macOS and Linux, [open-links.md](open-links.md)) | `[open_url]` |
 
 `tool` and `log-target` grants are bound to the workspace they were granted in, and so
 is an `fs-scope` grant unless it was made `--global`; `web-domain` and `net-host` grants

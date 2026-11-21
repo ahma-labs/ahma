@@ -681,11 +681,12 @@ fn hub_rendezvous_denies_for(runtime_dir: Option<&Path>, socket: &Path) -> Strin
 }
 
 /// Whether this process serves its commands any broker on a socket in the
-/// agent directory. Today the SSH key broker is the only one, served in
-/// `[sandbox] ssh_agent = "broker"` mode (SPEC R-CRED.11); a broker added
-/// later is one more term here, not another mode check in the profile.
+/// agent directory: the SSH key broker, in `[sandbox] ssh_agent = "broker"`
+/// mode (SPEC R-CRED.11), or the link broker, whatever that mode says (SPEC
+/// R-LINK.1). A broker added later is one more term here, not another mode
+/// check in the profile.
 fn brokers_served() -> bool {
-    super::ssh_agent::serves_ssh_broker()
+    super::ssh_agent::serves_ssh_broker() || crate::links::host::served()
 }
 
 /// Every broker's sockets (SPEC R-CRED.1): a command may reach a socket in
@@ -1475,7 +1476,7 @@ mod tests {
             set_ssh_agent_mode(mode);
             assert!(
                 !super::brokers_served(),
-                "{mode:?}: the SSH key broker is the only broker today"
+                "{mode:?}: this test process serves no link broker"
             );
             let rules = super::broker_rules(true);
             assert!(
@@ -1494,6 +1495,30 @@ mod tests {
             rules.contains("(allow file-read* file-write-data (subpath"),
             "{rules}"
         );
+    }
+
+    /// SPEC R-LINK.1: a process that serves the link broker lets its commands
+    /// connect to the broker directory under every `[sandbox] ssh_agent`
+    /// mode, in the profile itself — not only in `broker_rules`.
+    #[test]
+    fn a_served_link_broker_is_reachable_under_every_ssh_mode() {
+        use super::super::ssh_agent::{SshAgentMode, set_ssh_agent_mode};
+        let allow = broker_connect_allow().expect("a runtime dir");
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            Default::default(),
+        )
+        .unwrap();
+        crate::links::host::mark_served();
+        for mode in [SshAgentMode::Off, SshAgentMode::Passthrough] {
+            set_ssh_agent_mode(mode);
+            assert!(super::brokers_served(), "{mode:?}");
+            let profile = sb.generate_seatbelt_profile_test(dir.path());
+            assert!(profile.contains(&allow), "{mode:?}:\n{profile}");
+        }
+        set_ssh_agent_mode(SshAgentMode::Broker);
     }
 
     /// `~/.ssh` is denied as a whole, and the client files that hold no secret

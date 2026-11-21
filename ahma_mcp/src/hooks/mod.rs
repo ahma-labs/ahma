@@ -2016,7 +2016,34 @@ fn build_hook_adapter(
         )),
         None => adapter,
     };
+    // The command opens web links through ahma, outside the sandbox, for a
+    // site a human allowed (SPEC R-LINK.1): its `BROWSER` is ahma's helper.
+    #[cfg(unix)]
+    let adapter = adapter.with_link_brokers(std::sync::Arc::new(
+        crate::links::host::RecordedLinks::new(
+            cfg.settings_origin.user_settings_file(),
+            hook_scopes.to_vec(),
+        )
+        .for_workspace(harness_ask::workspace_for(Path::new(&payload.cwd)))
+        .with_egress(hook_egress_grants(cfg)),
+    ));
     Ok((std::sync::Arc::new(adapter), reporter))
+}
+
+/// The effective egress allow list while network restriction is on, `None`
+/// when it is off. No proxy runs for a hooked command, but a link is egress
+/// and may not get past the egress rules on any surface (SPEC R-LINK.5), so
+/// "any site" covers only what this list allows.
+#[cfg(unix)]
+fn hook_egress_grants(cfg: &AppConfig) -> Option<crate::egress::EgressGrants> {
+    cfg.restrict_network.then(|| {
+        crate::egress::EgressGrants::compute(crate::egress::EgressGrantSources {
+            operator_allow: &cfg.network_allow,
+            enabled_profiles: &cfg.sandbox_profiles,
+            profile_hosts: cfg.network_profile_hosts,
+            deny_profile_hosts: &cfg.network_deny_profile_hosts,
+        })
+    })
 }
 
 async fn execute_with_signal_forwarding(

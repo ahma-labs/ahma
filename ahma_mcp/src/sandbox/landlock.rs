@@ -105,6 +105,7 @@ fn build_landlock_ruleset(policy: &super::KernelPolicy) -> Result<landlock::Rule
         policy.package_cache_write,
     )?;
     add_landlock_client_config_rules(&mut ruleset, access_read)?;
+    add_landlock_own_binary_rule(&mut ruleset);
 
     if policy.temp_writable {
         add_landlock_temp_rules(&mut ruleset, access_all)?;
@@ -266,6 +267,32 @@ fn add_landlock_system_rules(
         }
     }
     Ok(())
+}
+
+/// ahma's own executable, read and execute, as one file (SPEC R-LINK.1): a
+/// command's `BROWSER` is the link helper, a symlink to it, and it may live
+/// anywhere (`~/.local/bin`, a build directory) that no system rule or
+/// profile covers. Running it inside the sandbox reaches nothing new: the
+/// helper inherits the command's Landlock domain, and the broker it talks to
+/// checks every link. Best effort: without it the helper fails to start, as
+/// any browser launch already did.
+#[cfg(target_os = "linux")]
+fn add_landlock_own_binary_rule(ruleset: &mut landlock::RulesetCreated) {
+    use landlock::{AccessFs, PathBeneath, PathFd, RulesetCreatedAttr};
+    let Some(exe) = own_binary() else {
+        return;
+    };
+    if let Ok(fd) = PathFd::new(&exe) {
+        let _ = ruleset.add_rule(PathBeneath::new(fd, AccessFs::Execute | AccessFs::ReadFile));
+    }
+}
+
+/// The canonical path of the running executable: what the helper symlink
+/// resolves to, and so what Landlock checks the exec against.
+#[cfg(target_os = "linux")]
+fn own_binary() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(dunce::canonicalize(&exe).unwrap_or(exe))
 }
 
 /// Apply the enabled sandbox **profiles** (SPEC R-PERM.5).
@@ -598,6 +625,41 @@ mod tests {
         assert!(
             result.is_err(),
             "applying an invalid ruleset fd must return an error, not succeed silently"
+        );
+    }
+
+    /// SPEC R-LINK.1: a confined command may run ahma's own binary — the
+    /// link helper `BROWSER` names — wherever it was installed. Run here as
+    /// this test binary, which lives in the build directory, outside the
+    /// scope and every system path: without the rule the exec is refused.
+    #[test]
+    fn a_confined_command_may_run_ahmas_own_binary() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let dir = tempdir().unwrap();
+        let Some(fd) = landlock_ruleset_fd(&super::super::KernelPolicy {
+            workspace: vec![dir.path().to_path_buf()],
+            access: super::super::WorkspaceAccess::ReadWrite,
+            read_only: Vec::new(),
+            temp_writable: false,
+            package_cache_write: false,
+            connect_tcp_port: None,
+        })
+        .expect("ruleset builds") else {
+            eprintln!("skipped: this kernel has no Landlock");
+            return;
+        };
+        let raw = fd.as_raw_fd();
+        let mut cmd = std::process::Command::new(own_binary().expect("this binary"));
+        // libtest's `--list` prints the test names and exits 0.
+        cmd.args(["--list", "--format", "terse"]);
+        // SAFETY: `apply_landlock_ruleset_in_child` makes only raw syscalls.
+        unsafe { cmd.pre_exec(move || apply_landlock_ruleset_in_child(raw)) };
+        let out = cmd.output().expect("ahma's own binary runs confined");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

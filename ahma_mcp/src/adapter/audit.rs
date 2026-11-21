@@ -249,6 +249,26 @@ pub enum AuditEventKind {
         trigger: String,
         tool_name: String,
     },
+
+    /// The link broker opened a web link a command asked for in the human's
+    /// browser (SPEC R-LINK.9).
+    LinkOpened {
+        /// Scheme, host, port and path, and only the lengths of the query and
+        /// fragment (`LinkTarget::audit_form`), redacted.
+        url: String,
+    },
+
+    /// The link broker did not open a link a command asked for (SPEC
+    /// R-LINK.9): not a web link, over the per-command cap, no grant, or the
+    /// opener failed.
+    LinkRefused {
+        /// As for [`AuditEventKind::LinkOpened`]; absent when the argument
+        /// was not a web link (a path, `file:`, another scheme), which is
+        /// never recorded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        why: String,
+    },
 }
 
 /// Terminal outcome label recorded on a [`AuditEventKind::ToolComplete`].
@@ -537,6 +557,24 @@ pub async fn record_handoff_write(
     .await;
 }
 
+/// Record a link the link broker opened (SPEC R-LINK.9). `url` is the
+/// address's audit form, which keeps no query or fragment.
+pub async fn record_link_opened(url: &str) {
+    record(AuditEventKind::LinkOpened {
+        url: redact_and_bound(url, MAX_ARGS_SUMMARY_CHARS),
+    })
+    .await;
+}
+
+/// Record a link the link broker did not open, and why (SPEC R-LINK.9).
+pub async fn record_link_refused(url: Option<&str>, why: &str) {
+    record(AuditEventKind::LinkRefused {
+        url: url.map(|u| redact_and_bound(u, MAX_ARGS_SUMMARY_CHARS)),
+        why: redact_and_bound(why, MAX_ARGS_SUMMARY_CHARS),
+    })
+    .await;
+}
+
 /// Record a runtime sandbox denial (SPEC R5.4.7).
 pub async fn record_sandbox_denial(
     operation_id: Option<&str>,
@@ -691,6 +729,41 @@ mod tests {
         let ts = events[0]["timestamp"].as_str().unwrap();
         assert!(ts.ends_with("+00:00"), "{ts}");
         assert!(ahma_common::timestamp::parse_rfc3339(ts).is_ok(), "{ts}");
+    }
+
+    /// SPEC R-LINK.9: an open and a refusal are one line each, tagged
+    /// `link_opened` / `link_refused`, and a refusal of something that is not
+    /// a web link carries no address at all.
+    #[tokio::test]
+    async fn link_opens_and_refusals_are_recorded_without_their_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::at(tmp.path().join("audit.jsonl"));
+        let target =
+            crate::links::policy::LinkTarget::parse("https://github.com/o/r?token=secret#frag")
+                .unwrap();
+        log.emit(AuditEventKind::LinkOpened {
+            url: target.audit_form(),
+        })
+        .await
+        .unwrap();
+        log.emit(AuditEventKind::LinkRefused {
+            url: None,
+            why: "not an http or https link".into(),
+        })
+        .await
+        .unwrap();
+        let contents = tokio::fs::read_to_string(log.path()).await.unwrap();
+        assert!(!contents.contains("secret"), "{contents}");
+        let events = parse_lines(&contents);
+        assert_eq!(events[0]["type"], "link_opened");
+        assert!(
+            events[0]["url"]
+                .as_str()
+                .is_some_and(|u| u.starts_with("https://github.com/o/r")),
+            "{contents}"
+        );
+        assert_eq!(events[1]["type"], "link_refused");
+        assert!(events[1].get("url").is_none(), "{contents}");
     }
 
     /// The whole reason this module reuses the vault's shape rather than
