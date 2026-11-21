@@ -8,7 +8,8 @@
 //! a human mid-handshake here; the dialog comes between commands.
 
 use super::broker::{Broker, Decision, Destination, KeySources, SignConsent, SignRequest};
-use super::host::{BrokerLease, agent_dir};
+use super::host::BrokerLease;
+use crate::credentials::host::agent_dir;
 use ahma_common::harness_asks::{self, CommandDigest, SshRefusal};
 use ahma_common::ssh_sign::{self, HOST_PREFIX, SSHSIG_PREFIX};
 use std::path::{Path, PathBuf};

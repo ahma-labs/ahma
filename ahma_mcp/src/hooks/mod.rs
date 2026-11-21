@@ -1776,7 +1776,7 @@ fn refusal_judging_scopes(sandbox: &crate::sandbox::Sandbox) -> Vec<PathBuf> {
 async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // Before anything restricts this process (SPEC R-CRED.9).
     #[cfg(unix)]
-    crate::credentials::ssh_agent::host::start();
+    crate::credentials::host::start();
     let approval = args.approve_grant.clone();
     let payload = args.resolve_payload()?;
     // A grant the human just approved in the harness dialog applies before

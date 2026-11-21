@@ -11,7 +11,10 @@ use super::proto::{self, Request};
 use super::purpose::{self, Purpose, SessionBind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::{UnixListener, UnixStream};
+#[cfg(test)]
+use tokio::net::UnixListener;
+use tokio::net::UnixStream;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
 /// How long the human's agent has to list its keys.
@@ -151,43 +154,6 @@ impl Broker {
             observer(&event);
         }
         self.events.lock().push(event);
-    }
-
-    /// Serve connections on `listener` until `cancel` fires, answering only
-    /// commands this process spawned (SPEC R-CRED.1). A connection from
-    /// anywhere else is closed unanswered and recorded.
-    pub(super) async fn serve_filtered(
-        self: Arc<Self>,
-        listener: UnixListener,
-        cancel: CancellationToken,
-    ) {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => {
-                        if !super::host::admitted(&stream) {
-                            self.record(BrokerEvent::RefusedOperation(
-                                "a connection from a process ahma did not spawn".into(),
-                            ));
-                            continue;
-                        }
-                        let broker = Arc::clone(&self);
-                        let cancel = cancel.clone();
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                _ = cancel.cancelled() => {}
-                                _ = broker.connection(stream) => {}
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::debug!("ssh broker accept: {e}");
-                        return;
-                    }
-                },
-            }
-        }
     }
 
     /// Serve every connection on `listener` until `cancel` fires: for tests
@@ -410,6 +376,20 @@ impl Broker {
         })
         .await
         .ok()?
+    }
+}
+
+/// Served on a per-command [`crate::credentials::host::SocketLease`], which
+/// admits only a command this process spawned (SPEC R-CRED.1).
+impl crate::credentials::host::SocketService for Broker {
+    async fn serve_connection(self: Arc<Self>, stream: UnixStream) {
+        self.connection(stream).await;
+    }
+
+    fn refused(&self) {
+        self.record(BrokerEvent::RefusedOperation(
+            "a connection from a process ahma did not spawn".into(),
+        ));
     }
 }
 

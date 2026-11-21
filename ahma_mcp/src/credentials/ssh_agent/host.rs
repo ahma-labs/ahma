@@ -1,81 +1,23 @@
-//! Where brokers run, and the per-command lease that serves one.
-//!
-//! Brokers run on one dedicated thread with its own runtime, started before
-//! anything restricts the process (SPEC R-CRED.9): on Linux `restrict_self`
-//! binds the calling thread and every thread it starts later, so a broker on
-//! a restricted thread could not read the key it signs with.
-//!
-//! Each sandboxed command gets its own socket in [`agent_dir`], named at
-//! random, and the broker answers only a connection from a process group led
-//! by a command this ahma process spawned (SPEC R-CRED.1): every command ahma
-//! runs leads its own group, and the kernel says who connected. A command of
-//! another session, another ahma process or anything else on the machine is
-//! refused, so no one borrows another session's consent.
+//! The SSH key broker's per-command lease (SPEC R-CRED.1): a [`Broker`] served
+//! on its own [`SocketLease`], which names, binds and removes the socket and
+//! admits only a command this process spawned. Where brokers run and where
+//! their sockets live is [`crate::credentials::host`].
 
 use super::broker::{Broker, BrokerEvent};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use tokio_util::sync::CancellationToken;
-
-/// The runtime brokers run on, started on first use.
-pub fn host() -> &'static tokio::runtime::Handle {
-    static HOST: OnceLock<tokio::runtime::Handle> = OnceLock::new();
-    HOST.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("ahma-credentials".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("the credential runtime starts");
-                let _ = tx.send(runtime.handle().clone());
-                runtime.block_on(std::future::pending::<()>());
-            })
-            .expect("the credential thread starts");
-        rx.recv()
-            .expect("the credential runtime reports its handle")
-    })
-}
-
-/// Start the broker thread now, before the process restricts itself
-/// (SPEC R-CRED.9). Cheap and idempotent.
-pub fn start() {
-    let _ = host();
-}
-
-/// The directory broker sockets live in: `<runtime dir>/agent`, owner-only.
-/// The sandbox profile lets a command connect to a socket here and nothing
-/// else (it cannot create, remove or list them).
-pub fn agent_dir() -> Option<PathBuf> {
-    let dir = ahma_common::hub::runtime_dir()?.join("agent");
-    std::fs::create_dir_all(&dir).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
-    }
-    Some(dir)
-}
-
-/// The longest socket path a Unix socket address holds: 103 chars on macOS (104-byte `sun_path`),
-/// 107 chars on Linux (108-byte `sun_path`).
-#[cfg(target_os = "macos")]
-const SUN_PATH_MAX: usize = 103;
-#[cfg(not(target_os = "macos"))]
-const SUN_PATH_MAX: usize = 107;
+use crate::credentials::host::SocketLease;
+use std::path::Path;
+use std::sync::Arc;
 
 /// One command's broker, served on its own socket for as long as this lives.
 pub struct BrokerLease {
-    socket: PathBuf,
+    socket: SocketLease,
     broker: Arc<Broker>,
-    cancel: CancellationToken,
 }
 
 impl std::fmt::Debug for BrokerLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrokerLease")
-            .field("socket", &self.socket)
+            .field("socket", &self.socket.socket())
             .finish_non_exhaustive()
     }
 }
@@ -83,35 +25,13 @@ impl std::fmt::Debug for BrokerLease {
 impl BrokerLease {
     /// Serve `broker` on a new socket in `dir`.
     pub fn start(broker: Arc<Broker>, dir: &Path) -> std::io::Result<Self> {
-        let name: String = (0..8)
-            .map(|_| format!("{:x}", rand::random::<u8>() & 0xf))
-            .collect();
-        let socket = dir.join(format!("{name}.sock"));
-        if socket.as_os_str().len() > SUN_PATH_MAX {
-            return Err(std::io::Error::other(format!(
-                "{} is too long for a socket address",
-                socket.display()
-            )));
-        }
-        let std_listener = std::os::unix::net::UnixListener::bind(&socket)?;
-        std_listener.set_nonblocking(true)?;
-        let runtime = host();
-        let listener = {
-            let _entered = runtime.enter();
-            tokio::net::UnixListener::from_std(std_listener)?
-        };
-        let cancel = CancellationToken::new();
-        runtime.spawn(Arc::clone(&broker).serve_filtered(listener, cancel.clone()));
-        Ok(Self {
-            socket,
-            broker,
-            cancel,
-        })
+        let socket = SocketLease::start(Arc::clone(&broker), dir, ".sock")?;
+        Ok(Self { socket, broker })
     }
 
     /// The socket to hand the command as `SSH_AUTH_SOCK`.
     pub fn socket(&self) -> &Path {
-        &self.socket
+        self.socket.socket()
     }
 
     /// What the broker did for this command.
@@ -123,41 +43,6 @@ impl BrokerLease {
     pub fn observe(&self, observer: super::broker::EventObserver) {
         self.broker.observe(observer);
     }
-}
-
-impl Drop for BrokerLease {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
-
-/// Whether the peer of `stream` may use this process's brokers: the same
-/// user, in a process group led by a direct child of this process — a
-/// command ahma spawned, which `base_command` makes a group leader.
-pub(super) fn admitted(stream: &tokio::net::UnixStream) -> bool {
-    let Ok(cred) = stream.peer_cred() else {
-        return false;
-    };
-    // SAFETY: `geteuid` has no preconditions.
-    if cred.uid() != unsafe { libc::geteuid() } {
-        return false;
-    }
-    let Some(pid) = cred.pid() else {
-        return false;
-    };
-    // SAFETY: `getpgid` has no preconditions; a vanished pid returns -1.
-    let group = unsafe { libc::getpgid(pid) };
-    if group <= 0 {
-        return false;
-    }
-    let leader = sysinfo::Pid::from_u32(group as u32);
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[leader]), true);
-    system
-        .process(leader)
-        .and_then(|p| p.parent())
-        .is_some_and(|parent| parent.as_u32() == std::process::id())
 }
 
 #[cfg(test)]
