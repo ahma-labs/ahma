@@ -263,6 +263,22 @@ pub enum Gate {
         tool: Option<String>,
         options: Vec<GateOption>,
     },
+    /// A link a hooked command was refused (SPEC R-LINK.6), asked here before
+    /// the harness dialog would: the question every surface shows.
+    Link {
+        decision_id: String,
+        /// The site, on a line of its own (ASCII; R-LINK.7).
+        site: String,
+        /// The repo the refused command ran in: what a session answer is bound to.
+        workspace: String,
+        /// `links::policy::LinkQuestion::text`: the site, the address, its notes
+        /// and the guidance (R-LINK.7).
+        text: String,
+        /// That nothing waits on the command, so an answer applies when it runs
+        /// again.
+        note: String,
+        options: Vec<GateOption>,
+    },
     /// The chat's tool-approval gate.
     Tool {
         op_id: String,
@@ -318,6 +334,10 @@ pub enum WireIntent {
         decision_id: String,
         answer: WireWebAnswer,
     },
+    AnswerLinkAsk {
+        decision_id: String,
+        answer: WireLinkAnswer,
+    },
     AnswerToolApproval {
         op_id: String,
         answer: WireToolAnswer,
@@ -352,7 +372,17 @@ pub enum WireWebAnswer {
     Session,
 }
 
-/// `always` is not here either.
+/// The answers a hooked command's refused link takes here (SPEC R-LINK.6,
+/// R-GUI.9): no saving answer, and no "this time", since nothing waits on the
+/// command.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireLinkAnswer {
+    Deny,
+    Session,
+}
+
+/// `always` is not here either, as for [`WireWebAnswer`].
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WireToolAnswer {
@@ -416,6 +446,42 @@ mod tests {
         ] {
             assert!(ok(refused.clone()).is_err(), "{refused} must be refused");
         }
+    }
+
+    /// SPEC R-LINK.6, R-GUI.9: the answer to a hooked command's refused link
+    /// is deny or this site for this session. "This time" is not one — nothing
+    /// waits on the command — and no saving answer can be said at all.
+    #[test]
+    fn a_link_answer_is_deny_or_this_site_for_this_session() {
+        let ok = |v: serde_json::Value| serde_json::from_value::<WireIntent>(v);
+        for (raw, answer) in [
+            ("deny", WireLinkAnswer::Deny),
+            ("session", WireLinkAnswer::Session),
+        ] {
+            assert_eq!(
+                ok(json!({"type": "answer_link_ask", "decision_id": "l", "answer": raw})).unwrap(),
+                WireIntent::AnswerLinkAsk {
+                    decision_id: "l".into(),
+                    answer
+                }
+            );
+        }
+        for refused in [
+            "once",
+            "always-site",
+            "always-site-this-repo",
+            "always-any-site",
+        ] {
+            assert!(
+                ok(json!({"type": "answer_link_ask", "decision_id": "l", "answer": refused}))
+                    .is_err(),
+                "{refused} must be refused"
+            );
+        }
+        assert!(
+            ok(json!({"type": "answer_link_ask", "decision_id": "l", "answer": "deny", "x": 1}))
+                .is_err()
+        );
     }
 
     #[test]

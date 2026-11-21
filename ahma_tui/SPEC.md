@@ -66,8 +66,12 @@ Criteria specified in §3 or in the root SPEC are cited by id, not restated.
   since nothing waits. Granting keys wait out `GRANT_ARMING_DELAY`; a saving key shows the exact
   line it writes and saves on its second press. The session answer is the hook-side session
   grant file (root R-LINK.4); every answer settles the recorded refusal, so Claude Code's dialog
-  does not ask it too, and a deny is remembered for that harness's session. Only `ahma tui`
-  reads link questions for now: `ahma web` and `ahma desktop` do not render one yet.
+  does not ask it too, and a deny is remembered for that harness's session. A session on every
+  surface reads link questions (`session::harness_link_source`): `ahma web` and `ahma desktop`
+  draw the same gate and give only deny and this site for this session
+  (`HarnessLinkAsk::unsaved_choices`); the controller refuses a saving answer from a surface
+  that may not save (root R-GUI.9). The line under the question is one
+  text, `harness_asks::LINK_NOT_PAUSED`.
 - **Trusted folders (root R-PERM.1.2, R-PERM.1.3)**.
 - **Guided setup, help and settings (R24.12)**.
 - **Minimal chrome (R24.11)**.

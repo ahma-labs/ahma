@@ -4721,8 +4721,7 @@ fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            "The command was not paused: an answer here applies when the agent runs it again, \
-             and Claude Code's dialog does not ask it too.",
+            crate::harness_asks::LINK_NOT_PAUSED,
             theme.dim(),
         )),
     ]);

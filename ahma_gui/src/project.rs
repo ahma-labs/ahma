@@ -506,6 +506,8 @@ pub fn gates(state: &AppState) -> Gates {
         + state.scope_grant_queue.len()
         + state.web_approval.iter().count()
         + state.web_approval_queue.len()
+        + state.link_ask.iter().count()
+        + state.link_ask_queue.len()
         + state.approval.iter().count();
 
     let top = if let Some(gate) = &state.scope_grant {
@@ -563,6 +565,8 @@ pub fn gates(state: &AppState) -> Gates {
                 ),
             ],
         })
+    } else if let Some(gate) = &state.link_ask {
+        Some(link(gate, persistent))
     } else {
         state.approval.as_ref().map(|gate| Gate::Tool {
             op_id: clean(&gate.op_id),
@@ -583,6 +587,65 @@ pub fn gates(state: &AppState) -> Gates {
         })
     };
     Gates { waiting, top }
+}
+
+/// A link a hooked command was refused (SPEC R-LINK.6): the question every
+/// surface shows (R-LINK.7) and the answers it offers in the TUI, in that
+/// order. A surface that may not save (R-GUI.9) gives only the ones
+/// `HarnessLinkAsk::unsaved_choices` names — deny and this site for this
+/// session — and each other one says where it is given: the TUI, or the grant
+/// line a human runs.
+fn link(gate: &ahma_tui::state::LinkAskGate, persistent: bool) -> Gate {
+    use ahma_tui::controller::LinkChoice;
+    let ask = &gate.ask;
+    let unsaved = ask.unsaved_choices();
+    let options = gate
+        .choices
+        .iter()
+        .map(|&choice| {
+            let allowed = persistent || unsaved.contains(&choice);
+            let hint = match choice {
+                LinkChoice::Session => Some(
+                    "Commands in this repo may open its links until the agent's harness exits \
+                     (at most 12 hours). Not saved."
+                        .to_string(),
+                ),
+                _ if allowed => None,
+                _ => ask.grant_command(choice).map(|grant| {
+                    clean(&format!(
+                        "Saved answers are given in `ahma tui`, or by running `{grant}`."
+                    ))
+                }),
+            };
+            let label = match choice {
+                LinkChoice::Deny => "Deny (default)".to_string(),
+                other => capitalised(other.label()),
+            };
+            GateOption {
+                value: choice.value().to_string(),
+                label: clean(&label),
+                granting: choice != LinkChoice::Deny,
+                allowed,
+                hint,
+            }
+        })
+        .collect();
+    Gate::Link {
+        decision_id: clean(&gate.decision_id),
+        site: clean(&ask.refusal.host.to_ascii_lowercase()),
+        workspace: clean(&ask.workspace.display().to_string()),
+        text: clean(&ask.question().text()),
+        note: ahma_tui::harness_asks::LINK_NOT_PAUSED.to_string(),
+        options,
+    }
+}
+
+fn capitalised(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// At most `max` characters, with an ellipsis when it was cut: a long address is
@@ -812,6 +875,134 @@ mod tests {
             url.len()
         );
         assert!(url.ends_with('…'));
+    }
+
+    fn link_gate(host: &str, local: bool) -> ahma_tui::state::LinkAskGate {
+        let mut gate =
+            ahma_tui::state::LinkAskGate::from_ask(ahma_tui::harness_asks::HarnessLinkAsk {
+                workspace: std::env::temp_dir().join("ws"),
+                refusal: ahma_common::harness_asks::LinkRefusal {
+                    host: host.into(),
+                    shown: format!("https://{host}/o/r/pull/12"),
+                    local,
+                    outside_egress: false,
+                    at: 1,
+                    harness_pid: Some(std::process::id()),
+                    command_digest: None,
+                },
+                harness_pid: std::process::id(),
+            });
+        gate.restart_arming(true);
+        gate
+    }
+
+    fn gui_state() -> AppState {
+        let mut gui = state();
+        gui.caps = Capabilities {
+            host_commands: false,
+            persistent_answers: false,
+            wait_for_presentation: true,
+            commands: ahma_tui::state::CommandPolicy::Only(&[]),
+        };
+        gui
+    }
+
+    /// SPEC R-LINK.6, R-LINK.7, R-GUI.9: a link a hooked command was refused
+    /// is the question every surface shows, ending with the guidance, and
+    /// offers the TUI's answers in its order, deny first — with only deny and
+    /// this site for this session given here, and each saving answer naming
+    /// the grant line that gives it. It waits behind a scope or web question,
+    /// as in the terminal, and counts as waiting.
+    #[test]
+    fn a_link_question_gives_deny_and_this_session_and_says_where_the_rest_are() {
+        use link_values::*;
+        let mut gui = gui_state();
+        gui.link_ask = Some(link_gate("github.com", false));
+        let g = gates(&gui);
+        assert_eq!(g.waiting, 1);
+        let Some(Gate::Link {
+            decision_id,
+            site,
+            workspace,
+            text,
+            note,
+            options,
+        }) = g.top
+        else {
+            panic!("a link question: {:?}", g.top)
+        };
+        let ask = &gui.link_ask.as_ref().unwrap().ask;
+        assert_eq!(decision_id, ask.decision_id());
+        assert_eq!(site, "github.com");
+        assert_eq!(workspace, ask.workspace.display().to_string());
+        assert_eq!(text, ask.question().text(), "the one question body");
+        assert!(text.ends_with(ahma_common::open_url::GUIDANCE), "{text}");
+        assert_eq!(note, ahma_tui::harness_asks::LINK_NOT_PAUSED);
+        assert_eq!(
+            options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
+            [
+                DENY,
+                SESSION,
+                ALWAYS_SITE,
+                ALWAYS_SITE_THIS_REPO,
+                ALWAYS_ANY
+            ],
+            "the TUI's answers, in its order"
+        );
+        let given: Vec<_> = options
+            .iter()
+            .filter(|o| o.allowed)
+            .map(|o| o.value.as_str())
+            .collect();
+        assert_eq!(given, [DENY, SESSION], "no saving answer, no \"this time\"");
+        assert!(!options[0].granting && options[0].label.contains("default"));
+        assert!(options[1..].iter().all(|o| o.granting));
+        for saving in options.iter().filter(|o| !o.allowed) {
+            let hint = saving.hint.as_deref().unwrap_or_default();
+            assert!(
+                hint.contains("`ahma tui`") && hint.contains("ahma permissions grant open-url"),
+                "{hint}"
+            );
+        }
+        assert!(
+            options[2]
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("`ahma permissions grant open-url github.com`")),
+            "{:?}",
+            options[2].hint
+        );
+
+        let mut local = gui_state();
+        local.link_ask = Some(link_gate("localhost", true));
+        local.link_ask_queue.push_back(link_gate("docs.rs", false));
+        let g = gates(&local);
+        assert_eq!(g.waiting, 2, "the queue counts");
+        let Some(Gate::Link { options, .. }) = g.top else {
+            panic!()
+        };
+        assert!(
+            options.iter().all(|o| o.value != ALWAYS_ANY),
+            "no any-site answer for a local site"
+        );
+
+        scope_gate(&mut local);
+        let g = gates(&local);
+        assert!(
+            matches!(g.top, Some(Gate::Scope { .. })),
+            "a scope question first"
+        );
+        assert_eq!(g.waiting, 3);
+    }
+
+    /// The values the page sends back, as `links::policy::LinkChoice::value`
+    /// spells them (pinned here so a rename is seen).
+    mod link_values {
+        pub const DENY: &str = "deny";
+        pub const SESSION: &str = "session";
+        pub const ALWAYS_SITE: &str = "always-site";
+        pub const ALWAYS_SITE_THIS_REPO: &str = "always-site-this-repo";
+        pub const ALWAYS_ANY: &str = "always-any-site";
     }
 
     #[test]

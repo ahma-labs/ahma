@@ -42,6 +42,11 @@ pub const ASSETS: &[Asset] = &[
         body: include_str!("../web/dist/act.js"),
     },
     Asset {
+        path: "/dist/answer.js",
+        content_type: JS,
+        body: include_str!("../web/dist/answer.js"),
+    },
+    Asset {
         path: "/dist/api.js",
         content_type: JS,
         body: include_str!("../web/dist/api.js"),

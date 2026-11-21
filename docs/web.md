@@ -60,6 +60,9 @@ and open `http://127.0.0.1:8765/` locally. There is no option to listen on anoth
   cannot be missed. Deny is always available and acts at once. An answer that grants becomes
   available a moment after the question has actually been on screen in a focused tab, so a
   keystroke meant for something else cannot grant it.
+- **Web links a hooked command was refused** (`gh pr view --web` run by Claude Code): the same
+  question the terminal UI shows, answered with deny or "this site, this session"; the saved
+  answers name the `ahma permissions grant open-url` line instead ([open-links.md](open-links.md)).
 
 Slash commands typed into the chat are the ones the controller allows a browser (see below);
 the terminal UI is where settings, setup and the doctor are used.

@@ -17,7 +17,9 @@
 //! A link a hooked command was refused (SPEC R-LINK.6) is a question of its
 //! own, a [`HarnessLinkAsk`], shown in the link question
 //! ([`LinkAskGate`]) with the answers `links::policy` offers this surface:
-//! deny, this site for this session, and the lasting ones. Its session answer
+//! deny, this site for this session, and the lasting ones; `ahma web` and
+//! `ahma desktop`, which may not save, give only the first two
+//! ([`HarnessLinkAsk::unsaved_choices`]). Its session answer
 //! is a session grant file bound to the harness process
 //! (`ahma_common::open_url::record_session`), which the hook reads as it
 //! reads a saved grant.
@@ -43,6 +45,12 @@ use anyhow::{Context, Result};
 
 /// How often the TUI re-reads the records.
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
+
+/// What every surface says under a hooked command's link question (SPEC
+/// R-LINK.6): nothing waits on the refused command, so an answer applies when
+/// it runs again, and settles the question for the harness dialog.
+pub const LINK_NOT_PAUSED: &str = "The command was not paused: an answer here applies when the \
+     agent runs it again, and Claude Code's dialog does not ask it too.";
 
 /// One question waiting for a harness dialog, with what an answer binds to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +368,27 @@ impl HarnessLinkAsk {
     /// on a hooked command, so no "this time".
     pub fn choices(&self) -> Vec<LinkChoice> {
         self.question().choices(link_policy::Surface::TuiForHarness)
+    }
+
+    /// What a surface that may not save (SPEC R-GUI.9: `ahma web`, `ahma
+    /// desktop`) can give for it, deny first: the answers it offers
+    /// ([`Self::choices`]) that `links::policy` also offers such a surface
+    /// (`Surface::Browser`) — deny and this site for this session. The
+    /// browser's "this time" is for a link a command waits on, and nothing
+    /// waits on a hooked command (R-LINK.6).
+    pub fn unsaved_choices(&self) -> Vec<LinkChoice> {
+        let browser = self.question().choices(link_policy::Surface::Browser);
+        self.choices()
+            .into_iter()
+            .filter(|c| browser.contains(c))
+            .collect()
+    }
+
+    /// The `ahma permissions grant open-url` line that gives a saving
+    /// `choice` (SPEC R-LINK.11): where a surface that may not save says that
+    /// answer is given. `None` for one that saves nothing.
+    pub fn grant_command(&self, choice: LinkChoice) -> Option<String> {
+        link_policy::grant_command(choice, &self.refusal.host, &self.workspace)
     }
 
     /// What a saving `choice` writes, for the step that shows it before it is
@@ -935,6 +964,31 @@ mod tests {
                 1,
                 "any site never covers a local one"
             );
+        }
+
+        /// SPEC R-LINK.6, R-GUI.9: a surface that may not save (`ahma web`,
+        /// `ahma desktop`) gives what both rules allow — deny and this site for
+        /// this session; not "this time", since nothing waits — and names each
+        /// lasting answer as the grant line a human runs instead.
+        #[test]
+        fn a_surface_that_may_not_save_gives_deny_and_this_session_only() {
+            for (host, local) in [("github.com", false), ("localhost", true)] {
+                let f = link_fixture(host, local);
+                let ask = waiting(&f).remove(0);
+                assert_eq!(ask.unsaved_choices(), [Deny, Session], "{host}");
+                assert_eq!(ask.grant_command(Deny), None);
+                assert_eq!(ask.grant_command(Session), None, "nothing saved");
+                assert_eq!(
+                    ask.grant_command(AlwaysSiteAllRepos).as_deref(),
+                    Some(format!("ahma permissions grant open-url {host}").as_str())
+                );
+                let this_repo = ask.grant_command(AlwaysSiteThisRepo).unwrap();
+                assert!(
+                    this_repo.contains(" --workspace ")
+                        && this_repo.contains(&f.ws.display().to_string()),
+                    "{this_repo}"
+                );
+            }
         }
 
         /// SPEC R-LINK.4: "this site, this session" is a session grant file

@@ -10,11 +10,12 @@
 //    assistive-technology users can grant as well as deny.
 //  - Deny answers are always enabled, visually primary, and Enter/Escape inside
 //    the panel (not on a granting button) choose the first of them.
-//  - A scope/web question tells the server whether it is being *read*: visible,
-//    focused document. Hidden is reported the moment that stops being true.
+//  - A scope, web or link question tells the server whether it is being
+//    *read*: visible, focused document. Hidden is reported the moment that stops being true.
 //  - The question stays until the server's view no longer has it.
-import { postReport } from "../api.js";
 import { send } from "../act.js";
+import { intentFor } from "../answer.js";
+import { postReport } from "../api.js";
 import { el, setHidden, setText } from "../dom.js";
 /** A click this soon after the question (re)drew is not a considered one. */
 const SETTLE_MS = 500;
@@ -30,16 +31,6 @@ function structureOf(gate) {
         options: gate.options.map((o) => ({ value: o.value, label: o.label, granting: o.granting })),
     });
 }
-function intentFor(gate, option) {
-    switch (gate.kind) {
-        case "scope":
-            return { type: "answer_scope_grant", decision_id: gate.decision_id, option: option.value };
-        case "web":
-            return { type: "answer_web_approval", decision_id: gate.decision_id, answer: option.value };
-        case "tool":
-            return { type: "answer_tool_approval", op_id: gate.op_id, answer: option.value };
-    }
-}
 function section(heading, body, mono = false) {
     return el("div", { class: "gate-section" }, heading !== null && el("div", { class: "gate-heading" }, heading), el("div", { class: mono ? "gate-body mono" : "gate-body" }, body));
 }
@@ -52,6 +43,8 @@ function bodyFor(g) {
                 return [...g.sections.map((s) => section(s.heading, s.body)), advice(g.advice)];
             case "web":
                 return [section("URL", g.url, true), g.tool === null ? null : section("Requested by", g.tool, true)];
+            case "link":
+                return [section("Refused in", g.workspace, true), section(null, g.text), advice(g.note)];
             case "tool":
                 return [section(null, g.description), advice(g.note)];
         }
@@ -59,10 +52,19 @@ function bodyFor(g) {
     return parts.filter((p) => p !== null);
 }
 function kickerFor(g) {
-    return { scope: "Sandbox access", web: "Network request", tool: "Tool approval" }[g.kind];
+    return { scope: "Sandbox access", web: "Network request", link: "Open a web link", tool: "Tool approval" }[g.kind];
 }
 function titleFor(g) {
-    return g.kind === "scope" ? g.title : g.kind === "web" ? g.domain : g.tool;
+    switch (g.kind) {
+        case "scope":
+            return g.title;
+        case "web":
+            return g.domain;
+        case "link":
+            return g.site;
+        case "tool":
+            return g.tool;
+    }
 }
 function makeOption(option, onClick) {
     const button = el("button", {
@@ -74,7 +76,7 @@ function makeOption(option, onClick) {
     return { option, button, hint: el("span", { class: "opt-hint quiet" }) };
 }
 function createReadReporter() {
-    let reportId = null; // the scope/web question on screen, if any
+    let reportId = null; // the scope, web or link question on screen, if any
     let reported = null; // the one the server was last told is visible
     let queue = Promise.resolve();
     function report(r) {
@@ -142,9 +144,12 @@ export function mount(root) {
     async function answer(g, option) {
         if (answering)
             return; // one request at a time; the server's view decides what happens next
+        const intent = intentFor(g, option);
+        if (intent === null)
+            return; // not this surface's to send; the button says where it is
         answering = true;
         try {
-            await send(intentFor(g, option));
+            await send(intent);
         }
         finally {
             answering = false;
