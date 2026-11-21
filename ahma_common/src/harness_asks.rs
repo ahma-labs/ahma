@@ -697,6 +697,12 @@ pub struct WorkspaceAsks {
     /// session, so the note is said once (SPEC R-PERM.11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos_noted: Vec<RepoAck>,
+    /// Links the link broker refused a hooked command (SPEC R-LINK.6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_refusals: Vec<LinkRefusal>,
+    /// Questions about them put to the human through the harness dialog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links_asked: Vec<AskedLink>,
 }
 
 /// Record that a plain read of `repo` from this workspace was noted in `session_id`. `true` the
@@ -1002,6 +1008,10 @@ fn forget_expired(asks: &mut WorkspaceAsks, now: u64) {
         .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
     asks.repos_noted
         .retain(|a| now.saturating_sub(a.at) <= MAX_AGE_SECS);
+    asks.link_refusals
+        .retain(|r| now.saturating_sub(r.at) <= MAX_AGE_SECS);
+    asks.links_asked
+        .retain(|a| now.saturating_sub(a.asked_at) <= MAX_AGE_SECS);
 }
 
 /// What spending a one-use token reads and writes of the record that carries it.
@@ -1118,6 +1128,27 @@ impl OneUseToken for AskedEscape {
     }
 }
 
+impl OneUseToken for AskedLink {
+    fn records(asks: &mut WorkspaceAsks) -> &mut Vec<Self> {
+        &mut asks.links_asked
+    }
+    /// Bound to the command the dialog was shown for: a link refused in `gh pr view --web` is
+    /// asked before `ahma open-url` of the same site too, and approves that command.
+    fn ticket(&mut self) -> Ticket<'_> {
+        Ticket {
+            token: &self.token,
+            approves: &self.command_digest,
+            asked_at: self.asked_at,
+            used: &mut self.used,
+        }
+    }
+    /// The site's refusals are answered.
+    fn settle(&self, asks: &mut WorkspaceAsks, _now: u64) {
+        asks.link_refusals
+            .retain(|r| !r.same_subject(&self.refusal.host));
+    }
+}
+
 /// Spend a one-use `token` for exactly the command `digest` names (SPEC R-PERM.10, R-PERM.11,
 /// R-CRED.3, R-ESCAPE.2): the first record of kind `A` that [honours](Ticket::honours) it is
 /// marked spent, and what it settles is settled, in one locked step. A token is good once.
@@ -1207,6 +1238,133 @@ pub fn take_ssh_approved(
     command: &str,
     now: u64,
 ) -> Option<AskedSsh> {
+    spend(dir, workspace, token, &CommandDigest::of(command), now)
+}
+
+/// A link the link broker refused a hooked command because no grant covered its site (SPEC
+/// R-LINK.6): asked about when that command, or a command that opens a link to the same site,
+/// runs again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkRefusal {
+    /// The site: lowercased ASCII, an internationalised name in punycode.
+    pub host: String,
+    /// The address as a question shows it: whole up to 300 characters, else cut with the length
+    /// of the rest (SPEC R-LINK.7).
+    pub shown: String,
+    /// The site is this machine or the local network (SPEC R-LINK.4).
+    #[serde(default)]
+    pub local: bool,
+    /// The site is off the network allow list while restriction is on (SPEC R-LINK.5).
+    #[serde(default)]
+    pub outside_egress: bool,
+    /// Unix seconds of the latest refusal.
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_pid: Option<u32>,
+    /// Digest of the command that was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_digest: Option<CommandDigest>,
+}
+
+impl LinkRefusal {
+    fn same_subject(&self, host: &str) -> bool {
+        self.host.eq_ignore_ascii_case(host)
+    }
+}
+
+/// A question about a refused link put to the human through a harness dialog, with the one-use
+/// token the approved command carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedLink {
+    pub session_id: String,
+    pub refusal: LinkRefusal,
+    pub token: String,
+    pub command_digest: CommandDigest,
+    pub asked_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_pid: Option<u32>,
+    /// Spent: the human said yes, and the approved command ran with it.
+    #[serde(default)]
+    pub used: bool,
+}
+
+/// Remember that the link broker refused a hooked command in `workspace` a link to
+/// `refusal.host`: the latest refusal of a site replaces the one before.
+pub fn record_link_refusal(dir: &Path, workspace: &Path, refusal: LinkRefusal) -> Result<()> {
+    update(dir, workspace, refusal.at, |asks| {
+        asks.link_refusals
+            .retain(|r| !r.same_subject(&refusal.host));
+        asks.link_refusals.push(refusal);
+    })
+}
+
+/// Whether the human said no to links to `host` in harness session `session_id`: a question
+/// about it was asked there and its token never spent. A no is remembered for the session; a
+/// yes is "this time" (SPEC R-LINK.6), so it leaves nothing to remember.
+pub fn link_declined(asks: &WorkspaceAsks, session_id: &str, host: &str) -> bool {
+    asks.links_asked
+        .iter()
+        .any(|a| a.session_id == session_id && !a.used && a.refusal.same_subject(host))
+}
+
+/// The refused link to ask about before `command` runs in harness session `session_id` (SPEC
+/// R-LINK.6): one refused when `command` last ran, or one to the site `command` opens
+/// (`opens_host`: a whole-line `open`, `ahma open-url` or `"$BROWSER"` of one link), that no
+/// grant covers (`covered`), and that this session has not declined or is not asking about now.
+/// Never before an unrelated command.
+pub fn next_link_question(
+    asks: &WorkspaceAsks,
+    session_id: &str,
+    command: &str,
+    opens_host: &dyn Fn(&str) -> Option<String>,
+    covered: &dyn Fn(&LinkRefusal) -> bool,
+) -> Option<LinkRefusal> {
+    let digest = CommandDigest::of(command);
+    let opens = opens_host(command);
+    asks.link_refusals
+        .iter()
+        .filter(|r| {
+            r.command_digest.as_ref() == Some(&digest)
+                || opens.as_deref().is_some_and(|h| r.same_subject(h))
+        })
+        .filter(|r| !covered(r))
+        .find(|r| !link_declined(asks, session_id, &r.host))
+        .cloned()
+}
+
+/// Record that `refusal` was put to the human in `session_id` before `command`, returning the
+/// one-use token the approved command will carry.
+pub fn mark_link_asked(
+    dir: &Path,
+    workspace: &Path,
+    session_id: &str,
+    refusal: &LinkRefusal,
+    command: &str,
+    harness_pid: Option<u32>,
+    now: u64,
+) -> Result<String> {
+    let token = new_token();
+    let asked = AskedLink {
+        session_id: session_id.to_string(),
+        refusal: refusal.clone(),
+        token: token.clone(),
+        command_digest: CommandDigest::of(command),
+        asked_at: now,
+        harness_pid,
+        used: false,
+    };
+    update(dir, workspace, now, |asks| asks.links_asked.push(asked))?;
+    Ok(token)
+}
+
+/// Spend a link `token` for exactly `command`, as [`take_approved`] does for a path.
+pub fn take_link_approved(
+    dir: &Path,
+    workspace: &Path,
+    token: &str,
+    command: &str,
+    now: u64,
+) -> Option<AskedLink> {
     spend(dir, workspace, token, &CommandDigest::of(command), now)
 }
 
@@ -1603,6 +1761,104 @@ mod tests {
             "once"
         );
         assert!(load(dir.path(), ws, 107).ssh_refusals.is_empty());
+    }
+
+    /// SPEC R-LINK.6: a refused link is asked about before the command that was refused runs
+    /// again, or before a command that opens a link to the same site, never before an unrelated
+    /// one; a grant that covers it asks nothing; a no is remembered for the harness session, and
+    /// a yes ("this time") is spent once and leaves the site to be asked again.
+    #[test]
+    fn a_link_refusal_is_asked_before_the_same_command_or_an_open_of_its_host_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Path::new("/ws/repo");
+        let cmd = "gh pr view 12 --web";
+        let refusal = LinkRefusal {
+            host: "github.com".into(),
+            shown: "https://github.com/o/r/pull/12".into(),
+            local: false,
+            outside_egress: false,
+            at: 100,
+            harness_pid: Some(7),
+            command_digest: Some(CommandDigest::of(cmd)),
+        };
+        record_link_refusal(dir.path(), ws, refusal.clone()).unwrap();
+        record_link_refusal(
+            dir.path(),
+            ws,
+            LinkRefusal {
+                host: "GitHub.com".into(),
+                at: 101,
+                ..refusal.clone()
+            },
+        )
+        .unwrap();
+        let asks = load(dir.path(), ws, 102);
+        assert_eq!(asks.link_refusals.len(), 1, "one site, one refusal");
+
+        // What `links::policy::link_open_host` answers, for the commands below.
+        let opens = |c: &str| -> Option<String> {
+            match c {
+                "ahma open-url https://github.com/x" => Some("github.com".into()),
+                "open https://docs.rs/" => Some("docs.rs".into()),
+                _ => None,
+            }
+        };
+        let never = |_: &LinkRefusal| false;
+        for unrelated in ["cargo build", "git status", "open https://docs.rs/"] {
+            assert!(
+                next_link_question(&asks, "s1", unrelated, &opens, &never).is_none(),
+                "{unrelated}: not held for it"
+            );
+        }
+        assert!(
+            next_link_question(&asks, "s1", cmd, &opens, &|_| true).is_none(),
+            "a grant that covers it asks nothing"
+        );
+        let q = next_link_question(
+            &asks,
+            "s1",
+            "ahma open-url https://github.com/x",
+            &opens,
+            &never,
+        )
+        .expect("an open of the same site is asked");
+        assert_eq!(q.host, "GitHub.com");
+        let q = next_link_question(&asks, "s1", cmd, &opens, &never).expect("the same command");
+
+        // Asked, and answered no: the token is never spent.
+        mark_link_asked(dir.path(), ws, "s1", &q, cmd, Some(7), 103).unwrap();
+        let asks = load(dir.path(), ws, 104);
+        assert!(link_declined(&asks, "s1", "github.com"));
+        assert!(
+            next_link_question(&asks, "s1", cmd, &opens, &never).is_none(),
+            "a no is remembered for the session"
+        );
+        assert!(
+            next_link_question(&asks, "s2", cmd, &opens, &never).is_some(),
+            "another session asks"
+        );
+
+        // Asked in s2, and answered yes: spent once, for the command it was asked before.
+        let token = mark_link_asked(dir.path(), ws, "s2", &q, cmd, Some(8), 105).unwrap();
+        assert!(take_link_approved(dir.path(), ws, &token, "gh pr list", 106).is_none());
+        let asked = take_link_approved(dir.path(), ws, &token, cmd, 106).expect("approved");
+        assert_eq!(asked.refusal.host, "GitHub.com");
+        assert!(
+            take_link_approved(dir.path(), ws, &token, cmd, 107).is_none(),
+            "once"
+        );
+        let asks = load(dir.path(), ws, 108);
+        assert!(asks.link_refusals.is_empty(), "the yes answered the site");
+        assert!(
+            !link_declined(&asks, "s2", "github.com"),
+            "a yes is not a no"
+        );
+
+        // A later refusal in s2 is asked again: the yes was for that run only.
+        record_link_refusal(dir.path(), ws, LinkRefusal { at: 109, ..refusal }).unwrap();
+        let asks = load(dir.path(), ws, 110);
+        assert!(next_link_question(&asks, "s2", cmd, &opens, &never).is_some());
+        assert!(next_link_question(&asks, "s1", cmd, &opens, &never).is_none());
     }
 
     /// SPEC R-ESCAPE: an escape is offered for exactly the refused command,
@@ -2431,7 +2687,7 @@ mod tests {
     }
 
     /// SPEC R-PERM.10, R-PERM.11, R-CRED.3, R-ESCAPE.2: every one-use token the harness dialog
-    /// issues (folder, repository, SSH signature, escape) is spent by one rule: only for the
+    /// issues (folder, repository, SSH signature, escape, link) is spent by one rule: only for the
     /// command it was issued for, whatever its surrounding whitespace; only while unspent; only
     /// within [`TOKEN_TTL_SECS`], to the last second; and an attempt that fails spends nothing.
     #[test]
@@ -2460,9 +2716,18 @@ mod tests {
             at,
             harness_pid: Some(7),
         };
+        let link = LinkRefusal {
+            host: "github.com".into(),
+            shown: "https://github.com/".into(),
+            local: false,
+            outside_egress: false,
+            at,
+            harness_pid: Some(7),
+            command_digest: None,
+        };
         record_escape(dir, ws, escape.clone()).unwrap();
         type Take = fn(&Path, &Path, &str, &str, u64) -> bool;
-        let kinds: [(&str, String, Take); 4] = [
+        let kinds: [(&str, String, Take); 5] = [
             (
                 "folder",
                 mark_asked(dir, ws, "s1", &question, cmd, Some(7), at).unwrap(),
@@ -2482,6 +2747,11 @@ mod tests {
                 "escape",
                 mark_escape_asked(dir, ws, "s1", &escape, at).unwrap(),
                 |d, w, t, c, n| take_escape_approved(d, w, t, c, n).is_some(),
+            ),
+            (
+                "link",
+                mark_link_asked(dir, ws, "s1", &link, cmd, Some(7), at).unwrap(),
+                |d, w, t, c, n| take_link_approved(d, w, t, c, n).is_some(),
             ),
         ];
         for (kind, token, take) in kinds {

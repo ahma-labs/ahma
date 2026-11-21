@@ -1,34 +1,51 @@
 //! How each command gets its link broker (SPEC R-LINK.1): the per-command
 //! lease, the helper link that `BROWSER` and `GH_BROWSER` name, and whether
-//! this process serves link brokers at all (which the sandbox profile reads,
-//! so a command may reach the broker directory whatever `[sandbox] ssh_agent`
-//! says).
+//! the command whose sandbox is being built is served one (which the sandbox
+//! profile reads, so that command may reach the broker directory whatever
+//! `[sandbox] ssh_agent` says, and no other command gains that from it).
 
 use super::broker::LinkBroker;
 use super::consent::RecordedLinkConsent;
 use super::helper::{HELPER_NAME, SOCKET_ENV};
 use crate::credentials::host::{SocketLease, agent_dir};
 use crate::egress::EgressGrants;
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The suffix that tells a link broker's socket from the SSH key broker's.
 pub const SOCKET_SUFFIX: &str = ".link.sock";
 
-static SERVED: AtomicBool = AtomicBool::new(false);
-
-/// Record that this process serves its commands a link broker, before any
-/// command's sandbox profile is built: from then on the profile lets a
-/// command connect to a socket in the broker directory (SPEC R-LINK.1).
-pub fn mark_served() {
-    SERVED.store(true, Ordering::SeqCst);
+thread_local! {
+    /// Whether the command whose sandbox this thread is building now is
+    /// served a link broker. Set only for the length of one build
+    /// ([`building_for`]).
+    static SERVING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether this process serves its commands a link broker.
+/// Build one command's sandboxed process with `build`, saying whether a link
+/// broker serves that command (SPEC R-LINK.1): while `build` runs, on this
+/// thread, the profile builder lets the command connect to a socket in the
+/// broker directory. Per command: a build before, after or beside it (on
+/// another thread) does not see it. `build` must build synchronously, as
+/// every sandbox spawn path does; the profile is fixed when it returns.
+pub fn building_for<T>(served: bool, build: impl FnOnce() -> T) -> T {
+    /// Puts back what the thread had, however `build` ends.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERVING.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SERVING.with(|s| s.replace(served)));
+    build()
+}
+
+/// Whether the command whose sandbox is being built on this thread is served
+/// a link broker ([`building_for`]).
 pub fn served() -> bool {
-    SERVED.load(Ordering::SeqCst)
+    SERVING.with(Cell::get)
 }
 
 /// Gives each command its link broker.
@@ -37,6 +54,13 @@ pub trait LinkBrokerFactory: Send + Sync + std::fmt::Debug {
     /// `None` when none can be served (the command then keeps whatever
     /// `BROWSER` it had, and a browser launch fails in the sandbox as before).
     fn lease_for_command(&self, working_dir: &Path, command: Option<&str>) -> Option<LinkLease>;
+
+    /// The helper a whole-line `open <URL>` runs as (SPEC R-LINK.10): the
+    /// one `BROWSER` names. `None` when it cannot be made; the line then runs
+    /// as written.
+    fn helper(&self) -> Option<PathBuf> {
+        helper_link()
+    }
 }
 
 /// One command's link broker, served on its own socket for as long as this
@@ -131,7 +155,8 @@ pub fn helper_link_in(dir: &Path, exe: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// The link broker factory for a terminal hook: consent from saved grants
-/// only ([`RecordedLinkConsent`]), keyed on the hook's workspace.
+/// and a harness-dialog yes ([`RecordedLinkConsent`]), keyed on the hook's
+/// workspace.
 #[derive(Debug, Clone)]
 pub struct RecordedLinks {
     settings_file: Option<PathBuf>,
@@ -141,6 +166,19 @@ pub struct RecordedLinks {
     workspace: Option<PathBuf>,
     /// The effective egress allow list while network restriction is on.
     egress: Option<EgressGrants>,
+    /// The one command every lease is for, as the harness ran it, with the
+    /// harness process and session that ran it: a refusal is asked about
+    /// when it runs again (SPEC R-LINK.6).
+    harness: Option<HarnessRun>,
+    /// The site a yes in the harness dialog allowed for this run.
+    this_run: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HarnessRun {
+    command: String,
+    pid: Option<u32>,
+    session_id: Option<String>,
 }
 
 impl RecordedLinks {
@@ -150,7 +188,35 @@ impl RecordedLinks {
             scopes,
             workspace: None,
             egress: None,
+            harness: None,
+            this_run: None,
         }
+    }
+
+    /// Every lease is for `command`, which harness process `pid` ran in its
+    /// session `session_id`: a link refused in it is recorded so the harness
+    /// dialog asks when it, or a command opening the same site, runs again.
+    /// The command as the harness wrote it, not as ahma ran it (a whole-line
+    /// `open`, R-LINK.10), because the harness re-runs what it wrote.
+    pub fn for_harness(
+        mut self,
+        command: &str,
+        pid: Option<u32>,
+        session_id: Option<String>,
+    ) -> Self {
+        self.harness = Some(HarnessRun {
+            command: command.to_string(),
+            pid,
+            session_id,
+        });
+        self
+    }
+
+    /// Open links to `host` in this run: a human said yes ("this time") to
+    /// it in the harness dialog before the run.
+    pub fn allowing_this_run(mut self, host: Option<String>) -> Self {
+        self.this_run = host;
+        self
     }
 
     /// Key every command's grants on `workspace`.
@@ -168,17 +234,21 @@ impl RecordedLinks {
 }
 
 impl LinkBrokerFactory for RecordedLinks {
+    /// `_command` is the line ahma runs; a refusal is keyed on the harness's
+    /// own line instead ([`RecordedLinks::for_harness`]), which is what it
+    /// runs again. Without a harness nothing is left for a dialog.
     fn lease_for_command(&self, working_dir: &Path, _command: Option<&str>) -> Option<LinkLease> {
         let workspace = self.workspace.clone().unwrap_or_else(|| {
             crate::adapter::workspace_queue::workspace_key(working_dir, &self.scopes)
         });
-        let consent = Arc::new(RecordedLinkConsent::new(
-            workspace,
-            self.settings_file.clone(),
-            self.egress.clone(),
-        ));
-        let broker = LinkBroker::new(consent, super::opener::for_this_process());
-        let helper = helper_link()?;
+        let mut consent =
+            RecordedLinkConsent::new(workspace, self.settings_file.clone(), self.egress.clone())
+                .allowing_this_run(self.this_run.as_deref());
+        if let Some(run) = &self.harness {
+            consent = consent.for_harness(&run.command, run.pid, run.session_id.clone());
+        }
+        let broker = LinkBroker::new(Arc::new(consent), super::opener::for_this_process());
+        let helper = self.helper()?;
         match LinkLease::start(broker, &agent_dir()?, helper) {
             Ok(lease) => Some(lease),
             Err(e) => {
@@ -192,6 +262,21 @@ impl LinkBrokerFactory for RecordedLinks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R-LINK.1: "a link broker serves this command" holds for the one
+    /// build it was said for — not before, not after (even if that build
+    /// panicked), not on another thread.
+    #[test]
+    fn a_served_build_leaves_no_trace_on_the_next() {
+        assert!(!served());
+        assert!(building_for(true, || {
+            let beside = std::thread::spawn(served).join().unwrap();
+            served() && !beside && !building_for(false, served) && served()
+        }));
+        assert!(!served(), "the next command's build is its own");
+        let _ = std::panic::catch_unwind(|| building_for(true, || panic!("build failed")));
+        assert!(!served(), "restored when a build panics");
+    }
 
     /// SPEC R-LINK.1: the helper is the running binary under the helper's
     /// name, one directory per executable; making it again is a no-op, and a

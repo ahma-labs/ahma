@@ -551,36 +551,55 @@ impl Adapter {
         Some(lease)
     }
 
-    /// Serve each command a link broker from `factory` (SPEC R-LINK.1). From
-    /// now on every command's sandbox profile lets it connect to a socket in
-    /// the broker directory, whatever `[sandbox] ssh_agent` says.
+    /// Serve each command a link broker from `factory` (SPEC R-LINK.1). A
+    /// command that gets one may connect to its socket in the broker
+    /// directory, whatever `[sandbox] ssh_agent` says; that is decided per
+    /// command, as its sandbox is built (`links::host::building_for`).
     #[cfg(unix)]
     pub fn with_link_brokers(
         mut self,
         factory: Arc<dyn crate::links::host::LinkBrokerFactory>,
     ) -> Self {
-        crate::links::host::mark_served();
         self.link_brokers = Some(factory);
         self
     }
 
-    /// The link lease for a command about to run in `working_dir`, with the
-    /// command pointed at it. Held until the command has finished.
+    /// The link lease for a command about to run in `working_dir`, taken
+    /// before its sandbox is built: whether it has one decides whether its
+    /// profile lets it reach the broker directory. Held until the command
+    /// has finished.
     #[cfg(unix)]
     fn lease_link_broker(
         &self,
-        cmd: &mut tokio::process::Command,
         working_dir: &std::path::Path,
         command: Option<&str>,
     ) -> Option<crate::links::host::LinkLease> {
-        let lease = self
-            .link_brokers
+        self.link_brokers
             .as_ref()?
-            .lease_for_command(working_dir, command)?;
-        for (key, value) in lease.env() {
-            cmd.env(key, value);
-        }
-        Some(lease)
+            .lease_for_command(working_dir, command)
+    }
+
+    /// A whole-line `open <URL>` (SPEC R-LINK.10) as the line ahma runs
+    /// instead — the link helper `BROWSER` names, given the address as
+    /// checked — and the line that says so. `None` for any other line, or
+    /// when no link broker serves this adapter's commands.
+    #[cfg(unix)]
+    fn link_open_substitute(&self, line: &str) -> Option<(String, String)> {
+        use crate::links::policy::{exact_open_command, sh_single_quote};
+        let factory = self.link_brokers.as_ref()?;
+        let target = exact_open_command(line)?;
+        let helper = factory.helper()?;
+        let runs = format!(
+            "{} {}",
+            sh_single_quote(&helper.to_string_lossy()),
+            sh_single_quote(target.as_str())
+        );
+        let said = format!(
+            "ahma: `{}` ran as `ahma open-url '{}'` (SPEC R-LINK.10).",
+            line.trim(),
+            target.as_str()
+        );
+        Some((runs, said))
     }
 
     /// Validate a working directory against the sandbox scope, raising a scope-grant
@@ -828,6 +847,28 @@ impl Adapter {
         // Validate working directory against sandbox scope.
         let safe_wd = self.validate_working_dir(working_dir, command).await?;
 
+        // A whole-line `open <URL>` runs as the link helper (SPEC R-LINK.10).
+        // The audit keeps the line as written; everything else runs the
+        // helper's line.
+        #[cfg(unix)]
+        let substitute =
+            shell_command_line(args.as_ref()).and_then(|line| self.link_open_substitute(line));
+        #[cfg(unix)]
+        let (args, written, link_note) = match substitute {
+            Some((runs, said)) => {
+                let written = args.clone();
+                let mut args = args;
+                if let Some(map) = args.as_mut() {
+                    map.insert("command".to_string(), serde_json::Value::String(runs));
+                }
+                (args, written, Some(said))
+            }
+            None => (args, None, None),
+        };
+        #[cfg(not(unix))]
+        let (written, link_note): (Option<Map<String, serde_json::Value>>, Option<String>) =
+            (None, None);
+
         let (program, args_vec) = self
             .prepare_command_and_args(command, args.as_ref(), subcommand_config, &safe_wd)
             .await?;
@@ -851,7 +892,7 @@ impl Adapter {
         let (lane, queue_reason) =
             self.resolve_lane_with_reason(args.as_ref(), subcommand_config, &safe_wd);
         self.command_starts(lane);
-        let title = shell_command_line(args.as_ref())
+        let title = shell_command_line(written.as_ref().or(args.as_ref()))
             .map(str::to_string)
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
         let timeout =
@@ -868,7 +909,7 @@ impl Adapter {
         audit::record_tool_call(
             &op_id,
             command,
-            args.as_ref(),
+            written.as_ref().or(args.as_ref()),
             &safe_wd_str,
             &program,
             &args_vec,
@@ -911,7 +952,10 @@ impl Adapter {
             run.exit_code,
         )
         .await;
-        run.result
+        match link_note {
+            Some(line) => said_first(run.result, &line),
+            None => run.result,
+        }
     }
 
     /// Whether a human declared this shell line long-running (SPEC R2.7.10):
@@ -999,23 +1043,38 @@ impl Adapter {
         shell_command: Option<&str>,
     ) -> SyncRun {
         let effective_command = shell_command.unwrap_or(command);
+        // Its link broker (SPEC R-LINK.1), held until the command has ended,
+        // and leased before its sandbox is built: having one is what lets
+        // this command, and no other, reach the broker directory.
+        #[cfg(unix)]
+        let links = self.lease_link_broker(safe_wd, Some(effective_command));
+        #[cfg(unix)]
+        let served_links = links.is_some();
+        #[cfg(not(unix))]
+        let served_links = false;
         // Create sandboxed command.
         // `create_shell_command` is only needed for raw /bin/sh invocations where
         // the caller has NOT already added the -c flag via a subcommand config.
         // For bash/powershell the preparer already embeds -c/-Command; always
         // use create_command so the sandbox wrapper is applied without double-wrapping.
-        let built = if lane == workspace_queue::Lane::ReadOnly {
-            self.command_executor
-                .build_read_only_command(&self.sandbox, program, args_vec, safe_wd)
-        } else {
-            build_sandboxed_command(
-                self.command_executor.as_ref(),
-                &self.sandbox,
-                program,
-                args_vec,
-                safe_wd,
-            )
-        };
+        let built = build_for_this_command(served_links, || {
+            if lane == workspace_queue::Lane::ReadOnly {
+                self.command_executor.build_read_only_command(
+                    &self.sandbox,
+                    program,
+                    args_vec,
+                    safe_wd,
+                )
+            } else {
+                build_sandboxed_command(
+                    self.command_executor.as_ref(),
+                    &self.sandbox,
+                    program,
+                    args_vec,
+                    safe_wd,
+                )
+            }
+        });
         let mut cmd = match built {
             Ok(cmd) => cmd,
             Err(e) => return SyncRun::failed(e),
@@ -1026,9 +1085,12 @@ impl Adapter {
         }
         #[cfg(unix)]
         let broker = self.lease_credential_broker(&mut cmd, safe_wd, Some(effective_command));
-        // Its link broker (SPEC R-LINK.1), held until the command has ended.
         #[cfg(unix)]
-        let links = self.lease_link_broker(&mut cmd, safe_wd, Some(effective_command));
+        if let Some(links) = &links {
+            for (key, value) in links.env() {
+                cmd.env(key, value);
+            }
+        }
         // The tag the kernel's records of this command's denials carry
         // (SPEC R-DENY.1).
         let denial_tag = sandbox::kernel_denials::tag_of(cmd.as_std().get_args());
@@ -1222,7 +1284,15 @@ impl Adapter {
             return SyncRun {
                 outcome: audit::Outcome::Failed,
                 exit_code,
-                result: kernel_report_result(&self.sandbox, report, result, op_id, command).await,
+                result: kernel_report_result(
+                    &self.sandbox,
+                    report,
+                    result,
+                    op_id,
+                    command,
+                    sandbox::launch_services::refused_link(stderr, stdout).as_deref(),
+                )
+                .await,
             };
         }
         let result = match fatal_unrunnable(result, stderr, stdout) {
@@ -2259,6 +2329,38 @@ fn broker_refusals(lease: &crate::credentials::ssh_agent::host::BrokerLease) -> 
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+/// Build one command's sandboxed process with `build`, saying whether a
+/// link broker serves it (SPEC R-LINK.1): its profile, and no other, may
+/// then reach the broker directory. Windows serves no link broker
+/// (R-LINK.12).
+fn build_for_this_command<T>(served_links: bool, build: impl FnOnce() -> T) -> T {
+    #[cfg(unix)]
+    {
+        crate::links::host::building_for(served_links, build)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = served_links;
+        build()
+    }
+}
+
+/// `result` with `line` said before it (SPEC R-LINK.10's one line). A typed
+/// error (a sandbox denial, a time limit) is left as it is: its caller reads
+/// its type, and its own text says what happened.
+fn said_first(result: Result<String, anyhow::Error>, line: &str) -> Result<String, anyhow::Error> {
+    match result {
+        Ok(out) => Ok(format!("{line}\n{out}")),
+        Err(e)
+            if e.downcast_ref::<sandbox::SandboxError>().is_none()
+                && e.downcast_ref::<time_limit::LimitReached>().is_none() =>
+        {
+            Err(anyhow::anyhow!("{line}\n{e}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The lines the link broker refused this command (SPEC R-LINK.6), once
 /// each, leaving out any the helper already printed into `stdout`/`stderr`:
 /// one line per refusal, never two copies, and never none because the tool
@@ -2282,13 +2384,18 @@ fn link_refusals(
 /// the MCP boundary turns into a structured `sandbox_denial` payload, with
 /// every record's line in its details; other denials are their lines; no
 /// records leave the failure as it was, with nothing suggested (R-DENY.3).
+/// `link`: the web link a refused LaunchServices launch was for
+/// ([`sandbox::launch_services::refused_link`]), which is explained, never
+/// offered as a run outside the sandbox ([`explain_refused_link`]).
 async fn kernel_report_result(
     sandbox: &sandbox::Sandbox,
     report: sandbox::grant_channel::KernelReport,
     result: Result<String, anyhow::Error>,
     op_id: &str,
     command: &str,
+    link: Option<&str>,
 ) -> Result<String, anyhow::Error> {
+    let report = explain_refused_link(report, link);
     if report.lines.is_empty() {
         return result;
     }
@@ -2317,6 +2424,30 @@ async fn kernel_report_result(
             Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
         },
     }
+}
+
+/// What every kernel line for a refused LaunchServices launch contains
+/// (`kernel_denials::one_line`).
+const LSOPEN_LINE: &str = "refused `lsopen`";
+
+/// The kernel's report for a run whose LaunchServices launch was of a web
+/// link (SPEC R6.2.10): the `lsopen` record's line, which offers one run
+/// outside the sandbox, gives way to the exact `ahma open-url` that opens
+/// the link with the human's consent, and the run is unfixable only if
+/// something else no grant allows was refused too. No R-ESCAPE is recorded
+/// for it, so no harness asks to run it outside the sandbox.
+fn explain_refused_link(
+    mut report: sandbox::grant_channel::KernelReport,
+    link: Option<&str>,
+) -> sandbox::grant_channel::KernelReport {
+    let Some(url) = link else {
+        return report;
+    };
+    report.lines.retain(|line| !line.contains(LSOPEN_LINE));
+    // Every other unfixable record's line is `Blocked: …` (`one_line`).
+    report.unfixable &= report.lines.iter().any(|l| l.starts_with("Blocked: "));
+    report.lines.push(sandbox::launch_services::link_note(url));
+    report
 }
 
 /// The first line of the [`sandbox::SandboxError::Unfixable`] a nested
@@ -3173,6 +3304,10 @@ async fn record_failure_diagnostics(
     )
     .await
     {
+        let report = explain_refused_link(
+            report,
+            sandbox::launch_services::refused_link(stderr_str, stdout_str).as_deref(),
+        );
         if let Some((path, access)) = &report.grant {
             audit::record_sandbox_denial(Some(op_id), path, access.label(), tool).await;
         }
@@ -3657,6 +3792,137 @@ mod tests {
         .unwrap_err();
         assert!(err.downcast_ref::<sandbox::SandboxError>().is_none());
         assert!(err.to_string().contains("R6.2.10"), "{err}");
+    }
+
+    /// SPEC R6.2.10 (amended), R-ESCAPE.1: a LaunchServices launch the kernel
+    /// refused is unfixable — the hook then offers to run it outside the
+    /// sandbox — unless it was a web link. A link has a narrower way out, so
+    /// its result names the exact `ahma open-url`, carries no line offering a
+    /// run outside the sandbox, and is not the unfixable error the hook
+    /// records as an escape.
+    #[tokio::test]
+    async fn a_refused_url_open_records_no_escape() {
+        use sandbox::kernel_denials::{KernelDenial, classify, one_line};
+        let (adapter, _td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let denial = KernelDenial::parse_seatbelt("Sandbox: open(12) deny(1) lsopen").unwrap();
+        let report = || sandbox::grant_channel::KernelReport {
+            lines: vec![one_line(&denial, &classify(&denial))],
+            grant: None,
+            unfixable: true,
+        };
+        let failed = || Err(anyhow::anyhow!("exit 1"));
+        let stderr =
+            "LSOpenURLsWithRole() failed with error -54 for the URL https://github.com/o/r/pull/1.";
+        let link = sandbox::launch_services::refused_link(stderr, "");
+        assert_eq!(link.as_deref(), Some("https://github.com/o/r/pull/1"));
+
+        let err = kernel_report_result(
+            &adapter.sandbox,
+            report(),
+            failed(),
+            "op",
+            "open",
+            link.as_deref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<sandbox::SandboxError>().is_none(),
+            "not an escape: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("`ahma open-url 'https://github.com/o/r/pull/1'`"),
+            "{text}"
+        );
+        assert!(!text.contains(LSOPEN_LINE), "{text}");
+        assert!(
+            !text.contains("whether to run it outside the sandbox"),
+            "{text}"
+        );
+
+        // An app is still unfixable: the hook asks to run it once outside.
+        let app = kernel_report_result(&adapter.sandbox, report(), failed(), "op", "open", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            app.downcast_ref::<sandbox::SandboxError>(),
+            Some(sandbox::SandboxError::Unfixable { .. })
+        ));
+    }
+
+    /// SPEC R-LINK.10: with a link broker serving its commands, a whole-line
+    /// `open <URL>` runs as the link helper — the one `BROWSER` names — given
+    /// the checked address, and the result says so first. Any other line runs
+    /// as written, and without a broker nothing is substituted. Before, the
+    /// line ran `open` itself, which the sandbox refuses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_whole_line_open_runs_as_the_helper() {
+        use std::os::unix::fs::PermissionsExt;
+        /// Leases nothing; its helper records the arguments it was run with.
+        #[derive(Debug)]
+        struct Recorded(std::path::PathBuf);
+        impl crate::links::host::LinkBrokerFactory for Recorded {
+            fn lease_for_command(
+                &self,
+                _: &std::path::Path,
+                _: Option<&str>,
+            ) -> Option<crate::links::host::LinkLease> {
+                None
+            }
+            fn helper(&self) -> Option<std::path::PathBuf> {
+                Some(self.0.clone())
+            }
+        }
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let ws = dunce::canonicalize(td.path()).unwrap();
+        let argv = ws.join("argv");
+        let helper = ws.join("fake helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", argv.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            adapter
+                .link_open_substitute("open https://example.com/z")
+                .is_none(),
+            "no broker, nothing substituted"
+        );
+        let adapter = adapter.with_link_brokers(Arc::new(Recorded(helper)));
+        assert!(
+            adapter
+                .link_open_substitute("open -a Safari https://x/")
+                .is_none()
+        );
+        let config = crate::AhmaMcpService::build_shell_subcommand_config(
+            Some(30),
+            &ExecutionMode::Synchronous,
+        );
+        let out = adapter
+            .execute_sync_in_dir(
+                crate::shell_pool::platform_shell_program(),
+                Some(shell_args("open 'HTTPS://Example.com/z?a=1&b=2'")),
+                &ws.to_string_lossy(),
+                Some(30),
+                Some(&config),
+            )
+            .await
+            .expect("the helper ran");
+        assert!(
+            out.starts_with(
+                "ahma: `open 'HTTPS://Example.com/z?a=1&b=2'` ran as `ahma open-url \
+                 'https://example.com/z?a=1&b=2'` (SPEC R-LINK.10)."
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&argv).unwrap(),
+            "https://example.com/z?a=1&b=2\n",
+            "one argument, the address as checked"
+        );
     }
 
     /// REGRESSION: the bare sccache failure a hooked `cargo` printed reached the

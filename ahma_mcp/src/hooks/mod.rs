@@ -1790,12 +1790,14 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         return run_command_once_unsandboxed(&payload, &refusal.why).await;
     }
     let mut trial = None;
+    let mut link_this_run = None;
     if let Some(token) = approval
         && let Some(approval) =
             harness_ask::apply_approval(&token, Path::new(&payload.cwd), &payload.command)
     {
         eprintln!("{}", approval.line);
         trial = approval.trial;
+        link_this_run = approval.link_this_run;
     }
     let mut hook_scopes = resolve_hook_sandbox_scopes(Path::new(&payload.cwd));
     // Session-tier grants a human approved at the TUI or a harness prompt apply
@@ -1876,6 +1878,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         sandbox,
         limit_secs,
         deferred_to_outer_sandbox,
+        link_this_run,
     )?;
 
     let result =
@@ -1940,6 +1943,7 @@ fn build_hook_adapter(
     sandbox: std::sync::Arc<crate::sandbox::Sandbox>,
     limit_secs: u64,
     deferred_to_outer_sandbox: bool,
+    #[cfg_attr(not(unix), allow(unused_variables))] link_this_run: Option<String>,
 ) -> Result<(
     std::sync::Arc<crate::adapter::Adapter>,
     Option<crate::hub_reporter::ReporterHandle>,
@@ -1999,6 +2003,9 @@ fn build_hook_adapter(
     // files (SPEC R-CRED.1), in `"broker"` mode. Its upstream is the agent
     // adopted at startup from this hook's own environment (R-CRED.7) — the
     // socket the profile refuses it a direct connect to (R-CRED.11).
+    // The harness process whose dialog asks about what the brokers refuse.
+    #[cfg(unix)]
+    let harness_pid = harness_ask::harness_pid();
     #[cfg(unix)]
     let adapter = match ahma_common::config::ahma_home_dir()
         .filter(|_| crate::sandbox::ssh_agent_mode() == crate::sandbox::SshAgentMode::Broker)
@@ -2008,7 +2015,7 @@ fn build_hook_adapter(
                 home,
                 crate::sandbox::upstream_agent(),
                 cfg.settings_origin.user_settings_file(),
-                harness_ask::harness_pid(),
+                harness_pid,
                 hook_scopes.to_vec(),
             )
             .for_workspace(harness_ask::workspace_for(Path::new(&payload.cwd)))
@@ -2018,6 +2025,8 @@ fn build_hook_adapter(
     };
     // The command opens web links through ahma, outside the sandbox, for a
     // site a human allowed (SPEC R-LINK.1): its `BROWSER` is ahma's helper.
+    // A link refused now is asked about in the harness dialog when this
+    // command runs again (R-LINK.6), and a yes there opens it in that run.
     #[cfg(unix)]
     let adapter = adapter.with_link_brokers(std::sync::Arc::new(
         crate::links::host::RecordedLinks::new(
@@ -2025,7 +2034,9 @@ fn build_hook_adapter(
             hook_scopes.to_vec(),
         )
         .for_workspace(harness_ask::workspace_for(Path::new(&payload.cwd)))
-        .with_egress(hook_egress_grants(cfg)),
+        .with_egress(hook_egress_grants(cfg))
+        .for_harness(&payload.command, harness_pid, payload.session_id.clone())
+        .allowing_this_run(link_this_run),
     ));
     Ok((std::sync::Arc::new(adapter), reporter))
 }
@@ -2638,6 +2649,20 @@ fn next_prior_step(
         cfg.settings_origin.user_settings_file().as_deref(),
     ) {
         return Some(ask((harness_ask::ssh_ask_reason(&refusal), token)));
+    }
+    // A link the link broker refused, before this command or one opening the
+    // same site runs again (SPEC R-LINK.6).
+    if let Some((refusal, token)) = harness_ask::next_link_ask(
+        cwd,
+        session_id,
+        command,
+        cfg.settings_origin.user_settings_file().as_deref(),
+    ) {
+        let workspace = harness_ask::workspace_for(cwd);
+        return Some(ask((
+            harness_ask::link_ask_reason(&refusal, &workspace),
+            token,
+        )));
     }
     // This exact command was refused what nothing allows: offer one
     // run outside the sandbox (SPEC R-ESCAPE).
