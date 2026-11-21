@@ -9,6 +9,7 @@ use crate::{
     service_builder::{BuiltService, ServiceBuilder},
     utils::stdio::emit_stdout_notification,
 };
+use ahma_common::hub::RestartMode;
 use ahma_http_mcp_client::client::HttpMcpTransport;
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
@@ -504,25 +505,22 @@ pub async fn get_bridge_version(socket_path: &str) -> Option<String> {
 
 /// POST `/restart` to the bridge at `path`.
 pub async fn trigger_uds_restart(path: &str) -> bool {
-    trigger_uds_restart_with_mode(path, None).await
+    trigger_uds_restart_with_mode(path, RestartMode::Now).await
 }
 
-/// POST `/restart` over the Unix socket, optionally with a `mode` query.
+/// POST `/restart` over the Unix socket, asking for `mode`.
 ///
-/// `Some("drain")` asks a hub to stop accepting new sessions and go once the
+/// [`RestartMode::Drain`] asks a hub to stop accepting new sessions and go once the
 /// live ones end, which is how a version handoff avoids ending sessions that
 /// belong to other windows (SPEC R-HUB.5).
-pub async fn trigger_uds_restart_with_mode(path: &str, mode: Option<&str>) -> bool {
+pub async fn trigger_uds_restart_with_mode(path: &str, mode: RestartMode) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connect = ahma_common::local_socket::LocalStream::connect(std::path::Path::new(path));
     let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(200), connect).await else {
         return false;
     };
 
-    let target = match mode {
-        Some(mode) => format!("/restart?mode={mode}"),
-        None => "/restart".to_string(),
-    };
+    let target = mode.path();
     // The hub's socket requires the hub's token (SPEC R-HUB.13).
     let authorization = ahma_common::hub::authorization_header_for(std::path::Path::new(path))
         .await
@@ -543,15 +541,12 @@ pub async fn trigger_uds_restart_with_mode(path: &str, mode: Option<&str>) -> bo
 }
 
 pub async fn trigger_tcp_restart(url: &str) -> bool {
-    trigger_tcp_restart_with_mode(url, None).await
+    trigger_tcp_restart_with_mode(url, RestartMode::Now).await
 }
 
 /// TCP counterpart of [`trigger_uds_restart_with_mode`].
-pub async fn trigger_tcp_restart_with_mode(url: &str, mode: Option<&str>) -> bool {
-    let restart_url = match mode {
-        Some(mode) => format!("{}/restart?mode={mode}", url.trim_end_matches('/')),
-        None => format!("{}/restart", url.trim_end_matches('/')),
-    };
+pub async fn trigger_tcp_restart_with_mode(url: &str, mode: RestartMode) -> bool {
+    let restart_url = format!("{}{}", url.trim_end_matches('/'), mode.path());
     // A local `ahma serve http` requires the token it published (SPEC R-HUB.14).
     let Ok(mut request) = PROBE_CLIENT.post(&restart_url).build() else {
         return false;
@@ -594,16 +589,16 @@ fn is_shared_socket_under_test(socket_path: &str) -> bool {
 }
 
 pub async fn trigger_bridge_restart(socket_path: &str) -> bool {
-    trigger_bridge_restart_with_mode(socket_path, None).await
+    trigger_bridge_restart_with_mode(socket_path, RestartMode::Now).await
 }
 
 /// Ask the hub to drain: finish the sessions it has, accept no new ones,
 /// then exit (SPEC R-HUB.5).
 pub async fn trigger_bridge_drain(socket_path: &str) -> bool {
-    trigger_bridge_restart_with_mode(socket_path, Some("drain")).await
+    trigger_bridge_restart_with_mode(socket_path, RestartMode::Drain).await
 }
 
-async fn trigger_bridge_restart_with_mode(socket_path: &str, mode: Option<&str>) -> bool {
+async fn trigger_bridge_restart_with_mode(socket_path: &str, mode: RestartMode) -> bool {
     !is_shared_socket_under_test(socket_path)
         && trigger_uds_restart_with_mode(socket_path, mode).await
 }
