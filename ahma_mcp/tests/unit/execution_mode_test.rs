@@ -463,7 +463,13 @@ async fn a_sync_flagged_result_is_the_direct_output_under_the_identity_line() ->
             identity.starts_with('\u{2713}') && identity.contains("exit 0"),
             "{tool}: the first line says how it ended: {identity}"
         );
-        assert_eq!(body, direct.trim_end(), "{tool}: the output is unchanged");
+        // A tracked operation keeps each line and joins them with `\n`; the direct
+        // path passed a Windows `\r\n` through. The lines are what must match.
+        assert_eq!(
+            body.lines().collect::<Vec<_>>(),
+            direct.trim_end().lines().collect::<Vec<_>>(),
+            "{tool}: the output is unchanged, line for line"
+        );
     }
     Ok(())
 }
