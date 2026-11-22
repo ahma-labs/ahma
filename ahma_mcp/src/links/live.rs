@@ -340,31 +340,27 @@ impl LiveLinkConsent {
                 self.session.state.lock().granted.push(pattern);
                 Settled::Allowed
             }
-            Effect::Persist(pattern, binding) => {
+            Effect::Persist(patterns, binding) => {
+                let texts: Vec<String> = patterns.iter().map(HostPattern::as_str).collect();
+                let named = texts.join(", ");
                 let saved = self.settings_file.as_deref().map(|file| {
-                    ahma_common::open_url::persist_open_url_allow(
-                        file,
-                        &pattern.as_str(),
-                        &binding,
-                        &surface,
-                    )
+                    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    ahma_common::open_url::persist_open_url_allows(file, &refs, &binding, &surface)
                 });
                 match saved {
                     Some(Ok(_)) => {}
                     Some(Err(e)) => tracing::warn!(
-                        "a link grant for {} was approved but could not be saved: {e:#}; it \
-                         holds for this session",
-                        pattern.as_str()
+                        "a link grant for {named} was approved but could not be saved: {e:#}; \
+                         it holds for this session"
                     ),
                     None => tracing::warn!(
-                        "a link grant for {} was approved but there is no settings file to \
-                         save it in; it holds for this session",
-                        pattern.as_str()
+                        "a link grant for {named} was approved but there is no settings file \
+                         to save it in; it holds for this session"
                     ),
                 }
                 // A "this repo only" answer stays in its repo this session too.
                 if binding_is_here(&binding, &self.workspace) {
-                    self.session.state.lock().granted.push(pattern);
+                    self.session.state.lock().granted.extend(patterns);
                 }
                 Settled::Allowed
             }
@@ -755,6 +751,7 @@ mod tests {
                 LinkChoice::Once,
                 LinkChoice::AlwaysSiteThisRepo,
                 LinkChoice::AlwaysSiteAllRepos,
+                LinkChoice::AlwaysDomainThisRepo,
                 LinkChoice::AlwaysAnyThisRepo,
             ]
         );
@@ -856,6 +853,35 @@ mod tests {
         assert_eq!(saved.repos[0].allow, ["*"]);
     }
 
+    /// SPEC R-LINK.6, R-LINK.4: "this site and its subdomains" saves the
+    /// registrable domain and its one-label wildcard for this repo, in one
+    /// write with an audit line each; a sibling subdomain then opens without
+    /// asking.
+    #[tokio::test]
+    async fn a_site_and_its_subdomains_is_saved_as_two_patterns() {
+        let asker = Scripted::new(vec![LinkAskOutcome::Answered(
+            LinkChoice::AlwaysDomainThisRepo,
+        )]);
+        let f = Fixture::new(Some(asker.clone()));
+        let consent = f.consent();
+        for link in [
+            "https://api.github.com/x",
+            "https://github.com/o/r",
+            "https://gist.github.com/x",
+        ] {
+            assert_eq!(consent.decide(&target(link), false).await, LinkAnswer::Open);
+        }
+        assert_eq!(asker.asked(), 1);
+        let saved = ahma_common::config::AhmaSettings::load_from_result(&f.settings)
+            .unwrap()
+            .open_url;
+        assert!(saved.allow.is_empty());
+        assert_eq!(saved.repos[0].allow, ["github.com", "*.github.com"]);
+        let audit = f.audit();
+        assert!(audit.contains("\"github.com in "), "{audit}");
+        assert!(audit.contains("\"*.github.com in "), "{audit}");
+    }
+
     /// SPEC R-PERM.3.4, R-LINK.6: the form is one single-select, deny the
     /// default, each answer titled with the site it saves, in order.
     #[test]
@@ -894,6 +920,10 @@ mod tests {
             (
                 "always-site-all-repos",
                 "Always for api.github.com — all repos",
+            ),
+            (
+                "always-domain-this-repo",
+                "Always for github.com and *.github.com — this repo only",
             ),
             (
                 "always-any-site-this-repo",

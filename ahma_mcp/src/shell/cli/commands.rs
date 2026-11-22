@@ -1095,11 +1095,18 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
             workspace,
             this_repo,
             global,
+            and_subdomains,
             yes,
         } => {
             if parse_kind(&kind)? == GrantKind::OpenUrl {
                 let binding = open_url_revoke_binding(workspace, this_repo, global)?;
-                return revoke_open_url(&file, subject.as_deref(), binding.as_ref(), yes);
+                return revoke_open_url(
+                    &file,
+                    subject.as_deref(),
+                    and_subdomains,
+                    binding.as_ref(),
+                    yes,
+                );
             }
             let subject = subject_or_bail(&kind, subject)?;
             revoke_permission(&file, load()?, &kind, &subject, workspace, global, yes)
@@ -1110,6 +1117,7 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
             workspace,
             this_repo: _,
             all_repos,
+            and_subdomains,
             lease,
             yes,
         } => {
@@ -1122,7 +1130,14 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
                 }
                 let binding = open_url_grant_binding(workspace, all_repos)?;
                 let settings = load()?;
-                return grant_open_url(&file, &settings, subject.as_deref(), binding, yes);
+                return grant_open_url(
+                    &file,
+                    &settings,
+                    subject.as_deref(),
+                    and_subdomains,
+                    binding,
+                    yes,
+                );
             }
             let subject = subject_or_bail(&kind, subject)?;
             grant_permission(&file, &kind, &subject, workspace, lease.as_deref(), yes)
@@ -1194,31 +1209,61 @@ fn open_url_pattern(site: Option<&str>) -> Result<String> {
     Ok(pattern.to_string())
 }
 
+/// The patterns `SITE` names: itself, or with `--and-subdomains` the
+/// registrable domain and its one-label wildcard, when it is one (SPEC
+/// R-LINK.4, R-LINK.11).
+fn open_url_patterns(site: Option<&str>, and_subdomains: bool) -> Result<Vec<String>> {
+    let pattern = open_url_pattern(site)?;
+    if !and_subdomains {
+        return Ok(vec![pattern]);
+    }
+    if site.is_none() {
+        anyhow::bail!("--and-subdomains needs a SITE: the domain whose subdomains to include");
+    }
+    let domain = crate::links::policy::and_subdomains(&pattern).map_err(anyhow::Error::msg)?;
+    Ok(vec![domain.clone(), format!("*.{domain}")])
+}
+
 /// `ahma permissions grant open-url [SITE]` (SPEC R-LINK.11): previews the
 /// line and the guidance, writes only with `--yes`, through the one audited
-/// writer.
+/// writer. A wildcard over a suffix many owners share is written as named,
+/// with the warning that it allows anyone's site there.
 fn grant_open_url(
     file: &std::path::Path,
     settings: &ahma_common::config::AhmaSettings,
     site: Option<&str>,
+    and_subdomains: bool,
     binding: ahma_common::open_url::OpenUrlBinding,
     yes: bool,
 ) -> Result<()> {
     use ahma_common::open_url::{ANY_SITE_WARNING, GUIDANCE, OpenUrlBinding};
-    let pattern = open_url_pattern(site)?;
-    let any = pattern == "*";
-    let line = match &binding {
-        OpenUrlBinding::AllRepos => format!("[open_url] allow = \"{pattern}\" (all repos)"),
-        OpenUrlBinding::Repo(ws) => format!(
-            "[open_url] repos = {{ workspace = \"{}\", allow = \"{pattern}\" }} (this repo only)",
-            ws.display()
-        ),
-    };
+    let patterns = open_url_patterns(site, and_subdomains)?;
+    let any = patterns == ["*"];
+    let lines: Vec<String> = patterns
+        .iter()
+        .map(|pattern| match &binding {
+            OpenUrlBinding::AllRepos => format!("[open_url] allow = \"{pattern}\" (all repos)"),
+            OpenUrlBinding::Repo(ws) => format!(
+                "[open_url] repos = {{ workspace = \"{}\", allow = \"{pattern}\" }} (this repo \
+                 only)",
+                ws.display()
+            ),
+        })
+        .collect();
+    let shared = patterns
+        .iter()
+        .find_map(|p| crate::links::policy::shared_wildcard_warning(p));
     if !yes {
-        println!("Would add: {line}");
+        for line in &lines {
+            println!("Would add: {line}");
+        }
         println!();
         if any {
             println!("{ANY_SITE_WARNING}");
+            println!();
+        }
+        if let Some(warning) = &shared {
+            println!("{warning}");
             println!();
         }
         if settings.network.restrict {
@@ -1235,16 +1280,24 @@ fn grant_open_url(
         println!("Nothing was changed. Re-run with --yes to apply.");
         return Ok(());
     }
-    if !ahma_common::open_url::persist_open_url_allow(
+    let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    if !ahma_common::open_url::persist_open_url_allows(
         file,
-        &pattern,
+        &refs,
         &binding,
         &ApproverSurface::Cli,
     )? {
-        println!("Already granted: {line}");
+        for line in &lines {
+            println!("Already granted: {line}");
+        }
         return Ok(());
     }
-    println!("✓ Granted: {line}");
+    if let Some(warning) = &shared {
+        println!("{warning}");
+    }
+    for line in &lines {
+        println!("✓ Granted: {line}");
+    }
     println!();
     let revoke_flag = match &binding {
         OpenUrlBinding::AllRepos => " --global".to_string(),
@@ -1253,12 +1306,16 @@ fn grant_open_url(
             crate::links::policy::sh_single_quote(&ws.to_string_lossy())
         ),
     };
-    let site_arg = if any {
-        String::new()
-    } else {
-        format!(" {pattern}")
+    let site_arg = match patterns.first() {
+        Some(p) if !any => format!(" {p}"),
+        _ => String::new(),
     };
-    println!("Revoke with: ahma permissions revoke open-url{site_arg}{revoke_flag} --yes");
+    let pair = if and_subdomains {
+        " --and-subdomains"
+    } else {
+        ""
+    };
+    println!("Revoke with: ahma permissions revoke open-url{site_arg}{pair}{revoke_flag} --yes");
     Ok(())
 }
 
@@ -1266,17 +1323,36 @@ fn grant_open_url(
 /// removes it, audited, only with `--yes`. A "this site, this session" grant
 /// given in the TUI ends with it, now (SPEC R-LINK.7, R-PERM.11); `--global`
 /// names only the grants for every repo, which a session grant never is.
+/// `--and-subdomains` also removes `*.SITE`; without it, a `*.SITE` left
+/// behind is named, so the pair is not half-revoked unnoticed (R-LINK.11).
 fn revoke_open_url(
     file: &std::path::Path,
     site: Option<&str>,
+    and_subdomains: bool,
     binding: Option<&ahma_common::open_url::OpenUrlBinding>,
     yes: bool,
 ) -> Result<()> {
     use ahma_common::open_url::OpenUrlBinding;
-    let pattern = site.map(|s| open_url_pattern(Some(s))).transpose()?;
+    let patterns: Vec<Option<String>> = match site {
+        None if and_subdomains => {
+            anyhow::bail!("--and-subdomains needs a SITE: the domain whose `*.SITE` to remove")
+        }
+        None => vec![None],
+        Some(s) => {
+            let p = open_url_pattern(Some(s))?;
+            if and_subdomains {
+                vec![Some(format!("*.{p}")), Some(p)]
+            } else {
+                vec![Some(p)]
+            }
+        }
+    };
     let settings = ahma_common::config::AhmaSettings::load_from_result(file)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let found = settings.open_url.matching(pattern.as_deref(), binding);
+    let found: Vec<(String, OpenUrlBinding)> = patterns
+        .iter()
+        .flat_map(|p| settings.open_url.matching(p.as_deref(), binding))
+        .collect();
     let session_repo: Option<Option<&std::path::Path>> = match binding {
         None => Some(None),
         Some(OpenUrlBinding::Repo(ws)) => Some(Some(ws.as_path())),
@@ -1291,19 +1367,34 @@ fn revoke_open_url(
         )
         .into_iter()
         .filter(|g| {
-            pattern
-                .as_deref()
-                .is_none_or(|p| g.site.eq_ignore_ascii_case(p))
+            patterns
+                .iter()
+                .any(|p| p.as_deref().is_none_or(|p| g.site.eq_ignore_ascii_case(p)))
                 && repo.is_none_or(|ws| g.workspace == ws)
         })
         .collect(),
         _ => Vec::new(),
     };
+    // A bare site whose wildcard sibling stays: say so, and how to remove it.
+    let sibling = match (&patterns[..], and_subdomains) {
+        ([Some(p)], false) if !p.starts_with('*') => {
+            let wild = format!("*.{p}");
+            (!settings.open_url.matching(Some(&wild), binding).is_empty()).then_some(wild)
+        }
+        _ => None,
+    };
+    let sibling_note = |site: &str| {
+        if let Some(wild) = &sibling {
+            println!(
+                "{wild} is still granted. To remove it too: ahma permissions revoke open-url \
+                 {site} --and-subdomains"
+            );
+        }
+    };
+    let named = site.unwrap_or("any site");
     if found.is_empty() && sessions.is_empty() {
-        println!(
-            "Nothing to revoke: no open-url grant for {}.",
-            pattern.as_deref().unwrap_or("any site")
-        );
+        println!("Nothing to revoke: no open-url grant for {named}.");
+        sibling_note(named);
         return Ok(());
     }
     let describe = |list: &[(String, OpenUrlBinding)]| {
@@ -1324,6 +1415,7 @@ fn revoke_open_url(
         if !sessions.is_empty() {
             println!("Would end the session grant for {describe_sessions}.");
         }
+        sibling_note(named);
         println!();
         println!("File: {}", file.display());
         println!();
@@ -1331,23 +1423,24 @@ fn revoke_open_url(
         return Ok(());
     }
     if !found.is_empty() {
-        let removed = ahma_common::open_url::revoke_open_url(
-            file,
-            pattern.as_deref(),
-            binding,
-            &ApproverSurface::Cli,
-        )?;
+        let mut removed = Vec::new();
+        for p in &patterns {
+            removed.extend(ahma_common::open_url::revoke_open_url(
+                file,
+                p.as_deref(),
+                binding,
+                &ApproverSurface::Cli,
+            )?);
+        }
         println!("✓ Revoked: the open-url grant for {}.", describe(&removed));
     }
     if let (Some(dir), Some(repo), false) = (&session_dir, session_repo, sessions.is_empty()) {
-        ahma_common::open_url::revoke_sessions(
-            dir,
-            pattern.as_deref(),
-            repo,
-            &ApproverSurface::Cli,
-        );
+        for p in &patterns {
+            ahma_common::open_url::revoke_sessions(dir, p.as_deref(), repo, &ApproverSurface::Cli);
+        }
         println!("✓ Ended: the session grant for {describe_sessions}.");
     }
+    sibling_note(named);
     Ok(())
 }
 
@@ -3858,6 +3951,7 @@ mod tests {
                     workspace: Some(ws.clone()),
                     this_repo: false,
                     all_repos: false,
+                    and_subdomains: false,
                     lease: Some("8h".into()),
                     yes,
                 },
@@ -3889,6 +3983,7 @@ mod tests {
                     workspace: Some(ws.clone()),
                     this_repo: false,
                     all_repos: false,
+                    and_subdomains: false,
                     lease: None,
                     yes: true,
                 },
@@ -3904,6 +3999,7 @@ mod tests {
                 workspace: None,
                 this_repo: false,
                 global: false,
+                and_subdomains: false,
                 yes: true,
             },
         })
@@ -3926,6 +4022,7 @@ mod tests {
                 kind: "open-url".into(),
                 subject: site.map(Into::into),
                 all_repos: workspace.is_none(),
+                and_subdomains: false,
                 workspace,
                 this_repo: false,
                 lease: lease.map(Into::into),
@@ -3944,6 +4041,7 @@ mod tests {
                 workspace: None,
                 this_repo,
                 all_repos: false,
+                and_subdomains: false,
                 lease: None,
                 yes,
             },
@@ -3958,6 +4056,7 @@ mod tests {
                 workspace,
                 this_repo: false,
                 global,
+                and_subdomains: false,
                 yes: true,
             },
         })
@@ -4089,6 +4188,89 @@ mod tests {
         assert_eq!(open_url_settings(home.path()), s, "nothing written");
     }
 
+    /// SPEC R-LINK.11, R-LINK.4: `--and-subdomains` writes a registrable
+    /// domain and its one-label wildcard together, for this repo by default;
+    /// a subdomain, a suffix many owners share and no site are refused, saying
+    /// why, and write nothing. Revoking the domain alone leaves the wildcard,
+    /// and says so; `--and-subdomains` removes both.
+    #[test]
+    fn and_subdomains_writes_the_pair_and_revokes_it() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let grant = |site: Option<&str>| {
+            in_dir(&repo, || {
+                run_permissions_command(PermissionsArgs {
+                    command: PermissionsCommand::Grant {
+                        kind: "open-url".into(),
+                        subject: site.map(Into::into),
+                        workspace: None,
+                        this_repo: false,
+                        all_repos: false,
+                        and_subdomains: true,
+                        lease: None,
+                        yes: true,
+                    },
+                })
+            })
+        };
+        for (site, says) in [
+            (Some("api.github.com"), "github.com --and-subdomains"),
+            (Some("github.io"), "many owners"),
+            (Some("someone.github.io"), "many owners"),
+            (None, "needs a SITE"),
+        ] {
+            let err = grant(site).expect_err("refused");
+            assert!(format!("{err:#}").contains(says), "{site:?}: {err:#}");
+        }
+        assert!(!ledger(home.path()).exists(), "nothing written");
+
+        grant(Some("GitHub.com")).unwrap();
+        let s = open_url_settings(home.path());
+        assert!(s.allow.is_empty());
+        assert_eq!(s.repos[0].workspace, dunce::canonicalize(&repo).unwrap());
+        assert_eq!(s.repos[0].allow, ["github.com", "*.github.com"]);
+
+        let revoke = |pair: bool| {
+            run_permissions_command(PermissionsArgs {
+                command: PermissionsCommand::Revoke {
+                    kind: "open-url".into(),
+                    subject: Some("github.com".into()),
+                    workspace: Some(repo.clone()),
+                    this_repo: false,
+                    global: false,
+                    and_subdomains: pair,
+                    yes: true,
+                },
+            })
+        };
+        revoke(false).unwrap();
+        assert_eq!(
+            open_url_settings(home.path()).repos[0].allow,
+            ["*.github.com"],
+            "the domain alone"
+        );
+        grant(Some("github.com")).unwrap();
+        revoke(true).unwrap();
+        assert_eq!(
+            open_url_settings(home.path()),
+            ahma_common::open_url::OpenUrlSettings::default(),
+            "both"
+        );
+    }
+
+    /// SPEC R-LINK.11: a wildcard over a suffix many owners share, named
+    /// directly, is the operator's to write (its preview warns that it allows
+    /// anyone's site there, `links::policy::shared_wildcard_warning`).
+    #[test]
+    fn a_wildcard_over_a_shared_suffix_is_written_as_named() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        grant_open_url_cli(Some("*.github.io"), None, None, true).unwrap();
+        assert_eq!(open_url_settings(home.path()).allow, ["*.github.io"]);
+    }
+
     /// What a grant names must be a site, and it lasts until revoked: a URL,
     /// a port and a lease are refused, saying why, and nothing is written.
     #[test]
@@ -4188,6 +4370,7 @@ mod tests {
                 workspace: None,
                 this_repo: false,
                 global: false,
+                and_subdomains: false,
                 yes: true,
             },
         })
@@ -4272,6 +4455,7 @@ mod tests {
                 workspace: None,
                 this_repo: false,
                 global: true,
+                and_subdomains: false,
                 yes: false,
             },
         })
@@ -4291,6 +4475,7 @@ mod tests {
                 workspace: None,
                 this_repo: false,
                 global: true,
+                and_subdomains: false,
                 yes: true,
             },
         })
@@ -4478,6 +4663,7 @@ mod tests {
                 workspace: None,
                 this_repo: false,
                 global: false,
+                and_subdomains: false,
                 yes: true,
             },
         })
@@ -4623,6 +4809,7 @@ mod tests {
                 workspace: None,
                 this_repo: false,
                 global: false,
+                and_subdomains: false,
                 yes: false,
             },
         })
@@ -4638,6 +4825,7 @@ mod tests {
                 workspace: None,
                 this_repo: false,
                 global: false,
+                and_subdomains: false,
                 yes: true,
             },
         })
@@ -4714,6 +4902,7 @@ mod tests {
                     workspace: Some(ws.path().to_path_buf()),
                     this_repo: false,
                     global: false,
+                    and_subdomains: false,
                     yes,
                 },
             })

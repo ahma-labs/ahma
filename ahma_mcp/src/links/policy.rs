@@ -251,6 +251,100 @@ pub fn domain_is_local(host: &str) -> bool {
             .any(|s| under(s))
 }
 
+/// Registrable domains whose subdomains belong to different owners though
+/// the public suffix list built into ahma does not say so: a wildcard over
+/// one would allow anyone's site (SPEC R-LINK.4). Checked against the list
+/// first: `githubusercontent.com` is in it, so it is not repeated here.
+const SHARED_DOMAINS: &[&str] = &["googleusercontent.com"];
+
+/// The registrable domain `D` of `host` when "`D` and `*.D`" is one owner's
+/// (SPEC R-LINK.4): `host` is a DNS name — not an IPv4 address, not local by
+/// name, no `xn--` label — whose registrable domain exists (it is not itself a
+/// public suffix) and lies under a suffix in the ICANN section of the public
+/// suffix list, not its private section of hosts many owners share
+/// (`github.io`, `vercel.app`, an S3 bucket's), nor in ahma's own short list
+/// of such domains the list does not mark (`googleusercontent.com`). The
+/// list is the `psl` crate's compiled-in snapshot: a multi-tenant host added
+/// after it is read as an ordinary domain.
+pub fn domain_family(host: &str) -> Option<String> {
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if host.parse::<Ipv4Addr>().is_ok()
+        || domain_is_local(&host)
+        || host.split('.').any(|l| l.starts_with("xn--"))
+    {
+        return None;
+    }
+    let domain = psl::domain(host.as_bytes())?;
+    if domain.suffix().typ() != Some(psl::Type::Icann) {
+        return None;
+    }
+    let d = std::str::from_utf8(domain.as_bytes()).ok()?.to_string();
+    (!SHARED_DOMAINS.contains(&d.as_str())).then_some(d)
+}
+
+/// Whether `name` is a suffix many owners share: in the public suffix list
+/// (either section) or in [`SHARED_DOMAINS`].
+fn is_shared_suffix(name: &str) -> bool {
+    SHARED_DOMAINS.contains(&name)
+        || psl::suffix(name.as_bytes())
+            .is_some_and(|s| s.is_known() && s.as_bytes() == name.as_bytes())
+}
+
+/// The registrable domain `ahma permissions grant open-url SITE
+/// --and-subdomains` writes with its wildcard (SPEC R-LINK.11): `SITE`
+/// itself, when it is a registrable domain [`domain_family`] offers. `Err`
+/// says why not, naming the right site where there is one.
+pub fn and_subdomains(site: &str) -> Result<String, String> {
+    let site = site.to_ascii_lowercase();
+    if site.contains('*') {
+        return Err(format!(
+            "--and-subdomains takes a site name (`github.com`), not a pattern: `{site}`"
+        ));
+    }
+    if site.parse::<Ipv4Addr>().is_ok()
+        || domain_is_local(&site)
+        || site.split('.').any(|l| l.starts_with("xn--"))
+    {
+        return Err(format!(
+            "--and-subdomains is not offered for an IP address, a local name or an \
+             internationalised (`xn--`) name; grant `{site}` alone"
+        ));
+    }
+    match domain_family(&site) {
+        Some(d) if d == site => Ok(d),
+        Some(d) => Err(format!(
+            "`{site}` is not a registrable domain; for it and its sibling subdomains use \
+             `{d} --and-subdomains`, or grant `{site}` alone"
+        )),
+        None if psl::suffix(site.as_bytes()).is_some_and(|s| s.is_known())
+            || SHARED_DOMAINS.iter().any(|d| site.ends_with(d)) =>
+        {
+            Err(format!(
+                "`{site}` is under a suffix many owners share (the public suffix list's private \
+                 section, as `github.io` and `vercel.app` are), so its subdomains are other \
+                 people's sites; grant one site by name instead (`someone.github.io`)"
+            ))
+        }
+        None => Err(format!(
+            "`{site}` is not under a public suffix ahma knows, so it cannot tell whether one \
+             owner holds its subdomains; grant `{site}` alone"
+        )),
+    }
+}
+
+/// The warning a grant of `pattern` carries when it is a wildcard over a
+/// suffix many owners share (`*.github.io`): it allows anyone's site there
+/// (SPEC R-LINK.11). `None` for any other pattern.
+pub fn shared_wildcard_warning(pattern: &str) -> Option<String> {
+    let suffix = pattern.strip_prefix("*.")?.to_ascii_lowercase();
+    is_shared_suffix(&suffix).then(|| {
+        format!(
+            "{pattern} allows anyone's site on {suffix}: many owners publish sites there. Naming \
+             one site (`someone.{suffix}`) is safer."
+        )
+    })
+}
+
 /// What the human has allowed, as the broker read it for one decision.
 #[derive(Debug, Default, Clone)]
 pub struct LinkGrants {
@@ -344,6 +438,10 @@ pub enum LinkChoice {
     AlwaysSiteThisRepo,
     /// This site, saved for every repo: `[open_url] allow` gains the site.
     AlwaysSiteAllRepos,
+    /// This site's registrable domain and its one-label subdomains, saved
+    /// for this repo only: `D` and `*.D` ([`LinkQuestion::domain`]). Offered
+    /// only where one owner holds `D` (R-LINK.4).
+    AlwaysDomainThisRepo,
     /// Any public site, saved for this repo only: this repo's `[open_url]
     /// repos` entry gains `*`. Any site for every repo is CLI-only.
     AlwaysAnyThisRepo,
@@ -351,12 +449,13 @@ pub enum LinkChoice {
 
 impl LinkChoice {
     /// Every answer, in the order surfaces offer them.
-    pub const ALL: [LinkChoice; 6] = [
+    pub const ALL: [LinkChoice; 7] = [
         LinkChoice::Deny,
         LinkChoice::Once,
         LinkChoice::Session,
         LinkChoice::AlwaysSiteThisRepo,
         LinkChoice::AlwaysSiteAllRepos,
+        LinkChoice::AlwaysDomainThisRepo,
         LinkChoice::AlwaysAnyThisRepo,
     ];
 
@@ -372,6 +471,7 @@ impl LinkChoice {
             LinkChoice::Session => "session",
             LinkChoice::AlwaysSiteThisRepo => "always-site-this-repo",
             LinkChoice::AlwaysSiteAllRepos => "always-site-all-repos",
+            LinkChoice::AlwaysDomainThisRepo => "always-domain-this-repo",
             LinkChoice::AlwaysAnyThisRepo => "always-any-site-this-repo",
         }
     }
@@ -397,6 +497,9 @@ impl LinkChoice {
             LinkChoice::Session => "this site, this session",
             LinkChoice::AlwaysSiteThisRepo => "always for this site — this repo only",
             LinkChoice::AlwaysSiteAllRepos => "always for this site — all repos",
+            LinkChoice::AlwaysDomainThisRepo => {
+                "always for this site and its subdomains — this repo only"
+            }
             LinkChoice::AlwaysAnyThisRepo => "always for any site — this repo only",
         }
     }
@@ -452,17 +555,20 @@ impl LinkQuestion {
     /// The answers `surface` offers, deny first (R-PERM.3.4), then the one
     /// that remembers nothing or least, then the lasting ones, narrowest
     /// first: this site in this repo (the usual one), this site in every
-    /// repo, then any site in this repo — only where it would cover this
-    /// link: never for a local host, never for one outside the egress allow
-    /// list.
+    /// repo, this site's domain and its subdomains in this repo — only where
+    /// [`Self::domain`] names one — then any site in this repo — only where
+    /// it would cover this link: never for a local host, never for one
+    /// outside the egress allow list. At most six.
     pub fn choices(&self, surface: Surface) -> Vec<LinkChoice> {
         let any = !self.local && !self.outside_egress;
+        let domain = self.domain().is_some();
         let all = match surface {
             Surface::Live | Surface::HarnessDialog => vec![
                 LinkChoice::Deny,
                 LinkChoice::Once,
                 LinkChoice::AlwaysSiteThisRepo,
                 LinkChoice::AlwaysSiteAllRepos,
+                LinkChoice::AlwaysDomainThisRepo,
                 LinkChoice::AlwaysAnyThisRepo,
             ],
             Surface::TuiForHarness => vec![
@@ -470,13 +576,29 @@ impl LinkQuestion {
                 LinkChoice::Session,
                 LinkChoice::AlwaysSiteThisRepo,
                 LinkChoice::AlwaysSiteAllRepos,
+                LinkChoice::AlwaysDomainThisRepo,
                 LinkChoice::AlwaysAnyThisRepo,
             ],
             Surface::Browser => vec![LinkChoice::Deny, LinkChoice::Once, LinkChoice::Session],
         };
         all.into_iter()
-            .filter(|c| any || *c != LinkChoice::AlwaysAnyThisRepo)
+            .filter(|c| match c {
+                LinkChoice::AlwaysAnyThisRepo => any,
+                LinkChoice::AlwaysDomainThisRepo => domain,
+                _ => true,
+            })
             .collect()
+    }
+
+    /// The registrable domain "this site and its subdomains" would grant
+    /// (`D`, written with `*.D`), when it is offered for this question (SPEC
+    /// R-LINK.4): never for a local host, an internationalised name or a site
+    /// outside the egress allow list, and otherwise as [`domain_family`] says.
+    pub fn domain(&self) -> Option<String> {
+        if self.local || self.outside_egress || self.internationalised {
+            return None;
+        }
+        domain_family(&self.host)
     }
 
     /// How every surface shows `choice` for this question: the answer in
@@ -487,6 +609,10 @@ impl LinkQuestion {
         match choice {
             LinkChoice::AlwaysSiteThisRepo => format!("Always for {host} — this repo only"),
             LinkChoice::AlwaysSiteAllRepos => format!("Always for {host} — all repos"),
+            LinkChoice::AlwaysDomainThisRepo => match self.domain() {
+                Some(d) => format!("Always for {d} and *.{d} — this repo only"),
+                None => capitalised(choice.label()),
+            },
             other => capitalised(other.label()),
         }
     }
@@ -557,9 +683,10 @@ pub enum Effect {
     },
     OpenOnce,
     Session(HostPattern),
-    /// Save the pattern where the binding says
-    /// (`ahma_common::open_url::persist_open_url_allow`), then open.
-    Persist(HostPattern, OpenUrlBinding),
+    /// Save the patterns — one, or a domain and its one-label wildcard —
+    /// where the binding says, in one write
+    /// (`ahma_common::open_url::persist_open_url_allows`), then open.
+    Persist(Vec<HostPattern>, OpenUrlBinding),
 }
 
 /// The effect of `choice` on the link to `host`, asked from the repo
@@ -573,9 +700,19 @@ pub fn effect(choice: LinkChoice, host: &str, workspace: &Path) -> Effect {
         },
         LinkChoice::Once => Effect::OpenOnce,
         LinkChoice::Session => Effect::Session(exact()),
-        LinkChoice::AlwaysSiteThisRepo => Effect::Persist(exact(), here()),
-        LinkChoice::AlwaysSiteAllRepos => Effect::Persist(exact(), OpenUrlBinding::AllRepos),
-        LinkChoice::AlwaysAnyThisRepo => Effect::Persist(HostPattern::Any, here()),
+        LinkChoice::AlwaysSiteThisRepo => Effect::Persist(vec![exact()], here()),
+        LinkChoice::AlwaysSiteAllRepos => Effect::Persist(vec![exact()], OpenUrlBinding::AllRepos),
+        // Only ever offered with a domain; without one it widens nothing.
+        LinkChoice::AlwaysDomainThisRepo => match domain_family(host) {
+            Some(d) => Effect::Persist(
+                vec![HostPattern::Exact(d.clone()), HostPattern::Wildcard(d)],
+                here(),
+            ),
+            None => Effect::Refuse {
+                remember_deny: false,
+            },
+        },
+        LinkChoice::AlwaysAnyThisRepo => Effect::Persist(vec![HostPattern::Any], here()),
     }
 }
 
@@ -584,13 +721,16 @@ pub fn effect(choice: LinkChoice, host: &str, workspace: &Path) -> Effect {
 /// its binding (`--workspace '<repo>'` or `--all-repos`), so it means the same
 /// whatever directory a human runs it in.
 pub fn grant_command(choice: LinkChoice, host: &str, workspace: &Path) -> Option<String> {
-    let Effect::Persist(pattern, binding) = effect(choice, host, workspace) else {
+    let Effect::Persist(patterns, binding) = effect(choice, host, workspace) else {
         return None;
     };
     let mut line = String::from("ahma permissions grant open-url");
-    if let HostPattern::Exact(site) = &pattern {
+    if let Some(HostPattern::Exact(site)) = patterns.first() {
         line.push(' ');
         line.push_str(site);
+    }
+    if patterns.len() > 1 {
+        line.push_str(" --and-subdomains");
     }
     match &binding {
         OpenUrlBinding::Repo(repo) => {
@@ -987,6 +1127,7 @@ mod tests {
                 Once,
                 AlwaysSiteThisRepo,
                 AlwaysSiteAllRepos,
+                AlwaysDomainThisRepo,
                 AlwaysAnyThisRepo
             ]
         );
@@ -997,6 +1138,7 @@ mod tests {
                 Session,
                 AlwaysSiteThisRepo,
                 AlwaysSiteAllRepos,
+                AlwaysDomainThisRepo,
                 AlwaysAnyThisRepo
             ]
         );
@@ -1010,6 +1152,7 @@ mod tests {
                 Once,
                 AlwaysSiteThisRepo,
                 AlwaysSiteAllRepos,
+                AlwaysDomainThisRepo,
                 AlwaysAnyThisRepo
             ]
         );
@@ -1032,7 +1175,7 @@ mod tests {
             panic!()
         };
         let answers = harness_dialog_answers(&q, ws);
-        assert_eq!(answers.len(), 5, "{answers:#?}");
+        assert_eq!(answers.len(), 6, "{answers:#?}");
         assert!(answers[0].starts_with("No — deny"), "{}", answers[0]);
         assert!(answers[1].starts_with("Yes — this time"), "{}", answers[1]);
         assert!(
@@ -1050,11 +1193,20 @@ mod tests {
             answers[3]
         );
         assert!(
-            answers[4].starts_with("Always for any site — this repo only")
-                && answers[4]
-                    .contains("`ahma permissions grant open-url --workspace '/w/my repo'`"),
+            answers[4].starts_with("Always for github.com and *.github.com — this repo only")
+                && answers[4].contains(
+                    "`ahma permissions grant open-url github.com --and-subdomains --workspace \
+                     '/w/my repo'`"
+                ),
             "{}",
             answers[4]
+        );
+        assert!(
+            answers[5].starts_with("Always for any site — this repo only")
+                && answers[5]
+                    .contains("`ahma permissions grant open-url --workspace '/w/my repo'`"),
+            "{}",
+            answers[5]
         );
         let LinkDecision::Ask(local) = decide(
             &t("http://localhost:3000/"),
@@ -1065,7 +1217,11 @@ mod tests {
             panic!()
         };
         let answers = harness_dialog_answers(&local, ws);
-        assert_eq!(answers.len(), 4, "no any-site answer for a local host");
+        assert_eq!(
+            answers.len(),
+            4,
+            "no domain or any-site answer for a local host"
+        );
         assert!(
             answers[3].contains("grant open-url localhost --all-repos`"),
             "{answers:#?}"
@@ -1112,76 +1268,226 @@ mod tests {
         }
     }
 
-    /// SPEC R-LINK.6: the three example links, on every surface. The first
-    /// lasting answer is this site in this repo; each other one widens it on
-    /// one axis; any site is for this repo only.
+    /// SPEC R-LINK.6, R-LINK.4: the three example links, on every surface.
+    /// The first lasting answer is this site in this repo; each other one
+    /// widens it on one axis. A site and its subdomains is offered for
+    /// `github.com` and `api.github.com` (both `github.com` and
+    /// `*.github.com`), never for `someone.github.io`, whose suffix many
+    /// owners share; any site is for this repo only.
     #[test]
     fn the_three_examples_offer_this_repo_first() {
         use LinkChoice::*;
         let ws = Path::new("/Users/me/proj");
-        for (link, host) in [
-            ("https://github.com/o/r/pull/1", "github.com"),
-            ("https://api.github.com/x", "api.github.com"),
-            ("https://someone.github.io/page", "someone.github.io"),
+        let grant = |args: &str| format!("a human runs `ahma permissions grant open-url {args}`.");
+        for (link, host, domain) in [
+            (
+                "https://github.com/o/r/pull/1",
+                "github.com",
+                Some("github.com"),
+            ),
+            (
+                "https://api.github.com/x",
+                "api.github.com",
+                Some("github.com"),
+            ),
+            ("https://someone.github.io/page", "someone.github.io", None),
         ] {
             let q = ask(link);
+            assert_eq!(q.domain().as_deref(), domain, "{link}");
+            let with_domain = |mut v: Vec<LinkChoice>| {
+                if domain.is_some() {
+                    v.insert(v.len() - 1, AlwaysDomainThisRepo);
+                }
+                v
+            };
             assert_eq!(
                 q.choices(Surface::Live),
-                [
+                with_domain(vec![
                     Deny,
                     Once,
                     AlwaysSiteThisRepo,
                     AlwaysSiteAllRepos,
                     AlwaysAnyThisRepo
-                ],
+                ]),
                 "{link}"
             );
             assert_eq!(
                 q.choices(Surface::TuiForHarness),
-                [
+                with_domain(vec![
                     Deny,
                     Session,
                     AlwaysSiteThisRepo,
                     AlwaysSiteAllRepos,
                     AlwaysAnyThisRepo
-                ],
+                ]),
                 "{link}"
             );
+            assert_eq!(q.choices(Surface::Browser), [Deny, Once, Session]);
+            assert!(q.choices(Surface::Live).len() <= 6);
             let titles: Vec<String> = q
                 .choices(Surface::Live)
                 .into_iter()
                 .map(|c| q.label(c))
                 .collect();
-            assert_eq!(
-                titles,
-                [
-                    "Deny".to_string(),
-                    "This time".into(),
-                    format!("Always for {host} — this repo only"),
-                    format!("Always for {host} — all repos"),
-                    "Always for any site — this repo only".into(),
-                ],
-                "{link}"
-            );
+            let mut want = vec![
+                "Deny".to_string(),
+                "This time".into(),
+                format!("Always for {host} — this repo only"),
+                format!("Always for {host} — all repos"),
+            ];
+            want.extend(domain.map(|d| format!("Always for {d} and *.{d} — this repo only")));
+            want.push("Always for any site — this repo only".into());
+            assert_eq!(titles, want, "{link}");
+
             let dialog = harness_dialog_answers(&q, ws);
+            let mut want = vec![
+                format!(
+                    "Always for {host} — this repo only (the usual lasting answer): {}",
+                    grant(&format!("{host} --workspace '/Users/me/proj'"))
+                ),
+                format!(
+                    "Always for {host} — all repos: {}",
+                    grant(&format!("{host} --all-repos"))
+                ),
+            ];
+            want.extend(domain.map(|d| {
+                format!(
+                    "Always for {d} and *.{d} — this repo only: {}",
+                    grant(&format!(
+                        "{d} --and-subdomains --workspace '/Users/me/proj'"
+                    ))
+                )
+            }));
+            want.push(format!(
+                "Always for any site — this repo only: {}",
+                grant("--workspace '/Users/me/proj'")
+            ));
+            assert_eq!(dialog[2..], want, "{link}");
+        }
+    }
+
+    /// SPEC R-LINK.4: "a site and its subdomains" writes the registrable
+    /// domain and its one-label wildcard, for this repo; the wildcard covers
+    /// one label only, as every pattern does.
+    #[test]
+    fn a_site_and_its_subdomains_is_two_patterns_for_this_repo() {
+        let ws = Path::new("/w/a");
+        assert_eq!(
+            effect(LinkChoice::AlwaysDomainThisRepo, "API.github.com", ws),
+            Effect::Persist(
+                vec![pat("github.com"), pat("*.github.com")],
+                OpenUrlBinding::Repo(ws.to_path_buf())
+            )
+        );
+        let g = LinkGrants {
+            always: vec![pat("github.com"), pat("*.github.com")],
+            ..Default::default()
+        };
+        for (link, opens) in [
+            ("https://github.com/", true),
+            ("https://gist.github.com/", true),
+            ("https://a.b.github.com/", false),
+            ("https://evilgithub.com/", false),
+        ] {
             assert_eq!(
-                dialog[2..],
-                [
-                    format!(
-                        "Always for {host} — this repo only (the usual lasting answer): a human \
-                         runs `ahma permissions grant open-url {host} --workspace '/Users/me/proj'`."
-                    ),
-                    format!(
-                        "Always for {host} — all repos: a human runs `ahma permissions grant \
-                         open-url {host} --all-repos`."
-                    ),
-                    "Always for any site — this repo only: a human runs `ahma permissions grant \
-                     open-url --workspace '/Users/me/proj'`."
-                        .to_string(),
-                ],
+                decide(&t(link), false, &g, &Egress::Open) == LinkDecision::Open,
+                opens,
                 "{link}"
             );
         }
+        // Never written for a host it is not offered for: a deny that is not
+        // remembered, so nothing is widened.
+        assert_eq!(
+            effect(LinkChoice::AlwaysDomainThisRepo, "someone.github.io", ws),
+            Effect::Refuse {
+                remember_deny: false
+            }
+        );
+    }
+
+    /// SPEC R-LINK.4: the domain answer is offered only for a public DNS
+    /// name whose registrable domain is under an ICANN suffix — never a
+    /// suffix many owners share, an IP address, a local or internationalised
+    /// name, or a site outside the egress allow list.
+    #[test]
+    fn a_domain_family_only_where_one_owner_holds_it() {
+        for (host, want) in [
+            ("github.com", Some("github.com")),
+            ("api.github.com", Some("github.com")),
+            ("a.b.example.co.uk", Some("example.co.uk")),
+            ("docs.rs", Some("docs.rs")),
+            ("someone.github.io", None),
+            ("my-app.vercel.app", None),
+            ("x.herokuapp.com", None),
+            ("bucket.s3.amazonaws.com", None),
+            ("raw.githubusercontent.com", None),
+            ("lh3.googleusercontent.com", None),
+            ("github.io", None),
+            ("co.uk", None),
+            ("8.8.8.8", None),
+            ("localhost", None),
+            ("printer.local", None),
+            ("xn--80ak6aa92e.com", None),
+            ("host.unknowntld", None),
+        ] {
+            assert_eq!(domain_family(host).as_deref(), want, "{host}");
+        }
+        let allows = |h: &str| h == "github.com";
+        let LinkDecision::Ask(outside) = decide(
+            &t("https://api.example.com/"),
+            false,
+            &LinkGrants::default(),
+            &Egress::Restricted(&allows),
+        ) else {
+            panic!()
+        };
+        assert_eq!(outside.domain(), None, "outside the egress list");
+        assert_eq!(
+            outside.choices(Surface::Live),
+            [
+                LinkChoice::Deny,
+                LinkChoice::Once,
+                LinkChoice::AlwaysSiteThisRepo,
+                LinkChoice::AlwaysSiteAllRepos
+            ]
+        );
+        let LinkDecision::Ask(resolved_local) = decide(
+            &t("http://127.0.0.1.nip.io/"),
+            true,
+            &LinkGrants::default(),
+            &Egress::Open,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            resolved_local.domain(),
+            None,
+            "a name that resolves locally"
+        );
+    }
+
+    /// SPEC R-LINK.11: `--and-subdomains` takes a registrable domain the
+    /// domain answer would be offered for, and names the right one otherwise.
+    #[test]
+    fn and_subdomains_takes_only_a_registrable_domain_one_owner_holds() {
+        assert_eq!(and_subdomains("GitHub.com"), Ok("github.com".to_string()));
+        for (site, says) in [
+            ("api.github.com", "github.com --and-subdomains"),
+            ("github.io", "many owners"),
+            ("someone.github.io", "many owners"),
+            ("*.github.com", "a site name"),
+            ("localhost", "not offered"),
+            ("8.8.8.8", "not offered"),
+            ("host.unknowntld", "not under a public suffix"),
+        ] {
+            let err = and_subdomains(site).expect_err(site);
+            assert!(err.contains(says), "{site}: {err}");
+        }
+        assert!(shared_wildcard_warning("*.github.io").is_some());
+        assert!(shared_wildcard_warning("*.vercel.app").is_some());
+        assert!(shared_wildcard_warning("*.googleusercontent.com").is_some());
+        assert!(shared_wildcard_warning("*.github.com").is_none());
+        assert!(shared_wildcard_warning("github.io").is_none(), "one site");
     }
 
     #[test]
@@ -1239,12 +1545,18 @@ mod tests {
                 "this site, this session",
                 "always for this site — this repo only",
                 "always for this site — all repos",
+                "always for this site and its subdomains — this repo only",
                 "always for any site — this repo only",
             ]
         );
         assert_eq!(
             LinkChoice::ALL[3..],
-            [AlwaysSiteThisRepo, AlwaysSiteAllRepos, AlwaysAnyThisRepo]
+            [
+                AlwaysSiteThisRepo,
+                AlwaysSiteAllRepos,
+                AlwaysDomainThisRepo,
+                AlwaysAnyThisRepo
+            ]
         );
         assert!(labels.iter().all(|l| !l.contains("host")), "{labels:?}");
     }
@@ -1254,16 +1566,22 @@ mod tests {
         let ws = Path::new("/w/a");
         assert_eq!(
             effect(LinkChoice::AlwaysSiteAllRepos, "GitHub.com", ws),
-            Effect::Persist(pat("github.com"), OpenUrlBinding::AllRepos)
+            Effect::Persist(vec![pat("github.com")], OpenUrlBinding::AllRepos)
         );
         assert_eq!(
             effect(LinkChoice::AlwaysSiteThisRepo, "GitHub.com", ws),
-            Effect::Persist(pat("github.com"), OpenUrlBinding::Repo(ws.to_path_buf()))
+            Effect::Persist(
+                vec![pat("github.com")],
+                OpenUrlBinding::Repo(ws.to_path_buf())
+            )
         );
         // "Any site" is this repo only; any site for every repo is CLI-only.
         assert_eq!(
             effect(LinkChoice::AlwaysAnyThisRepo, "github.com", ws),
-            Effect::Persist(HostPattern::Any, OpenUrlBinding::Repo(ws.to_path_buf()))
+            Effect::Persist(
+                vec![HostPattern::Any],
+                OpenUrlBinding::Repo(ws.to_path_buf())
+            )
         );
         assert_eq!(
             effect(LinkChoice::Session, "GitHub.com", ws),

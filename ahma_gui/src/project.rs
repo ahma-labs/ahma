@@ -938,6 +938,7 @@ mod tests {
                 SESSION,
                 ALWAYS_SITE_THIS_REPO,
                 ALWAYS_SITE_ALL_REPOS,
+                ALWAYS_DOMAIN_THIS_REPO,
                 ALWAYS_ANY_THIS_REPO
             ],
             "the TUI's answers, in its order"
@@ -992,12 +993,17 @@ mod tests {
     }
 
     /// SPEC R-LINK.6, R-GUI.9: the three example links in `ahma web` and
-    /// `ahma desktop`: the TUI's rows in its order, each lasting one naming
-    /// the site it would save, and only deny and this session given here.
+    /// `ahma desktop`: the TUI's rows in its order — the domain row only where
+    /// one owner holds the domain — each lasting one naming what it would
+    /// save, and only deny and this session given here.
     #[test]
     fn the_three_examples_show_this_repo_first_and_give_deny_and_session() {
         use link_values::*;
-        for host in ["github.com", "api.github.com", "someone.github.io"] {
+        for (host, domain) in [
+            ("github.com", Some("github.com")),
+            ("api.github.com", Some("github.com")),
+            ("someone.github.io", None),
+        ] {
             let mut gui = gui_state();
             gui.link_ask = Some(link_gate(host, false));
             let Some(Gate::Link { options, .. }) = gates(&gui).top else {
@@ -1007,7 +1013,7 @@ mod tests {
                 .iter()
                 .map(|o| (o.value.clone(), o.label.clone(), o.allowed))
                 .collect();
-            let want = [
+            let mut want = vec![
                 (DENY, "Deny (default)".to_string(), true),
                 (SESSION, "This site, this session".into(), true),
                 (
@@ -1020,14 +1026,32 @@ mod tests {
                     format!("Always for {host} — all repos"),
                     false,
                 ),
+            ];
+            want.extend(domain.map(|d| {
                 (
-                    ALWAYS_ANY_THIS_REPO,
-                    "Always for any site — this repo only".into(),
+                    ALWAYS_DOMAIN_THIS_REPO,
+                    format!("Always for {d} and *.{d} — this repo only"),
                     false,
-                ),
-            ]
-            .map(|(v, l, a)| (v.to_string(), l, a));
+                )
+            }));
+            want.push((
+                ALWAYS_ANY_THIS_REPO,
+                "Always for any site — this repo only".into(),
+                false,
+            ));
+            let want: Vec<_> = want
+                .into_iter()
+                .map(|(v, l, a)| (v.to_string(), l, a))
+                .collect();
             assert_eq!(rows, want, "{host}");
+            if domain.is_some() {
+                let hint = options
+                    .iter()
+                    .find(|o| o.value == ALWAYS_DOMAIN_THIS_REPO)
+                    .and_then(|o| o.hint.clone())
+                    .unwrap_or_default();
+                assert!(hint.contains("--and-subdomains --workspace"), "{hint}");
+            }
         }
     }
 
@@ -1038,6 +1062,7 @@ mod tests {
         pub const SESSION: &str = "session";
         pub const ALWAYS_SITE_THIS_REPO: &str = "always-site-this-repo";
         pub const ALWAYS_SITE_ALL_REPOS: &str = "always-site-all-repos";
+        pub const ALWAYS_DOMAIN_THIS_REPO: &str = "always-domain-this-repo";
         pub const ALWAYS_ANY_THIS_REPO: &str = "always-any-site-this-repo";
     }
 

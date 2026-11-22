@@ -2910,7 +2910,8 @@ pub(crate) fn resolve_link_ask(
 /// Keys for the open link question (SPEC R-LINK.6), from
 /// [`crate::state::LINK_ASK_KEYS`]: `n`, Enter and Esc deny; `s` this site for
 /// this session; `r` always for this site in this repo only, `a` in all repos,
-/// `*` any site in this repo only — each only where the question offers it.
+/// `d` this site's domain and its subdomains in this repo only, `*` any site in
+/// this repo only — each only where the question offers it.
 /// The rules for taking an answer are the controller's.
 fn handle_link_ask_key(
     key: crossterm::event::KeyEvent,
@@ -9504,7 +9505,8 @@ mod tests {
     /// SPEC R-LINK.6, R-LINK.7: the question shows the site on its own line,
     /// the address, the guidance and the answers in order — deny, this site
     /// for this session, always for this site in this repo, then all repos,
-    /// then any site in this repo — with no "this time"; a saving key shows
+    /// then its domain and subdomains, then any site in this repo — with no
+    /// "this time"; a saving key shows
     /// the exact line it writes before a second press saves it; `n` denies
     /// and records it, so the harness dialog does not ask it too.
     #[test]
@@ -9543,6 +9545,7 @@ mod tests {
             "[s] This site, this session",
             "[r] Always for github.com — this repo only",
             "[a] Always for github.com — all repos",
+            "[d] Always for github.com and *.github.com — this repo only",
             "[*] Always for any site — this repo only",
         ];
         assert!(

@@ -107,6 +107,8 @@ opentelemetry-otlp = { version = "0.32.0", features = [
     "reqwest-rustls",
 ] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+# Public suffix list, compiled in: which link hosts one owner holds (SPEC R-LINK.4).
+psl = "2.1"
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false }
 rmcp = { version = "3.9.0", features = [

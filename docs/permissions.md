@@ -500,6 +500,7 @@ ahma permissions revoke log-target /var/log/app.log --workspace ~/code/proj
 ahma permissions grant open-url github.com              # preview: the line, and what to weigh
 ahma permissions grant open-url github.com --yes        # this repo (run inside it)
 ahma permissions grant open-url docs.rs --all-repos --yes  # every repo
+ahma permissions grant open-url github.com --and-subdomains --yes  # github.com and *.github.com
 ahma permissions revoke open-url github.com --yes       # every repo, and each repo's own
 
 ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut, bound to this workspace
