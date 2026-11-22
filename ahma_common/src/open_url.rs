@@ -301,8 +301,8 @@ pub struct OpenUrlSessionGrant {
     /// internationalised name). Never a wildcard: a session answer names the
     /// site that was asked about.
     pub site: String,
-    /// The repo it was given in (canonical root); commands working in it, or
-    /// beneath it, may open the site's links.
+    /// The repo it was given in (canonical root). Commands working in it, or
+    /// beneath it ([`Self::applies_in`]), may open the site's links.
     pub workspace: PathBuf,
     /// The harness process whose life bounds it.
     pub owner_pid: u32,
@@ -314,10 +314,22 @@ pub struct OpenUrlSessionGrant {
 }
 
 impl OpenUrlSessionGrant {
+    /// Whether this grant applies to a command working in `workspace`: the
+    /// repo it was given in or a folder inside it, compared as resolved paths
+    /// (SPEC R-LINK.4), so the repo spelled through `..` or a symlink is still
+    /// the repo. Never a folder that only contains the repo: "this repo" is
+    /// what the human answered, and a command in the home folder above it is
+    /// not working in it.
+    pub fn applies_in(&self, workspace: &Path) -> bool {
+        crate::scope_grant::canonicalize_best_effort(workspace).starts_with(
+            crate::scope_grant::canonicalize_best_effort(&self.workspace),
+        )
+    }
+
     /// Whether this grant opens links to `host` for a command working in
     /// `workspace`.
     pub fn covers(&self, host: &str, workspace: &Path) -> bool {
-        self.site.eq_ignore_ascii_case(host) && workspace.starts_with(&self.workspace)
+        self.site.eq_ignore_ascii_case(host) && self.applies_in(workspace)
     }
 }
 
@@ -604,6 +616,27 @@ mod tests {
             .map(|e| (e.subject.as_str(), e.tier, e.surface.as_deref()))
             .collect();
         assert_eq!(grants[0], ("github.com", GrantTier::Session, Some("tui")));
+    }
+
+    /// SPEC R-LINK.4: a session grant matches a command's workspace as
+    /// resolved paths, so the repo spelled through `..` is still the repo it
+    /// was given in; a folder that only contains the repo is not in it.
+    #[test]
+    fn a_session_grant_covers_its_repo_spelled_through_dotdot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let beside = tmp.path().join("beside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&beside).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let mut grant = session("github.com", "", 1, 0);
+        grant.workspace = ws.clone();
+        assert!(grant.covers("github.com", &beside.join("..").join("ws")));
+        assert!(!grant.covers("github.com", &beside), "another folder");
+        assert!(
+            !grant.covers("github.com", tmp.path()),
+            "a folder that only contains the repo"
+        );
     }
 
     /// SPEC R-LINK.7, R-PERM.11: the undo every question names ends a
