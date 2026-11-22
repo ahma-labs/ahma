@@ -875,4 +875,236 @@ mod tests {
         // The important thing is it doesn't panic
         let _ = result;
     }
+
+    // ============= what `ahma tool run` prints =============
+    //
+    // Pinned before the one-shot moved onto a tracked operation (SPEC R2.1):
+    // stdout gets the result, stderr the error, and both read exactly as
+    // they did on the direct path. Shell syntax, so Unix only.
+
+    /// What `ahma tool run <tool>` prints: `Ok` is its stdout, `Err` its
+    /// stderr, as [`run_cli_mode`] writes them.
+    #[cfg(unix)]
+    async fn cli_prints(
+        scope: &std::path::Path,
+        tools_dir: Option<std::path::PathBuf>,
+        tool: &str,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<String, String> {
+        let sandbox = Arc::new(
+            sandbox::Sandbox::new(
+                vec![scope.to_path_buf()],
+                sandbox::SandboxMode::Test,
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let config = AppConfig {
+            skip_availability_probes: true,
+            tools_dir,
+            ..AppConfig::default()
+        };
+        let built = ServiceBuilder::new(&config, sandbox)
+            .force_synchronous(true)
+            .skip_availability_probes(true)
+            .build()
+            .await
+            .unwrap();
+        match execute_via_mcp_service(built.service, tool, args).await {
+            Ok(output) => Ok(format!("{output}\n")),
+            Err(e) => Err(format!("{}\n", cli_error_text(&e))),
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell_call(
+        scope: &std::path::Path,
+        line: &str,
+        timeout: Option<u64>,
+    ) -> serde_json::Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("command".into(), json!(line));
+        args.insert("working_directory".into(), json!(scope.to_str().unwrap()));
+        if let Some(secs) = timeout {
+            args.insert("timeout_seconds".into(), json!(secs));
+        }
+        args
+    }
+
+    #[cfg(unix)]
+    fn scope() -> (tempfile::TempDir, std::path::PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let scope = dunce::canonicalize(td.path()).unwrap();
+        (td, scope)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_success_prints_its_merged_output() {
+        let (_td, scope) = scope();
+        let printed = cli_prints(
+            &scope,
+            None,
+            "run_terminal_command",
+            shell_call(&scope, "printf 'out\\n'; printf 'err\\n' >&2", None),
+        )
+        .await;
+        // `run_terminal_command` merges stderr into stdout in arrival order.
+        assert_eq!(printed, Ok("out\nerr\n\n".to_string()));
+        let bare = cli_prints(
+            &scope,
+            None,
+            "run_terminal_command",
+            shell_call(&scope, "printf 'no newline'", None),
+        )
+        .await;
+        assert_eq!(bare, Ok("no newline\n".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_failure_prints_its_exit_code_and_output() {
+        let (_td, scope) = scope();
+        let printed = cli_prints(
+            &scope,
+            None,
+            "run_terminal_command",
+            shell_call(&scope, "printf 'out\\n'; printf 'err\\n' >&2; exit 3", None),
+        )
+        .await;
+        assert_eq!(
+            printed,
+            Err(
+                "Error executing tool: Mcp error: -32603: Synchronous execution failed: \
+                 Command failed with exit code 3: stderr: , stdout: out\nerr\n\n"
+                    .to_string()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_command_stopped_at_its_limit_prints_what_it_printed() {
+        let (_td, scope) = scope();
+        let printed = cli_prints(
+            &scope,
+            None,
+            "run_terminal_command",
+            shell_call(&scope, "printf 'started\\n'; sleep 30", Some(1)),
+        )
+        .await;
+        let stopped = crate::adapter::time_limit::LimitReached {
+            limit_secs: 1,
+            output: "started\n".to_string(),
+        };
+        assert_eq!(
+            printed,
+            Err(format!(
+                "Error executing tool: Mcp error: -32603: Synchronous execution failed: \
+                 {stopped}\n"
+            ))
+        );
+    }
+
+    /// A refusal the command's own stderr names, outside the scope, is the
+    /// typed runtime denial (SPEC R5.4.7): the CLI prints its details.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_refusal_prints_the_runtime_denial() {
+        let (_td, scope) = scope();
+        let outside = crate::test_utils::path_helpers::test_out_of_scope_path();
+        let line = format!(
+            "printf 'touch: {}: Operation not permitted\\n' >&2; exit 1",
+            outside.display()
+        );
+        let printed = cli_prints(
+            &scope,
+            None,
+            "run_terminal_command",
+            shell_call(&scope, &line, None),
+        )
+        .await;
+        let printed = printed.expect_err("a refusal is an error");
+        let (text, payload) = printed.split_once("({").expect("a structured payload");
+        assert_eq!(
+            text,
+            format!(
+                "Error executing tool: Mcp error: -32603: Synchronous execution failed: \
+                 Command failed with exit code 1: stderr: , stdout: touch: {}: Operation not \
+                 permitted\n",
+                outside.display()
+            )
+        );
+        let payload: Value =
+            serde_json::from_str(&format!("{{{}", payload.trim_end().trim_end_matches(')')))
+                .expect("the payload is JSON");
+        assert_eq!(payload["kind"], "sandbox_denial");
+        assert_eq!(payload["reason"], "runtime_kernel_denial");
+        assert_eq!(payload["access"], "write");
+        assert_eq!(
+            payload["path"],
+            outside.parent().unwrap().to_string_lossy().as_ref()
+        );
+    }
+
+    #[cfg(unix)]
+    fn tools_with(scope: &std::path::Path, name: &str, command: &str) -> std::path::PathBuf {
+        let tools = scope.join(".ahma");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(
+            tools.join(format!("{name}.json")),
+            format!(
+                r#"{{
+                    "name": "{name}",
+                    "description": "pinned",
+                    "command": "{command}",
+                    "enabled": true,
+                    "subcommand": [
+                        {{
+                            "name": "default",
+                            "description": "run it",
+                            "positional_args": [
+                                {{ "name": "message", "type": "string", "description": "m" }}
+                            ]
+                        }}
+                    ]
+                }}"#
+            ),
+        )
+        .unwrap();
+        tools
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configured_tool_prints_its_output_or_its_exit_code() {
+        let (_td, scope) = scope();
+        let mut args = Map::new();
+        args.insert("message".into(), json!("hello"));
+        args.insert("working_directory".into(), json!(scope.to_str().unwrap()));
+        let said = cli_prints(
+            &scope,
+            Some(tools_with(&scope, "say", "echo")),
+            "say",
+            args.clone(),
+        )
+        .await;
+        assert_eq!(said, Ok("hello\n\n".to_string()));
+
+        let failed = cli_prints(
+            &scope,
+            Some(tools_with(&scope, "nope", "false")),
+            "nope",
+            args,
+        )
+        .await;
+        assert_eq!(
+            failed,
+            Err(
+                "Error executing tool: Mcp error: -32603: Synchronous execution failed: \
+                 Command failed with exit code 1: stderr: , stdout: \n"
+                    .to_string()
+            )
+        );
+    }
 }

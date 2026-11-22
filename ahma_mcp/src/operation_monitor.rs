@@ -1322,6 +1322,15 @@ async fn wait_for_completion_flag(rx: &mut WatchReceiver<bool>, timeout: Option<
 /// tripped, or `None` if the operation is still within both. Pure and
 /// lock-free so [`OperationMonitor::check_timeouts`] can stay a thin
 /// collect-then-act loop.
+/// How the idle watchdog's reason opens: a stall, not the time limit.
+const STALLED: &str = "Operation stalled:";
+
+/// Whether a timeout's reason is the idle watchdog's (a stall), rather than
+/// a time limit's.
+pub(crate) fn is_stall(reason: &str) -> bool {
+    reason.starts_with(STALLED)
+}
+
 fn timeout_reason(
     op: &Operation,
     now: SystemTime,
@@ -1350,7 +1359,7 @@ fn timeout_reason(
     let idle = now.duration_since(op.last_activity.get()).ok()?;
     if idle > idle_limit {
         return Some(format!(
-            "Operation stalled: no output and no CPU activity for {:.1}s \
+            "{STALLED} no output and no CPU activity for {:.1}s \
              (idle limit: {:.1}s)",
             idle.as_secs_f64(),
             idle_limit.as_secs_f64()

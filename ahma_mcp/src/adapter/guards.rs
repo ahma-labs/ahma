@@ -52,14 +52,15 @@ impl RunGuards {
         subject: &str,
         admission: workspace_queue::Admission,
         cancel: &tokio_util::sync::CancellationToken,
+        queue: Option<&super::QueueWait>,
     ) -> Option<Self> {
         // From the task's start, so time spent queued is in the audit record.
         let mut guards = Self::held(op_id, subject, None);
-        match super::wait_for_lease(admission.into_ticket(), monitor, op_id, cancel).await {
+        match super::wait_for_lease(admission.into_ticket(), monitor, op_id, cancel, queue).await {
             // Held until the operation ends: until its process tree is gone.
             Ok(lease) => guards.lease = lease,
-            Err(()) => {
-                guards.end(monitor, super::cancelled()).await;
+            Err(ending) => {
+                guards.end(monitor, ending).await;
                 return None;
             }
         }
@@ -291,6 +292,7 @@ mod tests {
             "t",
             workspace_queue::Admission::Exclusive(None),
             &token,
+            None,
         )
         .await
         .expect("not cancelled yet");

@@ -106,6 +106,32 @@ fn cpu_probe_threshold(idle_limit: Option<Duration>) -> Option<Duration> {
     idle_limit.map(|limit| (limit / 3).min(CPU_LIVENESS_PROBE_AFTER))
 }
 
+/// `result` led by a trust-handoff alert (SPEC R6.1.7). A typed sandbox
+/// denial keeps its type, because the MCP boundary turns it into a
+/// structured `sandbox_denial` payload; the alert then reaches the log and
+/// the audit trail only.
+fn with_handoff_alert(
+    result: Result<String, anyhow::Error>,
+    alert: &str,
+) -> Result<String, anyhow::Error> {
+    match result {
+        Ok(output) => Ok(format!("{alert}\n\n{output}")),
+        Err(e) if e.downcast_ref::<sandbox::SandboxError>().is_some() => Err(e),
+        Err(e) => Err(anyhow::anyhow!("{alert}\n\n{e}")),
+    }
+}
+
+/// What a command stopped at its limit had printed, stdout then stderr: the
+/// last lines say what it was stuck on.
+fn printed_before_kill(raw: &sink::RawOutput) -> String {
+    [&raw.stdout, &raw.stderr]
+        .into_iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Result of one prepared synchronous run: what the caller gets back, plus the
 /// two facts the audit log needs (how it ended, and with which exit code).
 struct SyncRun {
@@ -120,11 +146,7 @@ impl SyncRun {
     /// structured `sandbox_denial` payload; the alert then reaches the log and
     /// the audit trail only.
     fn with_handoff_alert(mut self, alert: &str) -> Self {
-        self.result = match self.result {
-            Ok(output) => Ok(format!("{alert}\n\n{output}")),
-            Err(e) if e.downcast_ref::<sandbox::SandboxError>().is_some() => Err(e),
-            Err(e) => Err(anyhow::anyhow!("{alert}\n\n{e}")),
-        };
+        self.result = with_handoff_alert(self.result, alert);
         self
     }
 
@@ -1150,7 +1172,7 @@ impl Adapter {
                     .ok()
                     .and_then(Result::ok)
                     .unwrap_or_default();
-                std::process::Output {
+                RawExit {
                     status,
                     stdout,
                     stderr,
@@ -1158,205 +1180,36 @@ impl Adapter {
             }
         };
 
-        // A non-zero exit may be a runtime sandbox denial the kernel did not name;
-        // scan stderr and (best-effort, never blocking the result) offer to grant
-        // an out-of-scope path it references.
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let explain = WaitedRun {
+            sandbox: &self.sandbox,
+            scope_grant_notifier: self.scope_grant_notifier.as_ref(),
+            op_id,
+            command,
+            working_dir: safe_wd,
+            guards,
+        };
+        let raw = sink::RawOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            left_running,
+        };
         let exit_code = output.status.code();
-        let result = interpret_sync_command_output(output);
-        // What the SSH key broker refused this command, one line each
-        // (SPEC R-CRED.10), on whichever side the result is.
-        #[cfg(unix)]
-        let result = match guards.broker().and_then(broker_refusals) {
-            Some(lines) => match result {
-                Ok(out) => Ok(format!("{out}\n{lines}")),
-                Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
-            },
-            None => result,
-        };
-        // What the link broker refused, once each, unless the helper's own
-        // line already reached the output (SPEC R-LINK.6): a tool that ran
-        // `$BROWSER` may have swallowed it.
-        #[cfg(unix)]
-        let result = match guards
-            .links()
-            .and_then(|l| link_refusals(l, &stdout, &stderr))
-        {
-            Some(lines) => match result {
-                Ok(out) => Ok(format!("{out}\n{lines}")),
-                Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
-            },
-            None => result,
-        };
-        let result = match left_running {
-            Some(line) => match result {
-                Ok(out) => Ok(format!("{out}\n{line}")),
-                Err(e) => Err(anyhow::anyhow!("{e}\n\n{line}")),
-            },
-            None => result,
-        };
-        if result.is_err() {
-            return self
-                .finalize_sync_denial(
-                    command,
-                    op_id,
-                    exit_code,
-                    &stdout,
-                    &stderr,
-                    safe_wd,
-                    result,
-                    denial_tag.as_deref(),
-                    spawned_at.elapsed(),
-                )
-                .await;
-        }
+        let result = waited_result(
+            &explain,
+            exit_code,
+            raw,
+            denial_tag.as_deref(),
+            spawned_at.elapsed(),
+        )
+        .await;
         SyncRun {
-            outcome: audit::Outcome::Completed,
+            outcome: if result.is_ok() {
+                audit::Outcome::Completed
+            } else {
+                audit::Outcome::Failed
+            },
             exit_code,
             result,
-        }
-    }
-
-    /// Turn a failed sync command's output into the final [`SyncRun`], scanning
-    /// stderr/stdout for a sandbox denial the kernel did not name.
-    ///
-    /// Split out of [`Self::run_sync_prepared`] so the happy path there stays a
-    /// straight line; this is the async-path twin of `record_failure_diagnostics`.
-    #[allow(clippy::too_many_arguments)]
-    async fn finalize_sync_denial(
-        &self,
-        command: &str,
-        op_id: &str,
-        exit_code: Option<i32>,
-        stdout: &str,
-        stderr: &str,
-        safe_wd: &std::path::Path,
-        result: Result<String, anyhow::Error>,
-        denial_tag: Option<&str>,
-        ran_for: Duration,
-    ) -> SyncRun {
-        // A program that refuses any sandbox by its own check outranks every record (SPEC
-        // R-ESCAPE.1): the kernel refused nothing that mattered.
-        let result = match self_refused(result, stderr, stdout) {
-            Ok(fatal) => {
-                return SyncRun {
-                    outcome: audit::Outcome::Failed,
-                    exit_code,
-                    result: Err(fatal),
-                };
-            }
-            Err(result) => result,
-        };
-        // The kernel's own record decides where it can be read (SPEC R-DENY).
-        if let Some(report) = sandbox::grant_channel::kernel_denial_lines(
-            &self.sandbox,
-            self.scope_grant_notifier.as_ref(),
-            (stderr, stdout),
-            denial_tag,
-            ran_for,
-            command,
-            Some(op_id),
-        )
-        .await
-        {
-            return SyncRun {
-                outcome: audit::Outcome::Failed,
-                exit_code,
-                result: kernel_report_result(
-                    &self.sandbox,
-                    report,
-                    result,
-                    op_id,
-                    command,
-                    sandbox::launch_services::refused_link(stderr, stdout).as_deref(),
-                )
-                .await,
-            };
-        }
-        let result = match fatal_unrunnable(result, stderr, stdout) {
-            Ok(fatal) => {
-                return SyncRun {
-                    outcome: audit::Outcome::Failed,
-                    exit_code,
-                    result: Err(fatal),
-                };
-            }
-            Err(result) => result,
-        };
-        sandbox::grant_channel::raise_stderr_denial_question(
-            &self.sandbox,
-            self.scope_grant_notifier.as_ref(),
-            stderr,
-            stdout,
-            command,
-            Some(safe_wd),
-            Some(op_id),
-        );
-        // When the failure was a kernel denial on an out-of-scope path, return
-        // it as a typed error so the MCP boundary attaches a structured
-        // `sandbox_denial` payload (path + grant->restart->retry remediation)
-        // instead of leaving the agent with a raw `os error 1`.
-        let hit = sandbox::scan_denial_streams(stderr, stdout)
-            .filter(|hit| !self.sandbox.is_path_in_scope_in_dir(&hit.path, safe_wd));
-        if let Some(hit) = hit {
-            let target = sandbox::grant_channel::resolve_grant_target(
-                &hit.path,
-                Some(safe_wd),
-                &self.sandbox,
-            );
-            // Same payload, durable copy: the structured error reaches the
-            // agent now, the audit line survives the session (SPEC R5.4.7).
-            audit::record_sandbox_denial(Some(op_id), &target, hit.access.label(), command).await;
-            let details = result.err().map(|e| e.to_string()).unwrap_or_default();
-            return SyncRun {
-                outcome: audit::Outcome::Failed,
-                exit_code,
-                result: Err(sandbox::SandboxError::RuntimeDenial {
-                    path: target,
-                    access: hit.access,
-                    scopes: self.sandbox.scopes().to_vec(),
-                    details,
-                }
-                .into()),
-            };
-        }
-        // sccache prints a bare `Operation not permitted` with no path when the
-        // cache the user set lies outside the scope; name that directory as the
-        // denial, so every harness offers its grant (SPEC R-DOCTOR.9).
-        if let Some(dir) = sandbox::build_diagnostics::sccache_cache_outside_scope(
-            stderr,
-            stdout,
-            std::env::var("SCCACHE_DIR").ok(),
-            &|dir| self.sandbox.is_path_in_scope_in_dir(dir, safe_wd),
-        ) {
-            audit::record_sandbox_denial(
-                Some(op_id),
-                &dir,
-                ahma_common::config::ScopeAccess::Rw.label(),
-                command,
-            )
-            .await;
-            let error = result.err().map(|e| e.to_string()).unwrap_or_default();
-            let note = sandbox::build_diagnostics::sccache_cache_grant_note(&dir);
-            return SyncRun {
-                outcome: audit::Outcome::Failed,
-                exit_code,
-                result: Err(sandbox::SandboxError::RuntimeDenial {
-                    path: dir,
-                    access: ahma_common::config::ScopeAccess::Rw,
-                    scopes: self.sandbox.scopes().to_vec(),
-                    details: format!("{error}\n\n{note}"),
-                }
-                .into()),
-            };
-        }
-        SyncRun {
-            outcome: audit::Outcome::Failed,
-            exit_code,
-            result: explain_ungrantable_failure(result, stderr, stdout, &|hint| {
-                remediation_in_workspace(hint, &self.sandbox, Some(safe_wd))
-            }),
         }
     }
 
@@ -1450,6 +1303,126 @@ impl Adapter {
         working_dir: &str,
         options: AsyncExecOptions<'_>,
     ) -> Result<String> {
+        // Boxed, as `drive` is: one more unboxed level here nests every
+        // server future past the compiler's query depth limit.
+        let (operation, prepared) =
+            Box::pin(self.prepare_piped(tool_name, command, working_dir, options)).await?;
+        Ok(self.drive(operation, prepared).await)
+    }
+
+    /// Run a command as a tracked operation and wait for it to end, however
+    /// long it takes, returning its result as the caller reads it (SPEC
+    /// R2.1): for a caller that cannot collect a result later — a terminal
+    /// hook and the CLI one-shot. It runs as every other operation does
+    /// (`drive`): queued in its workspace, gated by its mutex group,
+    /// watched for drift and the deny tier, visible to `status`, the TUI and
+    /// the audit log. Only the waiting is the caller's:
+    ///
+    /// - its wait for the workspace is announced once
+    ///   ([`Self::with_queue_wait_notice`]) and bounded by the command's own
+    ///   time limit, after which it is **not** run (SPEC R2.7.1);
+    /// - its result is what the command printed, byte for byte, or a typed
+    ///   error the caller can read: a `time_limit::LimitReached`, or a
+    ///   [`sandbox::SandboxError`] for a refusal;
+    /// - dropping the returned future cancels the operation, which kills the
+    ///   command's whole process tree: a caller stopped by Ctrl-C or SIGTERM
+    ///   takes its command with it.
+    ///
+    /// `id` names the operation, as the caller already recorded it (the task
+    /// vault); `None` mints one. `command` also names the tool in the audit
+    /// log.
+    ///
+    /// Boxed, as `drive` is, so its callers' futures do not nest past the
+    /// compiler's query depth limit.
+    pub fn run_to_completion<'a>(
+        &'a self,
+        id: Option<&'a str>,
+        command: &'a str,
+        args: Option<Map<String, serde_json::Value>>,
+        working_dir: &'a str,
+        timeout_seconds: Option<u64>,
+        subcommand_config: Option<&'a crate::config::SubcommandConfig>,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<String, anyhow::Error>> + Send + 'a>,
+    > {
+        Box::pin(self.wait_for_completion(
+            id,
+            command,
+            args,
+            working_dir,
+            timeout_seconds,
+            subcommand_config,
+        ))
+    }
+
+    /// [`Self::run_to_completion`], unboxed.
+    async fn wait_for_completion(
+        &self,
+        id: Option<&str>,
+        command: &str,
+        args: Option<Map<String, serde_json::Value>>,
+        working_dir: &str,
+        timeout_seconds: Option<u64>,
+        subcommand_config: Option<&crate::config::SubcommandConfig>,
+    ) -> Result<String, anyhow::Error> {
+        let (operation, mut prepared) = self
+            .prepare_piped(
+                command,
+                command,
+                working_dir,
+                AsyncExecOptions {
+                    id: id.map(str::to_string),
+                    args,
+                    timeout: timeout_seconds,
+                    subcommand_config,
+                    log_monitor_config: None,
+                },
+            )
+            .await?;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let (done, ended) = tokio::sync::oneshot::channel();
+        prepared.waiter = Some(drive::Waiter {
+            reply,
+            notice: self.queue_wait_notice.clone(),
+            done,
+        });
+        // Armed before the operation is registered: a caller dropped from
+        // here on takes the command with it.
+        let mut stop = StopOnDrop {
+            monitor: self.monitor.clone(),
+            op_id: prepared.op_id.clone(),
+            token: operation.cancellation_token.clone(),
+            armed: true,
+        };
+        let op_id = self.drive(operation, prepared).await;
+        // The task has returned: the workspace is handed on, the ending
+        // published and the end audited, so a caller that exits at once
+        // leaves a complete record.
+        let _ = ended.await;
+        stop.armed = false;
+        let ended = self.monitor.wait_for_operation_bounded(&op_id, None).await;
+        match result.await {
+            Ok(result) => result,
+            // It ended before it ran: cancelled or given up while queued, or
+            // its mutex group's wait gave up. The reason is its result.
+            Err(_) => Err(match ended.and_then(|op| op.result) {
+                Some(serde_json::Value::String(why)) => anyhow::anyhow!("{why}"),
+                Some(other) => anyhow::anyhow!("{}", other["reason"].as_str().unwrap_or("")),
+                None => anyhow::anyhow!("Operation {op_id} ended without a result"),
+            }),
+        }
+    }
+
+    /// Everything a piped command needs before it is driven: its working
+    /// directory checked, its line prepared, its operation named and its
+    /// place in its workspace's line taken on arrival (SPEC R2.7.1).
+    async fn prepare_piped(
+        &self,
+        tool_name: &str,
+        command: &str,
+        working_dir: &str,
+        options: AsyncExecOptions<'_>,
+    ) -> Result<(Operation, drive::Prepared)> {
         let AsyncExecOptions {
             id,
             args,
@@ -1569,6 +1542,7 @@ impl Adapter {
             }),
             watch_handoff: self.watches_handoff(lane),
             limit: command_limit(&self.shell_pool, timeout),
+            waiter: None,
             run: drive::Run::Piped {
                 program: program_with_subcommand,
                 args: args_vec,
@@ -1582,7 +1556,7 @@ impl Adapter {
             working_dir: safe_wd,
             workspace,
         };
-        Ok(self.drive(operation, prepared).await)
+        Ok((operation, prepared))
     }
 
     /// Start `command_str` asynchronously inside a pseudo-terminal (PTY).
@@ -1655,6 +1629,7 @@ impl Adapter {
             }),
             watch_handoff: self.watches_handoff(workspace_queue::Lane::Exclusive),
             limit: command_limit(&self.shell_pool, timeout),
+            waiter: None,
             run: drive::Run::Pty {
                 line: run_line,
                 keep_leftovers: self.is_declared_long_running(command_str),
@@ -1725,6 +1700,7 @@ impl Adapter {
             }),
             watch_handoff: self.watches_handoff(workspace_queue::Lane::Exclusive),
             limit: command_limit(&self.shell_pool, timeout),
+            waiter: None,
             run: drive::Run::Session {
                 id: session_id.to_string(),
                 sessions: self.shell_sessions.clone(),
@@ -1766,11 +1742,206 @@ impl Adapter {
 // Extracted execution helpers (batch vs streaming)
 // ---------------------------------------------------------------------------
 
-/// Interpret a completed synchronous process output as success text or an error.
-fn interpret_sync_command_output(output: std::process::Output) -> Result<String, anyhow::Error> {
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !output.status.success() {
+/// What a synchronous run's process left: how it exited and what it wrote.
+struct RawExit {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// What a caller that waits for its command is told, and with what (SPEC
+/// R2.1): its result is explained here, once, whichever way it ran.
+struct WaitedRun<'a> {
+    sandbox: &'a sandbox::Sandbox,
+    /// Offered an out-of-scope path a failure names (SPEC R5).
+    scope_grant_notifier: Option<&'a Arc<dyn sandbox::ScopeGrantNotifier>>,
+    op_id: &'a str,
+    /// The command line its failure is explained by.
+    command: &'a str,
+    working_dir: &'a Path,
+    /// What it holds until it has ended: its brokers, whose refusals its
+    /// result says.
+    guards: &'a guards::RunGuards,
+}
+
+/// The result a caller that waits for its command reads, from what the
+/// command wrote and how it exited: its output, or an error naming its exit
+/// code and output, then what its brokers refused (SPEC R-CRED.10, R-LINK.6)
+/// and what it left running (R-PROC.5), and, for a failure, what the sandbox
+/// says about it ([`explain_failed_run`]). A typed error — a sandbox denial,
+/// an unrunnable program — keeps its type for the caller to read.
+async fn waited_result(
+    run: &WaitedRun<'_>,
+    exit_code: Option<i32>,
+    raw: sink::RawOutput,
+    denial_tag: Option<&str>,
+    ran_for: Duration,
+) -> Result<String, anyhow::Error> {
+    #[cfg(not(unix))]
+    let _ = run.guards;
+    // A non-zero exit may be a runtime sandbox denial the kernel did not name;
+    // scan stderr and (best-effort, never blocking the result) offer to grant
+    // an out-of-scope path it references.
+    let stderr = String::from_utf8_lossy(&raw.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&raw.stdout).into_owned();
+    let result = interpret_sync_command_output(exit_code, stdout.clone(), stderr.clone());
+    // What the SSH key broker refused this command, one line each
+    // (SPEC R-CRED.10), on whichever side the result is.
+    #[cfg(unix)]
+    let result = match run.guards.broker().and_then(broker_refusals) {
+        Some(lines) => match result {
+            Ok(out) => Ok(format!("{out}\n{lines}")),
+            Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
+        },
+        None => result,
+    };
+    // What the link broker refused, once each, unless the helper's own
+    // line already reached the output (SPEC R-LINK.6): a tool that ran
+    // `$BROWSER` may have swallowed it.
+    #[cfg(unix)]
+    let result = match run
+        .guards
+        .links()
+        .and_then(|l| link_refusals(l, &stdout, &stderr))
+    {
+        Some(lines) => match result {
+            Ok(out) => Ok(format!("{out}\n{lines}")),
+            Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
+        },
+        None => result,
+    };
+    let result = match raw.left_running {
+        Some(line) => match result {
+            Ok(out) => Ok(format!("{out}\n{line}")),
+            Err(e) => Err(anyhow::anyhow!("{e}\n\n{line}")),
+        },
+        None => result,
+    };
+    if result.is_err() {
+        return explain_failed_run(run, &stdout, &stderr, result, denial_tag, ran_for).await;
+    }
+    result
+}
+
+/// A failed command's result, scanning stderr/stdout for a sandbox denial the
+/// kernel did not name: the waiting caller's twin of
+/// `record_failure_diagnostics`, which says the same as operation alerts.
+async fn explain_failed_run(
+    run: &WaitedRun<'_>,
+    stdout: &str,
+    stderr: &str,
+    result: Result<String, anyhow::Error>,
+    denial_tag: Option<&str>,
+    ran_for: Duration,
+) -> Result<String, anyhow::Error> {
+    let WaitedRun {
+        sandbox,
+        scope_grant_notifier,
+        op_id,
+        command,
+        working_dir: safe_wd,
+        ..
+    } = *run;
+    // A program that refuses any sandbox by its own check outranks every record (SPEC
+    // R-ESCAPE.1): the kernel refused nothing that mattered.
+    let result = match self_refused(result, stderr, stdout) {
+        Ok(fatal) => return Err(fatal),
+        Err(result) => result,
+    };
+    // The kernel's own record decides where it can be read (SPEC R-DENY).
+    if let Some(report) = sandbox::grant_channel::kernel_denial_lines(
+        sandbox,
+        scope_grant_notifier,
+        (stderr, stdout),
+        denial_tag,
+        ran_for,
+        command,
+        Some(op_id),
+    )
+    .await
+    {
+        return kernel_report_result(
+            sandbox,
+            report,
+            result,
+            op_id,
+            command,
+            sandbox::launch_services::refused_link(stderr, stdout).as_deref(),
+        )
+        .await;
+    }
+    let result = match fatal_unrunnable(result, stderr, stdout) {
+        Ok(fatal) => return Err(fatal),
+        Err(result) => result,
+    };
+    sandbox::grant_channel::raise_stderr_denial_question(
+        sandbox,
+        scope_grant_notifier,
+        stderr,
+        stdout,
+        command,
+        Some(safe_wd),
+        Some(op_id),
+    );
+    // When the failure was a kernel denial on an out-of-scope path, return
+    // it as a typed error so the MCP boundary attaches a structured
+    // `sandbox_denial` payload (path + grant->restart->retry remediation)
+    // instead of leaving the agent with a raw `os error 1`.
+    let hit = sandbox::scan_denial_streams(stderr, stdout)
+        .filter(|hit| !sandbox.is_path_in_scope_in_dir(&hit.path, safe_wd));
+    if let Some(hit) = hit {
+        let target =
+            sandbox::grant_channel::resolve_grant_target(&hit.path, Some(safe_wd), sandbox);
+        // Same payload, durable copy: the structured error reaches the
+        // agent now, the audit line survives the session (SPEC R5.4.7).
+        audit::record_sandbox_denial(Some(op_id), &target, hit.access.label(), command).await;
+        let details = result.err().map(|e| e.to_string()).unwrap_or_default();
+        return Err(sandbox::SandboxError::RuntimeDenial {
+            path: target,
+            access: hit.access,
+            scopes: sandbox.scopes().to_vec(),
+            details,
+        }
+        .into());
+    }
+    // sccache prints a bare `Operation not permitted` with no path when the
+    // cache the user set lies outside the scope; name that directory as the
+    // denial, so every harness offers its grant (SPEC R-DOCTOR.9).
+    if let Some(dir) = sandbox::build_diagnostics::sccache_cache_outside_scope(
+        stderr,
+        stdout,
+        std::env::var("SCCACHE_DIR").ok(),
+        &|dir| sandbox.is_path_in_scope_in_dir(dir, safe_wd),
+    ) {
+        audit::record_sandbox_denial(
+            Some(op_id),
+            &dir,
+            ahma_common::config::ScopeAccess::Rw.label(),
+            command,
+        )
+        .await;
+        let error = result.err().map(|e| e.to_string()).unwrap_or_default();
+        let note = sandbox::build_diagnostics::sccache_cache_grant_note(&dir);
+        return Err(sandbox::SandboxError::RuntimeDenial {
+            path: dir,
+            access: ahma_common::config::ScopeAccess::Rw,
+            scopes: sandbox.scopes().to_vec(),
+            details: format!("{error}\n\n{note}"),
+        }
+        .into());
+    }
+    explain_ungrantable_failure(result, stderr, stdout, &|hint| {
+        remediation_in_workspace(hint, sandbox, Some(safe_wd))
+    })
+}
+
+/// Interpret a completed command's exit and output as success text or an error.
+fn interpret_sync_command_output(
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+) -> Result<String, anyhow::Error> {
+    if exit_code != Some(0) {
         // Append a remediation line when the failure is sandbox build
         // contamination (in-scope EPERM / sccache), so the CLI user sees what to
         // do instead of a bare `os error 1`. See `sandbox::build_diagnostics`.
@@ -1779,7 +1950,7 @@ fn interpret_sync_command_output(output: std::process::Output) -> Result<String,
             .unwrap_or_default();
         return Err(anyhow::anyhow!(
             "Command failed with exit code {}: stderr: {}, stdout: {}{}",
-            output.status.code().unwrap_or(-1),
+            exit_code.unwrap_or(-1),
             stderr,
             stdout,
             remediation
@@ -1921,34 +2092,109 @@ fn short_command(cmd: &str) -> String {
     }
 }
 
+/// How a caller that waits for its command waits for the command's turn in
+/// its workspace (SPEC R2.7.1): told once that it waits, and for no longer
+/// than the command's own time limit.
+struct QueueWait {
+    /// The command's time limit, which also bounds its wait for its turn.
+    limit: Duration,
+    /// Told once when the command has to wait; logged at `info` without one.
+    notice: Option<QueueWaitNotice>,
+}
+
 /// Wait for a ticket's turn (SPEC R2.7.1), keeping the operation visibly alive
 /// meanwhile: queued is not stalled, so the idle-output watchdog must not kill
-/// it, and observers see who it waits for. `Err` = cancelled while queued.
+/// it, and observers see who it waits for. `Err` is how the operation ends
+/// without running: cancelled while queued, or, for a caller that waits
+/// (`queue`), a turn that did not come within the command's time limit — the
+/// command was **not** run, and who held the workspace is named, never a
+/// silent hang until the caller gives up.
 async fn wait_for_lease(
     ticket: Option<workspace_queue::Ticket>,
     monitor: &Arc<OperationMonitor>,
     op_id: &str,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<Option<workspace_queue::Lease>, ()> {
+    queue: Option<&QueueWait>,
+) -> Result<Option<workspace_queue::Lease>, Terminal> {
     let Some(ticket) = ticket else {
         return Ok(None);
     };
     let started = Instant::now();
     let waiting = ticket.title().to_string();
     let reason = ticket.reason().map(str::to_string);
+    let last_ahead = parking_lot::Mutex::new(Vec::new());
+    let announced = std::sync::atomic::AtomicBool::new(false);
     let observe = |ahead: &[workspace_queue::HolderInfo]| {
         monitor.try_note_liveness(op_id);
-        monitor.note_progress(
-            op_id,
-            queued_message(Some(&waiting), reason.as_deref(), ahead),
-        );
+        let message = queued_message(Some(&waiting), reason.as_deref(), ahead);
+        if let Some(queue) = queue {
+            *last_ahead.lock() = ahead.to_vec();
+            if !announced.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let line = format!("ahma: {message}");
+                match &queue.notice {
+                    Some(notice) => (notice.0)(&line),
+                    None => tracing::info!("{line}"),
+                }
+            }
+        }
+        monitor.note_progress(op_id, message);
     };
-    let lease = ticket.acquire(cancel, &observe).await.map_err(|_| ())?;
+    let acquired = match queue {
+        Some(queue) => {
+            match tokio::time::timeout(queue.limit, ticket.acquire(cancel, &observe)).await {
+                Ok(acquired) => acquired,
+                Err(_) => {
+                    let ahead = last_ahead.lock().clone();
+                    return Err(Terminal::Failed(format!(
+                        "Not run: the workspace stayed busy for its whole {}s timeout. {}. \
+                         Retry once that finishes, or cancel it.",
+                        queue.limit.as_secs(),
+                        queued_message(Some(&waiting), reason.as_deref(), &ahead)
+                    )));
+                }
+            }
+        }
+        None => ticket.acquire(cancel, &observe).await,
+    };
+    let lease = acquired.map_err(|_| cancelled())?;
     let waited = started.elapsed();
     if waited >= QUEUE_WAIT_WORTH_REPORTING {
         monitor.left_queue(op_id, waited).await;
     }
     Ok(Some(lease))
+}
+
+/// Cancels a waited-for operation when its caller stops waiting
+/// ([`Adapter::run_to_completion`]): the caller's future was dropped, by a
+/// Ctrl-C, a SIGTERM or a caller of its own giving up. The token is
+/// signalled at once, which is what the run's executor watches to kill the
+/// whole process tree; the recorded cancel, with its reason, follows on the
+/// runtime when there is one. Disarmed once the operation has ended.
+struct StopOnDrop {
+    monitor: Arc<OperationMonitor>,
+    op_id: String,
+    token: tokio_util::sync::CancellationToken,
+    armed: bool,
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (monitor, op_id) = (self.monitor.clone(), std::mem::take(&mut self.op_id));
+            runtime.spawn(async move {
+                monitor
+                    .cancel_operation_with_reason(
+                        &op_id,
+                        Some("its caller stopped waiting".to_string()),
+                    )
+                    .await
+            });
+        }
+        self.token.cancel();
+    }
 }
 
 /// Where a synchronous call announces a wait for its workspace; see
@@ -2582,8 +2828,15 @@ async fn execute_with_streaming(
     let stdout = guard.child_mut().stdout.take().expect("stdout piped");
     let stderr = guard.child_mut().stderr.take().expect("stderr piped");
 
-    let mut stdout_reader = BufReader::new(stdout).lines();
-    let mut stderr_reader = BufReader::new(stderr).lines();
+    // Read up to each newline as bytes, not with `lines()`: a waiting
+    // caller reads what the command printed byte for byte (`OpSink::chunk`),
+    // and a byte that is not UTF-8 is replaced instead of ending the stream.
+    // `read_until` is cancel-safe in the `select!` below because a partial
+    // read stays in its buffer until the newline (or the end) arrives.
+    let mut stdout_reader = BufReader::new(stdout);
+    let mut stderr_reader = BufReader::new(stderr);
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
 
     let timeout_deadline = tokio::time::Instant::now() + limit;
     // Warn once at 80% of the limit (SPEC R2.6.6), so a healthy job near it
@@ -2696,33 +2949,31 @@ async fn execute_with_streaming(
             _ = reap_interval.tick(), if stdout_done && stderr_done => {}
 
             // Read stderr line
-            result = stderr_reader.next_line(), if !stderr_done => {
+            result = stderr_reader.read_until(b'\n', &mut stderr_buf), if !stderr_done => {
                 // EOF is not output. A child that closes its pipes but keeps
-                // running yields `Ok(None)` immediately and forever; treating
-                // that as activity would hold the CPU probe permanently off.
+                // running yields EOF immediately and forever; treating that
+                // as activity would hold the CPU probe permanently off.
                 //
                 // Real output also drops the CPU baseline, so the next quiet
                 // stretch measures a rise from *its own* start. Carrying a
                 // sample across an intervening chatty period would compare
                 // against a stale total and fabricate proof of life.
-                if matches!(result, Ok(Some(_))) {
+                if handle_stream_chunk(result, &mut stderr_buf, Stream::Stderr, sink).await {
                     last_output_at = tokio::time::Instant::now();
                     last_cpu_ms = None;
                 } else {
                     stderr_done = true;
                 }
-                handle_stream_line(result, Stream::Stderr, sink).await;
             }
 
             // Read stdout line
-            result = stdout_reader.next_line(), if !stdout_done => {
-                if matches!(result, Ok(Some(_))) {
+            result = stdout_reader.read_until(b'\n', &mut stdout_buf), if !stdout_done => {
+                if handle_stream_chunk(result, &mut stdout_buf, Stream::Stdout, sink).await {
                     last_output_at = tokio::time::Instant::now();
                     last_cpu_ms = None;
                 } else {
                     stdout_done = true;
                 }
-                handle_stream_line(result, Stream::Stdout, sink).await;
             }
         }
 
@@ -2735,9 +2986,14 @@ async fn execute_with_streaming(
                 // says so (SPEC R-PROC.5). Before the drain: a job it left in
                 // the background holds these pipes open.
                 if let Some(line) = sandbox::leftovers::note(&guard.end_leftovers().await) {
-                    sink.alert(line).await;
+                    sink.left_running(line).await;
                 }
-                drain_remaining_stream_lines(&mut stderr_reader, &mut stdout_reader, sink).await;
+                drain_remaining_stream_lines(
+                    (&mut stderr_reader, &mut stderr_buf),
+                    (&mut stdout_reader, &mut stdout_buf),
+                    sink,
+                )
+                .await;
                 break;
             }
             Ok(None) => {
@@ -2761,16 +3017,35 @@ async fn execute_with_streaming(
 }
 
 async fn drain_remaining_stream_lines(
-    stderr_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStderr>>,
-    stdout_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    stderr: (
+        &mut tokio::io::BufReader<tokio::process::ChildStderr>,
+        &mut Vec<u8>,
+    ),
+    stdout: (
+        &mut tokio::io::BufReader<tokio::process::ChildStdout>,
+        &mut Vec<u8>,
+    ),
     sink: &mut sink::OpSink,
 ) {
-    while let Ok(Some(line)) = stderr_reader.next_line().await {
-        sink.line(Stream::Stderr, &line).await;
-    }
-    while let Ok(Some(line)) = stdout_reader.next_line().await {
-        sink.line(Stream::Stdout, &line).await;
-    }
+    use tokio::io::AsyncBufReadExt;
+    let (reader, buf) = stderr;
+    while handle_stream_chunk(
+        reader.read_until(b'\n', buf).await,
+        buf,
+        Stream::Stderr,
+        sink,
+    )
+    .await
+    {}
+    let (reader, buf) = stdout;
+    while handle_stream_chunk(
+        reader.read_until(b'\n', buf).await,
+        buf,
+        Stream::Stdout,
+        sink,
+    )
+    .await
+    {}
 }
 
 /// Which sandbox layer to attribute a capability denial to, for the disclosure.
@@ -2997,18 +3272,23 @@ fn cancelled() -> Terminal {
     Terminal::Cancelled("Operation was cancelled".to_string())
 }
 
-/// Handle one result from a `next_line()` call inside the streaming select loop.
+/// Handle one `read_until` of a stream into `buf`, inside the streaming
+/// select loop or its final drain. Returns whether the stream may have more:
+/// `false` at its end or on a read error, which is logged.
 ///
-/// Writes a line to the sink, ignores closed-stream signals (`Ok(None)`), and
-/// logs a warning on read errors.
-async fn handle_stream_line(
-    result: Result<Option<String>, std::io::Error>,
+/// A chunk is written to the sink once its newline arrives, or at the end of
+/// the stream for a last line without one. The end can come with bytes
+/// already in `buf` from a read the loop cancelled part-way; they are that
+/// last line.
+async fn handle_stream_chunk(
+    result: std::io::Result<usize>,
+    buf: &mut Vec<u8>,
     stream: Stream,
     sink: &mut sink::OpSink,
-) {
-    match result {
-        Ok(Some(line)) => sink.line(stream, &line).await,
-        Ok(None) => {}
+) -> bool {
+    let more = match result {
+        Ok(0) => false,
+        Ok(_) => true,
         Err(e) => {
             tracing::warn!(
                 "Error reading {} for {}: {}",
@@ -3016,9 +3296,17 @@ async fn handle_stream_line(
                 sink.op_id(),
                 e
             );
+            false
         }
+    };
+    if !buf.is_empty() && (!more || buf.ends_with(b"\n")) {
+        sink.chunk(stream, &std::mem::take(buf)).await;
     }
+    more
 }
+
+#[cfg(test)]
+mod waited_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3428,24 +3716,18 @@ mod tests {
     }
 
     // ============= interpret_sync_command_output tests =============
-    // Gated to Unix: these synthesise an `ExitStatus` via the Unix-only
-    // `ExitStatusExt::from_raw` (Windows uses an incompatible u32 encoding). The
-    // remediation logic under test is itself platform-agnostic.
 
-    #[cfg(unix)]
     #[test]
     fn interpret_sync_output_appends_contamination_hint_on_provenance_failure() {
-        use std::os::unix::process::ExitStatusExt;
-        let output = std::process::Output {
-            status: std::process::ExitStatus::from_raw(256), // exit code 1
-            stdout: b"   Compiling foo".to_vec(),
-            stderr: b"error: error writing dependencies to `/w/target/debug/deps/x.d`: \
+        let err = interpret_sync_command_output(
+            Some(1),
+            "   Compiling foo".into(),
+            "error: error writing dependencies to `/w/target/debug/deps/x.d`: \
                 Operation not permitted (os error 1)"
-                .to_vec(),
-        };
-        let err = interpret_sync_command_output(output)
-            .unwrap_err()
-            .to_string();
+                .into(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("hint:"),
             "expected a remediation hint, got: {err}"
@@ -3453,34 +3735,36 @@ mod tests {
         assert!(err.contains("com.apple.provenance"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn interpret_sync_output_no_hint_for_ordinary_failure() {
-        use std::os::unix::process::ExitStatusExt;
-        let output = std::process::Output {
-            status: std::process::ExitStatus::from_raw(256),
-            stdout: Vec::new(),
-            stderr: b"error[E0382]: borrow of moved value".to_vec(),
-        };
-        let err = interpret_sync_command_output(output)
-            .unwrap_err()
-            .to_string();
+        let err = interpret_sync_command_output(
+            Some(1),
+            String::new(),
+            "error[E0382]: borrow of moved value".into(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             !err.contains("hint:"),
             "ordinary failure should not add a hint"
         );
     }
 
-    #[cfg(unix)]
+    /// Only exit 0 succeeds: an end by a signal has no exit code, and is a
+    /// failure written as exit code -1.
     #[test]
-    fn interpret_sync_output_ok_on_success() {
-        use std::os::unix::process::ExitStatusExt;
-        let output = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: b"done".to_vec(),
-            stderr: Vec::new(),
-        };
-        assert!(interpret_sync_command_output(output).is_ok());
+    fn interpret_sync_output_success_and_signal() {
+        assert_eq!(
+            interpret_sync_command_output(Some(0), "out".into(), "err".into()).unwrap(),
+            "out\nerr"
+        );
+        let err = interpret_sync_command_output(None, String::new(), String::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("Command failed with exit code -1:"),
+            "{err}"
+        );
     }
 
     // ============= generate_id tests =============
