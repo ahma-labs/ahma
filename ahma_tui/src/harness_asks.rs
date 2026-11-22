@@ -396,19 +396,22 @@ impl HarnessLinkAsk {
     /// What a saving `choice` writes, for the step that shows it before it is
     /// taken (SPEC R-PERM.3.5); `None` for one that saves nothing.
     pub fn save_line(&self, choice: LinkChoice) -> Option<String> {
-        let Effect::Persist(pattern, binding) =
+        let Effect::Persist(patterns, binding) =
             link_policy::effect(choice, &self.refusal.host, &self.workspace)
         else {
             return None;
         };
+        let quoted = patterns
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         Some(match binding {
             OpenUrlBinding::AllRepos => {
-                format!(
-                    "adds \"{pattern}\" to [open_url] allow (all repos) in ~/.ahma/settings.toml"
-                )
+                format!("adds {quoted} to [open_url] allow (all repos) in ~/.ahma/settings.toml")
             }
             OpenUrlBinding::Repo(repo) => format!(
-                "adds \"{pattern}\" to [open_url] repos for {} (this repo only) in \
+                "adds {quoted} to [open_url] repos for {} (this repo only) in \
                  ~/.ahma/settings.toml",
                 repo.display()
             ),
@@ -552,20 +555,18 @@ pub fn answer_link_in(
                 ),
             )
         }
-        Effect::Persist(pattern, binding) => {
+        Effect::Persist(patterns, binding) => {
             let file =
                 settings_file.context("cannot save the grant: ahma's settings file is unknown")?;
-            ahma_common::open_url::persist_open_url_allow(
-                file,
-                &pattern.to_string(),
-                &binding,
-                surface,
-            )?;
+            let texts: Vec<String> = patterns.iter().map(ToString::to_string).collect();
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            ahma_common::open_url::persist_open_url_allows(file, &refs, &binding, surface)?;
             (
                 false,
                 format!(
-                    "Allowed {pattern} links for {} — saved to ~/.ahma/settings.toml (undo with \
+                    "Allowed {} links for {} — saved to ~/.ahma/settings.toml (undo with \
                      `ahma permissions revoke open-url`); re-run the command to open it",
+                    texts.join(" and "),
                     binding.describe()
                 ),
             )
@@ -928,6 +929,7 @@ mod tests {
                     Session,
                     AlwaysSiteThisRepo,
                     AlwaysSiteAllRepos,
+                    AlwaysDomainThisRepo,
                     AlwaysAnyThisRepo
                 ]
             );
@@ -970,12 +972,17 @@ mod tests {
             );
         }
 
-        /// SPEC R-LINK.6: the three example links in the TUI, with their keys,
-        /// in order: this site in this repo is the first lasting answer, and
-        /// any site is for this repo only.
+        /// SPEC R-LINK.6, R-LINK.4: the three example links in the TUI, with
+        /// their keys, in order: this site in this repo is the first lasting
+        /// answer; `d`, a site and its subdomains, only where one owner holds
+        /// the domain (not `someone.github.io`); any site is for this repo only.
         #[test]
         fn the_three_examples_offer_this_repo_first_in_the_tui() {
-            for host in ["github.com", "api.github.com", "someone.github.io"] {
+            for (host, domain) in [
+                ("github.com", Some("github.com")),
+                ("api.github.com", Some("github.com")),
+                ("someone.github.io", None),
+            ] {
                 let f = link_fixture(host, false);
                 let ask = waiting(&f).remove(0);
                 let q = ask.question();
@@ -984,15 +991,24 @@ mod tests {
                     .into_iter()
                     .map(|c| (crate::state::LinkAskGate::key_for(c).unwrap(), q.label(c)))
                     .collect();
+                let mut want = vec![
+                    ('n', "Deny".to_string()),
+                    ('s', "This site, this session".into()),
+                    ('r', format!("Always for {host} — this repo only")),
+                    ('a', format!("Always for {host} — all repos")),
+                ];
+                want.extend(
+                    domain.map(|d| ('d', format!("Always for {d} and *.{d} — this repo only"))),
+                );
+                want.push(('*', "Always for any site — this repo only".into()));
+                assert_eq!(shown, want, "{host}");
                 assert_eq!(
-                    shown,
-                    [
-                        ('n', "Deny".to_string()),
-                        ('s', "This site, this session".into()),
-                        ('r', format!("Always for {host} — this repo only")),
-                        ('a', format!("Always for {host} — all repos")),
-                        ('*', "Always for any site — this repo only".into()),
-                    ],
+                    ask.save_line(AlwaysDomainThisRepo),
+                    domain.map(|d| format!(
+                        "adds \"{d}\", \"*.{d}\" to [open_url] repos for {} (this repo only) \
+                         in ~/.ahma/settings.toml",
+                        f.ws.display()
+                    )),
                     "{host}"
                 );
                 assert_eq!(
@@ -1074,6 +1090,16 @@ mod tests {
                 "any site is never for all repos"
             );
             assert_eq!(saved.open_url.allowed_in(&any.ws), ["*"]);
+
+            let dom = link_fixture("api.github.com", false);
+            answer(&dom, AlwaysDomainThisRepo);
+            let saved = ahma_common::config::AhmaSettings::load_from_result(&dom.settings).unwrap();
+            assert_eq!(
+                saved.open_url.allowed_in(&dom.ws),
+                ["github.com", "*.github.com"],
+                "the domain and its subdomains, one write"
+            );
+            assert_eq!(audited(&dom).len(), 2, "one audit line each");
 
             let g = link_fixture("docs.rs", false);
             answer(&g, AlwaysSiteAllRepos);

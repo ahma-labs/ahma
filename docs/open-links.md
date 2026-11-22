@@ -38,6 +38,9 @@ ahma permissions grant open-url docs.rs --all-repos --yes
 # For another repo, from anywhere:
 ahma permissions grant open-url github.com --workspace ~/code/proj --yes
 
+# GitHub and its subdomains (github.com and *.github.com: api., gist., docs.):
+ahma permissions grant open-url github.com --and-subdomains --yes
+
 # Inside any command ahma runs (hooked or over MCP), these now open in your browser:
 gh pr view 12 --web
 "$BROWSER" https://github.com/ahma-labs/ahma
@@ -69,6 +72,7 @@ it saves (`Always for github.com — this repo only`):
 | This time | This link opens now. Nothing is remembered; the next link to the site is asked again. |
 | Always for *site* — this repo only | Saved to `[open_url] repos` for this repo (or, for a folder that is not a git repo, that workspace). The usual lasting answer. |
 | Always for *site* — all repos | Saved to `[open_url] allow`, for every repo. |
+| Always for *domain* and \*.*domain* — this repo only | The site's registrable domain and its one-label subdomains (`github.com` and `*.github.com` for a link to `api.github.com`), for this repo. Offered only where one owner holds the domain ([below](#a-site-and-its-subdomains)). |
 | Always for any site — this repo only | `*` for this repo. Offered only where it would cover the link. Any site for every repo is never offered: run `ahma permissions grant open-url --all-repos` if you mean it. |
 
 The narrowest lasting answer — this site, this repo — comes first; each other one widens it in
@@ -97,6 +101,7 @@ so it names every answer, in this order:
 | This time | Yes | The approved run may open that site's links. Nothing is remembered; the next refusal asks again. |
 | Always for *site* — this repo only (the usual lasting answer) | `ahma permissions grant open-url <site> --workspace '<repo>'` | Saved for this repo. |
 | Always for *site* — all repos | `ahma permissions grant open-url <site> --all-repos` | Saved for every repo. |
+| Always for *domain* and \*.*domain* — this repo only | `ahma permissions grant open-url <domain> --and-subdomains --workspace '<repo>'` | The domain and its one-label subdomains, for this repo. Offered only where one owner holds the domain. |
 | Always for any site — this repo only | `ahma permissions grant open-url --workspace '<repo>'` | Any public site in this repo; never a local one, and with network restriction on only sites on your allow list. Offered only where it would cover the link. |
 
 Each line names its repo (`--workspace`) or `--all-repos`, so it means the same whatever
@@ -118,9 +123,10 @@ answers are there, deny first:
 | `s` | This site, this session | Commands in this repo may open that site's links until Claude Code exits (at most 12 hours). Not saved: an owner-only file in ahma's runtime directory. |
 | `r` | Always for *site* — this repo only | Saved to `[open_url] repos` for this repo. |
 | `a` | Always for *site* — all repos | Saved to `[open_url] allow`. |
+| `d` | Always for *domain* and \*.*domain* — this repo only | Both saved to `[open_url] repos` for this repo; offered only where one owner holds the domain. |
 | `*` | Always for any site — this repo only | Saved as `*` for this repo; offered only where it would cover the link. |
 
-`r`, `a` and `*` first show the exact line they add, and a second press saves it. Whatever you
+`r`, `a`, `d` and `*` first show the exact line they add, and a second press saves it. Whatever you
 answer, Claude Code's dialog does not ask the same question; the agent re-runs the command and
 it opens, or is refused naming the grant. Every answer is recorded in `permissions-audit.jsonl`
 with the surface `tui`.
@@ -158,6 +164,32 @@ tab for a moment. Answers are recorded with the surface `web` or `desktop`.
 5. Only a command that has a link broker may reach the broker's socket directory; another
    command run by the same ahma process gets no such access.
 
+## A site and its subdomains
+
+"Always for github.com and \*.github.com" saves two ordinary patterns: the registrable domain
+and its one-label wildcard. `*.github.com` covers `api.github.com` and `gist.github.com`, not
+`a.b.github.com` (one label, as everywhere in ahma), which is asked about on its own.
+
+It is offered only when one owner holds the whole domain. ahma decides that from the public
+suffix list built into it: the domain must sit under a suffix in the list's ICANN section
+(`com`, `co.uk`, `rs`, …), never one in its private section, where many people's sites share a
+suffix (`github.io`, `vercel.app`, `netlify.app`, `herokuapp.com`, `pages.dev`, an S3 bucket's,
+…), nor `googleusercontent.com`. For `someone.github.io` the answer is not offered: there
+`*.github.io` would allow anyone's site. It is also never offered for an IP address, a local or
+internationalised name, or a site outside your network allow list.
+
+Examples, from a repo at `/Users/me/proj`:
+
+| Link | Answers, deny first |
+|---|---|
+| `https://github.com/o/r/pull/1` | Deny · This time · Always for github.com — this repo only · Always for github.com — all repos · Always for github.com and \*.github.com — this repo only · Always for any site — this repo only |
+| `https://api.github.com/x` | Deny · This time · Always for api.github.com — this repo only · Always for api.github.com — all repos · Always for github.com and \*.github.com — this repo only · Always for any site — this repo only |
+| `https://someone.github.io/page` | Deny · This time · Always for someone.github.io — this repo only · Always for someone.github.io — all repos · Always for any site — this repo only |
+
+The list is a snapshot taken when ahma was built: a shared host added to it later is treated as
+an ordinary domain until ahma is updated. A domain and its subdomains for every repo is a CLI
+act: `ahma permissions grant open-url github.com --and-subdomains --all-repos`.
+
 ## Local addresses
 
 `localhost`, `*.local`, names without a dot, and private, loopback and link-local addresses
@@ -178,7 +210,8 @@ grant never lets commands reach a site, and a network grant never opens links.
 | `[open_url] allow` | Sites whose links open without asking in every repo: `github.com`, `*.github.com` (one label: `api.github.com`, not `github.com` itself), `*` (any public site). Written by `ahma permissions grant open-url --all-repos`. |
 | `[open_url] repos` | The same, for one repo. What `ahma permissions grant open-url` writes, run inside the repo, or with `--workspace <DIR>`. |
 | `ahma permissions grant open-url [SITE]` | Preview, then `--yes` to save. No site = any public site. For the git repo enclosing the current directory (`--this-repo` says the same); `--workspace <DIR>` for another; `--all-repos` for every repo. Outside a git repo with none of these it is refused and writes nothing. |
-| `ahma permissions revoke open-url [SITE]` | Remove one site, or with no site every one, in every repo unless `--global` / `--all-repos` (only the all-repos grants), `--this-repo` or `--workspace` narrows it; also ends a "this site, this session" answer for it now (not with `--global`). |
+| `ahma permissions grant open-url DOMAIN --and-subdomains` | Writes `DOMAIN` and `*.DOMAIN` together. Refused for a subdomain (it names the domain to use), a suffix many owners share, an IP address, a local or internationalised name. A wildcard you write yourself over a shared suffix (`*.github.io`) is saved as written, with a warning that it allows anyone's site there. |
+| `ahma permissions revoke open-url [SITE]` | Remove one site, or with no site every one, in every repo unless `--global` / `--all-repos` (only the all-repos grants), `--this-repo` or `--workspace` narrows it; also ends a "this site, this session" answer for it now (not with `--global`). `--and-subdomains` also removes `*.SITE`; without it, a `*.SITE` left behind is named. |
 | `ahma open-url <URL>…` | The helper, by name, inside a command ahma runs. |
 | `BROWSER`, `GH_BROWSER`, `AHMA_LINK_SOCK` | Set by ahma for each command; do not set them yourself. |
 

@@ -1016,11 +1016,12 @@ mod tests {
             "Yes — this time",
             "Always for github.com — this repo only (the usual lasting answer)",
             "Always for github.com — all repos",
+            "Always for github.com and *.github.com — this repo only",
             "Always for any site — this repo only",
         ];
         assert!(
             order.windows(2).all(|w| at(w[0]) < at(w[1])),
-            "deny, this time, this repo, all repos, any site in this repo:\n{reason}"
+            "deny, this time, this repo, all repos, the domain, any site in this repo:\n{reason}"
         );
         assert!(
             reason.contains(&format!(

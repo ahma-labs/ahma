@@ -1697,13 +1697,14 @@ pub struct LinkAskGate {
 
 /// The key that gives each answer to a link question in the terminal. "This
 /// time" has none: nothing waits on a hooked command (SPEC R-LINK.6).
-pub const LINK_ASK_KEYS: [(char, ahma_mcp::links::policy::LinkChoice); 5] = {
+pub const LINK_ASK_KEYS: [(char, ahma_mcp::links::policy::LinkChoice); 6] = {
     use ahma_mcp::links::policy::LinkChoice::*;
     [
         ('n', Deny),
         ('s', Session),
         ('r', AlwaysSiteThisRepo),
         ('a', AlwaysSiteAllRepos),
+        ('d', AlwaysDomainThisRepo),
         ('*', AlwaysAnyThisRepo),
     ]
 };

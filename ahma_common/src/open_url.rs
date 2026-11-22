@@ -198,11 +198,26 @@ pub fn audit_subject(pattern: &str, binding: &OpenUrlBinding) -> String {
 
 /// Save `pattern` (already checked and normalised by the caller) where
 /// `binding` says, and audit it with the `surface` that answered (SPEC
-/// R-LINK.9): the one writer, so no caller can grant unrecorded. `false` when
-/// it was already granted there (nothing written, nothing audited).
+/// R-LINK.9). `false` when it was already granted there (nothing written,
+/// nothing audited). One pattern of [`persist_open_url_allows`].
 pub fn persist_open_url_allow(
     settings_file: &Path,
     pattern: &str,
+    binding: &OpenUrlBinding,
+    surface: &ApproverSurface,
+) -> Result<bool> {
+    persist_open_url_allows(settings_file, &[pattern], binding, surface)
+}
+
+/// Save `patterns` (already checked and normalised by the caller) where
+/// `binding` says, in one write, and audit each one added, with the `surface`
+/// that answered (SPEC R-LINK.9): the one writer, so no caller can grant
+/// unrecorded. A site and its subdomains is two patterns given together
+/// (R-LINK.4). `false` when every one was already granted there (nothing
+/// written, nothing audited).
+pub fn persist_open_url_allows(
+    settings_file: &Path,
+    patterns: &[&str],
     binding: &OpenUrlBinding,
     surface: &ApproverSurface,
 ) -> Result<bool> {
@@ -215,22 +230,30 @@ pub fn persist_open_url_allow(
                 settings_file.display()
             )
         })?;
-    if !settings.open_url.add(pattern, binding) {
+    let added: Vec<&str> = patterns
+        .iter()
+        .copied()
+        .filter(|p| settings.open_url.add(p, binding))
+        .collect();
+    if added.is_empty() {
         return Ok(false);
     }
     settings
         .save_to(settings_file)
         .with_context(|| format!("failed to write {}", settings_file.display()))?;
-    crate::permissions::append_audit(
-        &AuditEntry::new(
-            crate::config::fmt_utc_datetime(crate::config::unix_now()),
-            AuditAction::Grant,
-            GrantKind::OpenUrl,
-            audit_subject(pattern, binding),
-            GrantTier::Always,
-        )
-        .with_surface(surface),
-    );
+    let at = crate::config::fmt_utc_datetime(crate::config::unix_now());
+    for pattern in added {
+        crate::permissions::append_audit(
+            &AuditEntry::new(
+                at.clone(),
+                AuditAction::Grant,
+                GrantKind::OpenUrl,
+                audit_subject(pattern, binding),
+                GrantTier::Always,
+            )
+            .with_surface(surface),
+        );
+    }
     Ok(true)
 }
 

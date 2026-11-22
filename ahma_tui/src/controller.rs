@@ -993,6 +993,7 @@ mod tests {
         for saving in [
             LinkChoice::AlwaysSiteThisRepo,
             LinkChoice::AlwaysSiteAllRepos,
+            LinkChoice::AlwaysDomainThisRepo,
             LinkChoice::AlwaysAnyThisRepo,
         ] {
             assert_eq!(link(&mut gui, &id, saving), Err(Refused::NotAllowed));

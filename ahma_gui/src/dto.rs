@@ -472,6 +472,7 @@ mod tests {
             "always-site-this-repo",
             "always-site-all-repos",
             "always-any-site",
+            "always-domain-this-repo",
             "always-any-site-this-repo",
         ] {
             assert!(

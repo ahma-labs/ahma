@@ -1648,6 +1648,9 @@ pub enum PermissionsCommand {
         /// For `open-url`: allow the site in every repo (`[open_url] allow`) instead of only the git repository enclosing the current directory. Wider than one repo: an address can carry data from any project.
         #[arg(long = "all-repos", conflicts_with_all = ["workspace", "this_repo"])]
         all_repos: bool,
+        /// For `open-url`: also allow SITE's one-label subdomains, writing SITE and `*.SITE` together (`github.com --and-subdomains` covers `github.com` and `api.github.com`, not `a.b.github.com`). SITE must be a registrable domain one owner holds: refused for a subdomain (it names the domain to use), for a suffix many owners share such as `github.io` or `vercel.app`, where `*.SITE` would allow anyone's site, and for an IP address, a local or an internationalised name.
+        #[arg(long = "and-subdomains")]
+        and_subdomains: bool,
         /// Grant it for this long (`8h`, `7d`) instead of until revoked.
         #[arg(long = "for", value_name = "DURATION")]
         lease: Option<String>,
@@ -1678,6 +1681,9 @@ pub enum PermissionsCommand {
         /// For `fs-scope`: revoke the legacy global grant, the one that applies to every workspace. For `open-url`: revoke only the grant for all repos (`--all-repos` is the same).
         #[arg(long = "global", visible_alias = "all-repos")]
         global: bool,
+        /// For `open-url`: also remove SITE's one-label wildcard (`*.SITE`), the pair `--and-subdomains` granted.
+        #[arg(long = "and-subdomains")]
+        and_subdomains: bool,
         /// Apply the previewed change (without this, nothing is written).
         #[arg(long = "yes", short = 'y')]
         yes: bool,
