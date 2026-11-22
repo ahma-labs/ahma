@@ -76,6 +76,7 @@ pub mod scope_grant;
 pub mod seatbelt;
 pub mod session_event;
 pub mod session_grants;
+pub mod setting_key;
 pub mod settings_origin;
 pub mod setup_detect;
 pub mod shell_words;

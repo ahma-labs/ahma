@@ -333,8 +333,8 @@ fn run_settings_set(
             &ApproverSurface::Cli,
             SettingsFile::for_path(&target).label(),
             key,
-            edit.before.as_deref(),
-            edit.after.as_deref(),
+            edit.before_toml().as_deref(),
+            edit.after_toml().as_deref(),
         ));
     }
     Ok(())

@@ -22,6 +22,13 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   and `${VAR}` interpolation for tool files. Settings resolve once (R-CFG4). Retired
   `AHMA_*` variables go through `warn_retired_env`, which reports only *whether* a variable
   is set, never its value (R-CFG1.2).
+- `setting_key`: `SettingKey`, one variant per settings key, in file order. Each key's
+  properties — trust tier (R-CFG2.1), ledger command (R-CFG10.7), redacted (R-CFG5.1),
+  CLI-only (R-CFG2.3), setup-view switch (R-SETUP.4.1) — are stated once, in its row; every
+  surface that classifies a key (tiers, `settings set`, `settings show`, the startup report,
+  the TUI panel, the setup view) reads them there. A test holds `SettingKey::ALL` equal to
+  the documented keys and the fields of `AhmaSettings`, so a key cannot be added in one place
+  only.
 - `settings_origin`: per-key provenance of the effective settings (cli / project / user /
   default) and the startup report built from it: one line per non-default setting
   (R-CFG5.2) and a warning per group- or world-writable settings file (R-CFG6.3). Both

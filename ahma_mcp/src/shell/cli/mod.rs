@@ -26,7 +26,7 @@ mod commands;
 use super::{list_tools, modes, resolution};
 
 use crate::sandbox;
-use ahma_common::config::MutexGroupConfig;
+use ahma_common::config::{MutexGroupConfig, SettingKey};
 use ahma_common::grant::ResolvedGrant;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -2007,52 +2007,52 @@ fn project_origin(cli: &Cli) -> Option<ProjectOrigin> {
 }
 
 fn collect_boolean_flag_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
-    let boolean_flags: &[(&'static str, bool)] = &[
-        ("tools.skip_probes", cli.skip_probes),
-        ("sandbox.disable", cli.no_sandbox),
-        ("sandbox.defer", cli.defer_sandbox),
-        ("sandbox.tmp_access", cli.tmp),
-        ("sandbox.disable_temp", cli.no_temp_files),
-        ("sandbox.use_scratch_directory", cli.use_scratch),
-        ("logging.log_monitor", cli.log_monitor),
-        ("http.disable_quic", cli.disable_quic),
-        ("http.disable_http1_1", cli.disable_http1_1),
+    let boolean_flags: &[(SettingKey, bool)] = &[
+        (SettingKey::ToolsSkipProbes, cli.skip_probes),
+        (SettingKey::SandboxDisable, cli.no_sandbox),
+        (SettingKey::SandboxDefer, cli.defer_sandbox),
+        (SettingKey::SandboxTmpAccess, cli.tmp),
+        (SettingKey::SandboxDisableTemp, cli.no_temp_files),
+        (SettingKey::SandboxUseScratchDirectory, cli.use_scratch),
+        (SettingKey::LoggingLogMonitor, cli.log_monitor),
+        (SettingKey::HttpDisableQuic, cli.disable_quic),
+        (SettingKey::HttpDisableHttp11, cli.disable_http1_1),
     ];
     for &(key, on) in boolean_flags {
         if on {
-            out.push((key, "true".to_string()));
+            out.push((key.as_str(), "true".to_string()));
         }
     }
     if cli.log_to_stderr {
-        out.push(("logging.target", "\"stderr\"".to_string()));
+        out.push((SettingKey::LoggingTarget.as_str(), "\"stderr\"".to_string()));
     }
     // `{:?}`, the format the settings rows render values in: a flag that
     // restates the default must compare equal to it, or the startup report
     // (R-CFG5.2) would log `--async` as a deviation from `Async`.
     if let Some(mode) = cli_execution_mode(cli) {
-        out.push(("tools.execution_mode", format!("{mode:?}")));
+        out.push((SettingKey::ToolsExecutionMode.as_str(), format!("{mode:?}")));
     }
 }
 
 /// Record `key` as CLI-overridden with a bare TOML scalar, if the flag was passed.
 fn push_scalar_override<T: std::fmt::Display>(
     out: &mut Vec<(&'static str, String)>,
-    key: &'static str,
+    key: SettingKey,
     value: Option<T>,
 ) {
     if let Some(v) = value {
-        out.push((key, v.to_string()));
+        out.push((key.as_str(), v.to_string()));
     }
 }
 
 /// Record `key` as CLI-overridden with a quoted TOML string, if the flag was passed.
 fn push_quoted_override(
     out: &mut Vec<(&'static str, String)>,
-    key: &'static str,
+    key: SettingKey,
     value: Option<&str>,
 ) {
     if let Some(v) = value {
-        out.push((key, format!("{v:?}")));
+        out.push((key.as_str(), format!("{v:?}")));
     }
 }
 
@@ -2061,96 +2061,113 @@ fn collect_option_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
         .require_token_path
         .as_ref()
         .map(|p| p.display().to_string());
-    push_scalar_override(out, "tools.timeout_secs", cli.timeout);
+    push_scalar_override(out, SettingKey::ToolsTimeoutSecs, cli.timeout);
     push_scalar_override(
         out,
-        "logging.monitor_rate_limit_secs",
+        SettingKey::LoggingMonitorRateLimitSecs,
         cli.monitor_rate_limit,
     );
-    push_scalar_override(out, "http.handshake_timeout_secs", cli.handshake_timeout);
-    push_quoted_override(out, "auth.require_token_path", token_path.as_deref());
-    push_scalar_override(out, "auth.rate_limit_rps", cli.rate_limit_rps);
-    push_scalar_override(out, "auth.rate_limit_burst", cli.rate_limit_burst);
-    push_quoted_override(out, "instance.label", cli.instance_label.as_deref());
+    push_scalar_override(
+        out,
+        SettingKey::HttpHandshakeTimeoutSecs,
+        cli.handshake_timeout,
+    );
+    push_quoted_override(out, SettingKey::AuthRequireTokenPath, token_path.as_deref());
+    push_scalar_override(out, SettingKey::AuthRateLimitRps, cli.rate_limit_rps);
+    push_scalar_override(out, SettingKey::AuthRateLimitBurst, cli.rate_limit_burst);
+    push_quoted_override(
+        out,
+        SettingKey::InstanceLabel,
+        cli.instance_label.as_deref(),
+    );
 }
 
 /// The other flags that override a setting (R-CFG5.1), each value rendered
 /// as the provenance row renders the field (`{:?}` of its type), so a flag
 /// that restates the default compares equal to it.
 fn collect_more_setting_overrides(cli: &Cli, out: &mut Vec<(&'static str, String)>) {
-    let mut push = |key: &'static str, value: Option<String>| {
+    let mut push = |key: SettingKey, value: Option<String>| {
         if let Some(v) = value {
-            out.push((key, v));
+            out.push((key.as_str(), v));
         }
     };
     let flag = |on: bool, value: bool| on.then(|| format!("{value:?}"));
     push(
-        "tools.await_timeout_secs",
+        SettingKey::ToolsAwaitTimeoutSecs,
         cli.await_timeout.map(|v| format!("{v:?}")),
     );
     push(
-        "tools.request_budget_override_secs",
+        SettingKey::ToolsRequestBudgetOverrideSecs,
         cli.request_budget_secs.map(|v| format!("{:?}", Some(v))),
     );
     push(
-        "tools.force_progress_notifications",
+        SettingKey::ToolsForceProgressNotifications,
         flag(cli.force_progress_notifications, true),
     );
-    push("tools.minimize_tokens", flag(cli.minimize_tokens, true));
     push(
-        "tools.small_model_harness",
+        SettingKey::ToolsMinimizeTokens,
+        flag(cli.minimize_tokens, true),
+    );
+    push(
+        SettingKey::ToolsSmallModelHarness,
         flag(cli.small_model_harness, true),
     );
     push(
-        "tools.tools_dir",
+        SettingKey::ToolsToolsDir,
         cli.tools_dir.as_ref().map(|d| format!("{:?}", Some(d))),
     );
     push(
-        "tools.tool_bundles",
+        SettingKey::ToolsToolBundles,
         (!cli.tool_bundles.is_empty()).then(|| format!("{:?}", cli.tool_bundles)),
     );
     push(
-        "sandbox.scopes",
+        SettingKey::SandboxScopes,
         (!cli.sandbox_scopes.is_empty()).then(|| format!("{:?}", cli.sandbox_scopes)),
     );
     push(
-        "sandbox.working_dirs",
+        SettingKey::SandboxWorkingDirs,
         (!cli.working_dirs.is_empty()).then(|| format!("{:?}", cli.working_dirs)),
     );
     push(
-        "sandbox.task_vault",
+        SettingKey::SandboxTaskVault,
         cli.task_vault.as_ref().map(|d| format!("{:?}", Some(d))),
     );
     push(
-        "sandbox.package_cache_write",
+        SettingKey::SandboxPackageCacheWrite,
         flag(cli.no_package_cache_write, false),
     );
     push(
-        "sandbox.allow_keychain",
+        SettingKey::SandboxAllowKeychain,
         if cli.no_allow_keychain {
             flag(true, false)
         } else {
             flag(cli.allow_keychain, true)
         },
     );
-    push("sandbox.allow_git_hooks", flag(cli.allow_git_hooks, true));
     push(
-        "sandbox.allow_project_tool_config",
+        SettingKey::SandboxAllowGitHooks,
+        flag(cli.allow_git_hooks, true),
+    );
+    push(
+        SettingKey::SandboxAllowProjectToolConfig,
         flag(cli.allow_project_tool_config, true),
     );
-    push("network.restrict", flag(cli.restrict_network, true));
     push(
-        "auth.require_token",
+        SettingKey::NetworkRestrict,
+        flag(cli.restrict_network, true),
+    );
+    push(
+        SettingKey::AuthRequireToken,
         cli.require_token.as_ref().map(|t| format!("{:?}", Some(t))),
     );
     push(
-        "http.unix_socket_path",
+        SettingKey::HttpUnixSocketPath,
         cli.unix_socket_path
             .as_ref()
             .map(|p| format!("{:?}", Some(p))),
     );
     push(
-        "logging.dir",
+        SettingKey::LoggingDir,
         cli.log_dir
             .as_ref()
             .map(|d| format!("{:?}", d.display().to_string())),

@@ -4,7 +4,7 @@
 //! navigator.  Users can browse categorized settings, toggle booleans with
 //! Space, edit numbers/strings, and persist changes to `~/.ahma/settings.toml`.
 
-use ahma_common::config::AhmaSettings;
+use ahma_common::config::{AhmaSettings, SettingsTier, dotted_settings_tier};
 
 // ─── Setting categories ───────────────────────────────────────────────────────
 
@@ -122,6 +122,27 @@ pub struct SettingItem {
 }
 
 impl SettingItem {
+    /// A row for `key`. It is read-only here exactly when `key` is not a
+    /// preference: the key's own tier decides (SPEC R-CFG2.1), never the row,
+    /// so the panel cannot disagree with the settings file. A row that is not
+    /// a setting (`permissions.trusted`) takes its table's tier.
+    pub fn new(
+        key: &'static str,
+        label: &'static str,
+        description: &'static str,
+        value: SettingValue,
+        default_value: SettingValue,
+    ) -> Self {
+        Self {
+            key,
+            label,
+            description,
+            value,
+            default_value,
+            security_tier: dotted_settings_tier(key) != Some(SettingsTier::Preference),
+        }
+    }
+
     /// Toggle a boolean setting. Returns true if changed.
     pub fn toggle(&mut self) -> bool {
         if self.security_tier {
@@ -545,52 +566,47 @@ impl SettingsEditor {
         let t = &self.settings.tools;
         let d = &defaults.tools;
         vec![
-            SettingItem {
-                key: "tools.timeout_secs",
-                label: "Timeout",
-                description: "Default tool timeout (seconds)",
-                value: SettingValue::U64(t.timeout_secs),
-                default_value: SettingValue::U64(d.timeout_secs),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "tools.execution_mode",
-                label: "Execution",
-                description: "sync: wait for results · async: return ids, collect with await",
-                value: SettingValue::Choice {
+            SettingItem::new(
+                "tools.timeout_secs",
+                "Timeout",
+                "Default tool timeout (seconds)",
+                SettingValue::U64(t.timeout_secs),
+                SettingValue::U64(d.timeout_secs),
+            ),
+            SettingItem::new(
+                "tools.execution_mode",
+                "Execution",
+                "sync: wait for results · async: return ids, collect with await",
+                SettingValue::Choice {
                     value: t.execution_mode.as_str(),
                     options: EXECUTION_MODE_OPTIONS,
                 },
-                default_value: SettingValue::Choice {
+                SettingValue::Choice {
                     value: d.execution_mode.as_str(),
                     options: EXECUTION_MODE_OPTIONS,
                 },
-                security_tier: false,
-            },
-            SettingItem {
-                key: "tools.skip_probes",
-                label: "Skip probes",
-                description: "Skip availability probes at startup",
-                value: SettingValue::Bool(t.skip_probes),
-                default_value: SettingValue::Bool(d.skip_probes),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "tools.minimize_tokens",
-                label: "Minimize tokens",
-                description: "Append a conciseness rule to the system prompt",
-                value: SettingValue::Bool(t.minimize_tokens),
-                default_value: SettingValue::Bool(d.minimize_tokens),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "tools.small_model_harness",
-                label: "Small model harness",
-                description: "Coaching hints for small-context LLMs",
-                value: SettingValue::Bool(t.small_model_harness),
-                default_value: SettingValue::Bool(d.small_model_harness),
-                security_tier: false,
-            },
+            ),
+            SettingItem::new(
+                "tools.skip_probes",
+                "Skip probes",
+                "Skip availability probes at startup",
+                SettingValue::Bool(t.skip_probes),
+                SettingValue::Bool(d.skip_probes),
+            ),
+            SettingItem::new(
+                "tools.minimize_tokens",
+                "Minimize tokens",
+                "Append a conciseness rule to the system prompt",
+                SettingValue::Bool(t.minimize_tokens),
+                SettingValue::Bool(d.minimize_tokens),
+            ),
+            SettingItem::new(
+                "tools.small_model_harness",
+                "Small model harness",
+                "Coaching hints for small-context LLMs",
+                SettingValue::Bool(t.small_model_harness),
+                SettingValue::Bool(d.small_model_harness),
+            ),
         ]
     }
 
@@ -598,78 +614,69 @@ impl SettingsEditor {
         let s = &self.settings.sandbox;
         let d = &defaults.sandbox;
         vec![
-            SettingItem {
-                key: "sandbox.disable",
-                label: "Disable sandbox",
-                description: "Ignored — only the --no-sandbox flag disables the sandbox",
-                value: SettingValue::Bool(s.disable),
-                default_value: SettingValue::Bool(d.disable),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.tmp_access",
-                label: "Temp access",
-                description: "Add system temp dir to sandbox scope",
-                value: SettingValue::Bool(s.tmp_access),
-                default_value: SettingValue::Bool(d.tmp_access),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.disable_temp",
-                label: "Disable temp",
-                description: "Block all temp directory access",
-                value: SettingValue::Bool(s.disable_temp),
-                default_value: SettingValue::Bool(d.disable_temp),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.defer",
-                label: "Defer lock",
-                description: "Defer sandbox until client provides roots",
-                value: SettingValue::Bool(s.defer),
-                default_value: SettingValue::Bool(d.defer),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.package_cache_write",
-                label: "Package cache write",
-                description: "Allow cargo registry/git cache writes",
-                value: SettingValue::Bool(s.package_cache_write),
-                default_value: SettingValue::Bool(d.package_cache_write),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.allow_keychain",
-                label: "Allow keychain",
-                description: "macOS: allow keychain read/write (gh, git-credential-osxkeychain)",
-                value: SettingValue::Bool(s.allow_keychain),
-                default_value: SettingValue::Bool(d.allow_keychain),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.allow_gpu",
-                label: "Allow GPU (Metal)",
-                description: "macOS: let sandboxed commands open the GPU; off = GPU work falls back to CPU (a capability, not a path)",
-                value: SettingValue::Bool(s.allow_gpu),
-                default_value: SettingValue::Bool(d.allow_gpu),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.allow_git_hooks",
-                label: "Allow git hooks",
-                description: "Let tools write <git dir>/hooks/**; a hook runs OUTSIDE the sandbox",
-                value: SettingValue::Bool(s.allow_git_hooks),
-                default_value: SettingValue::Bool(d.allow_git_hooks),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "sandbox.allow_project_tool_config",
-                label: "Allow project tool config",
-                description: "Let tools write this workspace's .ahma/ MTDF tool definitions",
-                value: SettingValue::Bool(s.allow_project_tool_config),
-                default_value: SettingValue::Bool(d.allow_project_tool_config),
-                security_tier: true,
-            },
+            SettingItem::new(
+                "sandbox.disable",
+                "Disable sandbox",
+                "Ignored — only the --no-sandbox flag disables the sandbox",
+                SettingValue::Bool(s.disable),
+                SettingValue::Bool(d.disable),
+            ),
+            SettingItem::new(
+                "sandbox.tmp_access",
+                "Temp access",
+                "Add system temp dir to sandbox scope",
+                SettingValue::Bool(s.tmp_access),
+                SettingValue::Bool(d.tmp_access),
+            ),
+            SettingItem::new(
+                "sandbox.disable_temp",
+                "Disable temp",
+                "Block all temp directory access",
+                SettingValue::Bool(s.disable_temp),
+                SettingValue::Bool(d.disable_temp),
+            ),
+            SettingItem::new(
+                "sandbox.defer",
+                "Defer lock",
+                "Defer sandbox until client provides roots",
+                SettingValue::Bool(s.defer),
+                SettingValue::Bool(d.defer),
+            ),
+            SettingItem::new(
+                "sandbox.package_cache_write",
+                "Package cache write",
+                "Allow cargo registry/git cache writes",
+                SettingValue::Bool(s.package_cache_write),
+                SettingValue::Bool(d.package_cache_write),
+            ),
+            SettingItem::new(
+                "sandbox.allow_keychain",
+                "Allow keychain",
+                "macOS: allow keychain read/write (gh, git-credential-osxkeychain)",
+                SettingValue::Bool(s.allow_keychain),
+                SettingValue::Bool(d.allow_keychain),
+            ),
+            SettingItem::new(
+                "sandbox.allow_gpu",
+                "Allow GPU (Metal)",
+                "macOS: let sandboxed commands open the GPU; off = GPU work falls back to CPU (a capability, not a path)",
+                SettingValue::Bool(s.allow_gpu),
+                SettingValue::Bool(d.allow_gpu),
+            ),
+            SettingItem::new(
+                "sandbox.allow_git_hooks",
+                "Allow git hooks",
+                "Let tools write <git dir>/hooks/**; a hook runs OUTSIDE the sandbox",
+                SettingValue::Bool(s.allow_git_hooks),
+                SettingValue::Bool(d.allow_git_hooks),
+            ),
+            SettingItem::new(
+                "sandbox.allow_project_tool_config",
+                "Allow project tool config",
+                "Let tools write this workspace's .ahma/ MTDF tool definitions",
+                SettingValue::Bool(s.allow_project_tool_config),
+                SettingValue::Bool(d.allow_project_tool_config),
+            ),
         ]
     }
 
@@ -698,23 +705,23 @@ impl SettingsEditor {
             })
             .collect();
         let web = &self.settings.web;
-        let row = |key, label, description, value| SettingItem {
-            key,
-            label,
-            description,
-            default_value: SettingValue::StringList(Vec::new()),
-            value,
-            security_tier: true,
+        let row = |key, label, description, value| {
+            SettingItem::new(
+                key,
+                label,
+                description,
+                value,
+                SettingValue::StringList(Vec::new()),
+            )
         };
         vec![
-            SettingItem {
-                key: "permissions.trusted",
-                label: "Trust this folder",
-                description: "Tools run here without asking; outside, network and settings still ask. Space changes (confirm)",
-                value: SettingValue::Bool(perms.is_workspace_trusted(&key)),
-                default_value: SettingValue::Bool(false),
-                security_tier: true,
-            },
+            SettingItem::new(
+                "permissions.trusted",
+                "Trust this folder",
+                "Tools run here without asking; outside, network and settings still ask. Space changes (confirm)",
+                SettingValue::Bool(perms.is_workspace_trusted(&key)),
+                SettingValue::Bool(false),
+            ),
             row(
                 "permissions.tool_approvals",
                 "Always-allowed tools here",
@@ -792,13 +799,14 @@ impl SettingsEditor {
     fn model_items(&self) -> Vec<SettingItem> {
         let a = &self.settings.agent;
         let text = |v: &Option<String>| SettingValue::String(v.clone().unwrap_or_default());
-        let row = |key, label, description, value| SettingItem {
-            key,
-            label,
-            description,
-            default_value: SettingValue::String(String::new()),
-            value,
-            security_tier: false,
+        let row = |key, label, description, value| {
+            SettingItem::new(
+                key,
+                label,
+                description,
+                value,
+                SettingValue::String(String::new()),
+            )
         };
         vec![
             row(
@@ -821,38 +829,34 @@ impl SettingsEditor {
         let l = &self.settings.logging;
         let d = &defaults.logging;
         vec![
-            SettingItem {
-                key: "logging.target",
-                label: "Log target",
-                description: "\"file\" (rolling) or \"stderr\"",
-                value: SettingValue::String(l.target.clone()),
-                default_value: SettingValue::String(d.target.clone()),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "logging.log_monitor",
-                label: "Log monitor",
-                description: "Enable live log monitoring via LLM",
-                value: SettingValue::Bool(l.log_monitor),
-                default_value: SettingValue::Bool(d.log_monitor),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "logging.monitor_rate_limit_secs",
-                label: "Monitor rate limit",
-                description: "Min seconds between log-monitor alerts",
-                value: SettingValue::U64(l.monitor_rate_limit_secs),
-                default_value: SettingValue::U64(d.monitor_rate_limit_secs),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "logging.dir",
-                label: "Log directory",
-                description: "Empty = repo root's .ahma/logs/; set to keep logs out of the tree",
-                value: SettingValue::String(l.dir.clone()),
-                default_value: SettingValue::String(d.dir.clone()),
-                security_tier: false,
-            },
+            SettingItem::new(
+                "logging.target",
+                "Log target",
+                "\"file\" (rolling) or \"stderr\"",
+                SettingValue::String(l.target.clone()),
+                SettingValue::String(d.target.clone()),
+            ),
+            SettingItem::new(
+                "logging.log_monitor",
+                "Log monitor",
+                "Enable live log monitoring via LLM",
+                SettingValue::Bool(l.log_monitor),
+                SettingValue::Bool(d.log_monitor),
+            ),
+            SettingItem::new(
+                "logging.monitor_rate_limit_secs",
+                "Monitor rate limit",
+                "Min seconds between log-monitor alerts",
+                SettingValue::U64(l.monitor_rate_limit_secs),
+                SettingValue::U64(d.monitor_rate_limit_secs),
+            ),
+            SettingItem::new(
+                "logging.dir",
+                "Log directory",
+                "Empty = repo root's .ahma/logs/; set to keep logs out of the tree",
+                SettingValue::String(l.dir.clone()),
+                SettingValue::String(d.dir.clone()),
+            ),
         ]
     }
 
@@ -860,30 +864,27 @@ impl SettingsEditor {
         let h = &self.settings.http;
         let d = &defaults.http;
         vec![
-            SettingItem {
-                key: "http.handshake_timeout_secs",
-                label: "Handshake timeout",
-                description: "MCP handshake timeout (seconds)",
-                value: SettingValue::U64(h.handshake_timeout_secs),
-                default_value: SettingValue::U64(d.handshake_timeout_secs),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "http.disable_quic",
-                label: "Disable QUIC",
-                description: "Disable HTTP/3; fall back to HTTP/2",
-                value: SettingValue::Bool(h.disable_quic),
-                default_value: SettingValue::Bool(d.disable_quic),
-                security_tier: false,
-            },
-            SettingItem {
-                key: "http.disable_http1_1",
-                label: "Disable HTTP/1.1",
-                description: "Require HTTP/2+",
-                value: SettingValue::Bool(h.disable_http1_1),
-                default_value: SettingValue::Bool(d.disable_http1_1),
-                security_tier: false,
-            },
+            SettingItem::new(
+                "http.handshake_timeout_secs",
+                "Handshake timeout",
+                "MCP handshake timeout (seconds)",
+                SettingValue::U64(h.handshake_timeout_secs),
+                SettingValue::U64(d.handshake_timeout_secs),
+            ),
+            SettingItem::new(
+                "http.disable_quic",
+                "Disable QUIC",
+                "Disable HTTP/3; fall back to HTTP/2",
+                SettingValue::Bool(h.disable_quic),
+                SettingValue::Bool(d.disable_quic),
+            ),
+            SettingItem::new(
+                "http.disable_http1_1",
+                "Disable HTTP/1.1",
+                "Require HTTP/2+",
+                SettingValue::Bool(h.disable_http1_1),
+                SettingValue::Bool(d.disable_http1_1),
+            ),
         ]
     }
 
@@ -891,36 +892,33 @@ impl SettingsEditor {
         let a = &self.settings.auth;
         let d = &defaults.auth;
         vec![
-            SettingItem {
-                key: "auth.rate_limit_rps",
-                label: "Rate limit RPS",
-                description: "Max requests/second (0 = unlimited)",
-                value: SettingValue::U64(a.rate_limit_rps),
-                default_value: SettingValue::U64(d.rate_limit_rps),
-                security_tier: true,
-            },
-            SettingItem {
-                key: "auth.rate_limit_burst",
-                label: "Rate limit burst",
-                description: "Burst allowance for rate limiter",
-                value: SettingValue::U32(a.rate_limit_burst),
-                default_value: SettingValue::U32(d.rate_limit_burst),
-                security_tier: true,
-            },
+            SettingItem::new(
+                "auth.rate_limit_rps",
+                "Rate limit RPS",
+                "Max requests/second (0 = unlimited)",
+                SettingValue::U64(a.rate_limit_rps),
+                SettingValue::U64(d.rate_limit_rps),
+            ),
+            SettingItem::new(
+                "auth.rate_limit_burst",
+                "Rate limit burst",
+                "Burst allowance for rate limiter",
+                SettingValue::U32(a.rate_limit_burst),
+                SettingValue::U32(d.rate_limit_burst),
+            ),
         ]
     }
 
     fn instance_items(&self, defaults: &AhmaSettings) -> Vec<SettingItem> {
         let i = &self.settings.instance;
         let d = &defaults.instance;
-        vec![SettingItem {
-            key: "instance.label",
-            label: "Instance label",
-            description: "Name shown in TUI and hub",
-            value: SettingValue::String(i.label.clone()),
-            default_value: SettingValue::String(d.label.clone()),
-            security_tier: false,
-        }]
+        vec![SettingItem::new(
+            "instance.label",
+            "Instance label",
+            "Name shown in TUI and hub",
+            SettingValue::String(i.label.clone()),
+            SettingValue::String(d.label.clone()),
+        )]
     }
 
     // ── Apply edits back to the settings struct ──────────────────────────
@@ -1195,6 +1193,52 @@ mod tests {
         };
         editor.close();
         assert!(!editor.open);
+    }
+
+    /// The rows the panel shows read-only are exactly the ones each row used
+    /// to mark by hand (pinned here as they were), now read from each key's
+    /// tier; and every row but the folder-trust switch is a real setting.
+    #[test]
+    fn read_only_rows_are_the_non_preference_keys() {
+        let editor = SettingsEditor::default();
+        let items: Vec<SettingItem> = SettingsCategory::ALL
+            .iter()
+            .flat_map(|c| editor.items_for_category(*c))
+            .collect();
+        let read_only: Vec<&str> = items
+            .iter()
+            .filter(|i| i.security_tier)
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(
+            read_only,
+            [
+                "sandbox.disable",
+                "sandbox.tmp_access",
+                "sandbox.disable_temp",
+                "sandbox.defer",
+                "sandbox.package_cache_write",
+                "sandbox.allow_keychain",
+                "sandbox.allow_gpu",
+                "sandbox.allow_git_hooks",
+                "sandbox.allow_project_tool_config",
+                "permissions.trusted",
+                "permissions.tool_approvals",
+                "sandbox.persistent_scopes",
+                "web.always_allow",
+                "web.never_allow",
+                "auth.rate_limit_rps",
+                "auth.rate_limit_burst",
+            ]
+        );
+        for item in &items {
+            assert!(
+                item.key == "permissions.trusted"
+                    || ahma_common::config::SettingKey::from_dotted(item.key).is_some(),
+                "row {} is not a setting",
+                item.key
+            );
+        }
     }
 
     #[test]

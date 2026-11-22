@@ -14,7 +14,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::config::{AhmaSettings, SettingsTier, settings_tier};
+use crate::config::{AhmaSettings, SettingKey, SettingsTier, dotted_settings_tier};
 
 /// One displayed setting: its dotted key, effective (file-resolved) value, and
 /// compiled-in default value, both pre-rendered with `{:?}`.
@@ -28,129 +28,61 @@ pub struct SettingRow {
     pub default: String,
 }
 
+/// The rows `settings show` has always printed first, in this order; every
+/// other reported key follows in name order (see [`setting_rows`]). Only the
+/// order is chosen here: which keys are reported is
+/// [`SettingKey::in_settings_report`].
+const FIRST_ROWS: [SettingKey; 22] = [
+    SettingKey::LmstudioBaseUrl,
+    SettingKey::LmstudioModel,
+    SettingKey::ToolsTimeoutSecs,
+    SettingKey::ToolsExecutionMode,
+    SettingKey::ToolsSkipProbes,
+    SettingKey::SandboxDisable,
+    SettingKey::SandboxTmpAccess,
+    SettingKey::SandboxDisableTemp,
+    SettingKey::SandboxDefer,
+    SettingKey::SandboxContainerRoot,
+    SettingKey::SandboxScratchDirectory,
+    SettingKey::SandboxUseScratchDirectory,
+    SettingKey::LoggingTarget,
+    SettingKey::LoggingLogMonitor,
+    SettingKey::LoggingMonitorRateLimitSecs,
+    SettingKey::HttpHandshakeTimeoutSecs,
+    SettingKey::HttpDisableQuic,
+    SettingKey::HttpDisableHttp11,
+    SettingKey::AuthRequireTokenPath,
+    SettingKey::AuthRateLimitRps,
+    SettingKey::AuthRateLimitBurst,
+    SettingKey::InstanceLabel,
+];
+
+/// Every key `settings show` and the startup report list, in their order:
+/// the rows they have always printed first, then the rest by name.
+pub fn report_keys() -> Vec<SettingKey> {
+    let mut rest: Vec<SettingKey> = SettingKey::ALL
+        .iter()
+        .copied()
+        .filter(|k| k.in_settings_report() && !FIRST_ROWS.contains(k))
+        .collect();
+    rest.sort_by_key(|k| k.as_str());
+    FIRST_ROWS.into_iter().chain(rest).collect()
+}
+
 /// Flatten [`AhmaSettings`] into dotted-key rows: every setting but the
 /// ledger keys (R-CFG5.1).
 ///
 /// Single source of truth for *which* settings both `settings show` variants
 /// print and the startup report considers, so the three can never drift apart.
 pub fn setting_rows(s: &AhmaSettings, d: &AhmaSettings) -> Vec<SettingRow> {
-    let mut rows = Vec::new();
-    macro_rules! row {
-        ($key:expr, $field:ident . $($rest:ident).+) => {
-            rows.push(SettingRow {
-                key: $key,
-                value: format!("{:?}", s.$field.$($rest).+),
-                default: format!("{:?}", d.$field.$($rest).+),
-            });
-        };
-    }
-    row!("lmstudio.base_url", lmstudio.base_url);
-    row!("lmstudio.model", lmstudio.model);
-    row!("tools.timeout_secs", tools.timeout_secs);
-    row!("tools.execution_mode", tools.execution_mode);
-    row!("tools.skip_probes", tools.skip_probes);
-    row!("sandbox.disable", sandbox.disable);
-    row!("sandbox.tmp_access", sandbox.tmp_access);
-    row!("sandbox.disable_temp", sandbox.disable_temp);
-    row!("sandbox.defer", sandbox.defer);
-    row!("sandbox.container_root", sandbox.container_root);
-    row!("sandbox.scratch_directory", sandbox.scratch_directory);
-    row!(
-        "sandbox.use_scratch_directory",
-        sandbox.use_scratch_directory
-    );
-    row!("logging.target", logging.target);
-    row!("logging.log_monitor", logging.log_monitor);
-    row!(
-        "logging.monitor_rate_limit_secs",
-        logging.monitor_rate_limit_secs
-    );
-    row!("http.handshake_timeout_secs", http.handshake_timeout_secs);
-    row!("http.disable_quic", http.disable_quic);
-    row!("http.disable_http1_1", http.disable_http1_1);
-    row!("auth.require_token_path", auth.require_token_path);
-    row!("auth.rate_limit_rps", auth.rate_limit_rps);
-    row!("auth.rate_limit_burst", auth.rate_limit_burst);
-    row!("instance.label", instance.label);
-    // Every other setting but the ledger keys (grants: `ahma sandbox list`,
-    // `ahma permissions list`, … show them), so the report is complete
-    // (R-CFG5.1). The drift test `every_setting_key_appears_in_every_list_it_must`
-    // checks each row reads the field it names.
-    row!("agent.model", agent.model);
-    row!("agent.provider", agent.provider);
-    row!("agent.provider_url", agent.provider_url);
-    row!("auth.require_token", auth.require_token);
-    row!("http.unix_socket_path", http.unix_socket_path);
-    row!("hub.drain_timeout_secs", hub.drain_timeout_secs);
-    row!("hub.idle_timeout_secs", hub.idle_timeout_secs);
-    row!("logging.dir", logging.dir);
-    row!("network.deny_profile_hosts", network.deny_profile_hosts);
-    row!("network.profile_hosts", network.profile_hosts);
-    row!("network.restrict", network.restrict);
-    row!("permissions.advisor", permissions.advisor);
-    row!(
-        "permissions.advisor_timeout_secs",
-        permissions.advisor_timeout_secs
-    );
-    row!(
-        "sandbox.allow_credential_reads",
-        sandbox.allow_credential_reads
-    );
-    row!("sandbox.allow_git_hooks", sandbox.allow_git_hooks);
-    row!("sandbox.allow_gpu", sandbox.allow_gpu);
-    row!("sandbox.allow_keychain", sandbox.allow_keychain);
-    row!(
-        "sandbox.allow_project_tool_config",
-        sandbox.allow_project_tool_config
-    );
-    row!(
-        "sandbox.deny_credential_reads",
-        sandbox.deny_credential_reads
-    );
-    row!("sandbox.env_allow", sandbox.env_allow);
-    row!("sandbox.linux_deny_tier", sandbox.linux_deny_tier);
-    row!("sandbox.package_cache_write", sandbox.package_cache_write);
-    row!("sandbox.profiles", sandbox.profiles);
-    row!("sandbox.scopes", sandbox.scopes);
-    row!(
-        "sandbox.signal_other_processes",
-        sandbox.signal_other_processes
-    );
-    row!("sandbox.ssh_agent", sandbox.ssh_agent);
-    row!("sandbox.task_vault", sandbox.task_vault);
-    row!("sandbox.working_dirs", sandbox.working_dirs);
-    row!("tools.await_timeout_secs", tools.await_timeout_secs);
-    row!(
-        "tools.background_timeout_secs",
-        tools.background_timeout_secs
-    );
-    row!("tools.context_length", tools.context_length);
-    row!("tools.edit_guard", tools.edit_guard);
-    row!(
-        "tools.force_progress_notifications",
-        tools.force_progress_notifications
-    );
-    row!("tools.idle_timeout_secs", tools.idle_timeout_secs);
-    row!("tools.long_running", tools.long_running);
-    row!("tools.max_turns", tools.max_turns);
-    row!("tools.minimize_tokens", tools.minimize_tokens);
-    row!("tools.mutex_groups", tools.mutex_groups);
-    row!(
-        "tools.request_budget_override_secs",
-        tools.request_budget_override_secs
-    );
-    row!("tools.small_model_harness", tools.small_model_harness);
-    row!("tools.source_readers", tools.source_readers);
-    row!("tools.tool_bundles", tools.tool_bundles);
-    row!("tools.tools_dir", tools.tools_dir);
-    row!("tools.workspace_queue", tools.workspace_queue);
-    row!("web.block_private_ranges", web.block_private_ranges);
-    row!("web.default_policy", web.default_policy);
-    row!(
-        "web.on_redirect_to_new_domain",
-        web.on_redirect_to_new_domain
-    );
-    rows
+    report_keys()
+        .into_iter()
+        .map(|k| SettingRow {
+            key: k.as_str(),
+            value: k.debug_value(s),
+            default: k.debug_value(d),
+        })
+        .collect()
 }
 
 /// Whether the raw settings-file TOML explicitly sets `dotted` (e.g.
@@ -290,29 +222,22 @@ pub struct StartupLine {
     pub message: String,
 }
 
-/// Keys whose value is never logged. None of today's rows hold a secret (the
-/// bearer token is configured by *path*), but a row added later might, and a
-/// startup log is a file that outlives the process.
-pub(crate) const SECRET_KEYS: &[&str] = &["auth.require_token"];
+/// Whether `key` holds a secret, whose value is never shown or logged: a
+/// startup log is a file that outlives the process ([`SettingKey::is_secret`]).
+fn is_secret(key: &str) -> bool {
+    SettingKey::from_dotted(key).is_some_and(SettingKey::is_secret)
+}
 
-/// Keys that only a CLI flag can set (SPEC R-CFG2.3). A file value parses but
-/// never takes effect, and `parse_sandbox_settings` already warns that it was
-/// ignored, so reporting it here as a deviation would claim the opposite.
-pub(crate) const CLI_ONLY_KEYS: &[&str] = &["sandbox.disable"];
-
-/// The trust tier of a dotted key, via the one classification (R-CFG2.1).
-fn dotted_tier(dotted: &str) -> Option<SettingsTier> {
-    let (table, key) = dotted.split_once('.')?;
-    settings_tier(table, key)
+/// Whether only a CLI flag can set `key` (SPEC R-CFG2.3). A file value parses
+/// but never takes effect, and `parse_sandbox_settings` already warns that it
+/// was ignored, so reporting it here as a deviation would claim the opposite.
+fn is_cli_only(key: &str) -> bool {
+    SettingKey::from_dotted(key).is_some_and(SettingKey::is_cli_only)
 }
 
 /// `value` as every report shows it: a secret key's is `<redacted>`.
 pub fn shown_value<'a>(key: &str, value: &'a str) -> &'a str {
-    if SECRET_KEYS.contains(&key) {
-        "<redacted>"
-    } else {
-        value
-    }
+    if is_secret(key) { "<redacted>" } else { value }
 }
 
 /// One line per setting whose effective value differs from the compiled-in
@@ -323,9 +248,9 @@ pub fn startup_deviation_lines(origins: &[SettingOrigin]) -> Vec<StartupLine> {
     origins
         .iter()
         .filter(|o| o.deviates())
-        .filter(|o| o.source == SettingSource::Cli || !CLI_ONLY_KEYS.contains(&o.key))
+        .filter(|o| o.source == SettingSource::Cli || !is_cli_only(o.key))
         .map(|o| {
-            let security = dotted_tier(o.key) != Some(SettingsTier::Preference);
+            let security = dotted_settings_tier(o.key) != Some(SettingsTier::Preference);
             let (level, tier) = if security {
                 (StartupLevel::Warn, "security-tier setting")
             } else {
