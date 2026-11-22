@@ -37,7 +37,8 @@ pub(super) struct RunGuards {
 
 impl RunGuards {
     /// Start a run, the one way for every async path: wait for its turn in
-    /// the workspace queue (SPEC R2.7.1), then mark it running, not before.
+    /// the workspace queue (SPEC R2.7.1) when its admission holds a place in
+    /// line, then mark it running, not before.
     /// `None` when it was cancelled first, while queued or as its turn came;
     /// it has then been ended. `subject` is what the handoff watch's findings
     /// name.
@@ -45,7 +46,7 @@ impl RunGuards {
         monitor: &Arc<OperationMonitor>,
         op_id: &str,
         subject: &str,
-        ticket: Option<workspace_queue::Ticket>,
+        admission: workspace_queue::Admission,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<Self> {
         let mut guards = Self {
@@ -61,7 +62,7 @@ impl RunGuards {
             #[cfg(unix)]
             links: None,
         };
-        match super::wait_for_lease(ticket, monitor, op_id, cancel).await {
+        match super::wait_for_lease(admission.into_ticket(), monitor, op_id, cancel).await {
             // Held until the operation ends: until its process tree is gone.
             Ok(lease) => guards.lease = lease,
             Err(()) => {
@@ -241,9 +242,15 @@ mod tests {
             .register(Operation::new("op".into(), "t".into(), "d".into(), None))
             .await;
         monitor.ends_by_task("op").await;
-        let guards = RunGuards::begin(&monitor, "op", "t", None, &token)
-            .await
-            .expect("not cancelled yet");
+        let guards = RunGuards::begin(
+            &monitor,
+            "op",
+            "t",
+            workspace_queue::Admission::Exclusive(None),
+            &token,
+        )
+        .await
+        .expect("not cancelled yet");
 
         let cancel = {
             let monitor = monitor.clone();

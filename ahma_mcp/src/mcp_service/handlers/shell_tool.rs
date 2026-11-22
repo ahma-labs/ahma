@@ -404,7 +404,8 @@ impl AhmaMcpService {
 
         let result = self
             .adapter
-            .execute_sync_in_dir(
+            .execute_sync_in_dir_as(
+                Some(&id),
                 platform_shell_program(),
                 Some(adapter_args),
                 working_directory,
@@ -1025,6 +1026,63 @@ mod tests {
             text.contains("pty") && text.contains("session_id"),
             "the refusal names both: {text}"
         );
+    }
+
+    /// The task vault and the execution audit log name a command by one id,
+    /// so a reader can join the two logs, on the synchronous path as on the
+    /// others. The synchronous path minted a second id for the execution log.
+    #[tokio::test]
+    async fn the_vault_and_the_execution_log_name_a_command_by_one_id() {
+        let audit_dir = tempfile::tempdir().unwrap();
+        // First caller wins; read back whichever file this process writes.
+        let _ = crate::adapter::audit::set_audit_log_path(audit_dir.path().join("audit.jsonl"));
+        let exec_log = crate::adapter::audit::audit_log().path().to_path_buf();
+        let vault = tempfile::tempdir().unwrap();
+        let mcp = create_in_process_mcp_empty()
+            .await
+            .expect("in-process MCP pair must build");
+        mcp.service.set_app_config(Arc::new(AppConfig {
+            task_vault: Some(vault.path().to_path_buf()),
+            ..AppConfig::default()
+        }));
+
+        /// The `operation_id` of the `tool_call` in `log` that mentions `marker`.
+        async fn call_id(log: &Path, marker: &str) -> Option<String> {
+            let text = tokio::fs::read_to_string(log).await.unwrap_or_default();
+            text.lines()
+                .filter(|line| line.contains(marker))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|event| event["type"] == "tool_call")
+                .and_then(|event| event["operation_id"].as_str().map(str::to_string))
+        }
+
+        for (marker, mode) in [
+            ("one_id_sync_marker", "Synchronous"),
+            ("one_id_async_marker", "AsyncResultPush"),
+        ] {
+            let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command"))
+                .with_arguments(args_of(json!({
+                    "command": format!("echo {marker}"),
+                    "execution_mode": mode,
+                })));
+            let result = tokio::time::timeout(
+                TestTimeouts::get(TimeoutCategory::ToolCall),
+                mcp.client.call_tool(params),
+            )
+            .await
+            .expect("call_tool must not time out")
+            .expect("the call runs");
+            assert!(!result.is_error.unwrap_or(false), "{mode}: {result:?}");
+
+            let in_vault = call_id(&vault.path().join("audit.jsonl"), marker)
+                .await
+                .unwrap_or_else(|| panic!("{mode}: the vault records the call"));
+            let in_exec_log = call_id(&exec_log, marker)
+                .await
+                .unwrap_or_else(|| panic!("{mode}: the execution log records the call"));
+            assert_eq!(in_vault, in_exec_log, "{mode}: one id for one command");
+        }
+        let _ = mcp.client.cancel().await;
     }
 
     #[cfg(unix)]

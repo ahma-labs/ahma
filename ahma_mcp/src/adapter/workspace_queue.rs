@@ -87,6 +87,37 @@ impl Lane {
     }
 }
 
+/// How a run is let into its workspace: its lane (SPEC R2.7.4) and, for an
+/// exclusive run, its place in line (R2.7.1). One value, so a read-only or
+/// service run cannot hold a place it must not wait on, and an exclusive run's
+/// place cannot be dropped apart from its lane.
+#[derive(Debug)]
+pub(crate) enum Admission {
+    ReadOnly,
+    Service,
+    /// `None` when the queue is off (`tools.workspace_queue = false`). Boxed:
+    /// a ticket is large, and the other lanes carry nothing.
+    Exclusive(Option<Box<Ticket>>),
+}
+
+impl Admission {
+    pub(crate) fn lane(&self) -> Lane {
+        match self {
+            Admission::ReadOnly => Lane::ReadOnly,
+            Admission::Service => Lane::Service,
+            Admission::Exclusive(_) => Lane::Exclusive,
+        }
+    }
+
+    /// The place in line the run waits on before it starts, if it has one.
+    pub(crate) fn into_ticket(self) -> Option<Ticket> {
+        match self {
+            Admission::Exclusive(ticket) => ticket.map(|t| *t),
+            Admission::ReadOnly | Admission::Service => None,
+        }
+    }
+}
+
 /// What a command does to the workspace's source files, for the edit guard
 /// (SPEC R2.7.8). Published with the holder so a hook in another process can
 /// decide without re-parsing the command.

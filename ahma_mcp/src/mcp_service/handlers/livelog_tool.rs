@@ -83,7 +83,9 @@ pub async fn handle_livelog_start(
         None,
         timeout,
     );
-    monitor.add_operation(operation).await;
+    // What the task watches, handed over at registration (a cancel through
+    // `cancel_tool` signals it), so nothing has to look the operation up again.
+    let cancellation_token = monitor.register(operation).await;
 
     info!(
         "livelog_tool: registered operation '{}' for tool '{}'",
@@ -99,20 +101,16 @@ pub async fn handle_livelog_start(
     let llm_service_task = llm_service.clone();
 
     tokio::spawn(async move {
-        // Retrieve the cancellation token from the monitor (set when the operation
-        // was registered so callers can cancel via `cancel_tool`).
-        let cancellation_token = match monitor_task.get_operation(&op_id_task).await {
-            Some(op) => op.cancellation_token.clone(),
-            None => {
-                tracing::error!(
-                    "livelog_tool: operation '{}' disappeared from monitor before task started",
-                    op_id_task
-                );
-                return;
-            }
-        };
-
         monitor_task.start(&op_id_task).await;
+        // Ended before its task ran (a cancel, the monitor's deadline): it
+        // has been ended, and its source is not started.
+        if cancellation_token.is_cancelled() {
+            info!(
+                "livelog_tool: operation '{}' ended before it started",
+                op_id_task
+            );
+            return;
+        }
 
         let outcome = run_livelog_pipeline(
             &op_id_task,

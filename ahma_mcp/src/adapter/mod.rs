@@ -372,15 +372,6 @@ impl Adapter {
         workspace_queue::workspace_key(working_dir, &self.sandbox.scopes())
     }
 
-    /// A command in `lane` is about to run: one that may write spends the
-    /// session's once-grants (SPEC R-PERM.2); a read-only one cannot use a
-    /// write grant, so it leaves them for the command that can.
-    fn command_starts(&self, lane: workspace_queue::Lane) {
-        if lane != workspace_queue::Lane::ReadOnly {
-            self.sandbox.spend_once_grants();
-        }
-    }
-
     /// Which lane a call runs in (SPEC R2.7.4): what the MTDF definition
     /// declares, else — for a shell command line run in `working_dir` — what
     /// the classifier says, else exclusive. A read-only verdict the kernel
@@ -472,18 +463,44 @@ impl Adapter {
         lane::held_only_for_doubt(line).then_some(lane::SOFT_HOLD)
     }
 
-    /// Take a place in the workspace line for an exclusive operation, now —
-    /// at arrival — so arrival order is execution order (SPEC R2.7.1).
-    fn enqueue_exclusive(
+    /// Let a run in `lane` into its workspace (SPEC R2.7), now, at arrival.
+    ///
+    /// A run that may write spends the session's once-grants (SPEC R-PERM.2);
+    /// a read-only one cannot use a write grant, so it leaves them for the
+    /// command that can. An exclusive run takes its place in line here, so
+    /// arrival order is execution order (R2.7.1); `reason` is why it waits its
+    /// turn (R2.7.4) and `soft_hold` how long it holds the workspace when it
+    /// holds it only out of doubt (R2.7.11).
+    fn admit(
         &self,
         lane: workspace_queue::Lane,
         working_dir: &std::path::Path,
         op_id: &str,
         title: &str,
-    ) -> Option<workspace_queue::Ticket> {
-        if lane != workspace_queue::Lane::Exclusive {
-            return None;
+        reason: Option<String>,
+        soft_hold: Option<Duration>,
+    ) -> workspace_queue::Admission {
+        use workspace_queue::{Admission, Lane};
+        if lane != Lane::ReadOnly {
+            self.sandbox.spend_once_grants();
         }
+        match lane {
+            Lane::ReadOnly => Admission::ReadOnly,
+            Lane::Service => Admission::Service,
+            Lane::Exclusive => Admission::Exclusive(
+                self.enqueue(working_dir, op_id, title)
+                    .map(|t| Box::new(t.with_reason(reason).with_soft_hold(soft_hold))),
+            ),
+        }
+    }
+
+    /// Take a place in the workspace line for an exclusive operation.
+    fn enqueue(
+        &self,
+        working_dir: &std::path::Path,
+        op_id: &str,
+        title: &str,
+    ) -> Option<workspace_queue::Ticket> {
         let key = self.workspace_key_for(working_dir);
         let mut holder = workspace_queue::HolderInfo::new(op_id, title)
             .with_typical_secs(self.monitor.typical_duration_secs(title));
@@ -616,7 +633,7 @@ impl Adapter {
         // Every execution path validates its working directory first, so this is
         // where "a command starts" is observed: the ledger and leases are
         // brought up to date here (SPEC R-PERM.2). Once-grants move on only
-        // when the command's lane is known ([`Self::command_starts`]).
+        // when the command's lane is known ([`Self::admit`]).
         self.sandbox.begin_command();
         match self
             .sandbox
@@ -831,9 +848,36 @@ impl Adapter {
     ///
     /// Returns the command output (stdout + stderr) as a `String` if successful.
     /// Returns an error if execution fails or times out.
-    #[tracing::instrument(skip(self, args, subcommand_config), fields(working_dir))]
-    pub async fn execute_sync_in_dir(
+    ///
+    /// Not an `async fn` of its own: it hands back
+    /// [`Self::execute_sync_in_dir_as`]'s future rather than wrapping it in
+    /// another, which would nest every server future one level deeper.
+    pub fn execute_sync_in_dir(
         &self,
+        command: &str,
+        args: Option<Map<String, serde_json::Value>>,
+        working_dir: &str,
+        timeout_seconds: Option<u64>,
+        subcommand_config: Option<&crate::config::SubcommandConfig>,
+    ) -> impl std::future::Future<Output = Result<String, anyhow::Error>> {
+        self.execute_sync_in_dir_as(
+            None,
+            command,
+            args,
+            working_dir,
+            timeout_seconds,
+            subcommand_config,
+        )
+    }
+
+    /// [`Self::execute_sync_in_dir`] as operation `id`: the id the caller
+    /// already recorded this call under (the task vault, progress), so the
+    /// execution audit log names it the same and the logs can be joined.
+    /// `None` mints one, from the one counter every id comes from.
+    #[tracing::instrument(skip(self, args, subcommand_config), fields(working_dir))]
+    pub async fn execute_sync_in_dir_as(
+        &self,
+        id: Option<&str>,
         command: &str,
         args: Option<Map<String, serde_json::Value>>,
         working_dir: &str,
@@ -881,10 +925,10 @@ impl Adapter {
             args_vec
         );
 
-        // Provenance before execution (SPEC R-HANDOFF / audit): the synchronous
-        // path has no operation id of its own, so mint one purely so the
-        // `tool_call` and its `tool_complete` can be correlated in the log.
-        let op_id = generate_id(command, command);
+        // Provenance before execution (SPEC R-HANDOFF.10): the synchronous
+        // path has no operation, so the id is the caller's, or one minted
+        // here, so the `tool_call` and its `tool_complete` can be correlated.
+        let op_id = id.map_or_else(|| generate_id(command, command), str::to_string);
         let safe_wd_str = safe_wd.to_string_lossy().into_owned();
 
         // Workspace write queue (SPEC R2.7): the synchronous path — terminal
@@ -893,17 +937,14 @@ impl Adapter {
         // an MCP `cargo nextest run`.
         let (lane, queue_reason) =
             self.resolve_lane_with_reason(args.as_ref(), subcommand_config, &safe_wd);
-        self.command_starts(lane);
         let title = shell_command_line(written.as_ref().or(args.as_ref()))
             .map(str::to_string)
             .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
         let timeout =
             self.sync_timeout(timeout_seconds.or_else(|| self.declared_timeout(args.as_ref())));
         let soft_hold = self.soft_hold_for(args.as_ref(), subcommand_config, lane);
-        let lease = match self
-            .enqueue_exclusive(lane, &safe_wd, &op_id, &title)
-            .map(|t| t.with_reason(queue_reason).with_soft_hold(soft_hold))
-        {
+        let admission = self.admit(lane, &safe_wd, &op_id, &title, queue_reason, soft_hold);
+        let lease = match admission.into_ticket() {
             Some(ticket) => Some(self.acquire_for_sync(ticket, timeout).await?),
             None => None,
         };
@@ -1602,18 +1643,22 @@ impl Adapter {
         // synchronously, before anything is spawned.
         let (lane, queue_reason) =
             self.resolve_lane_with_reason(run_args.as_ref(), subcommand_config, &safe_wd);
-        self.command_starts(lane);
-        let workspace = self.workspace_key_for(&safe_wd);
-        let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
         let holder_title = operation
             .command
             .clone()
             .or_else(|| operation.title.clone())
             .unwrap_or_else(|| command.to_string());
         let soft_hold = self.soft_hold_for(args.as_ref(), subcommand_config, lane);
-        let ticket = self
-            .enqueue_exclusive(lane, &safe_wd, &op_id, &holder_title)
-            .map(|t| t.with_reason(queue_reason).with_soft_hold(soft_hold));
+        let admission = self.admit(
+            lane,
+            &safe_wd,
+            &op_id,
+            &holder_title,
+            queue_reason,
+            soft_hold,
+        );
+        let workspace = self.workspace_key_for(&safe_wd);
+        let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
         let display_command = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| command.to_string());
@@ -1655,8 +1700,7 @@ impl Adapter {
             command_executor: self.command_executor.clone(),
             mutex_registry: self.mutex_registry.clone(),
             scope_grant_notifier: self.scope_grant_notifier.clone(),
-            lane,
-            ticket,
+            admission,
             workspace,
             drift_root,
             display_command,
@@ -1687,9 +1731,17 @@ impl Adapter {
         id: Option<String>,
     ) -> Result<String> {
         let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
-        // No lane of its own: it may write.
-        self.command_starts(workspace_queue::Lane::Exclusive);
         let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
+        // A PTY command is an arbitrary shell command: it may write, so it is
+        // exclusive (SPEC R2.7), and takes its place in line on arrival.
+        let admission = self.admit(
+            workspace_queue::Lane::Exclusive,
+            &safe_wd,
+            &op_id,
+            command_str,
+            None,
+            None,
+        );
         // A whole-line `open <URL>` runs as the link helper (SPEC R-LINK.10);
         // the operation keeps the line as written.
         #[cfg(unix)]
@@ -1752,20 +1804,13 @@ impl Adapter {
             root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
             lane: workspace_queue::Lane::Exclusive,
         };
-        // A PTY command is an arbitrary shell command: exclusive (SPEC R2.7).
-        let ticket = self.enqueue_exclusive(
-            workspace_queue::Lane::Exclusive,
-            &safe_wd,
-            &op_id,
-            &command_str,
-        );
 
         let task = async move {
             let Some(guards) = guards::RunGuards::begin(
                 &monitor,
                 &op_id_task,
                 &tool_task,
-                ticket,
+                admission,
                 &cancellation_token,
             )
             .await
@@ -1857,9 +1902,17 @@ impl Adapter {
         id: Option<String>,
     ) -> Result<String> {
         let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
-        // No lane of its own: it may write.
-        self.command_starts(workspace_queue::Lane::Exclusive);
         let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
+        // A session command is an arbitrary shell command: it may write, so it
+        // is exclusive (SPEC R2.7), and takes its place in line on arrival.
+        let admission = self.admit(
+            workspace_queue::Lane::Exclusive,
+            &safe_wd,
+            &op_id,
+            command_str,
+            None,
+            None,
+        );
 
         let mut operation = Operation::new_with_timeout(
             op_id.clone(),
@@ -1901,20 +1954,13 @@ impl Adapter {
             root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
             lane: workspace_queue::Lane::Exclusive,
         };
-        // A session command is an arbitrary shell command: exclusive (SPEC R2.7).
-        let ticket = self.enqueue_exclusive(
-            workspace_queue::Lane::Exclusive,
-            &safe_wd,
-            &op_id,
-            &command_str,
-        );
 
         let task = async move {
             let Some(guards) = guards::RunGuards::begin(
                 &monitor,
                 &op_id_task,
                 &tool_task,
-                ticket,
+                admission,
                 &cancellation_token,
             )
             .await
@@ -2091,10 +2137,8 @@ struct AsyncOperationRun {
     command_executor: Arc<dyn executor::CommandExecutor>,
     mutex_registry: Arc<CommandMutexRegistry>,
     scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
-    /// Workspace-queue lane (SPEC R2.7.4).
-    lane: workspace_queue::Lane,
-    /// Place in the workspace line, for an exclusive operation.
-    ticket: Option<workspace_queue::Ticket>,
+    /// Its lane and, if exclusive, its place in line (SPEC R2.7).
+    admission: workspace_queue::Admission,
     /// The workspace key (SPEC R2.7.2): the mutex groups' key.
     workspace: std::path::PathBuf,
     /// Where the drift probe walks: the workspace, clipped to the sandbox
@@ -2165,8 +2209,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         command_executor,
         mutex_registry,
         scope_grant_notifier,
-        lane,
-        ticket,
+        admission,
         workspace,
         drift_root,
         display_command,
@@ -2184,8 +2227,9 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // Wait for every exclusive operation that arrived earlier in this
     // workspace — in this process or any other — before starting. The lease is
     // held until the operation ends, i.e. until the process tree is gone.
+    let lane = admission.lane();
     let Some(guards) =
-        guards::RunGuards::begin(&monitor, &op_id, &command, ticket, &cancellation_token).await
+        guards::RunGuards::begin(&monitor, &op_id, &command, admission, &cancellation_token).await
     else {
         return;
     };
@@ -4126,6 +4170,35 @@ mod tests {
         (Adapter::new(monitor, shell_pool, sandbox).unwrap(), td)
     }
 
+    /// SPEC R2.7.1, R2.7.4: only an exclusive run takes a place in its
+    /// workspace's line; a read-only or service run never holds one, and with
+    /// the queue off no run does.
+    #[test]
+    fn only_an_exclusive_run_takes_a_place_in_line() {
+        use workspace_queue::{Admission, Lane, WorkspaceQueue};
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let queued = adapter.with_workspace_queue(WorkspaceQueue::with_lock_dir(true, None));
+        let admit = |adapter: &Adapter, lane| adapter.admit(lane, td.path(), "op", "t", None, None);
+        for lane in [Lane::ReadOnly, Lane::Service] {
+            let admission = admit(&queued, lane);
+            assert_eq!(admission.lane(), lane);
+            assert!(
+                admission.into_ticket().is_none(),
+                "{lane:?} takes no place in line"
+            );
+        }
+        let admission = admit(&queued, Lane::Exclusive);
+        assert!(
+            matches!(admission, Admission::Exclusive(Some(_))),
+            "an exclusive run takes its place: {admission:?}"
+        );
+        let (off, _td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        assert!(
+            matches!(admit(&off, Lane::Exclusive), Admission::Exclusive(None)),
+            "with the queue off, no run has a place in line"
+        );
+    }
+
     /// A command cancelled after it was registered but before it started
     /// leaves no task handle behind: every other way an async task ends removes
     /// its own, and this one did not, so the handle lived until shutdown.
@@ -4571,12 +4644,13 @@ mod tests {
             .add_once_grant(cache.path(), ahma_common::config::ScopeAccess::Rw)
             .unwrap();
         let live = || adapter.sandbox().scopes().iter().any(|s| s == &canon);
-        adapter.command_starts(workspace_queue::Lane::ReadOnly);
-        adapter.command_starts(workspace_queue::Lane::ReadOnly);
+        let admit = |lane| adapter.admit(lane, cache.path(), "op", "t", None, None);
+        admit(workspace_queue::Lane::ReadOnly);
+        admit(workspace_queue::Lane::ReadOnly);
         assert!(live(), "`git status` twice leaves it for the build");
-        adapter.command_starts(workspace_queue::Lane::Exclusive);
+        admit(workspace_queue::Lane::Exclusive);
         assert!(live(), "the build gets it");
-        adapter.command_starts(workspace_queue::Lane::Exclusive);
+        admit(workspace_queue::Lane::Exclusive);
         assert!(!live(), "and the command after it does not");
     }
 
