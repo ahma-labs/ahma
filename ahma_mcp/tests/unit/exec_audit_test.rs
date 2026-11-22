@@ -300,6 +300,64 @@ async fn the_synchronous_path_records_a_failed_command() {
     assert_eq!(complete["success"], false);
 }
 
+/// The synchronous path returns how a command ended inline, as the error of
+/// the call, and audits the same ending under the id the caller gave it: a
+/// non-zero exit is `failed` with its exit code in both, and a command stopped
+/// at its time limit is `timed_out` with no exit code (SPEC R-HANDOFF.10).
+#[tokio::test]
+async fn the_synchronous_path_returns_its_ending_inline_and_audits_the_same_one() {
+    use ahma_mcp::adapter::ExecutionMode;
+    let (_dir, scope) = scope_dir();
+    let adapter = test_adapter(&scope);
+    let run = |id: &'static str, line: &'static str, limit: u64| {
+        let (adapter, scope) = (&adapter, &scope);
+        async move {
+            let mut args = Map::new();
+            args.insert("command".into(), json!(line));
+            args.insert("c_flag".into(), json!(true));
+            let config = ahma_mcp::AhmaMcpService::build_shell_subcommand_config(
+                Some(limit),
+                &ExecutionMode::Synchronous,
+            );
+            adapter
+                .execute_sync_in_dir_as(
+                    Some(id),
+                    ahma_mcp::shell_pool::platform_shell_program(),
+                    Some(args),
+                    scope.to_str().unwrap(),
+                    Some(limit),
+                    Some(&config),
+                )
+                .await
+        }
+    };
+
+    // `exit` and `sleep` mean the same in sh and PowerShell.
+    let limit = TestTimeouts::get(TimeoutCategory::ToolCall).as_secs();
+    let err = run("op_sync_exit_three", "exit 3", limit)
+        .await
+        .expect_err("a non-zero exit is an error");
+    assert!(err.to_string().contains("exit code 3"), "{err:#}");
+    let events = events_for("op_sync_exit_three").await;
+    assert_eq!(events.len(), 2, "one pair: {events:?}");
+    assert_eq!(events[0]["type"], "tool_call");
+    assert_eq!(events[1]["type"], "tool_complete");
+    assert_eq!(events[1]["outcome"], "failed", "{events:?}");
+    assert_eq!(events[1]["exit_code"], 3, "{events:?}");
+
+    let err = run("op_sync_timed_out", "sleep 30", 1)
+        .await
+        .expect_err("stopped at its limit");
+    assert!(
+        err.to_string().contains("exceeded timeout limit"),
+        "{err:#}"
+    );
+    let events = events_for("op_sync_timed_out").await;
+    assert_eq!(events.len(), 2, "one pair: {events:?}");
+    assert_eq!(events[1]["outcome"], "timed_out", "{events:?}");
+    assert!(events[1]["exit_code"].is_null(), "{events:?}");
+}
+
 /// A command that gave up waiting for its `tools.mutex_groups` gate is
 /// published `Failed`, so its audit record says `failed`: the operation's
 /// state and its audit record are two views of one end. The record used to

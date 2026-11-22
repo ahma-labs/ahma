@@ -49,6 +49,7 @@ pub mod executor;
 mod guards;
 pub mod lane;
 pub mod mutex_groups;
+mod piped;
 mod preparer;
 mod pty_exec;
 mod sink;
@@ -552,23 +553,6 @@ impl Adapter {
         self
     }
 
-    /// The broker lease for a command about to run in `working_dir`, with the
-    /// command pointed at it. Held until the command has finished.
-    #[cfg(unix)]
-    fn lease_credential_broker(
-        &self,
-        cmd: &mut tokio::process::Command,
-        working_dir: &std::path::Path,
-        command: Option<&str>,
-    ) -> Option<crate::credentials::ssh_agent::host::BrokerLease> {
-        let lease = self
-            .credential_brokers
-            .as_ref()?
-            .lease_for_command(working_dir, command)?;
-        cmd.env("SSH_AUTH_SOCK", lease.socket());
-        Some(lease)
-    }
-
     /// Serve each command a link broker from `factory` (SPEC R-LINK.1). A
     /// command that gets one may connect to its socket in the broker
     /// directory, whatever `[sandbox] ssh_agent` says; that is decided per
@@ -580,21 +564,6 @@ impl Adapter {
     ) -> Self {
         self.link_brokers = Some(factory);
         self
-    }
-
-    /// The link lease for a command about to run in `working_dir`, taken
-    /// before its sandbox is built: whether it has one decides whether its
-    /// profile lets it reach the broker directory. Held until the command
-    /// has finished.
-    #[cfg(unix)]
-    fn lease_link_broker(
-        &self,
-        working_dir: &std::path::Path,
-        command: Option<&str>,
-    ) -> Option<crate::links::host::LinkLease> {
-        self.link_brokers
-            .as_ref()?
-            .lease_for_command(working_dir, command)
     }
 
     /// A whole-line `open <URL>` (SPEC R-LINK.10) as the line ahma runs
@@ -943,11 +912,16 @@ impl Adapter {
             self.sync_timeout(timeout_seconds.or_else(|| self.declared_timeout(args.as_ref())));
         let soft_hold = self.soft_hold_for(args.as_ref(), subcommand_config, lane);
         let admission = self.admit(lane, &safe_wd, &op_id, &title, queue_reason, soft_hold);
+        // Its own wait, not `RunGuards::begin`'s: bounded by the command's
+        // timeout, and a turn that never comes is an error returned here.
         let lease = match admission.into_ticket() {
             Some(ticket) => Some(self.acquire_for_sync(ticket, timeout).await?),
             None => None,
         };
 
+        // Sync only: the `tool_call` is written once the turn has come, so a
+        // call that gave up waiting leaves no record (the async path writes
+        // it before queueing).
         audit::record_tool_call(
             &op_id,
             command,
@@ -961,36 +935,61 @@ impl Adapter {
         // SPEC R6.1.7: where the kernel does not hold the deny tier, take its
         // inventory now and compare after the process is gone — before the
         // lease is released, so the next command's writes are not this one's.
+        // Sync only: taken before the brokers are leased and the sandbox is
+        // built (the async path takes it just before the spawn).
         let handoff = if self.watches_handoff(lane) {
             Some(begin_handoff_watch(&self.sandbox, &safe_wd).await)
         } else {
             None
         };
 
-        let start_time = Instant::now();
-        let mut run = self
-            .run_sync_prepared(
-                command,
-                &op_id,
-                &program,
-                &args_vec,
-                &safe_wd,
-                timeout,
-                lane,
-                lease.as_ref(),
-                shell_command_line(args.as_ref()),
-            )
-            .await;
-        if let Some(watch) = handoff
-            && let Some(report) = finish_handoff_watch(watch, &op_id, command).await
-        {
+        // What the call holds until the command has ended: the async path's
+        // guards, without an operation. The clock starts here, after the
+        // wait for the workspace. Sync only: no `tools.mutex_groups` gate
+        // (SPEC R2.7.2) and no drift report (R2.7.6).
+        let mut guards = guards::RunGuards::held(&op_id, command, lease);
+        guards.watch_handoff(handoff);
+        // The line it runs: for a whole-line `open <URL>`, the link helper's
+        // (SPEC R-LINK.10). Sync only: its brokers and the long-running check
+        // are matched on this line; the async path matches the line as written.
+        let line = shell_command_line(args.as_ref());
+        let piped = piped::PipedSpawn {
+            executor: self.command_executor.as_ref(),
+            sandbox: &self.sandbox,
+            #[cfg(unix)]
+            credential_brokers: self.credential_brokers.as_ref(),
+            #[cfg(unix)]
+            link_brokers: self.link_brokers.as_ref(),
+            program: &program,
+            args: &args_vec,
+            working_dir: &safe_wd,
+            lane,
+            line: line.unwrap_or(command),
+            keep_leftovers: line.is_some_and(|line| self.is_declared_long_running(line)),
+        }
+        .build(&mut guards);
+        let mut run = match piped {
+            Ok(piped) => {
+                self.run_sync_prepared(
+                    line.unwrap_or(command),
+                    &op_id,
+                    piped,
+                    &safe_wd,
+                    timeout,
+                    &guards,
+                )
+                .await
+            }
+            Err(e) => SyncRun::failed(e),
+        };
+        let released = guards.release().await;
+        if let Some(report) = released.handoff {
             run = run.with_handoff_alert(&report.render_alert());
         }
-        drop(lease);
         audit::record_tool_complete(
             &op_id,
             run.outcome,
-            start_time.elapsed().as_millis() as u64,
+            released.started.elapsed().as_millis() as u64,
             run.exit_code,
         )
         .await;
@@ -1064,78 +1063,31 @@ impl Adapter {
         }
     }
 
-    /// Spawn, wait for, and interpret one prepared synchronous command.
+    /// Spawn, wait for, and interpret one synchronous command, built by
+    /// [`piped::PipedSpawn::build`] as the async piped path builds its own.
+    /// `command` is the line it runs, which its failure is explained by;
+    /// `guards` hold its brokers, whose refusals its result says.
     ///
     /// Split out of [`Self::execute_sync_in_dir`] so that every terminal path —
     /// spawn failure, timeout, non-zero exit, sandbox denial — funnels through a
     /// single return value the caller can turn into exactly one `tool_complete`
     /// audit event.  Recording completion at each `return` instead would be one
     /// forgotten branch away from a `tool_call` that never closes.
-    #[allow(clippy::too_many_arguments)]
     async fn run_sync_prepared(
         &self,
         command: &str,
         op_id: &str,
-        program: &str,
-        args_vec: &[String],
+        piped: piped::PipedCommand,
         safe_wd: &std::path::Path,
         timeout: Duration,
-        lane: workspace_queue::Lane,
-        lease: Option<&workspace_queue::Lease>,
-        shell_command: Option<&str>,
+        guards: &guards::RunGuards,
     ) -> SyncRun {
-        let effective_command = shell_command.unwrap_or(command);
-        // Its link broker (SPEC R-LINK.1), held until the command has ended,
-        // and leased before its sandbox is built: having one is what lets
-        // this command, and no other, reach the broker directory.
-        #[cfg(unix)]
-        let links = self.lease_link_broker(safe_wd, Some(effective_command));
-        #[cfg(unix)]
-        let served_links = links.is_some();
         #[cfg(not(unix))]
-        let served_links = false;
-        // Create sandboxed command.
-        // `create_shell_command` is only needed for raw /bin/sh invocations where
-        // the caller has NOT already added the -c flag via a subcommand config.
-        // For bash/powershell the preparer already embeds -c/-Command; always
-        // use create_command so the sandbox wrapper is applied without double-wrapping.
-        let built = build_for_this_command(served_links, || {
-            if lane == workspace_queue::Lane::ReadOnly {
-                self.command_executor.build_read_only_command(
-                    &self.sandbox,
-                    program,
-                    args_vec,
-                    safe_wd,
-                )
-            } else {
-                build_sandboxed_command(
-                    self.command_executor.as_ref(),
-                    &self.sandbox,
-                    program,
-                    args_vec,
-                    safe_wd,
-                )
-            }
-        });
-        let mut cmd = match built {
-            Ok(cmd) => cmd,
-            Err(e) => return SyncRun::failed(e),
-        };
-        stamp_lease(&mut cmd, lease);
-        if shell_command.is_some_and(|line| self.is_declared_long_running(line)) {
-            sandbox::leftovers::keep(&mut cmd);
-        }
-        #[cfg(unix)]
-        let broker = self.lease_credential_broker(&mut cmd, safe_wd, Some(effective_command));
-        #[cfg(unix)]
-        if let Some(links) = &links {
-            for (key, value) in links.env() {
-                cmd.env(key, value);
-            }
-        }
-        // The tag the kernel's records of this command's denials carry
-        // (SPEC R-DENY.1).
-        let denial_tag = sandbox::kernel_denials::tag_of(cmd.as_std().get_args());
+        let _ = guards;
+        let piped::PipedCommand {
+            mut cmd,
+            denial_tag,
+        } = piped;
         let spawned_at = Instant::now();
 
         // Spawn manually (rather than `cmd.output()`) so a timeout can take down
@@ -1231,7 +1183,7 @@ impl Adapter {
         // What the SSH key broker refused this command, one line each
         // (SPEC R-CRED.10), on whichever side the result is.
         #[cfg(unix)]
-        let result = match broker.as_ref().and_then(broker_refusals) {
+        let result = match guards.broker().and_then(broker_refusals) {
             Some(lines) => match result {
                 Ok(out) => Ok(format!("{out}\n{lines}")),
                 Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
@@ -1242,8 +1194,8 @@ impl Adapter {
         // line already reached the output (SPEC R-LINK.6): a tool that ran
         // `$BROWSER` may have swallowed it.
         #[cfg(unix)]
-        let result = match links
-            .as_ref()
+        let result = match guards
+            .links()
             .and_then(|l| link_refusals(l, &stdout, &stderr))
         {
             Some(lines) => match result {
@@ -1262,7 +1214,7 @@ impl Adapter {
         if result.is_err() {
             return self
                 .finalize_sync_denial(
-                    effective_command,
+                    command,
                     op_id,
                     exit_code,
                     &stdout,
@@ -1877,20 +1829,6 @@ impl Adapter {
 // Extracted execution helpers (batch vs streaming)
 // ---------------------------------------------------------------------------
 
-/// Build a sandbox-wrapped `tokio::process::Command` for the given program and args.
-///
-/// Raw `/bin/sh` invocations use `create_shell_command` (injects `-c`); all other
-/// programs use `create_command` so the preparer's shell flags are not doubled.
-fn build_sandboxed_command(
-    executor: &dyn executor::CommandExecutor,
-    sandbox: &sandbox::Sandbox,
-    program: &str,
-    args_vec: &[String],
-    working_dir: &std::path::Path,
-) -> Result<tokio::process::Command> {
-    executor.build_command(sandbox, program, args_vec, working_dir)
-}
-
 /// Interpret a completed synchronous process output as success text or an error.
 fn interpret_sync_command_output(output: std::process::Output) -> Result<String, anyhow::Error> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -2359,17 +2297,6 @@ fn reads_like_a_refusal(text: &str) -> bool {
         || lower.contains("permission denied")
         || lower.contains("read-only file system")
         || sandbox::denial_scan::says_not_writable(&lower)
-}
-
-/// Stamp a child spawned under a lease with it (SPEC R2.7.7), so an ahma the
-/// command itself starts does not wait for the lease its ancestor holds.
-fn stamp_lease(cmd: &mut tokio::process::Command, lease: Option<&workspace_queue::Lease>) {
-    if let Some(lease) = lease {
-        cmd.env(
-            workspace_queue::HELD_LEASE_ENV,
-            workspace_queue::child_lease_env(lease.key()),
-        );
-    }
 }
 
 /// Take the "before" inventory of the trust-handoff deny tier for a command
@@ -4402,5 +4329,98 @@ mod tests {
         let adapter = Adapter::new(monitor, shell_pool, sandbox).unwrap();
         // Shutdown with no active tasks should complete without error
         adapter.shutdown().await;
+    }
+
+    /// SPEC R2.7.7: a synchronous command run under a workspace lease
+    /// inherits it, as an async one does, so an ahma it starts (a hooked
+    /// `cargo` that runs `ahma`) does not wait for the lease its own caller
+    /// holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sync_command_inherits_its_workspace_lease() {
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let locks = tempfile::tempdir().unwrap();
+        let adapter = adapter.with_workspace_queue(workspace_queue::WorkspaceQueue::with_lock_dir(
+            true,
+            Some(locks.path().to_path_buf()),
+        ));
+        let scope = dunce::canonicalize(td.path()).unwrap();
+        let held = workspace_queue::child_lease_env(&adapter.workspace_key_for(&scope));
+        // Writes a file, so it runs in the exclusive lane, under a lease.
+        let line = "touch out.txt; printf 'lease=%s\\n' \"$AHMA_HELD_WORKSPACE_LEASE\"";
+        let config = crate::AhmaMcpService::build_shell_subcommand_config(
+            Some(30),
+            &ExecutionMode::Synchronous,
+        );
+        let out = adapter
+            .execute_sync_in_dir(
+                crate::shell_pool::platform_shell_program(),
+                Some(shell_args(line)),
+                &scope.to_string_lossy(),
+                Some(30),
+                Some(&config),
+            )
+            .await
+            .expect("the command succeeds");
+        assert!(out.contains(&format!("lease={held}")), "{out}");
+    }
+
+    /// The synchronous path does not wait for a `tools.mutex_groups` gate
+    /// (SPEC R2.7.2), where the async paths do: a held group does not stop a
+    /// sync command in it. Pinned as it is today, so a change to it is a
+    /// decision, made in its own PR with its SPEC text, not a side effect of
+    /// sharing the spawn with the async path.
+    #[tokio::test]
+    async fn the_sync_path_does_not_wait_for_a_mutex_group() {
+        let td = tempfile::tempdir().unwrap();
+        let locks = tempfile::tempdir().unwrap();
+        let scope = dunce::canonicalize(td.path()).unwrap();
+        let group = ahma_common::config::MutexGroupConfig {
+            name: "echo".to_string(),
+            prefixes: vec!["echo".to_string()],
+            max_wait_secs: 0,
+        };
+        let registry = Arc::new(CommandMutexRegistry::from_config_with_lock_dir(
+            std::slice::from_ref(&group),
+            Some(locks.path().to_path_buf()),
+        ));
+        let adapter = Adapter::new_with_registry(
+            Arc::new(OperationMonitor::new(
+                crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
+            )),
+            Arc::new(ShellPoolManager::new(
+                crate::shell_pool::ShellPoolConfig::default(),
+            )),
+            Arc::new(
+                crate::sandbox::Sandbox::new(
+                    vec![scope.clone()],
+                    crate::sandbox::SandboxMode::Test,
+                    Default::default(),
+                )
+                .unwrap(),
+            ),
+            registry.clone(),
+        )
+        .unwrap();
+        // Another command holds the group in this workspace throughout.
+        let _held = registry
+            .acquire(&group, &adapter.workspace_key_for(&scope))
+            .await
+            .expect("the group is free");
+        let config = crate::AhmaMcpService::build_shell_subcommand_config(
+            Some(30),
+            &ExecutionMode::Synchronous,
+        );
+        let out = adapter
+            .execute_sync_in_dir(
+                crate::shell_pool::platform_shell_program(),
+                Some(shell_args("echo not-gated")),
+                &scope.to_string_lossy(),
+                Some(30),
+                Some(&config),
+            )
+            .await
+            .expect("a held group does not stop a sync command");
+        assert!(out.contains("not-gated"), "{out}");
     }
 }

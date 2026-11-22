@@ -24,15 +24,22 @@ UMVIXgsLH65MRi/7XnzQAAAADGZpeHR1cmVAYWhtYQE=
 const PUB: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHSgky+gJ3+bnUf/OSAtpCqUUMVIXgsLH65MRi/7XnzQ fixture@ahma";
 
-#[tokio::test]
-async fn a_refused_signature_is_an_alert_on_the_running_operation() {
+/// A workspace with a public key and a message to sign, and an adapter whose
+/// commands are served the recorded brokers for a home with the matching
+/// private key. `None` (skipped) without `ssh-keygen`.
+fn signing_fixture() -> Option<(
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Adapter,
+    Arc<OperationMonitor>,
+)> {
     if std::process::Command::new("ssh-keygen")
         .arg("-?")
         .output()
         .is_err()
     {
         eprintln!("skipped: ssh-keygen is not installed");
-        return;
+        return None;
     }
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
@@ -65,6 +72,14 @@ async fn a_refused_signature_is_an_alert_on_the_running_operation() {
         None,
         vec![ws.path().to_path_buf()],
     )));
+    Some((home, ws, adapter, monitor))
+}
+
+#[tokio::test]
+async fn a_refused_signature_is_an_alert_on_the_running_operation() {
+    let Some((_home, ws, adapter, monitor)) = signing_fixture() else {
+        return;
+    };
     let op_id = adapter
         .execute_async_in_dir(
             "run_terminal_command",
@@ -87,6 +102,34 @@ async fn a_refused_signature_is_an_alert_on_the_running_operation() {
             .any(|a| a.starts_with("Blocked until a human approves") && a.contains("sshsig:file")),
         "the refusal is an alert: {:?}",
         op.alerts
+    );
+    assert!(!ws.path().join("msg.sig").exists(), "nothing was signed");
+}
+
+/// The synchronous path (terminal hooks, `ahma tool run`, sync-mode
+/// `run_terminal_command`) is served the same broker, and has no operation
+/// to raise an alert on: what the broker refused is in the error the call
+/// returns, one line each (SPEC R-CRED.10).
+#[tokio::test]
+async fn the_synchronous_path_returns_a_refused_signature_with_its_error() {
+    let Some((_home, ws, adapter, _monitor)) = signing_fixture() else {
+        return;
+    };
+    let err = adapter
+        .execute_sync_in_dir(
+            "ssh-keygen -Y sign -n file -f key.pub msg",
+            None,
+            ws.path().to_str().unwrap(),
+            Some(30),
+            None,
+        )
+        .await
+        .expect_err("the signature is refused, so ssh-keygen fails");
+    let text = format!("{err:#}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("Blocked until a human approves") && l.contains("sshsig:file")),
+        "the refusal is in the error: {text}"
     );
     assert!(!ws.path().join("msg.sig").exists(), "nothing was signed");
 }

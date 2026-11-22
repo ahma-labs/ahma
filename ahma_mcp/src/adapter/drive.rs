@@ -23,11 +23,11 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::guards::RunGuards;
+use super::piped::PipedSpawn;
 use super::{
-    Adapter, CommandMutexRegistry, DriftProbe, audit, begin_handoff_watch, build_for_this_command,
-    build_sandboxed_command, cpu_probe_threshold, execute_with_streaming, executor, failed,
-    pty_exec, record_failure_diagnostics, run_session_operation, sink, stamp_lease,
-    workspace_queue,
+    Adapter, CommandMutexRegistry, DriftProbe, audit, begin_handoff_watch, cpu_probe_threshold,
+    execute_with_streaming, executor, failed, pty_exec, record_failure_diagnostics,
+    run_session_operation, sink, workspace_queue,
 };
 use crate::operation_monitor::{CommandOutput, Operation, OperationMonitor, Terminal};
 use crate::sandbox;
@@ -320,66 +320,44 @@ fn prepare(
             executor,
             scope_grant_notifier,
         } => {
-            // Its link broker, leased before its sandbox is built in either
-            // lane: having one is what lets this command, and no other,
-            // reach the broker directory (SPEC R-LINK.1).
-            #[cfg(unix)]
-            let links = deps
-                .link_brokers
-                .as_ref()
-                .and_then(|f| f.lease_for_command(working_dir, Some(line)));
-            #[cfg(unix)]
-            let served_links = links.is_some();
-            #[cfg(not(unix))]
-            let served_links = false;
-            let built = build_for_this_command(served_links, || {
-                if lane == workspace_queue::Lane::ReadOnly {
-                    executor.build_read_only_command(&deps.sandbox, &program, &args, working_dir)
-                } else {
-                    build_sandboxed_command(
-                        executor.as_ref(),
-                        &deps.sandbox,
-                        &program,
-                        &args,
-                        working_dir,
-                    )
-                }
-            });
-            let mut cmd = built.map_err(|e| format!("Failed to create sandboxed command: {e}"))?;
-            // An ahma it starts does not wait for the lease it runs under
-            // (SPEC R2.7.7).
-            stamp_lease(&mut cmd, guards.lease());
-            if keep_leftovers {
-                sandbox::leftovers::keep(&mut cmd);
+            // Built as the synchronous path builds its command: brokers
+            // matched on the line as the caller wrote it.
+            let piped = PipedSpawn {
+                executor: executor.as_ref(),
+                sandbox: &deps.sandbox,
+                #[cfg(unix)]
+                credential_brokers: deps.credential_brokers.as_ref(),
+                #[cfg(unix)]
+                link_brokers: deps.link_brokers.as_ref(),
+                program: &program,
+                args: &args,
+                working_dir,
+                lane,
+                line,
+                keep_leftovers,
             }
-            // Its SSH key broker (SPEC R-CRED.1): a refused signature is an
-            // alert while it still runs (R-CRED.10).
+            .build(guards)
+            .map_err(|e| format!("Failed to create sandboxed command: {e}"))?;
+            // Async only: what its brokers refuse, and what the link broker
+            // asks while the command waits, is an alert while it still runs
+            // (SPEC R-CRED.10, R-LINK.6). The synchronous path has no
+            // operation to alert, and says them in its result.
             #[cfg(unix)]
-            guards.hold_broker(
-                deps.credential_brokers
-                    .as_ref()
-                    .and_then(|f| f.lease_for_command(working_dir, Some(line)))
-                    .inspect(|broker| {
-                        cmd.env("SSH_AUTH_SOCK", broker.socket());
-                        super::alert_broker_refusals(broker, &deps.monitor, op_id);
-                    }),
-            );
-            // The link broker's helper and socket (SPEC R-LINK.1); what it
-            // refuses and asks while the command waits is an alert (R-LINK.6).
+            if let Some(broker) = guards.broker() {
+                super::alert_broker_refusals(broker, &deps.monitor, op_id);
+            }
             #[cfg(unix)]
-            guards.hold_links(links.inspect(|links| {
-                for (key, value) in links.env() {
-                    cmd.env(key, value);
-                }
+            if let Some(links) = guards.links() {
                 super::watch_links(links, &deps.monitor, op_id);
-            }));
+            }
             // The tag the kernel's records of its denials carry (SPEC
-            // R-DENY.1), for a failure to read them back.
-            if let Some(tag) = sandbox::kernel_denials::tag_of(cmd.as_std().get_args()) {
+            // R-DENY.1), remembered for a failure to read them back; the
+            // synchronous path reads them back inline.
+            if let Some(tag) = piped.denial_tag {
                 sandbox::kernel_denials::remember_tag(op_id, tag);
             }
             Ok(Ready::Piped {
-                cmd,
+                cmd: piped.cmd,
                 log_monitor,
                 explain: ExplainExit {
                     scope_grant_notifier,
