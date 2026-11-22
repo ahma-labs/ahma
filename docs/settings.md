@@ -266,6 +266,14 @@ Set it any of these ways (highest priority first):
 A running ahma session read its mode when it started: a change reaches new
 sessions, and a running one after it restarts (the agent's `restart` tool).
 
+One call can wait regardless of the mode: an MTDF tool marked `"synchronous": true`
+(deprecated), a call with `"blocking": true`, or `run_terminal_command`'s
+unadvertised `execution_mode: "Synchronous"` waits exactly as `sync` mode does —
+still a tracked operation, still bounded by the client's request budget.
+`"synchronous": false` or `"blocking": false` returns after the adaptive window even
+in `sync` mode. Only `ahma run` (the CLI one-shot) runs a command without an
+operation.
+
 | Key (`[tools]`) | Default | Effect |
 |---|---|---|
 | `workspace_queue` | `true` | Writers run one at a time per workspace, in arrival order (SPEC R2.7). Off restores unordered async — only sensible with `execution_mode = "sync"`. |

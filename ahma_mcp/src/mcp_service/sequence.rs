@@ -1,7 +1,8 @@
 //! Sequence execution for MCP tools.
 //!
 //! Contains handlers for executing sequence tools that invoke multiple
-//! other tools in order, both synchronously and asynchronously.
+//! other tools in order. Every step is a tracked operation; a call that waits
+//! (SPEC R2.1) waits for each step in turn.
 
 use parking_lot::RwLock;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError};
@@ -16,6 +17,7 @@ use crate::client_type::McpClientType;
 use crate::config::{SequenceStep, SubcommandConfig, ToolConfig};
 use crate::constants::SEQUENCE_STEP_DELAY_MS;
 use crate::mcp_service::progress_push::ProgressPushRouter;
+use crate::operation_monitor::OperationStatus;
 
 use super::handlers::common;
 use super::subcommand::find_subcommand_config_from_args;
@@ -124,15 +126,21 @@ async fn apply_step_delay(step_delay_ms: u64, current_index: usize, total_steps:
     }
 }
 
-/// In sync mode (SPEC R2.1), how long a sequence waits for the steps it
-/// started: the same client-safe window a single call gets, shared by all of
-/// them. `None` in async mode: the sequence returns once its steps started.
+/// When a sequence call waits (SPEC R2.1: sync mode, or `synchronous: true` /
+/// `blocking: true`), how long it waits for its steps: the same client-safe
+/// window a single call gets, shared by all of them. `None` otherwise: the
+/// sequence returns once its steps started.
 pub struct SequenceWait<'a> {
     pub monitor: &'a crate::operation_monitor::OperationMonitor,
     pub window: Duration,
 }
 
 /// Handles execution of sequence tools - tools that invoke multiple other tools in order.
+///
+/// Every step is a tracked operation. `wait` is the call's waiting policy
+/// (SPEC R2.1): MTDF `synchronous: true`, `blocking: true` or the server's
+/// sync mode ask it to wait for the steps; otherwise it answers once they
+/// have started.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_sequence_tool(
     adapter: &Adapter,
@@ -146,129 +154,36 @@ pub async fn handle_sequence_tool(
 ) -> Result<CallToolResult, McpError> {
     let sequence = config.sequence.as_ref().unwrap(); // Safe due to prior check
     let step_delay_ms = config.step_delay_ms.unwrap_or(SEQUENCE_STEP_DELAY_MS);
-
-    let dynamic_blocking = params
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("blocking"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    #[allow(deprecated)]
-    let run_synchronously = dynamic_blocking || config.synchronous.unwrap_or(false);
-
-    if run_synchronously {
-        handle_sequence_tool_sync(adapter, configs, config, params, sequence, step_delay_ms).await
-    } else {
-        handle_sequence_tool_async(
-            adapter,
-            progress_push,
-            configs,
-            params,
-            context,
-            sequence,
-            step_delay_ms,
-            force_progress_notifications,
-            wait,
-        )
-        .await
-    }
-}
-
-/// Handles synchronous sequence execution - blocks until all steps complete
-async fn handle_sequence_tool_sync(
-    adapter: &Adapter,
-    configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
-    config: &ToolConfig,
-    params: CallToolRequestParams,
-    sequence: &[SequenceStep],
-    step_delay_ms: u64,
-) -> Result<CallToolResult, McpError> {
-    let mut final_result = CallToolResult::success(vec![]);
-    let mut all_outputs = Vec::new();
-    let kind = SequenceKind::TopLevel;
     let parent_args = params.arguments.clone().unwrap_or_default();
     let working_directory = extract_working_directory(adapter, &params);
 
-    for (index, step) in sequence.iter().enumerate() {
-        if should_skip_step_with_context(&kind, step, &working_directory) {
-            final_result
-                .content
-                .push(ContentBlock::text(format_step_skipped_message(&kind, step)));
-            continue;
-        }
+    run_async_sequence(
+        adapter,
+        progress_push,
+        &context,
+        sequence,
+        step_delay_ms,
+        force_progress_notifications,
+        SequenceKind::TopLevel,
+        Some(&working_directory),
+        wait,
+        |step| {
+            let merged_args = merge_step_arguments(&parent_args, &step.args);
 
-        let merged_args = merge_step_arguments(&parent_args, &step.args);
-        let step_tool_config = get_tool_config(configs, &step.tool)?;
-        let (subcommand_config, command_parts) =
-            find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
+            let step_tool_config = get_tool_config(configs, &step.tool)?;
+            let (subcommand_config, command_parts) =
+                find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
 
-        let step_result = adapter
-            .execute_sync_in_dir(
-                &command_parts.join(" "),
-                Some(merged_args),
-                &working_directory,
-                config.timeout_seconds,
-                Some(subcommand_config),
-            )
-            .await;
-
-        match step_result {
-            Ok(output) => {
-                let output_text = if output.is_empty() {
-                    "(no output)"
-                } else {
-                    &output
-                };
-                let message = format!(
-                    "OK Step {} completed: {} {}\n{}",
-                    index + 1,
-                    step.tool,
-                    step.subcommand,
-                    output_text
-                );
-                all_outputs.push(message);
-                tracing::info!(
-                    "Sequence step {} succeeded: {} {}",
-                    index + 1,
-                    step.tool,
-                    step.subcommand
-                );
-            }
-            Err(e) => {
-                all_outputs.push(format!(
-                    "✗ Step {} FAILED: {} {}\nError: {}",
-                    index + 1,
-                    step.tool,
-                    step.subcommand,
-                    e
-                ));
-                tracing::error!(
-                    "Sequence step {} failed: {} {}: {}",
-                    index + 1,
-                    step.tool,
-                    step.subcommand,
-                    e
-                );
-                final_result.content.push(ContentBlock::text(format!(
-                    "Sequence failed at step {}:\n\n{}",
-                    index + 1,
-                    all_outputs.join("\n\n")
-                )));
-                final_result.is_error = Some(true);
-                return Ok(final_result);
-            }
-        }
-
-        apply_step_delay(step_delay_ms, index, sequence.len()).await;
-    }
-
-    final_result.content.push(ContentBlock::text(format!(
-        "All {} sequence steps completed successfully:\n\n{}",
-        sequence.len(),
-        all_outputs.join("\n\n")
-    )));
-    Ok(final_result)
+            Ok(ResolvedStep {
+                tool_name: step.tool.clone(),
+                working_dir: working_directory.clone(),
+                args: Some(merged_args),
+                subcommand_config: subcommand_config.clone(),
+                command_parts,
+            })
+        },
+    )
+    .await
 }
 
 /// A sequence step resolved to everything the adapter needs to start it.
@@ -284,10 +199,17 @@ struct ResolvedStep {
     command_parts: Vec<String>,
 }
 
-/// Shared driver for both async sequence flavours (top-level and subcommand):
-/// resolves each step via `resolve_step`, registers progress, starts the step,
-/// and collects started/skipped messages. `skip_working_directory` enables the
-/// skip-condition check — top-level sequences only, matching prior behavior.
+/// Shared driver for both sequence flavours (top-level and subcommand):
+/// resolves each step via `resolve_step`, registers progress, starts the step
+/// as a tracked operation, and collects started/skipped messages.
+/// `skip_working_directory` enables the skip-condition check — top-level
+/// sequences only, matching prior behavior.
+///
+/// With a `wait`, each step is waited for before the next starts, and a step
+/// that does not complete successfully stops the sequence: the steps after it
+/// are never started. Once the shared window is spent, the step still running
+/// and every later one are started without waiting, as without a `wait`, and
+/// named with how to collect them.
 #[allow(clippy::too_many_arguments)]
 async fn run_async_sequence(
     adapter: &Adapter,
@@ -302,7 +224,11 @@ async fn run_async_sequence(
     mut resolve_step: impl FnMut(&SequenceStep) -> Result<ResolvedStep, McpError>,
 ) -> Result<CallToolResult, McpError> {
     let mut final_result = CallToolResult::success(vec![]);
-    let mut started_ids = Vec::new();
+    let deadline = wait
+        .as_ref()
+        .map(|wait| tokio::time::Instant::now() + wait.window);
+    // Steps started once the window was spent, or that outlasted it.
+    let mut still_running = Vec::new();
 
     for (index, step) in sequence.iter().enumerate() {
         if let Some(working_directory) = skip_working_directory
@@ -334,15 +260,8 @@ async fn run_async_sequence(
             )
             .await;
 
-        match step_result {
-            Ok(id) => {
-                final_result
-                    .content
-                    .push(ContentBlock::text(format_step_started_message(
-                        &kind, step, &id,
-                    )));
-                started_ids.push(id);
-            }
+        let id = match step_result {
+            Ok(id) => id,
             Err(e) => {
                 let (prefix, step_name) = match kind {
                     SequenceKind::TopLevel => ("Sequence step", &step.tool),
@@ -353,88 +272,70 @@ async fn run_async_sequence(
                 tracing::error!("{}", error_message);
                 return Err(common::mcp_internal(error_message));
             }
+        };
+        final_result
+            .content
+            .push(ContentBlock::text(format_step_started_message(
+                &kind, step, &id,
+            )));
+
+        if let (Some(wait), Some(deadline)) = (&wait, deadline) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ended = if still_running.is_empty() {
+                wait_for_step(wait, &id, remaining).await
+            } else {
+                None
+            };
+            match ended {
+                Some((done, completed)) => {
+                    final_result.content.extend(done.content);
+                    if !completed {
+                        final_result.content.push(ContentBlock::text(format!(
+                            "Sequence stopped: step {} did not complete successfully, so the \
+                             steps after it were not started.",
+                            index + 1
+                        )));
+                        final_result.is_error = Some(true);
+                        return Ok(final_result);
+                    }
+                }
+                None => still_running.push(id),
+            }
         }
 
         apply_step_delay(step_delay_ms, index, sequence.len()).await;
     }
 
-    if let Some(wait) = wait {
-        append_step_results(&mut final_result, &started_ids, wait).await;
+    if let Some(wait) = wait
+        && !still_running.is_empty()
+    {
+        final_result.content.push(ContentBlock::text(format!(
+            "Still running after {}s — the longest this client can hold one \
+             request open: {}. They keep running: call `await` to collect \
+             the results.",
+            wait.window.as_secs(),
+            still_running.join(", ")
+        )));
     }
 
     Ok(final_result)
 }
 
-/// Sync mode: wait for each started step within the shared window and append
-/// its result. Once the window is spent, the steps still running are named
-/// with how to collect them, rather than being dropped from the answer.
-async fn append_step_results(
-    final_result: &mut CallToolResult,
-    ids: &[String],
-    wait: SequenceWait<'_>,
-) {
-    let deadline = tokio::time::Instant::now() + wait.window;
-    for (index, id) in ids.iter().enumerate() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match common::wait_for_completion(wait.monitor, id, remaining).await {
-            Some(done) => final_result.content.extend(done.content),
-            None => {
-                let pending = ids[index..].join(", ");
-                final_result.content.push(ContentBlock::text(format!(
-                    "Still running after {}s — the longest this client can hold one \
-                     request open: {pending}. They keep running: call `await` to collect \
-                     the results.",
-                    wait.window.as_secs()
-                )));
-                return;
-            }
-        }
-    }
-}
-
-/// Handles asynchronous sequence execution - starts all steps and returns immediately
-#[allow(clippy::too_many_arguments)]
-async fn handle_sequence_tool_async(
-    adapter: &Adapter,
-    progress_push: &ProgressPushRouter,
-    configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
-    params: CallToolRequestParams,
-    context: RequestContext<RoleServer>,
-    sequence: &[SequenceStep],
-    step_delay_ms: u64,
-    force_progress_notifications: bool,
-    wait: Option<SequenceWait<'_>>,
-) -> Result<CallToolResult, McpError> {
-    let parent_args = params.arguments.clone().unwrap_or_default();
-    let working_directory = extract_working_directory(adapter, &params);
-
-    run_async_sequence(
-        adapter,
-        progress_push,
-        &context,
-        sequence,
-        step_delay_ms,
-        force_progress_notifications,
-        SequenceKind::TopLevel,
-        Some(&working_directory),
-        wait,
-        |step| {
-            let merged_args = merge_step_arguments(&parent_args, &step.args);
-
-            let step_tool_config = get_tool_config(configs, &step.tool)?;
-            let (subcommand_config, command_parts) =
-                find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
-
-            Ok(ResolvedStep {
-                tool_name: step.tool.clone(),
-                working_dir: working_directory.clone(),
-                args: Some(merged_args),
-                subcommand_config: subcommand_config.clone(),
-                command_parts,
-            })
-        },
-    )
-    .await
+/// Wait up to `window` for step `id` to end: its inline result, and whether it
+/// completed successfully. `None` while it is still running.
+async fn wait_for_step(
+    wait: &SequenceWait<'_>,
+    id: &str,
+    window: Duration,
+) -> Option<(CallToolResult, bool)> {
+    let done = common::wait_for_completion(wait.monitor, id, window).await?;
+    // It has ended, so its history entry says how.
+    let completed = wait
+        .monitor
+        .check_completion_history_pub(id)
+        .await
+        .is_some_and(|op| op.state == OperationStatus::Completed);
+    Some((done, completed))
 }
 
 /// Handles execution of subcommand sequences - subcommands that invoke multiple cargo commands in order.

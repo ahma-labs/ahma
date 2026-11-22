@@ -229,9 +229,17 @@ async fn test_shell_timeout() -> Result<()> {
             "execution_mode": "Synchronous"
         }),
     )
-    .await;
+    .await?;
 
-    assert_timeout_error(result);
+    // A waiting call is a tracked operation (SPEC R2.1): the time limit ends
+    // the operation, and the result's identity line says so (R2.6.2).
+    let text = result_text(&result);
+    let identity = text.lines().next().unwrap_or_default();
+    assert!(
+        identity.starts_with('\u{2717}') && identity.contains("timedout"),
+        "the first line says the time limit ended it: {text}"
+    );
+    assert!(text.contains("timed out"), "and why: {text}");
 
     fixture.client.cancel().await?;
     Ok(())
@@ -242,22 +250,6 @@ fn result_text(r: &rmcp::model::CallToolResult) -> String {
         .iter()
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect()
-}
-
-fn assert_timeout_error<E: std::fmt::Debug>(result: Result<rmcp::model::CallToolResult, E>) {
-    if let Err(e) = result {
-        let msg = format!("{:?}", e);
-        assert!(msg.contains("timeout") || msg.contains("timed out"));
-    } else if let Ok(r) = result {
-        if !r.is_error.unwrap_or(false) {
-            panic!(
-                "Expected timeout failure, but shell command succeeded. Output: {}",
-                result_text(&r)
-            );
-        }
-        let text = result_text(&r);
-        assert!(text.contains("timeout") || text.contains("timed out") || text.contains("killed"));
-    }
 }
 
 // ============================================================================

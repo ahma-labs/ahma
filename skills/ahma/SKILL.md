@@ -238,8 +238,7 @@ Minimal example:
   "name": "deploy",
   "description": "Deploy the application to staging",
   "command": "scripts/deploy.sh",
-  "enabled": true,
-  "synchronous": true
+  "enabled": true
 }
 ```
 

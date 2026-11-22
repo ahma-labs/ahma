@@ -19,7 +19,6 @@
 //! (scripts/check-guardrails.sh rejects those).
 
 mod adapter_extended_coverage_test;
-mod adapter_retry_integration_test;
 mod adapter_sandbox_scope_regression_test;
 mod ahma_help_test;
 mod async_first_contract_e2e_test;

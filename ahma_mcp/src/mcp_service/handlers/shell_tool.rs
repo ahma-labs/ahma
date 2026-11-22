@@ -262,18 +262,20 @@ impl AhmaMcpService {
             }
         });
 
-        // Determine execution mode. `execution_mode` is the CLI/test escape
-        // hatch; models get no say (SPEC R2.6.3).
+        // Only the CLI one-shot runs the command directly (SPEC R2.1). Every
+        // tool call is a tracked operation; `execution_mode: "Synchronous"`,
+        // the unadvertised CLI/test escape hatch models get no say in
+        // (SPEC R2.6.3), only makes this request wait for it.
         let execution_mode = if self.force_synchronous {
             crate::adapter::ExecutionMode::Synchronous
-        } else if let Some(mode_str) = common::opt_str(&args, "execution_mode") {
-            match mode_str.as_str() {
-                "Synchronous" => crate::adapter::ExecutionMode::Synchronous,
-                _ => crate::adapter::ExecutionMode::AsyncResultPush,
-            }
         } else {
             crate::adapter::ExecutionMode::AsyncResultPush
         };
+        let wait = self.call_wait(crate::mcp_service::wait_asked_for(
+            None,
+            None,
+            common::opt_str(&args, "execution_mode").as_deref(),
+        ));
 
         // Build arguments map for adapter
         let mut adapter_args = Map::new();
@@ -305,6 +307,7 @@ impl AhmaMcpService {
                     &subcommand_config,
                     &context,
                     log_monitor_config,
+                    wait,
                 )
                 .await
             }
@@ -365,6 +368,9 @@ impl AhmaMcpService {
         }
     }
 
+    /// The direct, untracked path, reached only by the CLI one-shot
+    /// (`force_synchronous`, SPEC R2.1). A tool call's
+    /// `execution_mode: "Synchronous"` waits on a tracked operation instead.
     pub async fn execute_shell_sync(
         &self,
         adapter_args: Map<String, Value>,
@@ -520,6 +526,7 @@ impl AhmaMcpService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_shell_async(
         &self,
         adapter_args: Map<String, Value>,
@@ -528,6 +535,7 @@ impl AhmaMcpService {
         subcommand_config: &crate::config::SubcommandConfig,
         context: &RequestContext<RoleServer>,
         log_monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
+        wait: crate::mcp_service::CallWait,
     ) -> Result<CallToolResult, McpError> {
         let cmd_str = adapter_args
             .get("command")
@@ -552,9 +560,9 @@ impl AhmaMcpService {
             progress_token,
             client_type,
             context.peer.clone(),
-            // The operator's `tools.execution_mode` decides; the caller has
-            // no say (SPEC R2.6.3).
-            self.call_wait(false),
+            // The operator's `tools.execution_mode`, unless the CLI/test
+            // escape hatch asked to wait (SPEC R2.6.3).
+            wait,
             // Async is the *default* path, so this is the error agents
             // actually see: it must carry the same structured
             // `sandbox_denial` + remediation the sync path carries, or a
@@ -942,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_synchronous_execution_mode_echo_succeeds() {
-        // execution_mode = Synchronous routes through execute_shell_sync.
+        // execution_mode = Synchronous waits for the tracked operation (SPEC R2.6.3).
         let result = call_run_terminal(json!({
             "command": "echo hello_sync",
             "execution_mode": "Synchronous"

@@ -67,7 +67,6 @@ pub use pty_exec::pty_available;
 pub use types::{AsyncExecOptions, ExecutionMode};
 
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus, Stream, Terminal};
-use crate::retry::{self, RetryConfig};
 use crate::sandbox;
 use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch, HandoffWatchMode};
 use crate::shell_pool::{ProcessGroupGuard, ShellPoolManager, kill_process_tree};
@@ -203,7 +202,6 @@ impl BoundedLineCollector {
 /// *   **Operation Tracking**: Uses `OperationMonitor` to track the status (running, completed,
 ///     failed) of asynchronous operations.
 /// *   **Sandboxing**: Enforces path security by validating operations against a root directory.
-/// *   **Retry Logic**: Applies configured retry policies for transient failures.
 ///
 /// # Thread Safety
 ///
@@ -228,8 +226,6 @@ pub struct Adapter {
     task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     /// Temporary file manager for multi-line arguments - cleaned up automatically when dropped
     temp_file_manager: preparer::TempFileManager,
-    /// Optional retry configuration for transient error handling.
-    retry_config: Option<RetryConfig>,
     /// Custom command executor.
     pub command_executor: Arc<dyn executor::CommandExecutor>,
     /// Unified event dispatcher (P2).
@@ -313,7 +309,6 @@ impl Adapter {
             sandbox,
             task_handles: Arc::new(Mutex::new(HashMap::new())),
             temp_file_manager: preparer::TempFileManager::new(),
-            retry_config: None,
             command_executor: Arc::new(executor::DefaultCommandExecutor),
             event_dispatcher,
             shell_sessions: crate::shell_session::ShellSessionManager::new(),
@@ -523,12 +518,6 @@ impl Adapter {
         self
     }
 
-    /// Sets retry configuration for transient error handling.
-    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
-        self.retry_config = Some(config);
-        self
-    }
-
     /// Sets the scope-grant notifier that auto-detected violations are routed to.
     ///
     /// With a notifier installed, an out-of-scope path rejected by validation, or a
@@ -630,11 +619,6 @@ impl Adapter {
                 Err(e)
             }
         }
-    }
-
-    /// Returns the retry configuration, if set.
-    pub fn retry_config(&self) -> Option<&RetryConfig> {
-        self.retry_config.as_ref()
     }
 
     /// Run `task` as operation `op_id`'s background task. Its handle is kept
@@ -901,9 +885,9 @@ impl Adapter {
         let safe_wd_str = safe_wd.to_string_lossy().into_owned();
 
         // Workspace write queue (SPEC R2.7): the synchronous path — terminal
-        // hooks, CLI one-shots, `synchronous: true` tools — queues exactly like
-        // an async operation, so a hooked `sed -i` never lands in the middle of
-        // an MCP `cargo nextest run`.
+        // hooks and CLI one-shots — queues exactly like an async operation, so
+        // a hooked `sed -i` never lands in the middle of an MCP
+        // `cargo nextest run`.
         let (lane, queue_reason) =
             self.resolve_lane_with_reason(args.as_ref(), subcommand_config, &safe_wd);
         let title = shell_command_line(written.as_ref().or(args.as_ref()))
@@ -1416,54 +1400,6 @@ impl Adapter {
             .filter(|s| !s.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// Synchronously executes a command with optional retry logic for transient errors.
-    ///
-    /// If a `RetryConfig` is set on the adapter, transient errors (timeouts, resource
-    /// exhaustion, network issues) will be retried with exponential backoff.
-    /// Permanent errors (command not found, permission denied) fail immediately.
-    ///
-    /// If no retry config is set, this behaves identically to `execute_sync_in_dir`.
-    pub async fn execute_sync_with_retry(
-        &self,
-        command: &str,
-        args: Option<Map<String, serde_json::Value>>,
-        working_dir: &str,
-        timeout_seconds: Option<u64>,
-        subcommand_config: Option<&crate::config::SubcommandConfig>,
-    ) -> Result<String, anyhow::Error> {
-        match &self.retry_config {
-            Some(config) => {
-                // Clone args for each retry attempt since the closure needs ownership
-                let args_clone = args.clone();
-                retry::execute_with_retry(config, || {
-                    let args_inner = args_clone.clone();
-                    async move {
-                        self.execute_sync_in_dir(
-                            command,
-                            args_inner,
-                            working_dir,
-                            timeout_seconds,
-                            subcommand_config,
-                        )
-                        .await
-                    }
-                })
-                .await
-            }
-            None => {
-                // No retry config, execute directly
-                self.execute_sync_in_dir(
-                    command,
-                    args,
-                    working_dir,
-                    timeout_seconds,
-                    subcommand_config,
-                )
-                .await
-            }
-        }
     }
 
     /// Asynchronously starts a command, returning an operation ID immediately.
@@ -3631,8 +3567,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let adapter = Adapter::new(monitor, shell_pool, sandbox).unwrap();
-        assert!(adapter.retry_config().is_none());
+        Adapter::new(monitor, shell_pool, sandbox).expect("an adapter builds");
     }
 
     fn adapter_with_mode(mode: crate::sandbox::SandboxMode) -> (Adapter, tempfile::TempDir) {
@@ -3852,8 +3787,8 @@ mod tests {
         assert!(text.contains("before-the-limit"), "{text}");
     }
 
-    /// SPEC R2.7.1: the synchronous path (terminal hooks, CLI one-shots,
-    /// `synchronous: true` tools) waits for the workspace no longer than its
+    /// SPEC R2.7.1: the synchronous path (terminal hooks, CLI one-shots)
+    /// waits for the workspace no longer than its
     /// own timeout, says it is waiting, and — if the turn never comes — reports
     /// that the command did not run and who held the workspace.
     #[tokio::test]
@@ -4262,29 +4197,6 @@ mod tests {
             "{anonymous}"
         );
         assert!(!anonymous.contains("Queued because"), "{anonymous}");
-    }
-
-    #[test]
-    fn test_adapter_with_retry_config() {
-        let monitor = Arc::new(OperationMonitor::new(
-            crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
-        ));
-        let shell_pool = Arc::new(ShellPoolManager::new(
-            crate::shell_pool::ShellPoolConfig::default(),
-        ));
-        let td = tempfile::tempdir().unwrap();
-        let sandbox = Arc::new(
-            crate::sandbox::Sandbox::new(
-                vec![td.path().to_path_buf()],
-                crate::sandbox::SandboxMode::Test,
-                Default::default(),
-            )
-            .unwrap(),
-        );
-        let adapter = Adapter::new(monitor, shell_pool, sandbox)
-            .unwrap()
-            .with_retry_config(RetryConfig::default());
-        assert!(adapter.retry_config().is_some());
     }
 
     #[test]

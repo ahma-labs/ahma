@@ -1,14 +1,11 @@
 //! # Tool Resolution Module
 //!
-//! Provides utilities for resolving tool configurations, finding matching tools,
-//! and executing tool sequences.
+//! Provides utilities for resolving tool configurations and finding matching
+//! tools.
 
-use crate::{
-    adapter::Adapter,
-    config::{SubcommandConfig, ToolConfig},
-};
-use anyhow::{Context, Result, anyhow};
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use crate::config::{SubcommandConfig, ToolConfig};
+use anyhow::{Result, anyhow};
+use std::{collections::HashMap, path::PathBuf};
 
 /// Auto-detect .ahma directory or use explicitly provided tools_dir.
 ///
@@ -205,73 +202,6 @@ pub fn resolve_cli_subcommand<'a>(
     })?;
 
     Ok((subcommand_config, command_parts))
-}
-
-/// Execute a sequence of tool steps.
-///
-/// # Arguments
-/// * `adapter` - The adapter for executing commands.
-/// * `configs` - All available tool configurations.
-/// * `parent_config` - The parent tool configuration.
-/// * `subcommand_config` - The subcommand configuration containing the sequence.
-/// * `working_dir` - Working directory for execution.
-///
-/// # Errors
-/// Returns an error if any step in the sequence fails.
-pub async fn run_cli_sequence(
-    adapter: &Adapter,
-    configs: &HashMap<String, ToolConfig>,
-    parent_config: &ToolConfig,
-    subcommand_config: &SubcommandConfig,
-    working_dir: &str,
-) -> Result<()> {
-    let sequence = subcommand_config
-        .sequence
-        .as_ref()
-        .ok_or_else(|| anyhow!("Sequence not defined for tool '{}'", parent_config.name))?;
-
-    let delay_ms = subcommand_config
-        .step_delay_ms
-        .or(parent_config.step_delay_ms)
-        .unwrap_or(0);
-
-    for (index, step) in sequence.iter().enumerate() {
-        let (step_key, step_tool_config) = find_tool_config(configs, &step.tool)
-            .ok_or_else(|| anyhow!("Sequence step tool '{}' not found", step.tool))?;
-
-        let (step_subcommand_config, command_parts) =
-            resolve_cli_subcommand(step_key, step_tool_config, step_key, Some(&step.subcommand))?;
-
-        println!(
-            "▶ Running sequence step {} ({} {}):",
-            index + 1,
-            step.tool,
-            step.subcommand
-        );
-
-        let output = adapter
-            .execute_sync_in_dir(
-                &command_parts.join(" "),
-                Some(step.args.clone()),
-                working_dir,
-                step_subcommand_config.timeout_seconds,
-                Some(step_subcommand_config),
-            )
-            .await
-            .with_context(|| format!("Sequence step '{} {}' failed", step.tool, step.subcommand))?;
-
-        if !output.trim().is_empty() {
-            println!("{}", output);
-        } else {
-            println!("OK Completed without output");
-        }
-
-        if delay_ms > 0 && index + 1 < sequence.len() {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

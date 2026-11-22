@@ -639,7 +639,7 @@ async fn red_team_livelog_symlink_read_allowed() {
     if let Ok(tools_res) = result {
         for content in tools_res.content {
             if let Some(text) = content.as_text() {
-                // execute_shell_sync returns raw stdout text, not a JSON envelope.
+                // The inline operation result: identity line, then stdout.
                 assert!(
                     text.text.contains("livelog secret content"),
                     "SECURITY: Valid livelog symlink target read was blocked. Got: {}",

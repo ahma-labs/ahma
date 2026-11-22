@@ -129,10 +129,11 @@ All operation lifecycle data flows through one broadcast stream of
 `tools.execution_mode` (`sync` | `async`) is a server-operator decision, resolved once at
 startup: `--sync` / `--async` (the last one on the command line wins), then the project and
 user settings files, then the default **`async`** — safe as a default because writers are
-ordered by the workspace write queue (R2.7). Per call, an MTDF tool may pass `blocking: false`
-to return after the adaptive inline window (R2.6.1) in sync mode; `run_terminal_command` has
-no caller-selectable mode (R2.6.3). What each mode does is R2.1; the `initialize`
-instructions describe the session's mode (R1.5.4).
+ordered by the workspace write queue (R2.7). Per call, an MTDF tool may pass `blocking: true`
+to wait as sync mode does, or `blocking: false` to return after the adaptive inline window
+(R2.6.1) in sync mode; `run_terminal_command` has no caller-selectable mode (R2.6.3).
+What each mode does is R2.1; the `initialize` instructions describe the session's mode
+(R1.5.4).
 
 ### 2.6 Trust boundaries
 
@@ -254,11 +255,12 @@ may change.
 - **R2.1**: **Every call is a tracked operation; the mode decides how long it waits.** A tool call **must** start its command as an operation in `OperationMonitor` in both modes, so it is visible to `status`, the TUI and the audit log, cancellable, and spills its full output to `output_file`. `tools.execution_mode` (§2.5, R2.4; described to the model per R1.5.4) then decides the answer:
   - **`sync`** — the call waits for the operation to finish and returns its result in the inline format (R2.6.2). The wait is bounded exactly as a default `await` on it would be (R2.5, R2.6.5, R2.6.5.3), because a result written into a connection the client has abandoned is lost; an operation still running at that bound returns its id with a statement that it is still running and how to collect it (`await`). Progress keeps flowing to the call's token during the wait. A sequence waits for its steps within one such window.
   - **`async` (the default)** — the call waits the adaptive inline window (R2.6.1), then returns the operation id; the caller collects the result with `await`, and keeps thinking, reading and planning meanwhile. Operations that may write the workspace still run one at a time, in arrival order (R2.7).
-  - The legacy direct execution path (not a tracked operation) is used only by CLI one-shot mode and by the deprecated `blocking: true` / `"synchronous": true` (R2.3).
+  - **A call may choose its own wait, never its execution path.** MTDF `"synchronous": true` (R2.3), the `blocking: true` argument, and `run_terminal_command`'s unadvertised `execution_mode: "Synchronous"` (R2.6.3) make that call wait as `sync` does; `"synchronous": false` and `blocking: false` make it answer as `async` does. A request to wait wins over a request not to. The call is still a tracked operation, bounded by the same client budget; cancelling its MCP request cancels the operation, as it stopped the command on the direct path this replaces. A sequence that waits runs its steps one at a time and stops at the first step that does not complete successfully; steps reached after the shared window is spent are started without waiting, as in `async`.
+  - The direct execution path (not a tracked operation) is used only by CLI one-shot mode (`ahma run`), which no tool call can select. Why one path: the direct path had its own progress, audit, queueing and cancellation code, held the MCP request for the whole command regardless of the client's budget, and left `synchronous: true` tools (`git status`, `gh`, the file utilities) invisible to `status` and the TUI.
   - **Why async is the default**: a long command (`cargo nextest run`) overlaps the model's own thinking instead of stalling it, and the workspace write queue (R2.7) keeps two commands from interleaving their effects on the workspace; a short command still answers inline within the adaptive window (R2.6.1).
 - **R2.2**: On completion, the system **must** store results reliably in `OperationMonitor` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip.
 - **R2.2.1**: **A per-client progress suppression must be overridable, and must say so when it isn't measured.** `McpClientType::supports_progress()` may suppress R2.2's push for a specific client (currently: Cursor, believed to log a client-side error for valid progress tokens). MCP notifications are one-way, so ahma cannot observe whether the behaviour it works around still exists; unlike the elicitation-budget table (`McpClientType::elicitation_budget`, R5.3.1), which is set from captured measurements, a progress suppression **must** say in its own doc comment when it is asserted rather than measured. `tools.force_progress_notifications` / `--force-progress-notifications` **must** let an operator override the suppression uniformly once it is known to be stale.
-- **R2.3**: **Static `synchronous` flag (deprecated).** `"synchronous": true` in an MTDF definition selects the legacy direct (untracked) path; new definitions omit it and rely on `tools.execution_mode`.
+- **R2.3**: **Static `synchronous` flag (deprecated).** `"synchronous": true` in an MTDF definition makes every call to that tool wait for its tracked operation (R2.1), exactly as a `blocking: true` call does; `false` makes it answer after the adaptive window. New definitions omit it and rely on `tools.execution_mode`.
 - **R2.4**: **Resolution.** The server's mode is `tools.execution_mode`, resolved per §2.5. `--sync` and `--async` override each other, last one wins, because a worker receives its hub's flags first and its session's after them. The retired `tools.force_sync` key is parsed and ignored; an operator who wants every call to block sets `execution_mode = "sync"`.
 - **R2.5**: **`await` soft timeout.** The `await` tool waits at most `tools.await_timeout_secs` seconds (default `1800`, i.e. 30 minutes). Resolution order: the call's optional `timeout_seconds` argument, then the `--await-timeout` CLI flag, then `tools.await_timeout_secs` in `settings.toml`, then the compiled-in default. When awaiting by tool filter and no explicit `timeout_seconds` is given, the effective wait is `max(default, longest pending operation timeout)` so a legitimately long operation is never cut short by a shorter await default.
 - **R2.5.1**: The timeout is **soft**: expiry **must not** cancel the awaited operation(s), and the returned text **must** state that the work is still running in the background and that the client should call `await` again (by `id` where one was given) to keep waiting. This distinguishes "your wait ended" from "your operation died".
@@ -311,9 +313,9 @@ drops work — and it is built so that no crash, kill or power loss can leave it
   queued); its wait is bounded by its own timeout. When it leaves the queue its clocks
   restart, so its reported duration and its timeout measure the command, and the wait is
   recorded (`queue_wait_ms`) and stated in its result. Every execution path takes part: the
-  async path, the synchronous path (terminal hooks, CLI one-shots, `synchronous: true`
-  tools), PTY and persistent-session commands. On every path an operation is shown running
-  only once it holds its turn, and gives the lease up before its end is published, so a
+  async path, the synchronous path (terminal hooks, CLI one-shots), PTY and
+  persistent-session commands. On every path an operation is shown running only once it
+  holds its turn, and gives the lease up before its end is published, so a
   caller woken by that end never finds the workspace still held by it. On the async, PTY and
   session paths `adapter::guards::RunGuards::begin` is the one way an operation starts (it waits its
   turn, then marks the operation running, and ends it at once if it was cancelled first), and
@@ -1485,7 +1487,7 @@ pages — goes through `ahma_common::http_retry`, which owns retry (R-HTTP.1–2
 |-------|-------------|
 | `command` | Base executable (e.g., `git`, `cargo`) |
 | `subcommand` | Array of subcommands; final tool name is `{command}_{name}` |
-| `synchronous` | Deprecated (R2.3); omit it — `tools.execution_mode` decides |
+| `synchronous` | Deprecated (R2.3): `true` makes each call wait for its operation, as `blocking: true` does; omit it — `tools.execution_mode` decides |
 | `options` | Command-line flags (e.g., `--release`) |
 | `positional_args` | Positional arguments |
 | `format: "path"` | **CRITICAL**: Any path argument **must** include this for security validation |

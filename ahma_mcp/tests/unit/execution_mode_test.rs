@@ -223,3 +223,298 @@ async fn the_server_instructions_describe_the_active_mode() -> Result<()> {
     );
     Ok(())
 }
+
+// ==================== the sync flags are a waiting policy ====================
+//
+// MTDF `synchronous: true`, the `blocking: true` argument and
+// `run_terminal_command`'s unadvertised `execution_mode: "Synchronous"` ask
+// for one call to wait as sync mode waits (SPEC R2.1, R2.3). They are not a
+// second execution path: the call is a tracked operation like every other,
+// bounded by the same client budget.
+
+/// An MTDF tool that runs one line in the platform shell, the way
+/// `run_terminal_command` does, so a test can make it slow on every platform.
+async fn write_shell_tool(dir: &std::path::Path, name: &str, synchronous: Option<bool>) {
+    let mut tool = json!({
+        "name": name,
+        "description": "Run a shell line",
+        "command": ahma_mcp::shell_pool::platform_shell_program(),
+        "timeout_seconds": 600,
+        "enabled": true,
+        "subcommand": [{
+            "name": "default",
+            "description": "Run a shell line",
+            "options": [{
+                "name": "c_flag", "type": "boolean", "description": "run a line",
+                "alias": "c"
+            }],
+            "positional_args": [{
+                "name": "command", "type": "string", "description": "the line",
+                "required": true
+            }]
+        }]
+    });
+    if let Some(sync) = synchronous {
+        tool["synchronous"] = json!(sync);
+    }
+    tokio::fs::write(
+        dir.join(format!("{name}.json")),
+        serde_json::to_string_pretty(&tool).expect("tool json"),
+    )
+    .await
+    .expect("write tool config");
+}
+
+/// An async-mode server with a `synchronous: true` tool (`waits`) and an
+/// unflagged one (`plain`).
+async fn flagged_server() -> Result<(InProcessMcp, tempfile::TempDir)> {
+    let temp = tempfile::tempdir()?;
+    let tools = temp.path().join(".ahma");
+    tokio::fs::create_dir_all(&tools).await?;
+    write_shell_tool(&tools, "waits", Some(true)).await;
+    write_shell_tool(&tools, "plain", None).await;
+    let mcp = create_in_process_mcp_with_scope(&tools, vec![temp.path().to_path_buf()]).await?;
+    mcp.service.set_app_config(Arc::new(AppConfig {
+        execution_mode: ExecutionPolicy::Async,
+        request_budget_override_secs: Some(budget_secs()),
+        ..AppConfig::default()
+    }));
+    Ok((mcp, temp))
+}
+
+/// The three ways a call asks to wait, each as `(tool, arguments)` for `line`.
+fn sync_flagged_calls(line: &str) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("waits", json!({ "c_flag": true, "command": line })),
+        (
+            "plain",
+            json!({ "c_flag": true, "command": line, "blocking": true }),
+        ),
+        (
+            "run_terminal_command",
+            json!({ "command": line, "execution_mode": "Synchronous" }),
+        ),
+    ]
+}
+
+async fn call(
+    mcp: &InProcessMcp,
+    tool: &'static str,
+    args: &serde_json::Value,
+) -> Result<CallToolResult> {
+    let params = CallToolRequestParams::new(tool)
+        .with_arguments(args.as_object().cloned().unwrap_or_default());
+    let limit = TestTimeouts::scale_secs(60);
+    Ok(tokio::time::timeout(limit, mcp.client.call_tool(params))
+        .await
+        .unwrap_or_else(|_| panic!("{tool} must answer within {limit:?}"))?)
+}
+
+async fn status_of(mcp: &InProcessMcp, tool: &str) -> Result<String> {
+    let params = CallToolRequestParams::new("status").with_arguments(
+        json!({ "tools": tool })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    Ok(result_text(&mcp.client.call_tool(params).await?))
+}
+
+/// A call that asks to wait is still a tracked operation: it is in `status`
+/// (and so in the TUI and the audit log), like any other.
+#[tokio::test]
+async fn a_sync_flagged_call_is_a_tracked_operation() -> Result<()> {
+    for (tool, args) in sync_flagged_calls("echo flagged-and-tracked") {
+        let (mcp, _t) = flagged_server().await?;
+        let text = result_text(&call(&mcp, tool, &args).await?);
+        assert!(text.contains("flagged-and-tracked"), "{tool}: {text}");
+
+        let status = status_of(&mcp, tool).await?;
+        assert!(
+            !status.contains("(total: 0)") && status.contains("flagged-and-tracked"),
+            "{tool}: the call must be a monitored operation: {status}"
+        );
+    }
+    Ok(())
+}
+
+/// Asking to wait still waits: past the adaptive window, within the budget,
+/// the call answers with the output rather than an id.
+#[tokio::test]
+async fn a_sync_flagged_call_waits_past_the_adaptive_window() -> Result<()> {
+    let secs = budget_secs() * 3 / 4;
+    for (tool, args) in sync_flagged_calls(&sleep_then_done(secs)) {
+        let (mcp, _t) = flagged_server().await?;
+        let text = result_text(&call(&mcp, tool, &args).await?);
+        assert!(text.contains("done"), "{tool} waits for the output: {text}");
+        assert!(!text.contains("AHMA ID"), "{tool} is not an id: {text}");
+    }
+    Ok(())
+}
+
+/// A call that asks to wait for a command longer than the client can hold a
+/// request open gets the operation id at the budget, as sync mode does — it
+/// no longer holds the request for the whole command.
+#[tokio::test]
+async fn a_sync_flagged_call_hands_back_an_id_when_the_client_cannot_wait_longer() -> Result<()> {
+    for (tool, args) in sync_flagged_calls(&sleep_then_done(budget_secs() * 10)) {
+        let (mcp, _t) = flagged_server().await?;
+        let started = std::time::Instant::now();
+        let text = result_text(&call(&mcp, tool, &args).await?);
+        assert!(text.contains("AHMA ID"), "{tool}: {text}");
+        assert!(
+            text.contains("Still running") && text.contains("call `await`"),
+            "{tool}: says why it returned and how to collect: {text}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(budget_secs() * 5),
+            "{tool}: bounded by the budget, not the command"
+        );
+        let _ = mcp
+            .client
+            .call_tool(CallToolRequestParams::new("cancel"))
+            .await;
+    }
+    Ok(())
+}
+
+/// Cancelling the MCP request that asked to wait still stops the command, as
+/// it did on the direct path, but now as the operation's own cancellation:
+/// recorded, with the reason, where `status` and `await` can see it.
+#[tokio::test]
+async fn cancelling_a_sync_flagged_request_cancels_its_operation() -> Result<()> {
+    use rmcp::model::{CallToolRequest, ClientRequest};
+    use rmcp::service::PeerRequestOptions;
+
+    let secs = TestTimeouts::scale_secs(30).as_secs();
+    let (mcp, _t) = flagged_server().await?;
+    let params = CallToolRequestParams::new("waits").with_arguments(
+        json!({ "c_flag": true, "command": sleep_then_done(secs) })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let handle = mcp
+        .client
+        .peer()
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
+        .await?;
+
+    // Cancel once the command is running: it must be an operation by then.
+    let running = ahma_mcp::test_utils::concurrency::wait_for_condition(
+        TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::ToolCall),
+        TestTimeouts::poll_interval(),
+        || async {
+            status_of(&mcp, "waits")
+                .await
+                .is_ok_and(|s| s.contains("1 active"))
+        },
+    )
+    .await;
+    assert!(running, "the waiting call must show as an active operation");
+    handle.cancel(Some("test gives up".into())).await?;
+
+    let awaited = call(&mcp, "await", &json!({ "tools": "waits" })).await?;
+    let text = result_text(&awaited);
+    assert!(
+        text.contains("\"state\": \"Cancelled\"") && text.contains("test gives up"),
+        "the operation records its cancellation and why: {text}"
+    );
+    Ok(())
+}
+
+/// What a sync-flagged call answers when it finishes in time: the direct
+/// path's output, unchanged, under the identity line every inline result
+/// leads with (SPEC R2.6.2).
+#[tokio::test]
+async fn a_sync_flagged_result_is_the_direct_output_under_the_identity_line() -> Result<()> {
+    let line = "echo first-line; echo second-line";
+    let (mcp, temp) = flagged_server().await?;
+    let wd = temp.path().to_string_lossy().into_owned();
+    // The direct path, as `run_terminal_command` configures it.
+    let shell = ahma_mcp::AhmaMcpService::build_shell_subcommand_config(
+        None,
+        &ahma_mcp::adapter::ExecutionMode::Synchronous,
+    );
+    let direct = mcp
+        .service
+        .adapter
+        .execute_sync_in_dir(
+            ahma_mcp::shell_pool::platform_shell_program(),
+            json!({ "c_flag": true, "command": line })
+                .as_object()
+                .cloned(),
+            &wd,
+            None,
+            Some(&shell),
+        )
+        .await?;
+
+    for (tool, mut args) in sync_flagged_calls(line) {
+        args["working_directory"] = json!(wd);
+        let text = result_text(&call(&mcp, tool, &args).await?);
+        let (identity, body) = text
+            .split_once('\n')
+            .unwrap_or_else(|| panic!("{tool}: an identity line, then the output: {text}"));
+        assert!(
+            identity.starts_with('\u{2713}') && identity.contains("exit 0"),
+            "{tool}: the first line says how it ended: {identity}"
+        );
+        assert_eq!(body, direct.trim_end(), "{tool}: the output is unchanged");
+    }
+    Ok(())
+}
+
+/// A sequence that asks to wait runs its steps as tracked operations, and a
+/// failed step still stops the steps after it.
+#[tokio::test]
+async fn a_synchronous_sequence_tracks_its_steps_and_stops_at_a_failure() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let tools = temp.path().join(".ahma");
+    tokio::fs::create_dir_all(&tools).await?;
+    write_shell_tool(&tools, "step", None).await;
+    let fail = "exit 3";
+    tokio::fs::write(
+        tools.join("chain.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "chain", "description": "three steps", "command": "sequence",
+            "timeout_seconds": 60, "enabled": true, "synchronous": true,
+            "step_delay_ms": 10,
+            "sequence": [
+                { "tool": "step", "subcommand": "default", "description": "a",
+                  "args": { "c_flag": true, "command": "echo chain-step-one" } },
+                { "tool": "step", "subcommand": "default", "description": "b",
+                  "args": { "c_flag": true, "command": fail } },
+                { "tool": "step", "subcommand": "default", "description": "c",
+                  "args": { "c_flag": true, "command": "echo chain-step-three" } }
+            ]
+        }))?,
+    )
+    .await?;
+    let mcp = create_in_process_mcp_with_scope(&tools, vec![temp.path().to_path_buf()]).await?;
+    mcp.service.set_app_config(Arc::new(AppConfig {
+        execution_mode: ExecutionPolicy::Async,
+        request_budget_override_secs: Some(TestTimeouts::scale_secs(20).as_secs()),
+        ..AppConfig::default()
+    }));
+
+    let args = json!({ "working_directory": temp.path().to_string_lossy() });
+    let result = call(&mcp, "chain", &args).await?;
+    let text = result_text(&result);
+    assert!(text.contains("chain-step-one"), "step one ran: {text}");
+    assert!(
+        !text.contains("chain-step-three"),
+        "a failed step stops the ones after it: {text}"
+    );
+    assert_eq!(result.is_error, Some(true), "the sequence failed: {text}");
+
+    let status = status_of(&mcp, "step").await?;
+    assert!(
+        status.contains("chain-step-one") && !status.contains("chain-step-three"),
+        "the steps that ran are operations, the one after the failure never started: {status}"
+    );
+    Ok(())
+}
