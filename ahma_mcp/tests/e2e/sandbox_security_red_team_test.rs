@@ -639,7 +639,7 @@ async fn red_team_livelog_symlink_read_allowed() {
     if let Ok(tools_res) = result {
         for content in tools_res.content {
             if let Some(text) = content.as_text() {
-                // execute_shell_sync returns raw stdout text, not a JSON envelope.
+                // The inline operation result: identity line, then stdout.
                 assert!(
                     text.text.contains("livelog secret content"),
                     "SECURITY: Valid livelog symlink target read was blocked. Got: {}",
@@ -680,12 +680,21 @@ async fn red_team_livelog_symlink_read_allowed() {
     // Landlock scopes writes precisely: outside_target has only read access in read_scopes,
     // not write access.  When bash tries to open the file for writing, the kernel returns
     // EACCES and bash exits non-zero.  The MCP tool call itself returns Ok (the process
-    // started successfully), so we cannot use result3.is_err() here — we must check the
-    // command-level exit code via assert_blocked_shell_result.
-    assert_blocked_shell_result(
-        result3,
-        "hax",
-        "SECURITY: Livelog target should be strictly read-only; write should be blocked",
+    // started successfully), so we cannot use result3.is_err() here — we check the
+    // command-level failure, and that the file on disk is untouched. (The result's
+    // identity line echoes the command, `echo hax > …`, so "hax" in the text proves
+    // nothing either way; the file's content is the real evidence.)
+    if let Ok(result) = &result3 {
+        assert!(
+            blocked_shell_result_indicates_failure(result),
+            "SECURITY: Livelog target should be strictly read-only; the write must fail. Output: {}",
+            result_text(result)
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&outside_target).unwrap(),
+        "livelog secret content",
+        "SECURITY: Livelog target should be strictly read-only; the write must not land"
     );
 
     client.cancel().await.unwrap();

@@ -37,7 +37,6 @@ pub use cli::{
 
 pub use resolution::{
     find_matching_tool, find_tool_config, normalize_tools_dir, resolve_cli_subcommand,
-    run_cli_sequence,
 };
 
 pub use modes::{run_cli_mode, run_http_bridge_mode, run_list_tools_mode, run_server_mode};

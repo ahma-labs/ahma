@@ -61,8 +61,8 @@ pub struct ToolConfig {
     pub input_schema: Option<Value>,
     /// Default timeout for operations in seconds
     pub timeout_seconds: Option<u64>,
-    /// Override the default execution mode for this tool.
-    /// - `true`: Always run on the legacy direct path (blocking, untracked)
+    /// How long a call to this tool waits for its tracked operation.
+    /// - `true`: Wait for the result, as the server's sync mode does
     /// - `false`: Return after the adaptive window, even in sync mode
     /// - `null`/omitted: Use the server's `tools.execution_mode` (async by default)
     ///
@@ -468,9 +468,9 @@ pub struct SubcommandConfig {
     pub positional_args_first: Option<bool>,
     /// Override timeout for this specific subcommand
     pub timeout_seconds: Option<u64>,
-    /// Override the default execution mode for this subcommand.
-    /// - `true`: Always run synchronously (blocking, returns result immediately)
-    /// - `false`: Always run asynchronously (non-blocking, returns operation ID)
+    /// How long a call to this subcommand waits for its tracked operation.
+    /// - `true`: Wait for the result, as the server's sync mode does
+    /// - `false`: Return after the adaptive window, even in sync mode
     /// - `null`/omitted: Inherit from tool level, or use server default if tool doesn't specify
     ///
     /// Inheritance: Subcommand-level settings override tool-level settings.

@@ -211,10 +211,10 @@ the session that started it. An agent sees the same report in the `status` tool,
 - **The drift report is by modification time**, skips `.gitignore`d paths and `.git/`,
   never walks outside the sandbox scope, names at most 20 files, and cannot tell who wrote a file — a writer that also edits
   sources (`cargo fmt`) is listed too.
-- **A synchronous call waits at most its own timeout.** Terminal hooks, CLI one-shots and
-  `synchronous: true` tools have no operation id to hand back while they wait, so they say
-  once that they are waiting (a hook writes it to stderr, which the client shows) and, if the
-  workspace stays busy for the whole timeout, fail with `Not run: …` naming the holder.
+- **A synchronous call waits at most its own timeout.** Terminal hooks and CLI one-shots
+  have no operation id to hand back while they wait, so they say once that they are waiting
+  (a hook writes it to stderr, which the client shows) and, if the workspace stays busy
+  for the whole timeout, fail with `Not run: …` naming the holder.
 - **A long-running command in the exclusive lane holds the workspace** until it ends. Run
   log followers through `livelog`, declare an MTDF tool `"concurrency": "service"`, or, for a
   shell command that waits for a person or runs for hours (a local review server,

@@ -260,6 +260,31 @@ fn progress_enabled(force: bool, client_type: crate::client_type::McpClientType)
     force || client_type.supports_progress()
 }
 
+/// What a call says about waiting for its result (SPEC R2.1, R2.3): MTDF
+/// `synchronous`, the `blocking` argument, and `run_terminal_command`'s
+/// unadvertised `execution_mode: "Synchronous"` (R2.6.3). `Some(true)` asks
+/// to wait, `Some(false)` asks not to, and a request to wait wins over a
+/// request not to; `None` when nothing was said, so the server's mode decides.
+///
+/// Only the wait is the caller's to choose. Every call runs its command as a
+/// tracked operation; the one direct path left is the CLI one-shot's
+/// (`force_synchronous`), which is not a tool call's to ask for.
+pub(crate) fn wait_asked_for(
+    synchronous: Option<bool>,
+    blocking: Option<bool>,
+    execution_mode: Option<&str>,
+) -> Option<bool> {
+    let execution_mode = (execution_mode == Some("Synchronous")).then_some(true);
+    let said = [synchronous, blocking, execution_mode];
+    if said.contains(&Some(true)) {
+        Some(true)
+    } else if said.contains(&Some(false)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 impl AhmaMcpService {
     /// The server's sync/async policy (SPEC R2.1): `tools.execution_mode`, as
     /// resolved from `--sync`/`--async` and the settings files. A service with
@@ -273,25 +298,31 @@ impl AhmaMcpService {
             .unwrap_or(ahma_common::config::ExecutionPolicy::Async)
     }
 
-    /// How long this call waits: sync mode waits until done unless the call
-    /// (MTDF `synchronous: false`, `blocking: false`) explicitly asks not to.
-    pub(crate) fn call_wait(&self, opted_out_of_waiting: bool) -> CallWait {
-        match self.execution_policy() {
-            ahma_common::config::ExecutionPolicy::Sync if !opted_out_of_waiting => {
-                CallWait::UntilDone
-            }
-            _ => CallWait::Adaptive,
+    /// How long this call waits (SPEC R2.1, R2.3). `asked` is what the call or
+    /// its tool definition said about waiting ([`wait_asked_for`]):
+    /// `Some(true)` waits until done, `Some(false)` answers after the adaptive
+    /// window, and `None` leaves it to the server's mode. Either way the call
+    /// is a tracked operation: asking to wait chooses how long the request is
+    /// held, never how the command runs.
+    pub(crate) fn call_wait(&self, asked: Option<bool>) -> CallWait {
+        match asked {
+            Some(true) => CallWait::UntilDone,
+            Some(false) => CallWait::Adaptive,
+            None => match self.execution_policy() {
+                ahma_common::config::ExecutionPolicy::Sync => CallWait::UntilDone,
+                ahma_common::config::ExecutionPolicy::Async => CallWait::Adaptive,
+            },
         }
     }
 
-    /// A sequence's share of [`Self::call_wait`]: in sync mode, the steps are
+    /// A sequence's share of [`Self::call_wait`]: when it waits, the steps are
     /// waited for within the window a single call would get.
     fn sequence_wait(
         &self,
         context: &RequestContext<RoleServer>,
-        opted_out_of_waiting: bool,
+        asked: Option<bool>,
     ) -> Option<sequence::SequenceWait<'_>> {
-        if self.call_wait(opted_out_of_waiting) != CallWait::UntilDone {
+        if self.call_wait(asked) != CallWait::UntilDone {
             return None;
         }
         let (window, _) = self.sync_call_wait(
@@ -1261,44 +1292,34 @@ impl AhmaMcpService {
         }
     }
 
+    /// What a configured-tool call says about waiting ([`wait_asked_for`]):
+    /// its subcommand's MTDF `synchronous`, else its tool's, and the call's
+    /// `blocking` and `execution_mode` arguments.
     #[allow(deprecated)]
-    fn sync_override_from_config(
-        subcommand_config: &crate::config::SubcommandConfig,
-        tool_config: &ToolConfig,
-    ) -> Option<bool> {
-        subcommand_config.synchronous.or(tool_config.synchronous)
-    }
-
-    fn determine_execution_mode(
-        &self,
+    fn configured_wait_asked(
         subcommand_config: &crate::config::SubcommandConfig,
         tool_config: &ToolConfig,
         arguments: &serde_json::Map<String, serde_json::Value>,
-    ) -> crate::adapter::ExecutionMode {
-        let dynamic_blocking = arguments
-            .get("blocking")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        #[allow(deprecated)]
-        let sync_override = Self::sync_override_from_config(subcommand_config, tool_config);
-
-        if self.force_synchronous || dynamic_blocking || sync_override == Some(true) {
-            return crate::adapter::ExecutionMode::Synchronous;
-        }
-        if sync_override == Some(false) {
-            return crate::adapter::ExecutionMode::AsyncResultPush;
-        }
-        let explicit_mode_str = arguments.get("execution_mode").and_then(|v| v.as_str());
-        if explicit_mode_str == Some("Synchronous") {
-            return crate::adapter::ExecutionMode::Synchronous;
-        }
-        crate::adapter::ExecutionMode::AsyncResultPush
+    ) -> Option<bool> {
+        wait_asked_for(
+            subcommand_config.synchronous.or(tool_config.synchronous),
+            arguments
+                .get("blocking")
+                .and_then(serde_json::Value::as_bool),
+            arguments
+                .get("execution_mode")
+                .and_then(serde_json::Value::as_str),
+        )
     }
 
     fn sync_tool_progress_description(base_command: &str, working_directory: &str) -> String {
         format!("Execute {} in {}", base_command, working_directory)
     }
 
+    /// The direct, untracked path, reached only by the CLI one-shot
+    /// (`force_synchronous`, SPEC R2.1). A tool call that asks to wait —
+    /// `synchronous: true`, `blocking: true` — is a tracked operation waited
+    /// on instead ([`Self::call_wait`]).
     #[allow(clippy::too_many_arguments)]
     async fn call_sync_tool(
         &self,
@@ -2317,15 +2338,18 @@ impl AhmaMcpService {
         }
 
         if config.sequence.is_some() {
+            let arguments = params.arguments.as_ref();
             #[allow(deprecated)]
-            let opted_out = config.synchronous == Some(false)
-                || params
-                    .arguments
-                    .as_ref()
+            let asked = wait_asked_for(
+                config.synchronous,
+                arguments
                     .and_then(|a| a.get("blocking"))
-                    .and_then(|v| v.as_bool())
-                    == Some(false);
-            let wait = self.sequence_wait(&context, opted_out);
+                    .and_then(serde_json::Value::as_bool),
+                arguments
+                    .and_then(|a| a.get("execution_mode"))
+                    .and_then(serde_json::Value::as_str),
+            );
+            let wait = self.sequence_wait(&context, asked);
             return sequence::handle_sequence_tool(
                 &self.adapter,
                 &self.progress_push,
@@ -2435,15 +2459,14 @@ impl AhmaMcpService {
         subcommand_config: &crate::config::SubcommandConfig,
         config: &ToolConfig,
         context: RequestContext<RoleServer>,
-        execution_mode: crate::adapter::ExecutionMode,
     ) -> Result<CallToolResult, McpError> {
         let id = crate::utils::operation::mint_id(tool_name, base_command);
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
 
-        match execution_mode {
-            crate::adapter::ExecutionMode::Synchronous => {
-                self.call_sync_tool(
+        if self.force_synchronous {
+            return self
+                .call_sync_tool(
                     id,
                     base_command,
                     working_directory,
@@ -2454,41 +2477,38 @@ impl AhmaMcpService {
                     client_type,
                     context.peer.clone(),
                 )
-                .await
-            }
-            crate::adapter::ExecutionMode::AsyncResultPush => {
-                let vault_args_summary = Self::summarize_arguments(&arguments);
-                // In sync mode a tool can still ask to return early: MTDF
-                // `synchronous: false`, or `blocking: false` on the call.
-                #[allow(deprecated)]
-                let opted_out = Self::sync_override_from_config(subcommand_config, config)
-                    == Some(false)
-                    || arguments.get("blocking").and_then(|v| v.as_bool()) == Some(false);
-                let wait = self.call_wait(opted_out);
-                self.call_async_tool(
-                    tool_name,
-                    id,
-                    base_command,
-                    working_directory,
-                    arguments,
-                    timeout,
-                    subcommand_config,
-                    self.log_monitor_config_from_tool(config),
-                    &vault_args_summary,
-                    progress_token,
-                    client_type,
-                    context.peer.clone(),
-                    wait,
-                    |e| {
-                        let error_message =
-                            format!("Failed to start asynchronous operation: {}", e);
-                        tracing::error!("{}", error_message);
-                        handlers::common::mcp_internal(error_message)
-                    },
-                )
-                .await
-            }
+                .await;
         }
+
+        let vault_args_summary = Self::summarize_arguments(&arguments);
+        // `synchronous` / `blocking` choose how long this request waits for
+        // the operation, never whether there is one (SPEC R2.1, R2.3).
+        let wait = self.call_wait(Self::configured_wait_asked(
+            subcommand_config,
+            config,
+            &arguments,
+        ));
+        self.call_async_tool(
+            tool_name,
+            id,
+            base_command,
+            working_directory,
+            arguments,
+            timeout,
+            subcommand_config,
+            self.log_monitor_config_from_tool(config),
+            &vault_args_summary,
+            progress_token,
+            client_type,
+            context.peer.clone(),
+            wait,
+            |e| {
+                let error_message = format!("Failed to start asynchronous operation: {}", e);
+                tracing::error!("{}", error_message);
+                handlers::common::mcp_internal(error_message)
+            },
+        )
+        .await
     }
 
     /// Resolves the subcommand from arguments, then dispatches either as a
@@ -2514,11 +2534,10 @@ impl AhmaMcpService {
         };
 
         if subcommand_config.sequence.is_some() {
-            #[allow(deprecated)]
-            let opted_out = Self::sync_override_from_config(subcommand_config, &config)
-                == Some(false)
-                || arguments.get("blocking").and_then(|v| v.as_bool()) == Some(false);
-            let wait = self.sequence_wait(&context, opted_out);
+            let wait = self.sequence_wait(
+                &context,
+                Self::configured_wait_asked(subcommand_config, &config, &arguments),
+            );
             return sequence::handle_subcommand_sequence(
                 &self.adapter,
                 &self.progress_push,
@@ -2548,7 +2567,6 @@ impl AhmaMcpService {
         }
 
         let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
-        let execution_mode = self.determine_execution_mode(subcommand_config, &config, &arguments);
 
         match self
             .execute_subcommand_command(
@@ -2560,7 +2578,6 @@ impl AhmaMcpService {
                 subcommand_config,
                 &config,
                 context,
-                execution_mode,
             )
             .await
         {
@@ -3381,24 +3398,6 @@ mod tests {
         .expect("service")
     }
 
-    async fn make_service_force_sync() -> AhmaMcpService {
-        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            TestTimeouts::scale_secs(30),
-        )));
-        let adapter =
-            crate::test_utils::client::create_test_config(Path::new(".")).expect("adapter");
-        AhmaMcpService::new(
-            adapter,
-            monitor,
-            Arc::new(HashMap::new()),
-            Arc::new(None),
-            true,
-            false,
-        )
-        .await
-        .expect("service")
-    }
-
     fn cfg_from(v: serde_json::Value) -> ToolConfig {
         serde_json::from_value(v).expect("tool config")
     }
@@ -3751,57 +3750,55 @@ mod tests {
     // ==================== execution mode ====================
 
     #[tokio::test]
-    async fn determine_execution_mode_variants() {
-        use crate::adapter::ExecutionMode;
-        let service = make_service().await;
+    async fn every_way_of_asking_to_wait_is_a_wait_policy() {
+        let service = make_service().await; // no AppConfig: the async default
         let cfg = cfg_from(json!({"name": "t", "description": "d", "command": "c"}));
         let sub = sub_from(json!({"name": "default", "description": "d"}));
-
-        // Default -> async.
-        assert_eq!(
-            service.determine_execution_mode(&sub, &cfg, &serde_json::Map::new()),
-            ExecutionMode::AsyncResultPush
-        );
-        // Dynamic blocking arg -> sync.
-        assert_eq!(
-            service.determine_execution_mode(&sub, &cfg, &obj(json!({"blocking": true}))),
-            ExecutionMode::Synchronous
-        );
-        // Explicit execution_mode string -> sync.
-        assert_eq!(
-            service.determine_execution_mode(
-                &sub,
-                &cfg,
-                &obj(json!({"execution_mode": "Synchronous"}))
-            ),
-            ExecutionMode::Synchronous
-        );
-
-        // Subcommand-level synchronous override true / false.
         let sync_sub =
             sub_from(json!({"name": "default", "description": "d", "synchronous": true}));
-        assert_eq!(
-            service.determine_execution_mode(&sync_sub, &cfg, &serde_json::Map::new()),
-            ExecutionMode::Synchronous
-        );
         let async_sub =
             sub_from(json!({"name": "default", "description": "d", "synchronous": false}));
+        let wait = |sub: &crate::config::SubcommandConfig, args: serde_json::Value| {
+            service.call_wait(AhmaMcpService::configured_wait_asked(sub, &cfg, &obj(args)))
+        };
+
+        // Nothing said: the server's mode.
+        assert_eq!(wait(&sub, json!({})), CallWait::Adaptive);
+        // Each way of asking to wait waits for the operation.
+        assert_eq!(wait(&sub, json!({"blocking": true})), CallWait::UntilDone);
         assert_eq!(
-            service.determine_execution_mode(&async_sub, &cfg, &serde_json::Map::new()),
-            ExecutionMode::AsyncResultPush
+            wait(&sub, json!({"execution_mode": "Synchronous"})),
+            CallWait::UntilDone
+        );
+        assert_eq!(wait(&sync_sub, json!({})), CallWait::UntilDone);
+        // Asking not to wait, and an unknown mode, do not.
+        assert_eq!(wait(&async_sub, json!({})), CallWait::Adaptive);
+        assert_eq!(wait(&sub, json!({"blocking": false})), CallWait::Adaptive);
+        assert_eq!(
+            wait(&sub, json!({"execution_mode": "bogus"})),
+            CallWait::Adaptive
+        );
+        // A request to wait wins over a request not to.
+        assert_eq!(
+            wait(&async_sub, json!({"blocking": true})),
+            CallWait::UntilDone
+        );
+        assert_eq!(
+            wait(&sync_sub, json!({"blocking": false})),
+            CallWait::UntilDone
         );
     }
 
     #[tokio::test]
-    async fn determine_execution_mode_force_synchronous_service() {
-        use crate::adapter::ExecutionMode;
-        let service = make_service_force_sync().await;
-        let cfg = cfg_from(json!({"name": "t", "description": "d", "command": "c"}));
-        let sub = sub_from(json!({"name": "default", "description": "d"}));
-        assert_eq!(
-            service.determine_execution_mode(&sub, &cfg, &serde_json::Map::new()),
-            ExecutionMode::Synchronous
-        );
+    async fn nothing_said_about_waiting_follows_the_server_mode() {
+        let service = make_service().await;
+        service.set_app_config(Arc::new(crate::shell::cli::AppConfig {
+            execution_mode: ahma_common::config::ExecutionPolicy::Sync,
+            ..Default::default()
+        }));
+        assert_eq!(service.call_wait(None), CallWait::UntilDone);
+        assert_eq!(service.call_wait(Some(false)), CallWait::Adaptive);
+        assert_eq!(service.call_wait(Some(true)), CallWait::UntilDone);
     }
 
     // ==================== subcommand resolution ====================

@@ -258,7 +258,7 @@ fn add_blocking_property(properties: &mut Map<String, Value>) {
         "blocking".to_string(),
         serde_json::json!({
             "type": "boolean",
-            "description": "true: wait for the result before returning. false: return an operation id after a short window and collect the result with `await` (lets you run several at once). Default: the server's execution mode (sync — wait — unless it is configured async)."
+            "description": "true: wait for the result before returning, up to the client's budget for one request; a command still running then returns its operation id to collect with `await`. false: return an operation id after a short window (lets you run several at once). Default: the server's execution mode, async unless the operator configured sync. Either way the command runs as a tracked operation."
         }),
     );
 }

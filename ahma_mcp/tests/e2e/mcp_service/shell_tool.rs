@@ -302,8 +302,20 @@ async fn test_handle_run_terminal_command_sync_failing_command() -> Result<()> {
 
     let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
-    let result = client.call_tool(call_param).await;
-    assert!(result.is_err());
+    // A waiting call is a tracked operation (SPEC R2.1): a failed command is a
+    // result whose identity line names the exit code (R2.6.2), not a
+    // JSON-RPC error.
+    let result = client.call_tool(call_param).await?;
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect();
+    let identity = text.lines().next().unwrap_or_default();
+    assert!(
+        identity.starts_with('\u{2717}') && identity.contains("exit 1"),
+        "the first line says the command failed and how: {text}"
+    );
     Ok(())
 }
 
