@@ -386,7 +386,7 @@ async fn a_link_opens_this_time_when_the_client_answers_once() {
 #[tokio::test]
 async fn always_for_this_host_is_saved_and_audited() {
     let home = Home::new();
-    let client = RecordingClient::new("link-test").with_elicitation(Some("always-site"));
+    let client = RecordingClient::new("link-test").with_elicitation(Some("always-site-all-repos"));
     let prompts = client.elicitation().unwrap();
     let (_mcp, lease) = served(&home, client).await;
 

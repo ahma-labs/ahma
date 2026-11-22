@@ -1002,7 +1002,7 @@ mod tests {
             ahma_common::open_url::GUIDANCE,
             "No — deny",
             "Yes — this time",
-            "`ahma permissions grant open-url github.com`",
+            "`ahma permissions grant open-url github.com --all-repos`",
         ] {
             assert!(reason.contains(must), "missing {must:?} in:\n{reason}");
         }
@@ -1014,13 +1014,20 @@ mod tests {
         let order = [
             "No — deny",
             "Yes — this time",
-            "Always for this site — all repos",
-            "Always for this site — this repo only",
-            "Always (any site)",
+            "Always for github.com — this repo only (the usual lasting answer)",
+            "Always for github.com — all repos",
+            "Always for any site — this repo only",
         ];
         assert!(
             order.windows(2).all(|w| at(w[0]) < at(w[1])),
-            "deny, this time, all repos, this repo, any site:\n{reason}"
+            "deny, this time, this repo, all repos, any site in this repo:\n{reason}"
+        );
+        assert!(
+            reason.contains(&format!(
+                "`ahma permissions grant open-url github.com --workspace '{}'`",
+                workspace.display()
+            )),
+            "{reason}"
         );
 
         let approval =

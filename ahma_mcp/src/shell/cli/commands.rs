@@ -1108,7 +1108,8 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
             kind,
             subject,
             workspace,
-            this_repo,
+            this_repo: _,
+            all_repos,
             lease,
             yes,
         } => {
@@ -1119,7 +1120,7 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
                          (revoke with `ahma permissions revoke open-url <site> --yes`)"
                     );
                 }
-                let binding = open_url_grant_binding(workspace, this_repo)?;
+                let binding = open_url_grant_binding(workspace, all_repos)?;
                 let settings = load()?;
                 return grant_open_url(&file, &settings, subject.as_deref(), binding, yes);
             }
@@ -1134,23 +1135,41 @@ fn subject_or_bail(kind: &str, subject: Option<String>) -> Result<String> {
     subject.with_context(|| format!("`{kind}` needs a SUBJECT: what to grant or revoke"))
 }
 
+/// Why an `open-url` grant run outside a git repository names no repo, and
+/// the three ways to name one (SPEC R-LINK.11).
+const OPEN_URL_NO_REPO: &str = "Not inside a git repository, so there is no repo to bind \
+     this grant to, and nothing was written. Run it inside the repo, or add --workspace <DIR> \
+     for one repo, or --all-repos for every repo.";
+
 /// The repo an `open-url` grant is bound to (SPEC R-LINK.11): every repo
-/// unless `--this-repo` or `--workspace` names one.
+/// with `--all-repos`; the one `--workspace` names; otherwise (and with
+/// `--this-repo`) the git repository enclosing the current directory, or
+/// none, and then the grant is refused.
 fn open_url_grant_binding(
     workspace: Option<PathBuf>,
-    this_repo: bool,
+    all_repos: bool,
 ) -> Result<ahma_common::open_url::OpenUrlBinding> {
     use ahma_common::open_url::OpenUrlBinding;
-    if workspace.is_none() && !this_repo {
+    if all_repos {
         return Ok(OpenUrlBinding::AllRepos);
     }
-    let ws = resolve_cli_workspace(workspace, false)?
-        .context("cannot determine this repo; pass --workspace <DIR>")?;
-    Ok(OpenUrlBinding::Repo(ws))
+    if workspace.is_some() {
+        let ws = resolve_cli_workspace(workspace, false)?
+            .context("cannot determine the workspace; pass --workspace <DIR>")?;
+        return Ok(OpenUrlBinding::Repo(ws));
+    }
+    this_repo().map(OpenUrlBinding::Repo)
+}
+
+/// The git repository enclosing the current directory, strictly: never the
+/// temp directory a hooked command falls back to in the home directory.
+fn this_repo() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    crate::hooks::enclosing_git_workspace(&cwd).context(OPEN_URL_NO_REPO)
 }
 
 /// Where an `open-url` revoke looks: everywhere (`None`), only the grants
-/// for all repos (`--global`), or only one repo's.
+/// for all repos (`--global`, `--all-repos`), or only one repo's.
 fn open_url_revoke_binding(
     workspace: Option<PathBuf>,
     this_repo: bool,
@@ -1163,7 +1182,7 @@ fn open_url_revoke_binding(
     if workspace.is_none() && !this_repo {
         return Ok(None);
     }
-    open_url_grant_binding(workspace, this_repo).map(Some)
+    open_url_grant_binding(workspace, false).map(Some)
 }
 
 /// A site as `[open_url]` stores it: a host pattern, lowercased; `*` when
@@ -1227,9 +1246,12 @@ fn grant_open_url(
     }
     println!("✓ Granted: {line}");
     println!();
-    let revoke_flag = match binding {
-        OpenUrlBinding::AllRepos => "",
-        OpenUrlBinding::Repo(_) => " --this-repo",
+    let revoke_flag = match &binding {
+        OpenUrlBinding::AllRepos => " --global".to_string(),
+        OpenUrlBinding::Repo(ws) => format!(
+            " --workspace {}",
+            crate::links::policy::sh_single_quote(&ws.to_string_lossy())
+        ),
     };
     let site_arg = if any {
         String::new()
@@ -3835,6 +3857,7 @@ mod tests {
                     subject: Some(subject.into()),
                     workspace: Some(ws.clone()),
                     this_repo: false,
+                    all_repos: false,
                     lease: Some("8h".into()),
                     yes,
                 },
@@ -3865,6 +3888,7 @@ mod tests {
                     subject: Some("id_ed25519 for github.com".into()),
                     workspace: Some(ws.clone()),
                     this_repo: false,
+                    all_repos: false,
                     lease: None,
                     yes: true,
                 },
@@ -3889,6 +3913,8 @@ mod tests {
         assert!(settings.sandbox.ssh_sign.is_empty());
     }
 
+    /// `ahma permissions grant open-url`, for the repo `workspace` names, or
+    /// with `--all-repos` when it names none.
     fn grant_open_url_cli(
         site: Option<&str>,
         workspace: Option<PathBuf>,
@@ -3899,9 +3925,26 @@ mod tests {
             command: PermissionsCommand::Grant {
                 kind: "open-url".into(),
                 subject: site.map(Into::into),
+                all_repos: workspace.is_none(),
                 workspace,
                 this_repo: false,
                 lease: lease.map(Into::into),
+                yes,
+            },
+        })
+    }
+
+    /// `ahma permissions grant open-url SITE` with no binding flag, or with
+    /// `--this-repo`, run in the current directory.
+    fn grant_open_url_here(site: &str, this_repo: bool, yes: bool) -> Result<()> {
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Grant {
+                kind: "open-url".into(),
+                subject: Some(site.into()),
+                workspace: None,
+                this_repo,
+                all_repos: false,
+                lease: None,
                 yes,
             },
         })
@@ -3927,10 +3970,11 @@ mod tests {
             .open_url
     }
 
-    /// SPEC R-LINK.11: a site is granted for every repo by default, only with
-    /// `--yes`, normalised, listed as `open-url`, and audited as from the CLI.
+    /// SPEC R-LINK.11: with `--all-repos` a site is granted for every repo,
+    /// only with `--yes`, normalised, listed as `open-url`, and audited as
+    /// from the CLI.
     #[test]
-    fn an_open_url_grant_is_for_all_repos_and_written_only_with_yes() {
+    fn an_open_url_grant_for_all_repos_is_written_only_with_yes() {
         let home = TempDir::new().unwrap();
         let _guard = HomeGuard::new(home.path());
         grant_open_url_cli(Some("GitHub.com"), None, None, false).unwrap();
@@ -3965,13 +4009,84 @@ mod tests {
         let _guard = HomeGuard::new(home.path());
         let ws = home.path().join("repo");
         std::fs::create_dir_all(ws.join(".git")).unwrap();
-        grant_open_url_cli(Some("*.github.io"), Some(ws.clone()), None, true).unwrap();
+        grant_open_url_cli(Some("*.github.com"), Some(ws.clone()), None, true).unwrap();
         grant_open_url_cli(None, None, None, true).unwrap();
         let s = open_url_settings(home.path());
         assert_eq!(s.allow, ["*"]);
         assert_eq!(s.repos.len(), 1);
         assert_eq!(s.repos[0].workspace, dunce::canonicalize(&ws).unwrap());
-        assert_eq!(s.repos[0].allow, ["*.github.io"]);
+        assert_eq!(s.repos[0].allow, ["*.github.com"]);
+    }
+
+    /// Run `f` with the current directory set to `dir`, restoring it after.
+    /// The caller holds a [`HomeGuard`], which serialises on `ENV_MUTEX`.
+    fn in_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let out = f();
+        std::env::set_current_dir(prev).unwrap();
+        out
+    }
+
+    /// SPEC R-LINK.11: `--this-repo` run from the home directory names no
+    /// repo. It is refused, naming how to choose one, and writes nothing —
+    /// never bound to the temp directory the hook falls back to there.
+    #[test]
+    fn this_repo_from_home_is_refused_not_bound_to_the_temp_dir() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let err = in_dir(home.path(), || {
+            grant_open_url_here("github.com", true, true)
+        })
+        .expect_err("no repo encloses the home directory");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--workspace") && msg.contains("--all-repos"),
+            "{msg}"
+        );
+        assert!(!ledger(home.path()).exists(), "nothing written");
+    }
+
+    /// SPEC R-LINK.11: with no binding flag a grant is for the git repository
+    /// enclosing the current directory (its root, from a subdirectory), as
+    /// `--this-repo` says; outside one it is refused — preview too — naming
+    /// how to choose, and nothing is written.
+    #[test]
+    fn an_open_url_grant_is_for_this_repo_by_default_and_refused_outside_one() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let repo = home.path().join("repo");
+        let sub = repo.join("src");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        in_dir(&sub, || grant_open_url_here("GitHub.com", false, true)).unwrap();
+        let s = open_url_settings(home.path());
+        assert!(s.allow.is_empty(), "not every repo: {s:?}");
+        assert_eq!(s.repos.len(), 1);
+        assert_eq!(s.repos[0].workspace, dunce::canonicalize(&repo).unwrap());
+        assert_eq!(s.repos[0].allow, ["github.com"]);
+        in_dir(&sub, || grant_open_url_here("github.com", true, true)).unwrap();
+        assert_eq!(
+            open_url_settings(home.path()),
+            s,
+            "--this-repo is the default"
+        );
+
+        let plain = home.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        for yes in [false, true] {
+            let err = in_dir(&plain, || grant_open_url_here("docs.rs", false, yes))
+                .expect_err("no repo encloses it");
+            let msg = format!("{err:#}");
+            for must in [
+                "Not inside a git repository",
+                "--workspace <DIR>",
+                "--all-repos",
+            ] {
+                assert!(msg.contains(must), "missing {must:?}: {msg}");
+            }
+        }
+        assert_eq!(open_url_settings(home.path()), s, "nothing written");
     }
 
     /// What a grant names must be a site, and it lasts until revoked: a URL,

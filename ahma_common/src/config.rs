@@ -3251,13 +3251,13 @@ impl AhmaSettings {
             "open_url",
         );
         w.setting(
-            &format!("Sites whose http and https links commands ahma runs may open in your default browser without asking, in every repo: exact (`github.com`), one-label wildcard (`*.github.io`), or `*` for any public site (never localhost or a private address). {} Change with `ahma permissions grant open-url` and `ahma permissions revoke open-url`.", crate::open_url::GUIDANCE),
+            &format!("Sites whose http and https links commands ahma runs may open in your default browser without asking, in every repo: exact (`github.com`), one-label wildcard (`*.github.com`), or `*` for any public site (never localhost or a private address). {} Change with `ahma permissions grant open-url <site> --all-repos` and `ahma permissions revoke open-url`.", crate::open_url::GUIDANCE),
             "allow",
             toml_str_list(&self.open_url.allow),
             toml_str_list(&d.open_url.allow),
         );
         w.setting(
-            "Sites allowed in one repo only, as `allow` is for every repo (`ahma permissions grant open-url <site> --this-repo`).",
+            "Sites allowed in one repo only, as `allow` is for every repo: what `ahma permissions grant open-url <site>` writes, run inside the repo, or with `--workspace <DIR>`.",
             "repos",
             toml_open_url_repos(&self.open_url.repos),
             toml_open_url_repos(&d.open_url.repos),

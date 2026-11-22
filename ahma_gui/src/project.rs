@@ -598,6 +598,7 @@ pub fn gates(state: &AppState) -> Gates {
 fn link(gate: &ahma_tui::state::LinkAskGate, persistent: bool) -> Gate {
     use ahma_tui::controller::LinkChoice;
     let ask = &gate.ask;
+    let question = ask.question();
     let unsaved = ask.unsaved_choices();
     let options = gate
         .choices
@@ -619,7 +620,7 @@ fn link(gate: &ahma_tui::state::LinkAskGate, persistent: bool) -> Gate {
             };
             let label = match choice {
                 LinkChoice::Deny => "Deny (default)".to_string(),
-                other => capitalised(other.label()),
+                other => question.label(other),
             };
             GateOption {
                 value: choice.value().to_string(),
@@ -634,17 +635,9 @@ fn link(gate: &ahma_tui::state::LinkAskGate, persistent: bool) -> Gate {
         decision_id: clean(&gate.decision_id),
         site: clean(&ask.refusal.host.to_ascii_lowercase()),
         workspace: clean(&ask.workspace.display().to_string()),
-        text: clean(&ask.question().text()),
+        text: clean(&question.text()),
         note: ahma_tui::harness_asks::LINK_NOT_PAUSED.to_string(),
         options,
-    }
-}
-
-fn capitalised(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
     }
 }
 
@@ -943,9 +936,9 @@ mod tests {
             [
                 DENY,
                 SESSION,
-                ALWAYS_SITE,
                 ALWAYS_SITE_THIS_REPO,
-                ALWAYS_ANY
+                ALWAYS_SITE_ALL_REPOS,
+                ALWAYS_ANY_THIS_REPO
             ],
             "the TUI's answers, in its order"
         );
@@ -968,7 +961,10 @@ mod tests {
             options[2]
                 .hint
                 .as_deref()
-                .is_some_and(|h| h.contains("`ahma permissions grant open-url github.com`")),
+                .is_some_and(|h| h.contains(&format!(
+                    "`ahma permissions grant open-url github.com --workspace '{}'`",
+                    ask.workspace.display()
+                ))),
             "{:?}",
             options[2].hint
         );
@@ -982,7 +978,7 @@ mod tests {
             panic!()
         };
         assert!(
-            options.iter().all(|o| o.value != ALWAYS_ANY),
+            options.iter().all(|o| o.value != ALWAYS_ANY_THIS_REPO),
             "no any-site answer for a local site"
         );
 
@@ -995,14 +991,54 @@ mod tests {
         assert_eq!(g.waiting, 3);
     }
 
+    /// SPEC R-LINK.6, R-GUI.9: the three example links in `ahma web` and
+    /// `ahma desktop`: the TUI's rows in its order, each lasting one naming
+    /// the site it would save, and only deny and this session given here.
+    #[test]
+    fn the_three_examples_show_this_repo_first_and_give_deny_and_session() {
+        use link_values::*;
+        for host in ["github.com", "api.github.com", "someone.github.io"] {
+            let mut gui = gui_state();
+            gui.link_ask = Some(link_gate(host, false));
+            let Some(Gate::Link { options, .. }) = gates(&gui).top else {
+                panic!("a link question")
+            };
+            let rows: Vec<(String, String, bool)> = options
+                .iter()
+                .map(|o| (o.value.clone(), o.label.clone(), o.allowed))
+                .collect();
+            let want = [
+                (DENY, "Deny (default)".to_string(), true),
+                (SESSION, "This site, this session".into(), true),
+                (
+                    ALWAYS_SITE_THIS_REPO,
+                    format!("Always for {host} — this repo only"),
+                    false,
+                ),
+                (
+                    ALWAYS_SITE_ALL_REPOS,
+                    format!("Always for {host} — all repos"),
+                    false,
+                ),
+                (
+                    ALWAYS_ANY_THIS_REPO,
+                    "Always for any site — this repo only".into(),
+                    false,
+                ),
+            ]
+            .map(|(v, l, a)| (v.to_string(), l, a));
+            assert_eq!(rows, want, "{host}");
+        }
+    }
+
     /// The values the page sends back, as `links::policy::LinkChoice::value`
     /// spells them (pinned here so a rename is seen).
     mod link_values {
         pub const DENY: &str = "deny";
         pub const SESSION: &str = "session";
-        pub const ALWAYS_SITE: &str = "always-site";
         pub const ALWAYS_SITE_THIS_REPO: &str = "always-site-this-repo";
-        pub const ALWAYS_ANY: &str = "always-any-site";
+        pub const ALWAYS_SITE_ALL_REPOS: &str = "always-site-all-repos";
+        pub const ALWAYS_ANY_THIS_REPO: &str = "always-any-site-this-repo";
     }
 
     #[test]

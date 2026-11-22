@@ -4,8 +4,9 @@
 //! every decision about it carries (R-LINK.7).
 //!
 //! A grant names a site pattern — exact (`github.com`), one-label wildcard
-//! (`*.github.io`), or `*` for any public site — and is either for **all
-//! repos** (`allow`) or for **one repo** (`repos`). The patterns are checked
+//! (`*.github.com`), or `*` for any public site — and is either for **one
+//! repo** (`repos`, what a new grant is unless the human chooses every repo)
+//! or for **all repos** (`allow`). The patterns are checked
 //! and matched by the egress `HostPattern` in `ahma_mcp`; this module stores
 //! the normalised text and never interprets it, so the settings file reads
 //! exactly like `[network] allow`.

@@ -5,7 +5,8 @@
 
 `ahma desktop` opens the same view as [`ahma web`](web.md) — every editor session's work, hooked
 shell commands, a chat with your model for the current directory, and the permission
-questions, a web link a hooked command was refused among them ([open-links.md](open-links.md))
+questions, a web link a hooked command was refused among them (deny or this site for this
+session here; the lasting answers, this repo first, name their grant line, [open-links.md](open-links.md))
 — in a window of its own instead of a browser tab.
 
 ## Why

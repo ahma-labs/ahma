@@ -470,7 +470,9 @@ mod tests {
             "once",
             "always-site",
             "always-site-this-repo",
+            "always-site-all-repos",
             "always-any-site",
+            "always-any-site-this-repo",
         ] {
             assert!(
                 ok(json!({"type": "answer_link_ask", "decision_id": "l", "answer": refused}))

@@ -166,10 +166,14 @@ fn a_rerun_after_a_refusal_is_asked() {
         .unwrap_or_default();
     assert!(reason.contains("Site: example.com"), "{reason}");
     assert!(reason.contains("Yes — this time"), "{reason}");
-    assert!(
-        reason.contains("`ahma permissions grant open-url example.com`"),
-        "{reason}"
-    );
+    // Each lasting answer names its binding, this repo first.
+    let this_repo = reason
+        .find("Always for example.com — this repo only (the usual lasting answer)")
+        .unwrap_or_else(|| panic!("{reason}"));
+    let all_repos = reason
+        .find("`ahma permissions grant open-url example.com --all-repos`")
+        .unwrap_or_else(|| panic!("{reason}"));
+    assert!(this_repo < all_repos, "{reason}");
     let rewritten = hook["updatedInput"]["command"].as_str().unwrap_or_default();
     assert!(rewritten.contains("--approve-grant"), "{rewritten}");
 }

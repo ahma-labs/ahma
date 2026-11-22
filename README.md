@@ -370,8 +370,8 @@ with `ahma permissions grant ssh-sign`. See [docs/ssh-agent-broker.md](docs/ssh-
 ### Opening web links — `gh … --web` inside the sandbox *(experimental)*
 
 A sandboxed command can't start a browser itself, so ahma opens `http`/`https` links for it,
-outside the sandbox, in your default browser — only for sites you allowed, for every repo or
-one, with `ahma permissions grant open-url github.com`. Each command's `BROWSER` is ahma's
+outside the sandbox, in your default browser — only for sites you allowed, for the repo you
+are in by default or every repo with `--all-repos`, with `ahma permissions grant open-url github.com`. Each command's `BROWSER` is ahma's
 own helper, and a whole-line `open https://…` runs as it. A link to any other site is asked
 about: over MCP in your client's own prompt while the command waits; from a hook it is refused
 with one line, and when the command runs again Claude Code's own dialog asks you (yes opens it

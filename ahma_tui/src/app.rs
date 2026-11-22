@@ -2909,9 +2909,9 @@ pub(crate) fn resolve_link_ask(
 
 /// Keys for the open link question (SPEC R-LINK.6), from
 /// [`crate::state::LINK_ASK_KEYS`]: `n`, Enter and Esc deny; `s` this site for
-/// this session; `a` always for this site in all repos, `r` in this repo only,
-/// `*` any site — each only where the question offers it. The rules for taking
-/// an answer are the controller's.
+/// this session; `r` always for this site in this repo only, `a` in all repos,
+/// `*` any site in this repo only — each only where the question offers it.
+/// The rules for taking an answer are the controller's.
 fn handle_link_ask_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
@@ -9503,10 +9503,10 @@ mod tests {
 
     /// SPEC R-LINK.6, R-LINK.7: the question shows the site on its own line,
     /// the address, the guidance and the answers in order — deny, this site
-    /// for this session, always for this site in all repos, then this repo,
-    /// then any site — with no "this time"; a saving key shows the exact line
-    /// it writes before a second press saves it; `n` denies and records it,
-    /// so the harness dialog does not ask it too.
+    /// for this session, always for this site in this repo, then all repos,
+    /// then any site in this repo — with no "this time"; a saving key shows
+    /// the exact line it writes before a second press saves it; `n` denies
+    /// and records it, so the harness dialog does not ask it too.
     #[test]
     fn a_link_question_shows_the_guidance_and_its_answers_and_is_answered_here() {
         use crate::state::AppState;
@@ -9540,10 +9540,10 @@ mod tests {
         };
         let order = [
             "[n] Deny",
-            "[s] this site, this session",
-            "[a] always for this site — all repos",
-            "[r] always for this site — this repo only",
-            "[*] always (any site)",
+            "[s] This site, this session",
+            "[r] Always for github.com — this repo only",
+            "[a] Always for github.com — all repos",
+            "[*] Always for any site — this repo only",
         ];
         assert!(
             order.windows(2).all(|w| at(w[0]) < at(w[1])),

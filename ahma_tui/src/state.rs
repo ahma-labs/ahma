@@ -1702,9 +1702,9 @@ pub const LINK_ASK_KEYS: [(char, ahma_mcp::links::policy::LinkChoice); 5] = {
     [
         ('n', Deny),
         ('s', Session),
-        ('a', AlwaysSiteAllRepos),
         ('r', AlwaysSiteThisRepo),
-        ('*', AlwaysAny),
+        ('a', AlwaysSiteAllRepos),
+        ('*', AlwaysAnyThisRepo),
     ]
 };
 

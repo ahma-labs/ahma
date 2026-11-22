@@ -27,12 +27,16 @@ http and https links, in your default browser, never files or apps. Undo with
 ## Quickstart
 
 ```bash
-# Let commands open GitHub links without asking (preview first, then --yes):
+# Inside a repo: let its commands open GitHub links without asking
+# (preview first, then --yes). A grant is for this repo unless you say otherwise:
 ahma permissions grant open-url github.com
 ahma permissions grant open-url github.com --yes
 
-# In this repo only:
-ahma permissions grant open-url github.com --this-repo --yes
+# In every repo (wider: name it on purpose):
+ahma permissions grant open-url docs.rs --all-repos --yes
+
+# For another repo, from anywhere:
+ahma permissions grant open-url github.com --workspace ~/code/proj --yes
 
 # Inside any command ahma runs (hooked or over MCP), these now open in your browser:
 gh pr view 12 --web
@@ -56,15 +60,19 @@ A command run through ahma's MCP server (`run_terminal_command`, with or without
 while ahma asks you in the MCP client's own prompt (`elicitation/create`), for at most that
 client's question budget (45–120 s). The command's operation carries an alert saying it is
 waiting for you, and the question shows the site on its own line, the address, any note, and
-the guidance above. The answers, deny first and the default:
+the guidance above. The answers, deny first and the default; each lasting one names the site
+it saves (`Always for github.com — this repo only`):
 
 | Answer | What it does |
 |---|---|
 | Deny | Not opened. ahma does not ask about that site again in this session. |
 | This time | This link opens now. Nothing is remembered; the next link to the site is asked again. |
-| Always for this site — all repos | Saved to `[open_url] allow`, as `ahma permissions grant open-url <site>` would. |
-| Always for this site — this repo only | Saved for this repo, as `--this-repo` would. |
-| Always (any site) | Any public site. Offered only where it would cover the link. |
+| Always for *site* — this repo only | Saved to `[open_url] repos` for this repo (or, for a folder that is not a git repo, that workspace). The usual lasting answer. |
+| Always for *site* — all repos | Saved to `[open_url] allow`, for every repo. |
+| Always for any site — this repo only | `*` for this repo. Offered only where it would cover the link. Any site for every repo is never offered: run `ahma permissions grant open-url --all-repos` if you mean it. |
+
+The narrowest lasting answer — this site, this repo — comes first; each other one widens it in
+exactly one way.
 
 Every yes is in `permissions-audit.jsonl`, with the surface `harness`. Two commands opening the
 same site at once share one question. Link questions count toward the session's budget of five
@@ -87,9 +95,12 @@ so it names every answer, in this order:
 |---|---|---|
 | Deny | No | Not opened. ahma does not ask about that site again in this Claude Code session. |
 | This time | Yes | The approved run may open that site's links. Nothing is remembered; the next refusal asks again. |
-| Always for this site — all repos (the usual lasting answer) | `ahma permissions grant open-url <site>` | Saved for every repo. |
-| Always for this site — this repo only | `ahma permissions grant open-url <site> --workspace '<repo>'` | Saved for this repo. |
-| Always (any site) | `ahma permissions grant open-url` | Any public site; never a local one, and with network restriction on only sites on your allow list. Offered only where it would cover the link. |
+| Always for *site* — this repo only (the usual lasting answer) | `ahma permissions grant open-url <site> --workspace '<repo>'` | Saved for this repo. |
+| Always for *site* — all repos | `ahma permissions grant open-url <site> --all-repos` | Saved for every repo. |
+| Always for any site — this repo only | `ahma permissions grant open-url --workspace '<repo>'` | Any public site in this repo; never a local one, and with network restriction on only sites on your allow list. Offered only where it would cover the link. |
+
+Each line names its repo (`--workspace`) or `--all-repos`, so it means the same whatever
+directory you paste it into.
 
 Each yes is recorded in `permissions-audit.jsonl` as a one-time `open-url` grant from the
 harness dialog.
@@ -105,11 +116,11 @@ answers are there, deny first:
 |---|---|---|
 | `n`, Enter, Esc | Deny | Not opened, and not asked again in that Claude Code session. |
 | `s` | This site, this session | Commands in this repo may open that site's links until Claude Code exits (at most 12 hours). Not saved: an owner-only file in ahma's runtime directory. |
-| `a` | Always for this site — all repos | Saved to `[open_url] allow`. |
-| `r` | Always for this site — this repo only | Saved to `[open_url] repos` for this repo. |
-| `*` | Always (any site) | Saved as `*`; offered only where it would cover the link. |
+| `r` | Always for *site* — this repo only | Saved to `[open_url] repos` for this repo. |
+| `a` | Always for *site* — all repos | Saved to `[open_url] allow`. |
+| `*` | Always for any site — this repo only | Saved as `*` for this repo; offered only where it would cover the link. |
 
-`a`, `r` and `*` first show the exact line they add, and a second press saves it. Whatever you
+`r`, `a` and `*` first show the exact line they add, and a second press saves it. Whatever you
 answer, Claude Code's dialog does not ask the same question; the agent re-runs the command and
 it opens, or is refused naming the grant. Every answer is recorded in `permissions-audit.jsonl`
 with the surface `tui`.
@@ -164,10 +175,10 @@ grant never lets commands reach a site, and a network grant never opens links.
 
 | Setting / command | What |
 |---|---|
-| `[open_url] allow` | Sites whose links open without asking in every repo: `github.com`, `*.github.io` (one label), `*` (any public site). Written by `ahma permissions grant open-url`. |
-| `[open_url] repos` | The same, for one repo (`--this-repo`, `--workspace <DIR>`). |
-| `ahma permissions grant open-url [SITE]` | Preview, then `--yes` to save. No site = any public site. |
-| `ahma permissions revoke open-url [SITE]` | Remove one site, or with no site every one; also ends a "this site, this session" answer for it now (not with `--global`). |
+| `[open_url] allow` | Sites whose links open without asking in every repo: `github.com`, `*.github.com` (one label: `api.github.com`, not `github.com` itself), `*` (any public site). Written by `ahma permissions grant open-url --all-repos`. |
+| `[open_url] repos` | The same, for one repo. What `ahma permissions grant open-url` writes, run inside the repo, or with `--workspace <DIR>`. |
+| `ahma permissions grant open-url [SITE]` | Preview, then `--yes` to save. No site = any public site. For the git repo enclosing the current directory (`--this-repo` says the same); `--workspace <DIR>` for another; `--all-repos` for every repo. Outside a git repo with none of these it is refused and writes nothing. |
+| `ahma permissions revoke open-url [SITE]` | Remove one site, or with no site every one, in every repo unless `--global` / `--all-repos` (only the all-repos grants), `--this-repo` or `--workspace` narrows it; also ends a "this site, this session" answer for it now (not with `--global`). |
 | `ahma open-url <URL>…` | The helper, by name, inside a command ahma runs. |
 | `BROWSER`, `GH_BROWSER`, `AHMA_LINK_SOCK` | Set by ahma for each command; do not set them yourself. |
 

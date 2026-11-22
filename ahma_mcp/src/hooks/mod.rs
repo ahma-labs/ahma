@@ -1723,6 +1723,20 @@ fn collect_git_scopes(canon_cwd: &Path, canon_home: Option<&Path>, scopes: &mut 
     scopes.push(canon_git_root);
 }
 
+/// The git repository enclosing `cwd`, keyed as a hooked command's workspace
+/// is (the main repository for a worktree, canonical): what a grant "for
+/// this repo" binds to (SPEC R-LINK.11). `None` outside a git repository, and
+/// for one rooted at the home directory or a filesystem root, which is no
+/// one repo (R5.2.4) — never the temp directory the hook scopes fall back to.
+pub fn enclosing_git_workspace(cwd: &Path) -> Option<PathBuf> {
+    let canon_cwd = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let canon_home =
+        ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
+    let mut scopes = Vec::new();
+    collect_git_scopes(&canon_cwd, canon_home.as_deref(), &mut scopes);
+    filter_enclosing_scopes(&scopes).into_iter().next()
+}
+
 fn filter_enclosing_scopes(deduped: &[PathBuf]) -> Vec<PathBuf> {
     deduped
         .iter()
