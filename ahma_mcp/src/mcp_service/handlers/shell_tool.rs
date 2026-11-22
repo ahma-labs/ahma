@@ -290,14 +290,28 @@ impl AhmaMcpService {
 
         match execution_mode {
             crate::adapter::ExecutionMode::Synchronous => {
-                self.execute_shell_sync(
+                let line = adapter_args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let id = crate::utils::operation::mint_id("run_terminal_command", &line);
+                self.run_one_shot(
+                    &id,
+                    "run_terminal_command",
+                    &VaultArgs::new(working_directory, &line).to_json(),
+                    platform_shell_program(),
                     adapter_args,
                     working_directory,
                     timeout,
                     &subcommand_config,
-                    &context,
                 )
                 .await
+                .map(common::text_result)
+                // On an out-of-scope path access this attaches a
+                // machine-readable `sandbox_denial` payload to the error's
+                // `data` field; otherwise a plain internal error.
+                .map_err(|e| common::execution_error(&e))
             }
             crate::adapter::ExecutionMode::AsyncResultPush => {
                 self.execute_shell_async(
@@ -365,82 +379,6 @@ impl AhmaMcpService {
             // Undeclared on purpose: the adapter classifies each command line
             // (SPEC R2.7.4) — `git status` reads, `cargo build` writes.
             concurrency: None,
-        }
-    }
-
-    /// The direct, untracked path, reached only by the CLI one-shot
-    /// (`force_synchronous`, SPEC R2.1). A tool call's
-    /// `execution_mode: "Synchronous"` waits on a tracked operation instead.
-    pub async fn execute_shell_sync(
-        &self,
-        adapter_args: Map<String, Value>,
-        working_directory: &str,
-        timeout: Option<u64>,
-        subcommand_config: &crate::config::SubcommandConfig,
-        context: &RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let cmd_str = adapter_args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let id = crate::utils::operation::mint_id("run_terminal_command", cmd_str);
-        let started_at = std::time::Instant::now();
-        self.emit_vault_tool_call(
-            &id,
-            "run_terminal_command",
-            &VaultArgs::new(working_directory, cmd_str).to_json(),
-        )
-        .await;
-
-        let progress_token = context.meta.get_progress_token();
-        let client_type = McpClientType::from_peer(&context.peer);
-
-        // Sync operations never enter the OperationMonitor, so the event
-        // forwarder cannot see them — push start/final progress directly via
-        // the shared sync-progress helpers (the shell's "base command" is the
-        // platform shell program).
-        let push_token = progress_token.filter(|_| self.effective_supports_progress(client_type));
-        self.push_sync_start_progress(
-            push_token.clone(),
-            &context.peer,
-            platform_shell_program(),
-            working_directory,
-        )
-        .await;
-
-        let result = self
-            .adapter
-            .execute_sync_in_dir_as(
-                Some(&id),
-                platform_shell_program(),
-                Some(adapter_args),
-                working_directory,
-                timeout,
-                Some(subcommand_config),
-            )
-            .await;
-
-        let duration_ms = started_at.elapsed().as_millis() as u64;
-        self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
-            .await;
-
-        self.push_sync_final_progress(
-            push_token,
-            &context.peer,
-            &id,
-            platform_shell_program(),
-            working_directory,
-            duration_ms,
-            &result,
-        )
-        .await;
-
-        match result {
-            Ok(output) => Ok(common::text_result(output)),
-            // On an out-of-scope path access this attaches a machine-readable
-            // `sandbox_denial` payload to the error's `data` field; otherwise a
-            // plain internal error. (Logs the failure internally.)
-            Err(e) => Err(common::execution_error(&e)),
         }
     }
 

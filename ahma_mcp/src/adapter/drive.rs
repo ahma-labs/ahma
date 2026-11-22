@@ -25,9 +25,9 @@ use tokio_util::sync::CancellationToken;
 use super::guards::RunGuards;
 use super::piped::PipedSpawn;
 use super::{
-    Adapter, CommandMutexRegistry, DriftProbe, audit, begin_handoff_watch, cpu_probe_threshold,
-    execute_with_streaming, executor, failed, pty_exec, record_failure_diagnostics,
-    run_session_operation, sink, workspace_queue,
+    Adapter, CommandMutexRegistry, DriftProbe, QueueWait, QueueWaitNotice, WaitedRun, audit,
+    begin_handoff_watch, cpu_probe_threshold, execute_with_streaming, executor, failed, pty_exec,
+    record_failure_diagnostics, run_session_operation, sink, waited_result, workspace_queue,
 };
 use crate::operation_monitor::{CommandOutput, Operation, OperationMonitor, Terminal};
 use crate::sandbox;
@@ -135,6 +135,25 @@ pub(super) struct Prepared {
     /// Its time limit ([`super::command_limit`]).
     pub(super) limit: Duration,
     pub(super) run: Run,
+    /// A caller waiting for its result ([`Adapter::run_to_completion`]);
+    /// `None` for one that collects it from the operation.
+    pub(super) waiter: Option<Waiter>,
+}
+
+/// A caller that waits for a command's result as it runs, rather than
+/// collecting the operation's (SPEC R2.1): a terminal hook and the CLI
+/// one-shot. Only how it waits differs; the command runs as every other.
+pub(super) struct Waiter {
+    /// Where its result goes, typed as the caller reads it: a time limit, a
+    /// sandbox denial or an unrunnable program keeps its type. Sent once the
+    /// run's reports are in, before the workspace is handed on.
+    pub(super) reply: tokio::sync::oneshot::Sender<anyhow::Result<String>>,
+    /// Told once when the command has to wait for its workspace (SPEC
+    /// R2.7.1).
+    pub(super) notice: Option<QueueWaitNotice>,
+    /// Dropped when the task returns, however it returns: by then the
+    /// workspace is handed on, the ending published and the end audited.
+    pub(super) done: tokio::sync::oneshot::Sender<()>,
 }
 
 /// What every run gets from the adapter.
@@ -211,16 +230,37 @@ async fn run_to_end(prepared: Prepared, deps: Deps, cancel: CancellationToken) {
         watch_handoff,
         limit,
         run,
+        waiter,
+        link_note,
         ..
     } = prepared;
     let monitor = &deps.monitor;
     let stages = run.stages();
     let lane = admission.lane();
+    // A waiting caller waits for its turn no longer than the command's own
+    // limit, and is told once that it waits (SPEC R2.7.1).
+    let (reply, queue, _done) = match waiter {
+        Some(Waiter {
+            reply,
+            notice,
+            done,
+        }) => (Some(reply), Some(QueueWait { limit, notice }), Some(done)),
+        None => (None, None, None),
+    };
 
     // Wait for every exclusive operation that arrived earlier in this
     // workspace, in this process or any other (SPEC R2.7.1). The lease is
     // held until the run has ended: until its process tree is gone.
-    let Some(guards) = RunGuards::begin(monitor, &op_id, &subject, admission, &cancel).await else {
+    let Some(guards) = RunGuards::begin(
+        monitor,
+        &op_id,
+        &subject,
+        admission,
+        &cancel,
+        queue.as_ref(),
+    )
+    .await
+    else {
         return;
     };
     let mut guards = if stages.mutex_group {
@@ -251,12 +291,20 @@ async fn run_to_end(prepared: Prepared, deps: Deps, cancel: CancellationToken) {
         guards.watch_handoff(Some(begin_handoff_watch(&deps.sandbox, &working_dir).await));
     }
 
-    let mut sink = ready.sink(monitor, &op_id, stages.near_limit);
+    let mut sink = ready
+        .sink(monitor, &op_id, stages.near_limit)
+        .keep_raw(reply.is_some());
     let end = ready
         .run(&deps, &working_dir, limit, started, &cancel, &mut sink)
         .await;
+    let raw = sink.take_raw();
     let ending = sink.close(end).await;
-    if let (Ready::Piped { explain, .. }, Terminal::Exited(output)) = (&ready, &ending) {
+    // A waiting caller reads the failure explained in its result; anyone
+    // else, in the operation's alerts. Never both: each raises its grant
+    // question and writes its denial record once.
+    if let (Ready::Piped { explain, .. }, Terminal::Exited(output), None) =
+        (&ready, &ending, &reply)
+    {
         explain
             .exit(output, &deps, &op_id, &subject, &working_dir)
             .await;
@@ -271,9 +319,102 @@ async fn run_to_end(prepared: Prepared, deps: Deps, cancel: CancellationToken) {
         monitor,
     )
     .await;
+    // A cancel or the watchdog that asked the run to stop decides how it
+    // ended (SPEC R13.3), for a waiting caller's result as for the operation.
+    let ending = match monitor.take_stop_request(&op_id).await {
+        Some(asked) => asked,
+        None => ending,
+    };
+    if let (Some(reply), Ready::Piped { explain, .. }) = (reply, &ready) {
+        let result = Reply {
+            raw: raw.unwrap_or_default(),
+            limit,
+            link_note: link_note.as_deref(),
+        }
+        .result(
+            &ending,
+            &deps,
+            explain,
+            &op_id,
+            &line,
+            &working_dir,
+            &guards,
+        )
+        .await;
+        // The caller may have stopped waiting; the operation still ends.
+        let _ = reply.send(result);
+    }
     // The process tree is gone and the reports are in: the guards hand the
     // workspace on, then publish, then audit the end.
     guards.end(monitor, ending).await;
+}
+
+/// What a waiting caller is sent once its command has ended.
+struct Reply<'a> {
+    /// What the command wrote, as written ([`sink::RawOutput`]).
+    raw: sink::RawOutput,
+    limit: Duration,
+    /// That a whole-line `open <URL>` ran as the link helper (SPEC
+    /// R-LINK.10), said first.
+    link_note: Option<&'a str>,
+}
+
+impl Reply<'_> {
+    /// The result, by how the command ended: an exit is explained as the
+    /// direct path explained it ([`waited_result`]); a time limit is the typed
+    /// [`super::time_limit::LimitReached`] with what it printed; a cancel or
+    /// a failure to start is its reason. The deny-tier alert leads it (SPEC
+    /// R6.1.7).
+    #[allow(clippy::too_many_arguments)]
+    async fn result(
+        self,
+        ending: &Terminal,
+        deps: &Deps,
+        explain: &ExplainExit,
+        op_id: &str,
+        line: &str,
+        working_dir: &std::path::Path,
+        guards: &RunGuards,
+    ) -> anyhow::Result<String> {
+        // Read back here, never left behind (SPEC R-DENY.1).
+        let (tag, ran_for) = match sandbox::kernel_denials::take_tag(op_id) {
+            Some((tag, ran)) => (Some(tag), ran),
+            None => (None, Duration::default()),
+        };
+        let result = match ending {
+            Terminal::Exited(output) => {
+                let run = WaitedRun {
+                    sandbox: &deps.sandbox,
+                    scope_grant_notifier: explain.scope_grant_notifier.as_ref(),
+                    op_id,
+                    command: line,
+                    working_dir,
+                    guards,
+                };
+                let result =
+                    waited_result(&run, output.exit_code, self.raw, tag.as_deref(), ran_for).await;
+                match &output.handoff_alert {
+                    Some(alert) => super::with_handoff_alert(result, alert),
+                    None => result,
+                }
+            }
+            // The idle watchdog stopped it: not its time limit.
+            Terminal::TimedOut(why) if crate::operation_monitor::is_stall(why) => {
+                Err(anyhow::anyhow!("{why}"))
+            }
+            Terminal::TimedOut(_) => Err(super::time_limit::LimitReached {
+                limit_secs: self.limit.as_secs(),
+                output: super::printed_before_kill(&self.raw),
+            }
+            .into()),
+            Terminal::Cancelled(why) | Terminal::Failed(why) => Err(anyhow::anyhow!("{why}")),
+            Terminal::Done(_) => Ok(String::new()),
+        };
+        match self.link_note {
+            Some(note) => super::said_first(result, note),
+            None => result,
+        }
+    }
 }
 
 /// A run with its process about to start: what each runner needs to start

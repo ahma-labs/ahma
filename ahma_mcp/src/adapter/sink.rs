@@ -89,6 +89,22 @@ pub(super) struct OpSink {
     /// its path's decision ([`super::drive`]), which the runner reads through
     /// [`Self::near_limit`].
     warn_near_limit: bool,
+    /// The bytes the command wrote, unbounded and unredacted, for a caller
+    /// that waits for its result (SPEC R2.1): what it reads is what the
+    /// command printed, byte for byte, as the direct path gave it. `None`
+    /// for a caller that collects the operation's bounded result instead.
+    raw: Option<RawOutput>,
+}
+
+/// What a command wrote, as written, and what it left running: what a
+/// caller that waits for the command reads its result from
+/// ([`super::waited_result`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct RawOutput {
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    /// The line saying what it left running ended with it (SPEC R-PROC.5).
+    pub(super) left_running: Option<String>,
 }
 
 impl OpSink {
@@ -102,7 +118,21 @@ impl OpSink {
             stderr: BoundedLineCollector::default(),
             log_monitor: None,
             warn_near_limit: true,
+            raw: None,
         }
+    }
+
+    /// Keep every byte the command writes for a caller that waits for its
+    /// result ([`RawOutput`]).
+    pub(super) fn keep_raw(mut self, keep: bool) -> Self {
+        self.raw = keep.then(RawOutput::default);
+        self
+    }
+
+    /// What the command wrote, as written, when [`Self::keep_raw`] asked
+    /// for it; taken once, before [`Self::close`].
+    pub(super) fn take_raw(&mut self) -> Option<RawOutput> {
+        self.raw.take()
     }
 
     /// Watch each line for the configured error and warning patterns, and
@@ -142,6 +172,23 @@ impl OpSink {
         }
     }
 
+    /// One chunk of `stream` as read up to and including its newline (or
+    /// the stream's end): kept as written for a waiting caller, and a line
+    /// as [`tokio::io::AsyncBufReadExt::lines`] reads one for everyone else,
+    /// without its `\n` or `\r\n`. Bytes that are not UTF-8 are replaced, not
+    /// an error that would end the stream.
+    pub(super) async fn chunk(&mut self, stream: Stream, bytes: &[u8]) {
+        if let Some(raw) = &mut self.raw {
+            match stream {
+                Stream::Stdout => raw.stdout.extend_from_slice(bytes),
+                Stream::Stderr => raw.stderr.extend_from_slice(bytes),
+            }
+        }
+        let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        self.line(stream, &String::from_utf8_lossy(line)).await;
+    }
+
     /// One line the command wrote to `stream`.
     pub(super) async fn line(&mut self, stream: Stream, line: &str) {
         self.started().await;
@@ -173,6 +220,15 @@ impl OpSink {
     /// An alert on the operation while it still runs.
     pub(super) async fn alert(&self, text: String) {
         self.monitor.append_alert(&self.op_id, text).await;
+    }
+
+    /// What the command left running ended with it (SPEC R-PROC.5): an
+    /// alert, and a line in a waiting caller's result.
+    pub(super) async fn left_running(&mut self, line: String) {
+        if let Some(raw) = &mut self.raw {
+            raw.left_running = Some(line.clone());
+        }
+        self.alert(line).await;
     }
 
     /// A transient progress note ("still running"), not kept.
@@ -377,5 +433,35 @@ mod tests {
         assert_eq!(result["stdout"], "out one\nout two");
         assert_eq!(result["stderr"], "err one");
         assert_eq!(result["exit_code"], 1);
+    }
+
+    /// A chunk is a line for the operation, without its line ending, and
+    /// kept byte for byte for a caller that waits: a missing final newline,
+    /// a `\r\n` and bytes that are not UTF-8 all survive in what it reads.
+    #[tokio::test]
+    async fn a_chunk_is_a_line_and_kept_as_written_for_a_waiting_caller() {
+        let monitor = monitor_with("sink-chunks").await;
+        let mut sink = OpSink::new(monitor, "sink-chunks", Shape::Piped).keep_raw(true);
+        sink.chunk(Stream::Stdout, b"one\r\n").await;
+        sink.chunk(Stream::Stdout, b"t\xffo\n").await;
+        sink.chunk(Stream::Stdout, b"last").await;
+        sink.chunk(Stream::Stderr, b"err\n").await;
+        sink.left_running("left".into()).await;
+        let raw = sink.take_raw().expect("kept");
+        assert_eq!(raw.stdout, b"one\r\nt\xffo\nlast");
+        assert_eq!(raw.stderr, b"err\n");
+        assert_eq!(raw.left_running.as_deref(), Some("left"));
+        let result = sink
+            .close(RunEnd::Exited(Some(0)))
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(result["stdout"], "one\nt\u{fffd}o\nlast");
+        assert_eq!(result["stderr"], "err");
+
+        let monitor = monitor_with("sink-unkept").await;
+        let mut sink = OpSink::new(monitor, "sink-unkept", Shape::Piped);
+        sink.chunk(Stream::Stdout, b"x\n").await;
+        assert_eq!(sink.take_raw(), None);
     }
 }

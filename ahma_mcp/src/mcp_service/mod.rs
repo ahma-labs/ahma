@@ -1312,132 +1312,46 @@ impl AhmaMcpService {
         )
     }
 
-    fn sync_tool_progress_description(base_command: &str, working_directory: &str) -> String {
-        format!("Execute {} in {}", base_command, working_directory)
-    }
-
-    /// The direct, untracked path, reached only by the CLI one-shot
-    /// (`force_synchronous`, SPEC R2.1). A tool call that asks to wait —
-    /// `synchronous: true`, `blocking: true` — is a tracked operation waited
-    /// on instead ([`Self::call_wait`]).
+    /// The CLI one-shot (`force_synchronous`, SPEC R2.1): the command runs as
+    /// a tracked operation and this call waits for it to end, however long it
+    /// takes — a one-shot has no later call to collect it with. What comes back
+    /// is what the command printed, or its error, typed as the direct path
+    /// typed it, for the caller to render as the CLI always has. A tool call
+    /// that asks to wait — `synchronous: true`, `blocking: true` — waits on its
+    /// operation within the client's budget instead ([`Self::call_wait`]).
     #[allow(clippy::too_many_arguments)]
-    async fn call_sync_tool(
+    pub(crate) async fn run_one_shot(
         &self,
-        id: String,
-        base_command: &str,
-        working_directory: &str,
+        id: &str,
+        vault_tool: &str,
+        vault_args: &str,
+        command: &str,
         arguments: serde_json::Map<String, serde_json::Value>,
+        working_directory: &str,
         timeout: Option<u64>,
         subcommand_config: &crate::config::SubcommandConfig,
-        progress_token: Option<rmcp::model::ProgressToken>,
-        client_type: McpClientType,
-        peer: Peer<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<String, anyhow::Error> {
         let started_at = std::time::Instant::now();
-        self.emit_vault_tool_call(&id, base_command, &Self::summarize_arguments(&arguments))
-            .await;
-
-        // Sync operations never enter the OperationMonitor, so the event
-        // forwarder cannot see them — push start/final progress directly.
-        let push_token = progress_token.filter(|_| self.effective_supports_progress(client_type));
-        self.push_sync_start_progress(push_token.clone(), &peer, base_command, working_directory)
-            .await;
-
+        self.emit_vault_tool_call(id, vault_tool, vault_args).await;
+        // Completed here, once the result is in hand, not by the subscriber
+        // when the operation's end is published: a one-shot process may exit
+        // before the subscriber runs.
+        self.vault_audited_ops.lock().remove(id);
         let result = self
             .adapter
-            .execute_sync_in_dir_as(
-                Some(&id),
-                base_command,
+            .run_to_completion(
+                Some(id),
+                command,
                 Some(arguments),
                 working_directory,
                 timeout,
                 Some(subcommand_config),
             )
             .await;
-
         let duration_ms = started_at.elapsed().as_millis() as u64;
-        self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
+        self.emit_vault_tool_complete(id, result.is_ok(), duration_ms)
             .await;
-
-        self.push_sync_final_progress(
-            push_token,
-            &peer,
-            &id,
-            base_command,
-            working_directory,
-            duration_ms,
-            &result,
-        )
-        .await;
-
-        match result {
-            Ok(output) => Ok(handlers::common::text_result(output)),
-            Err(e) => {
-                let error_message = format!("Synchronous execution failed: {}", e);
-                tracing::error!("{}", error_message);
-                Err(handlers::common::mcp_internal(error_message))
-            }
-        }
-    }
-
-    /// Pushes the initial 0% progress notification for a sync tool call.
-    /// `progress_token` must already be filtered by the client's progress
-    /// support (see the `push_token` computation in callers); `None` is a
-    /// no-op.
-    async fn push_sync_start_progress(
-        &self,
-        progress_token: Option<rmcp::model::ProgressToken>,
-        peer: &Peer<RoleServer>,
-        base_command: &str,
-        working_directory: &str,
-    ) {
-        let Some(token) = progress_token else {
-            return;
-        };
-        progress_push::push_progress(
-            peer,
-            token,
-            0.0,
-            format!(
-                "{base_command}: {}",
-                Self::sync_tool_progress_description(base_command, working_directory)
-            ),
-            false,
-        )
-        .await;
-    }
-
-    /// Pushes the terminal 100% progress notification for a sync tool call,
-    /// under the same gating as [`Self::push_sync_start_progress`]. No-op
-    /// otherwise.
-    #[allow(clippy::too_many_arguments)]
-    async fn push_sync_final_progress(
-        &self,
-        progress_token: Option<rmcp::model::ProgressToken>,
-        peer: &Peer<RoleServer>,
-        id: &str,
-        base_command: &str,
-        working_directory: &str,
-        duration_ms: u64,
-        result: &Result<String, anyhow::Error>,
-    ) {
-        let Some(token) = progress_token else {
-            return;
-        };
-        let (success, full_output) = match result {
-            Ok(output) => (true, output.clone()),
-            Err(e) => (false, format!("Error: {}", e)),
-        };
-        let message = progress_push::sync_final_message(
-            id,
-            base_command,
-            &Self::sync_tool_progress_description(base_command, working_directory),
-            working_directory,
-            success,
-            duration_ms,
-            &full_output,
-        );
-        progress_push::push_progress(peer, token, 100.0, message, true).await;
+        result
     }
 
     /// Registers `op_id` as a progress-push destination when the client
@@ -2465,19 +2379,25 @@ impl AhmaMcpService {
         let client_type = McpClientType::from_peer(&context.peer);
 
         if self.force_synchronous {
+            let summary = Self::summarize_arguments(&arguments);
             return self
-                .call_sync_tool(
-                    id,
+                .run_one_shot(
+                    &id,
                     base_command,
-                    working_directory,
+                    &summary,
+                    base_command,
                     arguments,
+                    working_directory,
                     timeout,
                     subcommand_config,
-                    progress_token,
-                    client_type,
-                    context.peer.clone(),
                 )
-                .await;
+                .await
+                .map(handlers::common::text_result)
+                .map_err(|e| {
+                    let error_message = format!("Synchronous execution failed: {}", e);
+                    tracing::error!("{}", error_message);
+                    handlers::common::mcp_internal(error_message)
+                });
         }
 
         let vault_args_summary = Self::summarize_arguments(&arguments);
@@ -3451,12 +3371,6 @@ mod tests {
 
         let args = obj(json!({"a": 1}));
         assert_eq!(AhmaMcpService::summarize_arguments(&args), "{\"a\":1}");
-    }
-
-    #[test]
-    fn sync_tool_progress_description_formats_command_and_dir() {
-        let s = AhmaMcpService::sync_tool_progress_description("cargo", "/work");
-        assert_eq!(s, "Execute cargo in /work");
     }
 
     #[test]

@@ -320,23 +320,6 @@ fn final_result_message(
     )
 }
 
-/// Build the final message for a synchronous tool call (no monitor event —
-/// the sync path pushes directly).  Mirrors the legacy `FinalResult` format.
-pub fn sync_final_message(
-    id: &str,
-    command: &str,
-    description: &str,
-    working_directory: &str,
-    success: bool,
-    duration_ms: u64,
-    full_output: &str,
-) -> String {
-    let status = if success { "COMPLETED" } else { "FAILED" };
-    format!(
-        "OPERATION {status}: '{id}'\nCommand: {command}\nDescription: {description}\nWorking Directory: {working_directory}\nDuration: {duration_ms}ms\n\n=== FULL OUTPUT ===\n{full_output}"
-    )
-}
-
 /// Push a single best-effort progress notification.
 ///
 /// `must_deliver` only affects the log level on failure: terminal results are
@@ -497,23 +480,6 @@ mod tests {
         })
         .unwrap();
         assert!(message.contains("plain text output"));
-    }
-
-    #[test]
-    fn sync_final_message_mirrors_legacy_format() {
-        let message = sync_final_message(
-            "op-7",
-            "cargo",
-            "Execute cargo in /work",
-            "/work",
-            false,
-            42,
-            "Error: boom",
-        );
-        assert!(message.contains("OPERATION FAILED: 'op-7'"));
-        assert!(message.contains("Command: cargo"));
-        assert!(message.contains("Working Directory: /work"));
-        assert!(message.contains("=== FULL OUTPUT ===\nError: boom"));
     }
 }
 
