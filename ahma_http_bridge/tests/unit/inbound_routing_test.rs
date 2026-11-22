@@ -7,6 +7,8 @@
 //! forwarded and answered, a notification (no `id`) is forwarded and answered
 //! `202` with no body, and a client response (an `id`, no string `method`, and
 //! a `result` or `error`) is delivered to the server request waiting for it.
+//! A request without a usable id — `"id": null`, or an `initialize` with no
+//! `id` — is refused `400` with advice on what to do, and never forwarded.
 //! The edge cases below — a `null` id, a message that has both a `method` and
 //! a `result`, a payload that is not an object, a batch array, bytes that are
 //! not JSON — record what the bridge does with each today, so a change to any
@@ -21,7 +23,7 @@ use crate::common;
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::{TransportMode, make_h2_client, spawn_in_process_server};
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
@@ -30,8 +32,10 @@ const SENTINEL_METHOD: &str = "notifications/test/sentinel";
 /// A peer that records every message the bridge writes to it, and answers
 /// every one that expects an answer: anything with an `id`, except a message
 /// that is itself a response (no `method`, and a `result` or `error`).
+/// `spawned` counts the peers created: one per session.
 struct RecordingPeerFactory {
     received: Arc<Mutex<Vec<Value>>>,
+    spawned: Arc<AtomicUsize>,
 }
 
 impl ahma_common::peer_factory::PeerFactory for RecordingPeerFactory {
@@ -40,6 +44,7 @@ impl ahma_common::peer_factory::PeerFactory for RecordingPeerFactory {
         _options: ahma_common::peer_factory::PeerSpawnOptions,
     ) -> ahma_common::peer_factory::BoxFuture<anyhow::Result<ahma_common::peer_factory::PeerStreams>>
     {
+        self.spawned.fetch_add(1, Ordering::SeqCst);
         let received = Arc::clone(&self.received);
         Box::pin(async move {
             let (bridge_end, peer_end) = tokio::io::duplex(64 * 1024);
@@ -126,6 +131,8 @@ struct Harness {
     mode: TransportMode,
     session_id: String,
     received: Arc<Mutex<Vec<Value>>>,
+    /// How many sessions (one peer each) the bridge has created.
+    peers_spawned: Arc<AtomicUsize>,
     sentinels: AtomicU64,
 }
 
@@ -176,8 +183,10 @@ impl Harness {
     /// `notifications/initialized`, so a request is forwarded at once.
     async fn start(mode: TransportMode) -> Self {
         let received = Arc::new(Mutex::new(Vec::new()));
+        let peers_spawned = Arc::new(AtomicUsize::new(0));
         let factory = Arc::new(RecordingPeerFactory {
             received: Arc::clone(&received),
+            spawned: Arc::clone(&peers_spawned),
         });
         let server = spawn_in_process_server(factory)
             .await
@@ -206,6 +215,7 @@ impl Harness {
             mode,
             session_id,
             received,
+            peers_spawned,
             sentinels: AtomicU64::new(0),
         };
         let initialized = harness
@@ -473,32 +483,78 @@ async fn shapeless_messages_route_by_id_sse() {
     run_shapeless_messages_route_by_id(TransportMode::Sse).await;
 }
 
-/// A request whose `id` is `null` is forwarded, but the bridge registers no
-/// pending entry for it (a `null` id keys as a notification at the session
-/// layer), so it does not wait for the subprocess: the client gets HTTP 200
-/// carrying `{"jsonrpc":"2.0","result":null}` — no `id` at all.
-async fn run_request_with_null_id_gets_an_idless_null_result(mode: TransportMode) {
+/// The refusal of a request that carries no usable id (SPEC R8.3.9): `400`, a
+/// JSON body on either transport, JSON-RPC `-32600` under `id: null`, a
+/// message that says what was wrong (`what`), why, and what to do, and the
+/// same advice as machine-readable `data`.
+fn assert_refused_for_missing_id(reply: &Reply, what: &str) {
+    assert_eq!(reply.status, 400, "{reply:?}");
+    assert!(reply.content_type.contains("application/json"), "{reply:?}");
+    let body: Value = serde_json::from_str(&reply.body).expect("JSON body");
+    assert_eq!(body["jsonrpc"], "2.0", "{body}");
+    assert!(
+        body.get("id").is_some_and(Value::is_null),
+        "the id is present and null: {body}"
+    );
+    assert_eq!(body["error"]["code"], -32600, "{body}");
+    let message = body["error"]["message"].as_str().expect("a message");
+    for part in [
+        what,
+        "MCP requires a string or number id",
+        "update or reconfigure the MCP client",
+        "`ahma doctor`",
+        "`/doctor <question>` in `ahma tui`",
+    ] {
+        assert!(message.contains(part), "missing {part:?} in: {message}");
+    }
+    let data = &body["error"]["data"];
+    assert_eq!(data["kind"], "request_id_required", "{body}");
+    assert_eq!(data["doctor"], "ahma doctor", "{body}");
+    assert!(
+        data["remediation"]
+            .as_str()
+            .is_some_and(|r| r.contains("ahma doctor")),
+        "{body}"
+    );
+}
+
+/// A request whose `id` is `null` is refused (SPEC R8.3.9): MCP forbids a
+/// null request id, and a JSON-RPC answer to it could not be matched to
+/// anything. It is never forwarded, and the session it was posted on keeps
+/// working.
+async fn run_request_with_null_id_is_refused_with_help(mode: TransportMode) {
     let h = Harness::start(mode).await;
     let payload = json!({"jsonrpc": "2.0", "id": null, "method": "tools/list"});
     let reply = h.post(payload.clone()).await;
-    assert_eq!(reply.status, 200, "{reply:?}");
-    assert_eq!(
-        reply.session_header.as_deref(),
-        Some(h.session_id.as_str()),
-        "{reply:?}"
+    assert_refused_for_missing_id(&reply, r#"`tools/list` request was sent with "id": null"#);
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["error"]["data"]["reason"], "null_id", "{body}");
+    assert!(
+        !h.subprocess_received(&payload).await,
+        "a null-id request was forwarded"
     );
-    assert_eq!(reply.message(), json!({"jsonrpc": "2.0", "result": null}));
-    assert!(h.subprocess_received(&payload).await, "not forwarded");
+    // A request with neither a method nor a usable id is refused the same way.
+    let bare = json!({"jsonrpc": "2.0", "id": null});
+    let reply = h.post(bare.clone()).await;
+    assert_refused_for_missing_id(&reply, r#"request was sent with "id": null"#);
+    assert!(!h.subprocess_received(&bare).await, "forwarded");
+    // The session is untouched.
+    assert_request_answered(
+        &h,
+        json!({"jsonrpc": "2.0", "id": 8, "method": "tools/list"}),
+        json!("tools/list"),
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn request_with_null_id_gets_an_idless_null_result_json() {
-    run_request_with_null_id_gets_an_idless_null_result(TransportMode::Json).await;
+async fn request_with_null_id_is_refused_with_help_json() {
+    run_request_with_null_id_is_refused_with_help(TransportMode::Json).await;
 }
 
 #[tokio::test]
-async fn request_with_null_id_gets_an_idless_null_result_sse() {
-    run_request_with_null_id_gets_an_idless_null_result(TransportMode::Sse).await;
+async fn request_with_null_id_is_refused_with_help_sse() {
+    run_request_with_null_id_is_refused_with_help(TransportMode::Sse).await;
 }
 
 /// A JSON-RPC batch array is refused before any routing: `400`, `-32600`,
@@ -609,32 +665,66 @@ async fn messages_without_a_session_are_refused_with_their_id_sse() {
     run_messages_without_a_session_are_refused_with_their_id(TransportMode::Sse).await;
 }
 
-/// `initialize` is routed by its method alone: sent as a notification (no
-/// `id`) it still creates a session, and — as for any id-less message the
-/// session forwards — the bridge does not wait for the subprocess and answers
-/// HTTP 200 with `{"jsonrpc":"2.0","result":null}`.
-async fn run_initialize_without_id_creates_a_session(mode: TransportMode) {
+/// `initialize` is a request, so it needs a string or number id (SPEC
+/// R8.3.9). Sent without one — as a notification, or with `"id": null` — it
+/// is refused before anything happens: no session is created, and one named
+/// by the `Mcp-Session-Id` header is not torn down for a restart.
+async fn run_initialize_without_id_is_refused_with_help(mode: TransportMode) {
     let h = Harness::start(mode).await;
-    let reply = post_raw(
-        &h.client,
-        &h.url,
-        mode,
-        None,
-        initialize_payload(Value::Null).to_string().into_bytes(),
+    assert_eq!(h.peers_spawned.load(Ordering::SeqCst), 1);
+
+    let without_id = initialize_payload(Value::Null);
+    assert!(without_id.get("id").is_none());
+    let mut null_id = without_id.clone();
+    null_id["id"] = Value::Null;
+
+    for (payload, what, reason) in [
+        (
+            &without_id,
+            "`initialize` request was sent without an id",
+            "missing_id",
+        ),
+        (
+            &null_id,
+            r#"`initialize` request was sent with "id": null"#,
+            "null_id",
+        ),
+    ] {
+        for session in [None, Some(h.session_id.as_str())] {
+            let reply = post_raw(
+                &h.client,
+                &h.url,
+                mode,
+                session,
+                payload.to_string().into_bytes(),
+            )
+            .await;
+            assert_refused_for_missing_id(&reply, what);
+            let body: Value = serde_json::from_str(&reply.body).unwrap();
+            assert_eq!(body["error"]["data"]["reason"], reason, "{body}");
+            assert_eq!(reply.session_header, None, "no session: {reply:?}");
+        }
+    }
+    assert_eq!(
+        h.peers_spawned.load(Ordering::SeqCst),
+        1,
+        "an initialize without an id created a session"
+    );
+    // The session named in the header was not restarted.
+    assert_request_answered(
+        &h,
+        json!({"jsonrpc": "2.0", "id": 10, "method": "tools/list"}),
+        json!("tools/list"),
     )
     .await;
-    assert_eq!(reply.status, 200, "{reply:?}");
-    let session = reply.session_header.clone().expect("a session was created");
-    assert_ne!(session, h.session_id);
-    assert_eq!(reply.message(), json!({"jsonrpc": "2.0", "result": null}));
 }
 
 #[tokio::test]
-async fn initialize_without_id_creates_a_session_json() {
-    run_initialize_without_id_creates_a_session(TransportMode::Json).await;
+async fn initialize_without_id_is_refused_with_help_json() {
+    run_initialize_without_id_is_refused_with_help(TransportMode::Json).await;
 }
 
 #[tokio::test]
-async fn initialize_without_id_creates_a_session_sse() {
-    run_initialize_without_id_creates_a_session(TransportMode::Sse).await;
+async fn initialize_without_id_is_refused_with_help_sse() {
+    run_initialize_without_id_is_refused_with_help(TransportMode::Sse).await;
 }

@@ -8,6 +8,7 @@
 //! re-reading `id`, `method`, `result` and `error` from the raw JSON
 //! (SPEC R8.3.8).
 
+use ahma_common::mcp_methods::INITIALIZE_METHOD;
 use serde_json::Value;
 
 /// How one JSON-RPC message POSTed by the client must be routed.
@@ -34,8 +35,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Inbound<'a> {
     /// Has an `id`: forwarded, and answered with the subprocess's response —
-    /// except under a `null` id, which the session does not wait for
-    /// (`session::RpcId::of_request`).
+    /// except under a `null` id, which is refused before routing
+    /// ([`Inbound::missing_request_id`], SPEC R8.3.9).
     /// `method` is `None` when the message has none (or not a string); such a
     /// message is still forwarded, and the subprocess answers it.
     Request {
@@ -67,6 +68,13 @@ impl<'a> Inbound<'a> {
         if method.is_none() && (result.is_some() || payload.get("error").is_some()) {
             return Self::Response { id, result };
         }
+        // A `notifications/…` method is never a request, whatever a loose
+        // client puts beside it: one sent with `"id": null` is still the
+        // notification it names, so the handshake's `notifications/initialized`
+        // is not refused over a stray null (SPEC R8.3.9).
+        if id.is_null() && method.is_some_and(|m| m.starts_with("notifications/")) {
+            return Self::Notification { method };
+        }
         Self::Request { id, method }
     }
 
@@ -88,12 +96,48 @@ impl<'a> Inbound<'a> {
         }
     }
 
+    /// Why this message is a request that cannot be answered, if it is one
+    /// (SPEC R8.3.9): a [`Request`](Inbound::Request) whose `id` is `null`,
+    /// or an `initialize` sent with no `id` (a request whatever its shape).
+    /// No reply could carry an id the client would match, so the bridge
+    /// refuses it instead of routing it. A client response under a `null` id
+    /// answers a request and is not one, so it is never named here.
+    pub(crate) fn missing_request_id(&self) -> Option<MissingRequestId> {
+        match self {
+            Self::Request { id, .. } if id.is_null() => Some(MissingRequestId::Null),
+            Self::Notification {
+                method: Some(INITIALIZE_METHOD),
+            } => Some(MissingRequestId::Absent),
+            _ => None,
+        }
+    }
+
     /// A short name for logs.
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Request { .. } => "request",
             Self::Notification { .. } => "notification",
             Self::Response { .. } => "response",
+        }
+    }
+}
+
+/// How a request lacks the string or number id MCP requires
+/// ([`Inbound::missing_request_id`], SPEC R8.3.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingRequestId {
+    /// The request carries `"id": null`.
+    Null,
+    /// An `initialize` with no `id` member at all.
+    Absent,
+}
+
+impl MissingRequestId {
+    /// The `error.data.reason` naming this case.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Null => "null_id",
+            Self::Absent => "missing_id",
         }
     }
 }
@@ -243,6 +287,53 @@ mod tests {
                 Inbound::Notification { method: None },
                 "{payload}"
             );
+        }
+    }
+
+    #[test]
+    fn a_request_without_a_usable_id_is_named() {
+        // SPEC R8.3.9: a request under a `null` id, and an `initialize` with no
+        // id at all, cannot be answered and are refused.
+        let null = json!({"jsonrpc": "2.0", "id": null, "method": "tools/list"});
+        assert_eq!(
+            classify(&null).missing_request_id(),
+            Some(MissingRequestId::Null)
+        );
+        let bare_null = json!({"jsonrpc": "2.0", "id": null});
+        assert_eq!(
+            classify(&bare_null).missing_request_id(),
+            Some(MissingRequestId::Null)
+        );
+        // A notification sent with a stray `"id": null` is still a
+        // notification: the handshake must not fail over it.
+        let loose = json!({"jsonrpc": "2.0", "id": null, "method": "notifications/initialized"});
+        assert_eq!(
+            classify(&loose),
+            Inbound::Notification {
+                method: Some("notifications/initialized")
+            }
+        );
+        assert_eq!(classify(&loose).missing_request_id(), None);
+        let initialize = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        assert_eq!(
+            classify(&initialize).missing_request_id(),
+            Some(MissingRequestId::Absent)
+        );
+        let null_initialize = json!({"jsonrpc": "2.0", "id": null, "method": "initialize"});
+        assert_eq!(
+            classify(&null_initialize).missing_request_id(),
+            Some(MissingRequestId::Null)
+        );
+        // A usable id, a notification and a client response are not affected:
+        // a response under `null` answers a request, it is not one.
+        for fine in [
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize"}),
+            json!({"jsonrpc": "2.0", "id": "", "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": null, "result": {}}),
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": -1, "message": "x"}}),
+        ] {
+            assert_eq!(classify(&fine).missing_request_id(), None, "{fine}");
         }
     }
 

@@ -1,6 +1,6 @@
 use crate::bridge::{MCP_SESSION_ID_HEADER, session_id_from_headers};
 use crate::error::BridgeError;
-use crate::inbound::Inbound;
+use crate::inbound::{Inbound, MissingRequestId};
 use crate::session::{McpRoot, SessionManager};
 use ahma_common::mcp_methods::{
     INITIALIZE_METHOD, INITIALIZED_METHOD, ROOTS_LIST_CHANGED_METHOD, ROOTS_LIST_METHOD,
@@ -140,6 +140,105 @@ pub(crate) fn batch_not_supported_response() -> Response {
         RpcErrorCode::InvalidRequest,
         "JSON-RPC batch requests are not supported by this server. Send one request per POST.",
     )
+}
+
+/// What to do about a request without a usable id (SPEC R8.3.9). Sent as the
+/// end of the error message and as `error.data.remediation`.
+const MISSING_REQUEST_ID_REMEDIATION: &str = "This usually means a misbehaving MCP client or a \
+     hand-written request: send a string or number id, or update or reconfigure the MCP client. \
+     If it keeps happening, run `ahma doctor` in a terminal to check your ahma setup, or ask \
+     `/doctor <question>` in `ahma tui` to have the chat model explain its report.";
+
+/// The error message for a request without a usable id: what was wrong, why
+/// it matters, and what to do (SPEC R8.3.9).
+fn missing_request_id_message(missing: MissingRequestId, method: Option<&str>) -> String {
+    let request = match method {
+        Some(method) => format!("the `{method}` request"),
+        None => "a request".to_string(),
+    };
+    let problem = match missing {
+        MissingRequestId::Null => "was sent with \"id\": null",
+        MissingRequestId::Absent => "was sent without an id",
+    };
+    let outcome = if method == Some(INITIALIZE_METHOD) {
+        "so ahma started no session"
+    } else {
+        "so ahma did not run it"
+    };
+    format!(
+        "Invalid request: {request} {problem}. MCP requires a string or number id on every \
+         request, {outcome}. {MISSING_REQUEST_ID_REMEDIATION}"
+    )
+}
+
+/// HTTP 400 / `-32600` for a request without a usable id (SPEC R8.3.9), under
+/// `id: null` since there is no id to echo, with the advice repeated as
+/// machine-readable `data` in the shape ahma's own MCP errors use (`kind`,
+/// `reason`, `remediation`).
+fn missing_request_id_response(missing: MissingRequestId, method: Option<&str>) -> Response {
+    let mut body = json_rpc_error_value(
+        Value::Null,
+        RpcErrorCode::InvalidRequest,
+        &missing_request_id_message(missing, method),
+    );
+    body["error"]["data"] = serde_json::json!({
+        "kind": "request_id_required",
+        "reason": missing.reason(),
+        "method": method,
+        "remediation": MISSING_REQUEST_ID_REMEDIATION,
+        "doctor": "ahma doctor",
+    });
+    json_response_with_status(StatusCode::BAD_REQUEST, body)
+}
+
+/// The MCP client to name in a log line, from its `initialize` `clientInfo`.
+fn describe_client(client_info: Option<&Value>) -> String {
+    let name = client_info
+        .and_then(|info| info.get("name"))
+        .and_then(Value::as_str);
+    let version = client_info
+        .and_then(|info| info.get("version"))
+        .and_then(Value::as_str);
+    match (name, version) {
+        (Some(name), Some(version)) => format!("{name} {version}"),
+        (Some(name), None) => name.to_string(),
+        (None, _) => "an unidentified client".to_string(),
+    }
+}
+
+/// Refuse a request without a usable id before anything else happens to it
+/// (SPEC R8.3.9): nothing is forwarded, no session is created or restarted.
+/// Logs one warning naming the client — from this `initialize`'s own
+/// `clientInfo`, or from the session the request names — so the human running
+/// the bridge can see which client is misbehaving.
+async fn refuse_missing_request_id(
+    session_manager: &SessionManager,
+    session_id: Option<&str>,
+    inbound: Inbound<'_>,
+    payload: &Value,
+) -> Option<Response> {
+    let missing = inbound.missing_request_id()?;
+    let method = inbound.method();
+    let client_info = if method == Some(INITIALIZE_METHOD) {
+        payload
+            .get("params")
+            .and_then(|p| p.get("clientInfo"))
+            .cloned()
+    } else {
+        match session_id.and_then(|id| session_manager.get_session(id)) {
+            Some(session) => session.client_info.lock().await.clone(),
+            None => None,
+        }
+    };
+    warn!(
+        session_id = session_id.unwrap_or(""),
+        method = method.unwrap_or(""),
+        reason = missing.reason(),
+        "Refused a request without a usable id from MCP client {}: MCP requires a string or \
+         number id. Update or reconfigure that client.",
+        describe_client(client_info.as_ref())
+    );
+    Some(missing_request_id_response(missing, method))
 }
 
 /// Per MCP Streamable HTTP, an unknown or terminated session ID gets **404**,
@@ -422,6 +521,12 @@ async fn handle_post_request(
     tracing::Span::current().record("method", method.unwrap_or(""));
     tracing::Span::current().record("session_id", session_id.as_deref().unwrap_or(""));
     debug!(method = ?method, session_id = ?session_id, kind = inbound.kind(), "Incoming MCP request");
+
+    if let Some(refusal) =
+        refuse_missing_request_id(&session_manager, session_id.as_deref(), inbound, &payload).await
+    {
+        return refusal;
+    }
 
     if method == Some(INITIALIZE_METHOD) {
         terminate_session_being_reinitialized(&session_manager, session_id.as_deref()).await;
@@ -2052,6 +2157,98 @@ mod tests {
         );
     }
 
+    // ─── SPEC R8.3.9: a request without a usable id ─────────────────────
+
+    #[test]
+    fn missing_request_id_message_says_what_why_and_what_to_do() {
+        assert_eq!(
+            missing_request_id_message(MissingRequestId::Null, Some("tools/list")),
+            format!(
+                "Invalid request: the `tools/list` request was sent with \"id\": null. \
+                 MCP requires a string or number id on every request, so ahma did not \
+                 run it. {MISSING_REQUEST_ID_REMEDIATION}"
+            )
+        );
+        assert_eq!(
+            missing_request_id_message(MissingRequestId::Absent, Some(INITIALIZE_METHOD)),
+            format!(
+                "Invalid request: the `initialize` request was sent without an id. \
+                 MCP requires a string or number id on every request, so ahma started \
+                 no session. {MISSING_REQUEST_ID_REMEDIATION}"
+            )
+        );
+        assert!(
+            missing_request_id_message(MissingRequestId::Null, None)
+                .starts_with("Invalid request: a request was sent with \"id\": null.")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_request_id_response_is_400_with_data() {
+        let resp = missing_request_id_response(MissingRequestId::Null, Some("tools/call"));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(content_type(&resp).contains("application/json"));
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], Value::Null);
+        assert!(body.get("id").is_some(), "id present: {body}");
+        assert_eq!(body["error"]["code"], -32600);
+        assert_eq!(
+            body["error"]["data"],
+            json!({
+                "kind": "request_id_required",
+                "reason": "null_id",
+                "method": "tools/call",
+                "remediation": MISSING_REQUEST_ID_REMEDIATION,
+                "doctor": "ahma doctor",
+            })
+        );
+    }
+
+    #[test]
+    fn describe_client_names_the_client_from_client_info() {
+        assert_eq!(
+            describe_client(Some(&json!({"name": "acme-ide", "version": "2.1"}))),
+            "acme-ide 2.1"
+        );
+        assert_eq!(
+            describe_client(Some(&json!({"name": "acme-ide"}))),
+            "acme-ide"
+        );
+        assert_eq!(
+            describe_client(Some(&Value::Null)),
+            "an unidentified client"
+        );
+        assert_eq!(describe_client(None), "an unidentified client");
+    }
+
+    #[tokio::test]
+    async fn initialize_without_id_is_refused_before_a_session_exists() {
+        let mgr = keepalive_manager();
+        let existing_id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18",
+            "clientInfo": {"name": "acme-ide", "version": "2.1"}
+        }});
+        let resp = handle_session_isolated_request(
+            mgr.clone(),
+            headers_with_session(&existing_id),
+            payload,
+            String::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(header_session_id(&resp).is_none());
+        assert_eq!(
+            body_json(resp).await["error"]["data"]["reason"],
+            "missing_id"
+        );
+        assert!(
+            mgr.session_exists(&existing_id),
+            "the session was restarted"
+        );
+        assert_eq!(mgr.session_count(), 1, "a session was created");
+    }
+
     #[tokio::test]
     async fn server_discover_probe_without_session_returns_200_discover_result() {
         let sm = keepalive_manager();
@@ -2471,7 +2668,7 @@ mod tests {
     #[tokio::test]
     async fn isolated_request_initialize_with_stale_session_header_routes_to_initialize() {
         let mgr = keepalive_manager();
-        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let resp = handle_session_isolated_request(
             mgr,
             headers_with_session("stale-id"),
@@ -2486,7 +2683,7 @@ mod tests {
     #[tokio::test]
     async fn isolated_sse_request_initialize_with_stale_session_header_routes_to_initialize() {
         let mgr = keepalive_manager();
-        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let resp = handle_session_isolated_request_sse(
             mgr,
             headers_with_session("stale-id"),
@@ -2504,7 +2701,7 @@ mod tests {
         let existing_id = mgr.create_session().await.expect("create session");
         assert!(mgr.session_exists(&existing_id));
 
-        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let _ = handle_session_isolated_request(
             mgr.clone(),
             headers_with_session(&existing_id),
@@ -2524,7 +2721,7 @@ mod tests {
         let existing_id = mgr.create_session().await.expect("create session");
         assert!(mgr.session_exists(&existing_id));
 
-        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let _ = handle_session_isolated_request_sse(
             mgr.clone(),
             headers_with_session(&existing_id),
@@ -3007,7 +3204,7 @@ mod tests {
     async fn isolated_request_initialize_validates_payload() {
         let mgr = keepalive_manager();
         // initialize with no session id but invalid params → -32602.
-        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let resp =
             handle_session_isolated_request(mgr, HeaderMap::new(), payload, String::new()).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);

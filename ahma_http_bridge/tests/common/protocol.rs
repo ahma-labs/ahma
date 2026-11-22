@@ -11,6 +11,9 @@ fn next_request_id() -> u64 {
 #[derive(Debug, Serialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
+    /// `None` for a notification, which has no `id` member at all: written as
+    /// `"id": null` it would be a request the bridge refuses (SPEC R8.3.9).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     pub method: String,
     pub params: Value,
