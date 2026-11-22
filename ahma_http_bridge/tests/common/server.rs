@@ -379,6 +379,14 @@ fn configure_server_command(
         .env("AHMA_TEST_ISOLATION", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The test's own home, named: without it each process derives one from its
+    // executable's target directory, and under `cargo llvm-cov` the test binary
+    // (`target/llvm-cov-target/...`) and the server (`target/debug/ahma`) live in
+    // different ones, so the server published its token where the test never
+    // looked (SPEC R-ISO.1).
+    if let Some(home) = ahma_common::config::ahma_home_dir() {
+        cmd.env("AHMA_TEST_HOME", home);
+    }
 
     for (k, v) in env {
         cmd.env(k, v);
@@ -893,4 +901,19 @@ pub async fn spawn_in_process_server(
         port,
         _abort: abort,
     })
+}
+
+/// A server a test spawns uses the test's own home, so what it publishes there
+/// (a token, a lease) is where the test reads it, whichever target directory
+/// each binary was built in.
+#[test]
+fn a_spawned_server_shares_the_tests_home() {
+    let mut cmd = Command::new("ahma");
+    configure_server_command(&mut cmd, Path::new("."), &[], &[], "");
+    let home = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "AHMA_TEST_HOME")
+        .and_then(|(_, v)| v)
+        .map(std::path::PathBuf::from);
+    assert_eq!(home, ahma_common::config::ahma_home_dir());
 }
