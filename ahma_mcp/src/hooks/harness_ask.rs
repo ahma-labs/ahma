@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use ahma_common::config::{PersistentScope, ScopeAccess};
+use ahma_common::grant::ResolvedGrant;
 use ahma_common::harness_asks::{self, CommandDigest, Question, Refusal};
 
 /// The `run-shell` flag that carries an approved question's token. Only the
@@ -93,6 +94,17 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
     }
 }
 
+/// The grants in force for a hooked command whose sandbox scopes are `scopes`:
+/// the saved ones in `persistent` (the settings file's, expired leases already
+/// left out) and the session grants of its workspace (SPEC R-PERM.4.4).
+fn granted_in(persistent: &[PersistentScope], scopes: &[PathBuf]) -> Vec<ResolvedGrant> {
+    persistent
+        .iter()
+        .map(ResolvedGrant::saved)
+        .chain(crate::sandbox::session_grants_for(scopes))
+        .collect()
+}
+
 /// The question to put to the human before `command` runs again in `cwd`, in
 /// harness session `session_id`, with the token that approves it. Recording
 /// the question is what makes it the only time it is asked this session.
@@ -118,8 +130,7 @@ pub(super) fn next_ask(
         (may_write || !r.access.is_write()) && harness_asks::refused_for(r, command)
     };
     let scopes = super::resolve_hook_sandbox_scopes(cwd);
-    let mut granted = persistent.to_vec();
-    granted.extend(crate::sandbox::session_scopes_for(&scopes));
+    let granted = granted_in(persistent, &scopes);
     let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
     let is_covered =
         |p: &Path, a: ScopeAccess| harness_asks::grant_covers(&granted, &workspace, p, a);
@@ -176,19 +187,17 @@ pub(super) fn next_repo_step(
     command: &str,
     persistent: &[PersistentScope],
 ) -> Option<RepoStep> {
-    use ahma_common::grant::GrantedBy;
-    use ahma_common::scope_grant::{grant_applies, other_repository};
+    use ahma_common::scope_grant::other_repository;
     let dir = harness_asks::default_dir()?;
     let workspace = workspace_for(cwd);
     let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
     let now = ahma_common::session_grants::now_secs();
     let scopes = super::resolve_hook_sandbox_scopes(cwd);
-    let mut granted = persistent.to_vec();
-    granted.extend(crate::sandbox::session_scopes_for(&scopes));
+    let granted = granted_in(persistent, &scopes);
     let granted_by_a_human = |repo: &Path| {
         granted.iter().any(|g| {
-            GrantedBy::parse(g.granted_by.as_deref()).is_deliberate()
-                && grant_applies(g.workspace.as_deref(), std::slice::from_ref(&workspace))
+            g.by.is_deliberate()
+                && g.applies_to(std::slice::from_ref(&workspace))
                 && (repo.starts_with(&g.path) || g.path.starts_with(repo))
         })
     };
@@ -1211,7 +1220,7 @@ mod tests {
         let approval = apply_approval(&token, &ws, "make heavy").expect("a line");
         assert!(approval.line.contains("approved"), "{}", approval.line);
         let granted =
-            crate::sandbox::session_scopes_for(&super::super::resolve_hook_sandbox_scopes(&ws));
+            crate::sandbox::session_grants_for(&super::super::resolve_hook_sandbox_scopes(&ws));
         assert!(
             granted
                 .iter()
@@ -1365,14 +1374,21 @@ mod tests {
         // A grant the dialog's own yes made is no deliberate setup, saved or for the
         // session. The session kind was once read back as `session grant (harness
         // dialog)`, which counted as a human's because it was not the exact dialog
-        // mark; it is built here the way the sandbox builds it.
-        for kind in ["saved", "session"] {
+        // mark; it is read here from the session-grant store, as the hook reads it. A
+        // session grant a human made there is a deliberate setup: nothing is asked.
+        let dialog_mark = ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG;
+        for (kind, by, asks) in [
+            ("saved", dialog_mark, true),
+            ("session", dialog_mark, true),
+            ("session-by-tui", "tui", false),
+        ] {
             let repo = tmp.path().join(format!("dialog-made-{kind}"));
             std::fs::create_dir_all(repo.join(".git")).unwrap();
             let repo = dunce::canonicalize(&repo).unwrap();
-            let by = ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string();
-            let scope = if kind == "saved" {
-                PersistentScope {
+            let by = by.to_string();
+            let mut dialog = crate::shell::cli::AppConfig::default();
+            if kind == "saved" {
+                dialog.persistent_scopes.push(PersistentScope {
                     path: repo.clone(),
                     access: ScopeAccess::Rw,
                     workspace: Some(ws.clone()),
@@ -1380,26 +1396,24 @@ mod tests {
                     granted_at: None,
                     note: None,
                     expires_at: None,
-                }
+                });
             } else {
-                ahma_common::session_grants::as_persistent_scopes(&[
-                    ahma_common::session_grants::SessionGrant {
-                        path: repo.clone(),
-                        access: ScopeAccess::Rw,
-                        workspace: ws.clone(),
-                        owner_pid: std::process::id(),
-                        granted_at: 1,
-                        granted_by: Some(by),
-                    },
-                ])
-                .remove(0)
-            };
-            let mut dialog = crate::shell::cli::AppConfig::default();
-            dialog.persistent_scopes.push(scope);
+                let store = ahma_common::session_grants::default_dir().expect("runtime dir");
+                let grant = ahma_common::session_grants::SessionGrant {
+                    path: repo.clone(),
+                    access: ScopeAccess::Rw,
+                    workspace: ws.clone(),
+                    owner_pid: std::process::id(),
+                    granted_at: ahma_common::session_grants::now_secs(),
+                    granted_by: Some(by),
+                };
+                ahma_common::session_grants::record(&store, &grant).unwrap();
+            }
             let cmd = format!("cd {} && ls", repo.display());
-            assert!(
+            assert_eq!(
                 matches!(decide_with(&cmd, &dialog), HooksDecision::AskGrant { .. }),
-                "a {kind} grant the dialog made still asks"
+                asks,
+                "a {kind} grant: asks = {asks}"
             );
         }
     }

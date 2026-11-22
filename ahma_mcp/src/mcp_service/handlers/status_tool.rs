@@ -140,7 +140,7 @@ impl AhmaMcpService {
         out.push_str(&sandbox.active_sandbox().disclosure_line());
         out.push('\n');
         out.push_str(&sandbox.scope_text(sandbox.scope_source()));
-        let grants = sandbox.persistent_grants_in_effect();
+        let grants = sandbox.grants_in_effect();
         if grants.is_empty() {
             out.push_str("  grants: (none in force for this session)\n");
         } else {
@@ -150,16 +150,15 @@ impl AhmaMcpService {
                     "    {} ({}) workspace={} by={}\n",
                     g.path.display(),
                     g.access.label(),
-                    g.workspace
-                        .as_deref()
+                    g.workspace()
                         .map(|w| w.display().to_string())
                         .unwrap_or_else(|| "GLOBAL (legacy)".to_string()),
-                    g.granted_by.as_deref().unwrap_or("user"),
+                    g.by.label().as_deref().unwrap_or("user"),
                 ));
             }
         }
         out.push_str(&lease_forecast(
-            &sandbox.persistent_grants_in_effect(),
+            &sandbox.grants_in_effect(),
             ahma_common::config::unix_now(),
         ));
         out.push_str(
@@ -231,11 +230,11 @@ const LEASE_FORECAST_SECS: u64 = 12 * 3_600;
 /// The leases in force that end within [`LEASE_FORECAST_SECS`], so an agent
 /// about to start a long unattended run can ask the human to renew them once,
 /// before it starts, instead of losing access partway through.
-fn lease_forecast(grants: &[ahma_common::config::PersistentScope], now: u64) -> String {
+fn lease_forecast(grants: &[ahma_common::grant::ResolvedGrant], now: u64) -> String {
     let mut due: Vec<_> = grants
         .iter()
         .filter_map(|g| {
-            let at = g.expires_at?;
+            let at = g.expires_at()?;
             (at > now && at - now <= LEASE_FORECAST_SECS).then_some((at - now, g))
         })
         .collect();
@@ -313,14 +312,16 @@ mod sandbox_report_tests {
     #[test]
     fn status_forecasts_leases_that_end_within_twelve_hours() {
         use ahma_common::config::{PersistentScope, ScopeAccess};
-        let g = |path: &str, expires_at: Option<u64>| PersistentScope {
-            path: path.into(),
-            access: ScopeAccess::Rw,
-            workspace: None,
-            granted_by: None,
-            granted_at: None,
-            note: None,
-            expires_at,
+        let g = |path: &str, expires_at: Option<u64>| {
+            ahma_common::grant::ResolvedGrant::saved(&PersistentScope {
+                path: path.into(),
+                access: ScopeAccess::Rw,
+                workspace: None,
+                granted_by: None,
+                granted_at: None,
+                note: None,
+                expires_at,
+            })
         };
         let now = 1_000_000;
         let text = super::lease_forecast(

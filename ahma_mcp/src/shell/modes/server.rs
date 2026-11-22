@@ -1055,6 +1055,7 @@ mod tests {
             defer_sandbox: false,
             working_dirs: vec![],
             persistent_scopes: vec![],
+            session_grants: vec![],
             explicit_tools_dir: false,
             tools_dir: None,
             tool_bundles: vec![],

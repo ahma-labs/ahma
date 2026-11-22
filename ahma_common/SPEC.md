@@ -33,6 +33,11 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   Distinct from `hub::Surface`, the interface a session runs on.
 - `scope_grant`, `sandbox_state`: the grant coordinator (ask once per path, R-PERM.3) and
   the sandbox lifecycle state machine.
+- `grant`: one grant as every consumer sees it, `ResolvedGrant` (folder, access, `Binding`,
+  `GrantedBy`, `GrantLife`), built from a saved grant or lease of the settings file or from a
+  session grant (`session_grants`); neither store's file format changes. Whether a grant is
+  for the session is its `GrantLife`, never its text (R-PERM.4.4), and which sessions it
+  applies to is `ResolvedGrant::applies_to`, the sandbox's one workspace rule (R5.4.11).
 - `hook_consent`, `net_approval`, `web_approval`, `web_policy`: the terminal-hook fall-open
   consent ledger (R5.5.3), subprocess-egress and `fetch_webpage` session approvals, and the
   web domain policy (R-WEB).

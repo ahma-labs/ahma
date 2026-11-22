@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{PersistentScope, ScopeAccess};
+use crate::config::ScopeAccess;
+use crate::grant::ResolvedGrant;
 use crate::scope_grant::{GrantRisk, classify_grant_risk, sensitive_dirs};
 use crate::shell_words::{self, Word};
 
@@ -1473,10 +1474,12 @@ pub fn load_all(dir: &Path, now: u64) -> Vec<WorkspaceAsks> {
 /// Whether a grant in `granted` already lets a command in `workspace` reach
 /// `path` with `access` (SPEC R-PERM.10(c)): the test the hook and the TUI
 /// both apply before asking. Which grants apply to the workspace is the
-/// sandbox's own rule (`scope_grant::grant_applies`), so nothing the sandbox
-/// would allow is asked about.
+/// sandbox's own rule ([`ResolvedGrant::applies_to`]), so nothing the sandbox
+/// would allow is asked about, whatever the grant's life: saved, a lease or
+/// for the session. The caller passes only grants in force (an expired lease
+/// is left out where the settings are read).
 pub fn grant_covers(
-    granted: &[PersistentScope],
+    granted: &[ResolvedGrant],
     workspace: &Path,
     path: &Path,
     access: ScopeAccess,
@@ -1488,7 +1491,7 @@ pub fn grant_covers(
     let scopes = [canonical(workspace)];
     granted.iter().any(|g| {
         let root = canonical(&crate::config::expand_home(&g.path));
-        crate::scope_grant::grant_applies(g.workspace.as_deref(), &scopes)
+        g.applies_to(&scopes)
             && (g.access.is_write() || !access.is_write())
             && path.starts_with(&root)
     })
@@ -1687,6 +1690,7 @@ fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PersistentScope;
 
     /// SPEC R-ESCAPE.4: `sudo` is setuid, so no sandbox runs it; the hook asks to run the command
     /// once outside the sandbox before trying.
@@ -2161,7 +2165,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let ws = root.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        let granted = [PersistentScope {
+        let granted = [ResolvedGrant::saved(&PersistentScope {
             path: dunce::canonicalize(&real).unwrap(),
             access: ScopeAccess::Rw,
             workspace: Some(link.join("..").join("ws")),
@@ -2169,7 +2173,7 @@ mod tests {
             granted_at: None,
             note: None,
             expires_at: None,
-        }];
+        })];
         assert!(grant_covers(
             &granted,
             &ws,
@@ -2466,17 +2470,76 @@ mod tests {
         );
     }
 
+    /// A saved, a leased and a session grant cover alike: the same workspace
+    /// rule and the same access rule, whatever the grant's life. Pins today's
+    /// answers across the move from note text to `grant::GrantLife`.
+    #[test]
+    fn saved_leased_and_session_grants_cover_alike() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        let other = root.path().join("other");
+        let cache = root.path().join("cache");
+        for d in [&ws, &other, &cache] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let saved = |access, workspace: &Path, expires_at| PersistentScope {
+            path: cache.clone(),
+            access,
+            workspace: Some(workspace.to_path_buf()),
+            granted_by: Some("cli".into()),
+            granted_at: None,
+            note: None,
+            expires_at,
+        };
+        let session = |access, workspace: &Path| crate::session_grants::SessionGrant {
+            path: cache.clone(),
+            access,
+            workspace: workspace.to_path_buf(),
+            owner_pid: 7,
+            granted_at: 1_000,
+            granted_by: Some("tui".into()),
+        };
+        let lock = cache.join("lock");
+        for (life, access, bound_to, asked, covers) in [
+            ("saved", ScopeAccess::Rw, &ws, ScopeAccess::Rw, true),
+            ("saved", ScopeAccess::Ro, &ws, ScopeAccess::Rw, false),
+            ("saved", ScopeAccess::Ro, &ws, ScopeAccess::Ro, true),
+            ("saved", ScopeAccess::Rw, &other, ScopeAccess::Rw, false),
+            ("lease", ScopeAccess::Rw, &ws, ScopeAccess::Rw, true),
+            ("lease", ScopeAccess::Ro, &ws, ScopeAccess::Rw, false),
+            ("lease", ScopeAccess::Rw, &other, ScopeAccess::Ro, false),
+            ("session", ScopeAccess::Rw, &ws, ScopeAccess::Rw, true),
+            ("session", ScopeAccess::Ro, &ws, ScopeAccess::Rw, false),
+            ("session", ScopeAccess::Ro, &ws, ScopeAccess::Ro, true),
+            ("session", ScopeAccess::Rw, &other, ScopeAccess::Rw, false),
+        ] {
+            let granted = match life {
+                "saved" => ResolvedGrant::saved(&saved(access, bound_to, None)),
+                "lease" => ResolvedGrant::saved(&saved(access, bound_to, Some(u64::MAX))),
+                _ => ResolvedGrant::session(&session(access, bound_to)),
+            };
+            assert_eq!(
+                grant_covers(&[granted], &ws, &lock, asked),
+                covers,
+                "{life} {access:?} grant for {} asked {asked:?}",
+                bound_to.display()
+            );
+        }
+    }
+
     #[test]
     fn a_grant_covers_its_workspace_and_access() {
         let ws = PathBuf::from("/w/proj");
-        let g = |path: &str, access, workspace: Option<&str>| PersistentScope {
-            path: PathBuf::from(path),
-            access,
-            workspace: workspace.map(PathBuf::from),
-            granted_by: None,
-            granted_at: None,
-            note: None,
-            expires_at: None,
+        let g = |path: &str, access, workspace: Option<&str>| {
+            ResolvedGrant::saved(&PersistentScope {
+                path: PathBuf::from(path),
+                access,
+                workspace: workspace.map(PathBuf::from),
+                granted_by: None,
+                granted_at: None,
+                note: None,
+                expires_at: None,
+            })
         };
         let p = Path::new("/c/neubit/lock");
         assert!(grant_covers(
@@ -2520,14 +2583,16 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         let target = root.path().join("cache");
         std::fs::create_dir_all(&target).unwrap();
-        let grant = |workspace: &Path| PersistentScope {
-            path: target.clone(),
-            access: ScopeAccess::Rw,
-            workspace: Some(workspace.to_path_buf()),
-            granted_by: Some("cli".into()),
-            granted_at: None,
-            note: None,
-            expires_at: None,
+        let grant = |workspace: &Path| {
+            ResolvedGrant::saved(&PersistentScope {
+                path: target.clone(),
+                access: ScopeAccess::Rw,
+                workspace: Some(workspace.to_path_buf()),
+                granted_by: Some("cli".into()),
+                granted_at: None,
+                note: None,
+                expires_at: None,
+            })
         };
         for (granted_for, session) in [
             (&repo, &repo),
