@@ -143,6 +143,7 @@ Protocol notes:
 - Notifications (id-less JSON-RPC messages) are answered `202 Accepted` with no body, on both POST transports.
 - An unknown or expired `Mcp-Session-Id` is answered `404 Not Found` — re-send `initialize` to start a fresh session.
 - JSON-RPC **batch arrays are rejected** with `400` (batching was removed from the MCP spec in 2025-06-18).
+- A request whose `id` is `null`, or an `initialize` sent without an `id`, is rejected with `400` and JSON-RPC `-32600`: MCP requires a string or number id on every request. Nothing is run and no session is started. The error message, and its `data.remediation`, say what to do — fix or update the client sending it; if it keeps happening, run [`ahma doctor`](doctor.md), or ask `/doctor <question>` in `ahma tui`.
 - Browser requests are accepted only from loopback origins; a non-loopback `Origin` header is rejected with `403` (DNS-rebinding guard). Non-browser clients send no `Origin` and are unaffected.
 - The **deprecated 2024-11-05 two-endpoint HTTP+SSE transport** (`/sse` + `/messages`) is **not** implemented; clients must speak Streamable HTTP on `/mcp`.
 
