@@ -815,7 +815,7 @@ mod tests {
         );
         assert_eq!(grants.len(), 1, "{grants:?}");
         assert!(grants[0].covers("github.com", &home.path().join("ws")));
-        assert_eq!(grants[0].granted_by.as_deref(), Some("web"));
+        assert_eq!(grants[0].granted_by.as_str(), Some("web"));
         let audited: Vec<_> = ahma_common::permissions::read_audit_entries(
             &home.path().join(".ahma").join("permissions-audit.jsonl"),
         )

@@ -75,7 +75,7 @@ fn a_hooked_command_signs_through_the_broker_only_once_allowed() {
             workspace: ws.clone(),
             granted_at: ahma_common::config::unix_now(),
             expires_at: None,
-            granted_by: Some("e2e".into()),
+            granted_by: ahma_common::grant::GrantedBy::Named("e2e".into()),
             owner_pid: None,
         },
         &ahma_common::approver::ApproverSurface::Cli,

@@ -1828,7 +1828,7 @@ mod tests {
             workspace: std::path::PathBuf::from("/ws"),
             granted_at: 1,
             expires_at: None,
-            granted_by: None,
+            granted_by: ahma_common::grant::GrantedBy::Unmarked,
             owner_pid: None,
         };
         AhmaSettings::update(|s| s.sandbox.ssh_sign.push(grant("sshsig:old"))).unwrap();

@@ -106,7 +106,7 @@ pub fn bang_started(op_id: &str, command: &str, cwd: &str) -> HubEvent {
         title: Some(command.to_string()),
         cwd: Some(cwd.to_string()),
         command: Some(command.to_string()),
-        origin: Some("tui".to_string()),
+        origin: Some(ahma_common::hub::InstanceMode::Tui.as_str().to_string()),
         partial: false,
         unsandboxed: true,
     }
@@ -312,6 +312,20 @@ mod tests {
         // Nothing above awaited; the only assertion available is that we got
         // here, and that the handle is still usable.
         assert!(!reporter.session_id().is_empty());
+    }
+
+    /// A `!` command's origin is the TUI's own kind of instance, under the
+    /// name the hub row (`via tui`) has always shown.
+    #[test]
+    fn a_bang_command_comes_from_the_tui() {
+        let HubEvent::OpStarted { origin, .. } = bang_started("op", "ls", "/w") else {
+            panic!("expected OpStarted");
+        };
+        assert_eq!(origin.as_deref(), Some("tui"));
+        assert_eq!(
+            origin.as_deref().map(ahma_common::hub::InstanceMode::of),
+            Some(ahma_common::hub::InstanceMode::Tui)
+        );
     }
 
     /// Two commands are two operations, even from one window and one session.

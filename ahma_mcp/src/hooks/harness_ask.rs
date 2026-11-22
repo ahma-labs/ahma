@@ -687,7 +687,7 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
         q.access,
         Some(&workspace),
         owner,
-        ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG,
+        ahma_common::grant::GrantedBy::HarnessDialog,
     );
     let verb = if q.access.is_write() { "write" } else { "read" };
     Some(Approval {
@@ -846,7 +846,7 @@ fn apply_ssh_approval(asked: &harness_asks::AskedSsh, workspace: &Path, now: u64
             workspace: workspace.to_path_buf(),
             granted_at: now,
             expires_at: None,
-            granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.to_string()),
+            granted_by: ahma_common::grant::GrantedBy::HarnessDialog,
             owner_pid: Some(owner),
         };
         ahma_common::ssh_sign::record_session(&dir, &grant).ok()
@@ -1081,7 +1081,7 @@ mod tests {
                 workspace: workspace.clone(),
                 owner_pid: std::process::id(),
                 granted_at: now,
-                granted_by: Some("tui".into()),
+                granted_by: ahma_common::approver::ApproverSurface::Tui.into(),
             },
             &ahma_common::approver::ApproverSurface::Tui,
         )
@@ -1408,7 +1408,7 @@ mod tests {
                     workspace: ws.clone(),
                     owner_pid: std::process::id(),
                     granted_at: ahma_common::session_grants::now_secs(),
-                    granted_by: Some(by),
+                    granted_by: ahma_common::grant::GrantedBy::parse(Some(&by)),
                 };
                 ahma_common::session_grants::record(&store, &grant).unwrap();
             }

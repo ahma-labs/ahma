@@ -2497,7 +2497,7 @@ mod tests {
             workspace: workspace.to_path_buf(),
             owner_pid: 7,
             granted_at: 1_000,
-            granted_by: Some("tui".into()),
+            granted_by: crate::approver::ApproverSurface::Tui.into(),
         };
         let lock = cache.join("lock");
         for (life, access, bound_to, asked, covers) in [

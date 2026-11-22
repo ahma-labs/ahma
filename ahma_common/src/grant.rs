@@ -19,6 +19,13 @@
 //! match. A session grant carries its maker as made; it was once wrapped as
 //! `session grant (<maker>)`, a second spelling a text comparison missed.
 //!
+//! The session-grant store, the link session grants and the ssh-sign grants
+//! hold a [`GrantedBy`] itself, and serde stores it as the same optional
+//! text it always was: a maker is written as the name it has always had
+//! (`From<ApproverSurface>`), and any text already on disk reads back
+//! unchanged. The settings file's `persistent_scopes` still keep the text and
+//! read it here.
+//!
 //! Paths are kept as the store holds them. They are compared canonical where
 //! they are compared ([`crate::scope_grant::grant_applies`],
 //! [`crate::harness_asks::grant_covers`]), and the sandbox resolves them
@@ -28,15 +35,23 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::approver::ApproverSurface;
 use crate::config::{PersistentScope, ScopeAccess};
 use crate::scope_grant::GRANTED_BY_HARNESS_DIALOG;
 use crate::session_grants::SessionGrant;
 
 /// Who made a grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Stored as the optional text a record's `granted_by` has always held
+/// ([`Self::as_str`]): `Unmarked` is no text, so a field of this type takes
+/// `#[serde(default, skip_serializing_if = "GrantedBy::is_unmarked")]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GrantedBy {
     /// No `granted_by` at all: a grant written by hand into the settings file,
     /// or by a version of ahma that did not record it.
+    #[default]
     Unmarked,
     /// The harness dialog's yes (SPEC R-PERM.10): never typed or confirmed by
     /// a human for this folder.
@@ -58,12 +73,22 @@ impl GrantedBy {
     }
 
     /// The `granted_by` text this is read from; `None` for [`Self::Unmarked`].
-    pub fn label(&self) -> Option<String> {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::Unmarked => None,
-            Self::HarnessDialog => Some(GRANTED_BY_HARNESS_DIALOG.to_string()),
-            Self::Named(by) => Some(by.clone()),
+            Self::HarnessDialog => Some(GRANTED_BY_HARNESS_DIALOG),
+            Self::Named(by) => Some(by),
         }
+    }
+
+    /// [`Self::as_str`], owned.
+    pub fn label(&self) -> Option<String> {
+        self.as_str().map(str::to_string)
+    }
+
+    /// No maker recorded: the field is left out of the record.
+    pub fn is_unmarked(&self) -> bool {
+        matches!(self, Self::Unmarked)
     }
 
     /// Whether a person set this grant up on purpose (SPEC R-PERM.11): anything
@@ -73,6 +98,32 @@ impl GrantedBy {
             Self::HarnessDialog => false,
             Self::Unmarked | Self::Named(_) => true,
         }
+    }
+}
+
+/// A grant a human made at an approver surface records it under the name the
+/// surface has always had (`tui`, `web`, `cli`, …; SPEC R-GUI.7).
+impl From<ApproverSurface> for GrantedBy {
+    fn from(surface: ApproverSurface) -> Self {
+        Self::from(&surface)
+    }
+}
+
+impl From<&ApproverSurface> for GrantedBy {
+    fn from(surface: &ApproverSurface) -> Self {
+        Self::Named(surface.to_string())
+    }
+}
+
+impl Serialize for GrantedBy {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_str().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for GrantedBy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<String>::deserialize(deserializer).map(|raw| Self::parse(raw.as_deref()))
     }
 }
 
@@ -151,7 +202,7 @@ impl ResolvedGrant {
             path: grant.path.clone(),
             access: grant.access,
             binding: Binding::Workspace(grant.workspace.clone()),
-            by: GrantedBy::parse(grant.granted_by.as_deref()),
+            by: grant.granted_by.clone(),
             life: GrantLife::Session {
                 owner_pid: grant.owner_pid,
                 granted_at: grant.granted_at,
@@ -211,6 +262,61 @@ mod tests {
         }
     }
 
+    /// `granted_by` is a field of three on-disk records (a session grant, a
+    /// link session grant, an ssh-sign grant), stored as plain text. Each
+    /// maker writes exactly the text it wrote before the field was typed,
+    /// reads back as the maker it was, and text this build never writes (a
+    /// tool's name, a newer surface) survives a read and a write unchanged.
+    #[test]
+    fn granted_by_is_stored_as_the_text_each_maker_has_always_written() {
+        use serde_json::{Value, json};
+
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Record {
+            #[serde(default, skip_serializing_if = "GrantedBy::is_unmarked")]
+            granted_by: GrantedBy,
+        }
+
+        let made = [
+            (GrantedBy::from(ApproverSurface::Tui), Some("tui")),
+            (GrantedBy::from(ApproverSurface::Web), Some("web")),
+            (GrantedBy::from(ApproverSurface::Desktop), Some("desktop")),
+            (GrantedBy::from(ApproverSurface::Cli), Some("cli")),
+            (GrantedBy::from(ApproverSurface::Harness), Some("harness")),
+            (GrantedBy::HarnessDialog, Some("harness dialog")),
+            (GrantedBy::Unmarked, None),
+        ];
+        for (by, text) in made {
+            let stored = serde_json::to_value(Record {
+                granted_by: by.clone(),
+            })
+            .unwrap();
+            assert_eq!(
+                stored.get("granted_by").and_then(Value::as_str),
+                text,
+                "{by:?} is stored as {text:?}, and an unmarked one not at all"
+            );
+            assert_eq!(by.as_str(), text, "{by:?}");
+            let read: Record = serde_json::from_value(stored).unwrap();
+            assert_eq!(read.granted_by, by, "{text:?} reads back as its maker");
+        }
+
+        for text in ["sccache", "logs_approve", "a surface from a newer ahma", ""] {
+            let read: Record = serde_json::from_value(json!({ "granted_by": text })).unwrap();
+            assert_eq!(read.granted_by, GrantedBy::Named(text.into()));
+            assert_eq!(
+                serde_json::to_value(&read).unwrap(),
+                json!({ "granted_by": text }),
+                "{text:?} survives a read and a write"
+            );
+        }
+        for absent in [json!({}), json!({ "granted_by": null })] {
+            let read: Record = serde_json::from_value(absent.clone()).unwrap();
+            assert_eq!(read.granted_by, GrantedBy::Unmarked, "{absent}");
+            assert_eq!(serde_json::to_value(&read).unwrap(), json!({}));
+        }
+    }
+
     fn scope(note: Option<&str>, expires_at: Option<u64>) -> PersistentScope {
         PersistentScope {
             path: PathBuf::from("/cache/a"),
@@ -246,7 +352,7 @@ mod tests {
             workspace: PathBuf::from("/ws/a"),
             owner_pid: 7,
             granted_at: 100,
-            granted_by: Some(GRANTED_BY_HARNESS_DIALOG.into()),
+            granted_by: GrantedBy::HarnessDialog,
         });
         assert_eq!(
             session.life,

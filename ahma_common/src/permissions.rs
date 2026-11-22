@@ -261,7 +261,7 @@ fn ssh_sign_record(g: &crate::ssh_sign::SshSignGrant) -> GrantRecord {
         subject: format!("{} for {}", g.key, g.destination),
         access: None,
         tier: GrantTier::for_expiry(g.expires_at),
-        granted_by: g.granted_by.clone(),
+        granted_by: g.granted_by.label(),
         granted_at: Some(crate::config::fmt_utc_datetime(g.granted_at)),
         surface: None,
         note: (!g.label.is_empty()).then(|| g.label.clone()),

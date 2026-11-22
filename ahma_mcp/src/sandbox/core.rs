@@ -2294,7 +2294,7 @@ mod grant_life_tests {
             workspace: canon(workspace),
             owner_pid: std::process::id(),
             granted_at: ahma_common::session_grants::now_secs(),
-            granted_by: Some(ahma_common::scope_grant::GRANTED_BY_HARNESS_DIALOG.into()),
+            granted_by: ahma_common::grant::GrantedBy::HarnessDialog,
         }
     }
 

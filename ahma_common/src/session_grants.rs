@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ScopeAccess;
+use crate::grant::GrantedBy;
 
 /// Session grants older than this are dropped even if their owner is alive: a
 /// "for this session" answer must not quietly become a day-long one.
@@ -42,9 +43,10 @@ pub struct SessionGrant {
     pub owner_pid: u32,
     /// Unix seconds when it was approved.
     pub granted_at: u64,
-    /// Who made it (`"tui"`, `"web"`, `"cli"`, `"harness dialog"`, a tool name).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_by: Option<String>,
+    /// Who made it, stored as the text it always was (`"tui"`, `"web"`,
+    /// `"cli"`, `"harness dialog"`, a tool name).
+    #[serde(default, skip_serializing_if = "GrantedBy::is_unmarked")]
+    pub granted_by: GrantedBy,
 }
 
 /// The directory session grants live in: `runtime_dir()/session-grants`.
@@ -182,8 +184,42 @@ mod tests {
             workspace: ws.to_path_buf(),
             owner_pid: pid,
             granted_at: at,
-            granted_by: Some("tui".into()),
+            granted_by: crate::approver::ApproverSurface::Tui.into(),
         }
+    }
+
+    /// The file holds its maker as the text it always has (`"tui"`), leaves
+    /// the key out when no maker was recorded, and a file naming a maker this
+    /// build does not know still loads, as made.
+    #[test]
+    fn a_session_grant_file_holds_its_maker_as_the_text_it_always_has() {
+        use crate::grant::GrantedBy;
+        let td = tempdir().unwrap();
+        let dir = td.path().join("session-grants");
+        let mut g = grant(Path::new("/cache/a"), Path::new("/ws/a"), 7, 1_000);
+        let stored = |file: &Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap()
+        };
+        let file = record(&dir, &g).unwrap();
+        let mut on_disk = stored(&file);
+        assert_eq!(on_disk["granted_by"], "tui");
+        assert_eq!(active(&dir, 1_100, &|_| true), vec![g.clone()]);
+
+        on_disk["granted_by"] = "a surface from a newer ahma".into();
+        std::fs::write(&file, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let read = active(&dir, 1_100, &|_| true);
+        assert_eq!(
+            read[0].granted_by,
+            GrantedBy::Named("a surface from a newer ahma".into())
+        );
+
+        g.granted_by = GrantedBy::Unmarked;
+        let file = record(&dir, &g).unwrap();
+        assert!(
+            stored(&file).get("granted_by").is_none(),
+            "no maker, no key"
+        );
+        assert_eq!(active(&dir, 1_100, &|_| true), vec![g]);
     }
 
     /// Two writers recording the same grant at once (two hooks approving the
@@ -312,7 +348,7 @@ mod tests {
     #[test]
     fn a_session_grant_keeps_its_maker_as_made() {
         let mut g = grant(Path::new("/cache/a"), Path::new("/ws/a"), 7, 1_000);
-        g.granted_by = Some(crate::scope_grant::GRANTED_BY_HARNESS_DIALOG.into());
+        g.granted_by = crate::grant::GrantedBy::HarnessDialog;
         let resolved = crate::grant::ResolvedGrant::session(&g);
         assert_eq!(resolved.by, crate::grant::GrantedBy::HarnessDialog);
         assert!(resolved.is_session());
