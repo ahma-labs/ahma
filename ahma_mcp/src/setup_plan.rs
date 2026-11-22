@@ -1173,7 +1173,8 @@ fn list_entry_undo(key: &str, item: &str) -> Undo {
 /// The switches the setup view lists when they are on, in its order: every
 /// key with a [`SettingKey::switch_label`], each once (a test holds the two
 /// equal, so a new switch cannot be left out of the view).
-const SWITCH_ORDER: [SettingKey; 6] = [
+const SWITCH_ORDER: [SettingKey; 7] = [
+    SettingKey::SandboxDisableTemp,
     SettingKey::SandboxAllowGpu,
     SettingKey::SandboxAllowKeychain,
     SettingKey::SandboxSignalOtherProcesses,
@@ -1271,23 +1272,28 @@ fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
         });
     }
     // Every switch that is on ([`SettingKey::switch_label`]), in the order the
-    // setup view has always listed them.
+    // setup view lists them. A switch is read through
+    // [`SettingKey::switch_is_on`], so an opt-out key (`disable_temp`, whose
+    // "temporary files" switch is on while it is `false`) reads the right way
+    // round.
     let defaults = AhmaSettings::default();
     for setting in SWITCH_ORDER {
         let Some(what) = setting.switch_label() else {
             continue;
         };
-        let is_on = |s: &AhmaSettings| setting.value(s) == Some(toml::Value::Boolean(true));
+        let is_on = |s: &AhmaSettings| setting.switch_is_on(s) == Some(true);
         let key = setting.as_str();
         if is_on(s) {
             // Back to the default is `unset`, unless the default is itself on
-            // (the login keychain): then only `false` turns it off.
+            // (the login keychain, temporary files): then only the value that
+            // turns it off does — `false` for an `allow_*` key, `true` for
+            // `disable_temp`.
             let on_by_default = is_on(&defaults);
             let undo = if on_by_default {
                 Change::Set {
                     file: SettingsFile::User,
                     key: key.into(),
-                    value: "false".into(),
+                    value: (!setting.switch_on_value()).to_string(),
                 }
             } else {
                 Change::Unset {
@@ -1711,6 +1717,38 @@ mod tests {
             ),
             "{:?}",
             keychain.undo
+        );
+    }
+
+    /// SPEC R5.2.5, R-SETUP.4.1: temporary files are on by default and listed
+    /// as a switch; its undo is the expert opt-out, `disable_temp = true`, and
+    /// once that is set the switch is off and no longer listed.
+    #[test]
+    fn temporary_files_are_a_switch_whose_undo_disables_temp() {
+        let f = fixture();
+        let rows = allow_rows(&f.env, &AhmaSettings::default());
+        let temp = rows
+            .iter()
+            .find(|r| r.detail == "sandbox.disable_temp")
+            .expect("temporary files are on by default");
+        assert_eq!(temp.subject, "temporary files");
+        assert!(
+            matches!(
+                &temp.undo,
+                Undo::Proposal(Change::Set { key, value, .. })
+                    if key == "sandbox.disable_temp" && value == "true"
+            ),
+            "{:?}",
+            temp.undo
+        );
+
+        let mut off = AhmaSettings::default();
+        off.sandbox.disable_temp = true;
+        let rows = allow_rows(&f.env, &off);
+        assert!(
+            !rows.iter().any(|r| r.detail == "sandbox.disable_temp"),
+            "disable_temp = true turns the switch off: {:?}",
+            rows.iter().map(|r| &r.subject).collect::<Vec<_>>()
         );
     }
 

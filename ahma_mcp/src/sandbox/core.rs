@@ -222,8 +222,8 @@ fn is_in_temp_dir(path: &Path) -> bool {
     cached_canonical_temp_dir().is_some_and(|temp_dir| path.starts_with(temp_dir))
 }
 
-/// The system temp directory, canonicalized — the one spelling every `--tmp`
-/// decision uses (the question's path, the live grant, the in-scope check).
+/// The system temp directory, canonicalized — the one spelling every temp
+/// scope decision uses (the auxiliary scope, the in-scope check).
 fn cached_canonical_temp_dir() -> Option<&'static Path> {
     // `std::env::temp_dir()` is fixed for the process lifetime, and
     // canonicalizing it is a syscall — cache it once rather than paying that
@@ -234,14 +234,42 @@ fn cached_canonical_temp_dir() -> Option<&'static Path> {
         .as_deref()
 }
 
-/// Where the `--tmp` question stands for this session (SPEC R5.2.5, R5.3).
-/// It is asked at most once: [`Sandbox::claim_tmp_consent`] moves it out of
-/// `NotAsked`, and only that caller asks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TmpConsent {
-    NotAsked,
-    Asking,
-    Settled,
+/// The canonical system temp directory when it may join `scopes` as an
+/// auxiliary scope (SPEC R5.2.5), else `None`: never as the sole scope (an
+/// empty set is a sandbox still waiting for its workspace, R5.2.4), never when
+/// a scope already contains it, and never when the hard denylist refuses it
+/// for this workspace (R-PERM.4.3) — a workspace *inside* the temp directory,
+/// where adding it would widen the scope above the workspace.
+///
+/// The one rule for every surface that puts temp in scope: the commit
+/// ([`Sandbox::admit_temp_scope`]) and the one-shot `ahma tool run` / hook
+/// seed, which runs before a [`Sandbox`] exists.
+pub fn auxiliary_temp_scope(scopes: &[PathBuf]) -> Option<PathBuf> {
+    if scopes.is_empty() {
+        return None;
+    }
+    let temp = cached_canonical_temp_dir()?;
+    let live: Vec<PathBuf> = scopes
+        .iter()
+        .map(|s| dunce::canonicalize(s).unwrap_or_else(|_| s.clone()))
+        .collect();
+    if path_within_scopes(temp, &live) {
+        return None;
+    }
+    if let ahma_common::scope_grant::GrantRisk::Refused(why) =
+        ahma_common::scope_grant::classify_grant_risk(
+            temp,
+            ahma_common::config::ahma_home_dir().as_deref(),
+            &live,
+        )
+    {
+        tracing::info!(
+            "The temp directory {} stays out of this scope ({why}).",
+            temp.display()
+        );
+        return None;
+    }
+    Some(temp.to_path_buf())
 }
 
 /// The name of the immediate child of `container` that `requested` lives in, or
@@ -328,15 +356,13 @@ pub struct Sandbox {
     pub(super) read_scopes: parking_lot::RwLock<Vec<PathBuf>>,
     pub(super) mode: SandboxMode,
     pub(super) no_temp_files: bool,
-    /// Whether `--tmp` / `[sandbox] tmp_access` *asked* for the system temp
-    /// directory. A request, not a grant (SPEC R5.2.5, R5.3): a commit never
-    /// adds the temp directory on the strength of it. Under `serve` it joins
-    /// the scope only through a human-approved live grant
-    /// ([`Self::add_live_grant`]); `ahma tool run` seeds it into the scope it
-    /// is constructed with. Whether it is in scope is [`Self::tmp_in_scope`].
+    /// Whether the system temp directory belongs in ahma's own scope
+    /// (`[sandbox] tmp_access`, on by default; SPEC R5.2.5). Always `false`
+    /// when [`Self::no_temp_files`] is set: `disable_temp` closes temp at every
+    /// layer. Every commit admits the temp directory as an auxiliary scope on
+    /// the strength of it ([`Self::admit_temp_scope`]); whether it actually is
+    /// in scope is [`Self::tmp_in_scope`].
     pub(super) tmp_access: bool,
-    /// Whether the `--tmp` question has been asked this session.
-    tmp_consent: parking_lot::Mutex<TmpConsent>,
     /// When set, this user-configured scratch directory is preserved across every
     /// `update_scopes` call so that `roots/list` replacements produce
     /// `roots ∪ {sandbox_dir}` rather than discarding the secondary scope.
@@ -588,7 +614,6 @@ impl Clone for Sandbox {
             mode: self.mode,
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
-            tmp_consent: parking_lot::Mutex::new(*self.tmp_consent.lock()),
             scratch_dir: self.scratch_dir.clone(),
             explicit_scopes: self.explicit_scopes,
             ledger: parking_lot::RwLock::new(self.ledger.read().clone()),
@@ -613,7 +638,6 @@ impl std::fmt::Debug for Sandbox {
             .field("mode", &self.mode)
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
-            .field("tmp_consent", &*self.tmp_consent.lock())
             .field("scratch_dir", &self.scratch_dir)
             .field("ledger", &*self.ledger.read())
             .field("explicit_scopes", &self.explicit_scopes)
@@ -631,12 +655,15 @@ impl std::fmt::Debug for Sandbox {
 /// every call, so a swap was invisible.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SandboxOptions {
-    /// `--no-temp-files`: no temp directory is writable.
+    /// `--disable-temp-files` / `[sandbox] disable_temp`: no temp directory is
+    /// writable, and the temp directory never joins the scope.
     pub no_temp_files: bool,
     /// Live log monitoring: the targets of `<scope>/.ahma/logs/*.log` links
     /// become read-only scopes.
     pub livelog: bool,
-    /// `--tmp`: the system temp directory is a scope (SPEC R5.2.5).
+    /// `[sandbox] tmp_access` (on by default in the settings file): the system
+    /// temp directory joins every committed scope as an auxiliary scope (SPEC
+    /// R5.2.5). Ignored when [`Self::no_temp_files`] is set.
     pub tmp_access: bool,
 }
 
@@ -695,8 +722,8 @@ impl Sandbox {
             read_scopes: parking_lot::RwLock::new(read_scopes),
             mode,
             no_temp_files,
-            tmp_access,
-            tmp_consent: parking_lot::Mutex::new(TmpConsent::NotAsked),
+            // The opt-out wins at every layer (SPEC R5.2.5).
+            tmp_access: tmp_access && !no_temp_files,
             scratch_dir: None,
             explicit_scopes: false,
             ledger: parking_lot::RwLock::new(Ledger::default()),
@@ -1122,6 +1149,7 @@ impl Sandbox {
             return Ok(ScopeCommit::AlreadyCommitted);
         }
         self.apply_scopes(scopes)?;
+        self.admit_temp_scope();
         Ok(ScopeCommit::Applied)
     }
 
@@ -1135,20 +1163,45 @@ impl Sandbox {
     /// already claimed.
     pub fn commit_existing_scopes(&self) -> ScopeCommit {
         if self.scope_lock.try_commit() {
+            self.admit_temp_scope();
             ScopeCommit::Applied
         } else {
             ScopeCommit::AlreadyCommitted
         }
     }
 
+    /// Put the system temp directory in scope as an auxiliary scope, after the
+    /// workspace, when `tmp_access` is on and `disable_temp` is off (SPEC
+    /// R5.2.5). No prompt: commands may already write temp at the kernel layer,
+    /// and this only lets ahma's own tools (`working_directory`, `format: path`
+    /// arguments, the built-in file tools) follow them there. Skipped as
+    /// [`auxiliary_temp_scope`] says — no workspace yet, temp already in scope,
+    /// or the hard denylist refuses it for this workspace. Called by every
+    /// commit; a one-shot `ahma tool run` seeds the same directory before its
+    /// sandbox exists, under the same rule. Returns whether the temp directory
+    /// is in scope afterwards.
+    pub fn admit_temp_scope(&self) -> bool {
+        if self.tmp_access {
+            let mut scopes = self.scopes.write();
+            if let Some(temp) = auxiliary_temp_scope(&scopes) {
+                tracing::info!(
+                    "The temp directory {} joins the scope after the workspace \
+                     ([sandbox] tmp_access; turn temp off with disable_temp, SPEC R5.2.5)",
+                    temp.display()
+                );
+                append_missing_scopes(&mut scopes, &[temp]);
+            }
+        }
+        self.tmp_in_scope()
+    }
+
     /// Replace the sandbox scopes, preserving the scratch dir if `--scratch`
     /// was set and any user-granted persistent scopes
     /// (`[sandbox].persistent_scopes`).
     ///
-    /// The temp directory is **not** re-added for `--tmp`. It used to be,
-    /// which made `--tmp` an unprompted scope downgrade at every commit; it is
-    /// now a request a human answers after the commit (SPEC R5.2.5, R5.3), and
-    /// a granted temp directory arrives through [`Self::add_live_grant`].
+    /// The commit then admits the temp directory as an auxiliary scope when
+    /// `tmp_access` is on ([`Self::admit_temp_scope`], SPEC R5.2.5), so the
+    /// scope a client is told about already holds it.
     ///
     /// Private on purpose: every wholesale scope replacement must go through
     /// [`commit_scopes`](Self::commit_scopes), which claims the one-shot commit
@@ -1394,53 +1447,29 @@ impl Sandbox {
         self.is_test_mode() || self.is_committed()
     }
 
-    /// Check if no-temp-files mode is enabled.
+    /// Whether `--disable-temp-files` / `[sandbox] disable_temp` closed temp.
     pub fn is_no_temp_files(&self) -> bool {
         self.no_temp_files
     }
 
-    /// Whether `--tmp` / `[sandbox] tmp_access` asked for the temp directory.
-    /// A request, not a grant: see [`Self::tmp_in_scope`] for whether it is in
-    /// the scope (SPEC R5.2.5).
+    /// Whether the temp directory belongs in this session's scope
+    /// (`[sandbox] tmp_access`, and not `disable_temp`). See
+    /// [`Self::tmp_in_scope`] for whether it is in the scope now (SPEC R5.2.5).
     pub fn is_tmp_access(&self) -> bool {
         self.tmp_access
     }
 
-    /// The canonical system temp directory: the literal path the `--tmp`
-    /// question names and the one a granted answer adds.
+    /// The canonical system temp directory: the path a commit adds as the
+    /// auxiliary temp scope.
     pub fn canonical_temp_dir() -> Option<PathBuf> {
         cached_canonical_temp_dir().map(Path::to_path_buf)
     }
 
     /// Whether the system temp directory lies within the live scopes — because
-    /// a human granted it, `ahma tool run --tmp` seeded it, or a scope already
-    /// contains it. Answers in every mode, like [`Self::is_path_in_scope`].
+    /// a commit admitted it, a human granted it, or a scope already contains
+    /// it. Answers in every mode, like [`Self::is_path_in_scope`].
     pub fn tmp_in_scope(&self) -> bool {
         cached_canonical_temp_dir().is_some_and(|temp| self.is_path_in_scope(temp))
-    }
-
-    /// Claim the one `--tmp` question this session may raise. `true` for the
-    /// first caller only; every later caller (a second commit path, a repeat
-    /// `initialized`) gets `false` and must not ask (SPEC R-PERM.4).
-    pub fn claim_tmp_consent(&self) -> bool {
-        let mut state = self.tmp_consent.lock();
-        if *state == TmpConsent::NotAsked {
-            *state = TmpConsent::Asking;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Record that the `--tmp` question has run its course: answered, or
-    /// nobody could be asked, or it was never raised after being claimed.
-    pub fn settle_tmp_consent(&self) {
-        *self.tmp_consent.lock() = TmpConsent::Settled;
-    }
-
-    /// Whether the `--tmp` question was claimed and has run its course.
-    pub fn tmp_consent_settled(&self) -> bool {
-        *self.tmp_consent.lock() == TmpConsent::Settled
     }
 
     /// Check if package-cache writes are enabled (default `true`).
@@ -1850,17 +1879,17 @@ mod scope_view_tests {
             },
         )
         .unwrap();
-        assert!(sb.is_tmp_access(), "the request is recorded");
+        assert!(sb.is_tmp_access());
         assert!(
             !sb.tmp_in_scope(),
-            "a request is not a grant: the temp dir is not in scope"
+            "the temp dir joins at the commit, not at construction"
         );
     }
 
     /// A workspace that is not inside the temp directory, without creating
-    /// anything: granting the temp directory to a workspace *inside* it is
-    /// refused as a parent of the live scope (R-PERM.4.3), which is the right
-    /// answer there and the wrong precondition here.
+    /// anything: the temp directory is refused to a workspace *inside* it, as
+    /// a parent of the live scope (R-PERM.4.3), which is the right answer
+    /// there and the wrong precondition here.
     fn workspace_outside_temp() -> PathBuf {
         let ws = dunce::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
         let temp = Sandbox::canonical_temp_dir().unwrap();
@@ -1873,51 +1902,53 @@ mod scope_view_tests {
         ws
     }
 
-    /// SPEC R5.2.5 / R5.3: `--tmp` is a request a human answers, so a commit —
-    /// the one door a scope becomes locked through — never adds the temp
-    /// directory on its own. It used to, at every commit.
-    #[test]
-    fn tmp_requested_is_not_in_scope_after_commit() {
-        let ws = workspace_outside_temp();
-        let sb = Sandbox::new(
+    fn tmp_sandbox(tmp_access: bool, no_temp_files: bool) -> Sandbox {
+        Sandbox::new(
             Vec::new(),
             SandboxMode::Strict,
             SandboxOptions {
-                tmp_access: true,
+                tmp_access,
+                no_temp_files,
                 ..SandboxOptions::default()
             },
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// SPEC R5.2.5: with `tmp_access` (the settings default) the commit — the
+    /// one door a scope becomes locked through — admits the temp directory
+    /// after the workspace, with no prompt, and every surface says so.
+    #[test]
+    fn tmp_access_puts_temp_in_scope_at_commit() {
+        let ws = workspace_outside_temp();
+        let sb = tmp_sandbox(true, false);
         assert_eq!(
             sb.commit_scopes(vec![ws.clone()]).unwrap(),
             ScopeCommit::Applied
         );
 
         let temp = Sandbox::canonical_temp_dir().unwrap();
-        assert!(sb.is_tmp_access());
-        assert!(!sb.tmp_in_scope());
-        assert!(
-            !sb.scopes().contains(&temp),
-            "the commit must not carry the temp dir: {:?}",
-            sb.scopes().to_vec()
-        );
-        assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp"], false);
-        assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp_requested"], true);
+        assert!(sb.tmp_in_scope());
+        assert_eq!(sb.scopes().first(), Some(&ws), "workspace stays primary");
+        assert_eq!(sb.scopes().last(), Some(&temp), "temp is auxiliary");
+        assert!(sb.validate_path(&temp.join("scratch.txt")).is_ok());
+        assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp"], true);
+        assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp_in_scope"], true);
         assert!(
             sb.scope_text(ScopeSource::RootsList)
-                .contains("tmp  : requested, awaiting consent"),
+                .contains("tmp  : in scope"),
             "{}",
             sb.scope_text(ScopeSource::RootsList)
         );
     }
 
-    /// A granted `--tmp` arrives the way every human-approved grant does:
-    /// through the live grant, behind the denylist (R-PERM.4.3).
+    /// The explicit-scope commit (`--sandbox-scope`, committed at startup)
+    /// admits it the same way.
     #[test]
-    fn tmp_live_grant_brings_temp_into_scope() {
+    fn tmp_access_puts_temp_in_an_explicit_scope_at_commit() {
         let ws = workspace_outside_temp();
         let sb = Sandbox::new(
-            Vec::new(),
+            vec![ws],
             SandboxMode::Strict,
             SandboxOptions {
                 tmp_access: true,
@@ -1925,40 +1956,75 @@ mod scope_view_tests {
             },
         )
         .unwrap();
+        assert_eq!(sb.commit_existing_scopes(), ScopeCommit::Applied);
+        assert!(sb.tmp_in_scope(), "{:?}", sb.scopes().to_vec());
+    }
+
+    /// SPEC R5.2.5: `disable_temp` is the expert opt-out and wins over
+    /// `tmp_access` at the scope layer as well as the kernel one.
+    #[test]
+    fn disable_temp_keeps_temp_out_of_scope_at_commit() {
+        let ws = workspace_outside_temp();
+        let sb = tmp_sandbox(true, true);
+        let _ = sb.commit_scopes(vec![ws]).unwrap();
+        assert!(!sb.is_tmp_access(), "disable_temp overrides tmp_access");
+        assert!(!sb.tmp_in_scope(), "{:?}", sb.scopes().to_vec());
+        assert!(!sb.admit_temp_scope(), "nor can it be admitted later");
+        assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp"], false);
+        assert!(
+            sb.scope_text(ScopeSource::RootsList).contains("tmp  : off"),
+            "{}",
+            sb.scope_text(ScopeSource::RootsList)
+        );
+    }
+
+    /// `tmp_access = false` keeps it out of ahma's own scope.
+    #[test]
+    fn tmp_access_off_keeps_temp_out_of_scope_at_commit() {
+        let ws = workspace_outside_temp();
+        let sb = tmp_sandbox(false, false);
+        let _ = sb.commit_scopes(vec![ws]).unwrap();
+        assert!(!sb.tmp_in_scope(), "{:?}", sb.scopes().to_vec());
+    }
+
+    /// SPEC R5.2.4: temp is never the sole scope, and never added above a
+    /// workspace that lies inside it (R-PERM.4.3).
+    #[test]
+    fn the_auxiliary_temp_scope_needs_a_workspace_outside_it() {
+        let temp = Sandbox::canonical_temp_dir().unwrap();
+        assert_eq!(auxiliary_temp_scope(&[]), None, "never the sole scope");
+        assert_eq!(
+            auxiliary_temp_scope(&[temp.join("project")]),
+            None,
+            "never above a workspace inside it"
+        );
+        assert_eq!(
+            auxiliary_temp_scope(&[workspace_outside_temp(), temp.clone()]),
+            None,
+            "already in scope"
+        );
+        assert_eq!(
+            auxiliary_temp_scope(&[workspace_outside_temp()]),
+            Some(temp)
+        );
+    }
+
+    /// A granted temp directory still arrives the way every human-approved
+    /// grant does: through the live grant, behind the denylist (R-PERM.4.3).
+    #[test]
+    fn tmp_live_grant_brings_temp_into_scope() {
+        let ws = workspace_outside_temp();
+        let sb = tmp_sandbox(false, false);
         let _ = sb.commit_scopes(vec![ws]).unwrap();
         let temp = Sandbox::canonical_temp_dir().unwrap();
+        assert!(!sb.tmp_in_scope());
 
         sb.add_live_grant(&temp, ahma_common::config::ScopeAccess::Rw)
             .expect("the temp dir is grantable to a workspace outside it");
 
         assert!(sb.tmp_in_scope());
         assert!(sb.validate_path(&temp.join("scratch.txt")).is_ok());
-        assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp"], true);
         assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp_in_scope"], true);
-        assert!(
-            sb.scope_text(ScopeSource::RootsList)
-                .contains("tmp  : granted (session)")
-        );
-    }
-
-    /// The question is asked at most once a session, whichever path asks.
-    #[test]
-    fn the_tmp_question_is_claimed_once() {
-        let sb = Sandbox::new(
-            Vec::new(),
-            SandboxMode::Strict,
-            SandboxOptions {
-                tmp_access: true,
-                ..SandboxOptions::default()
-            },
-        )
-        .unwrap();
-        assert!(!sb.tmp_consent_settled());
-        assert!(sb.claim_tmp_consent());
-        assert!(!sb.claim_tmp_consent(), "a second claim must not ask again");
-        sb.settle_tmp_consent();
-        assert!(sb.tmp_consent_settled());
-        assert!(!sb.claim_tmp_consent(), "nor after it settled");
     }
 
     #[test]

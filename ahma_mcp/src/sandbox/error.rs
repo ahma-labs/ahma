@@ -61,7 +61,7 @@ pub enum SandboxError {
     PrerequisiteFailed(String),
 
     #[error(
-        "Path '{path}' is blocked by high-security mode (no-temp-files)",
+        "Path '{path}' is blocked by high-security mode (--disable-temp-files / [sandbox] disable_temp)",
         path = display_path(.path)
     )]
     HighSecurityViolation { path: PathBuf },
@@ -230,7 +230,7 @@ mod tests {
             "Should reference blocked path: {msg}"
         );
         assert!(
-            msg.contains("no-temp-files")
+            msg.contains("disable-temp-files")
                 || msg.contains("high-security")
                 || msg.contains("blocked"),
             "Should mention high-security mode: {msg}"

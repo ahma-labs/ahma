@@ -40,7 +40,8 @@ ahma explain temp
 
 `ahma explain` never waits behind a build and writes nothing. Inside a hooked
 command it cannot read `~/.ahma`, so it reports temp as "probably available"
-and names the one switch (`--no-temp-files`) that would turn it off.
+and names the one switch (`--disable-temp-files`, `[sandbox] disable_temp`) that would
+turn it off.
 
 ## Topics
 
@@ -56,17 +57,18 @@ and names the one switch (`--no-temp-files`) that would turn it off.
 ## Temp space
 
 The kernel sandbox lets commands write `/tmp` on Linux and `/private/tmp` and
-`/private/var/folders` on macOS, unless the session was started with
-`--no-temp-files`. `ahma_help topic=temp` reports which of these is true, the
+`/private/var/folders` on macOS, unless the session runs with
+`--disable-temp-files` (`[sandbox] disable_temp`). `ahma_help topic=temp` reports which of these is true, the
 real path, and a warning if `TMPDIR` points somewhere commands cannot write. It
 shows how to make a folder of your own (`mktemp -d`) and how to point common tools
 at it (`XDG_CACHE_HOME`, `pip --cache-dir`, `npm --cache`, `CARGO_TARGET_DIR`,
 `GOCACHE`, `PYTHONPYCACHEPREFIX`, `GRADLE_USER_HOME`).
 
 Temp is shared with every process on the machine and cleaned on the operating
-system's schedule. ahma's own file tools and `working_directory` still treat it as
-outside the workspace (R5.2.5). Caches worth keeping between sessions belong in a
-gitignored folder in the workspace.
+system's schedule. ahma's own file tools and `working_directory` accept it too,
+by default (`[sandbox] tmp_access`, R5.2.5); the text says whether they do in this
+session. Caches worth keeping between sessions belong in a gitignored folder in the
+workspace.
 
 ## When a human is needed
 

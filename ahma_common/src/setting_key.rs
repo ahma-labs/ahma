@@ -31,6 +31,10 @@ struct KeySpec {
     /// Listed by the setup view as a switch that is on, with this label
     /// (SPEC R-SETUP.4.1).
     switch: Option<&'static str>,
+    /// The boolean value that means the switch is *on*: `true` for every
+    /// `allow_*`-style key, `false` for a key that names the opt-out
+    /// (`disable_temp`: temporary files are on while it is `false`).
+    switch_on_when: bool,
 }
 
 /// A preference: a repository's `.ahma/settings.toml` may set it.
@@ -40,6 +44,7 @@ const PREFERENCE: KeySpec = KeySpec {
     redacted: false,
     cli_only: false,
     switch: None,
+    switch_on_when: true,
 };
 
 /// Shapes the security boundary: only the user's own file (SPEC R-CFG2.2).
@@ -74,6 +79,16 @@ impl KeySpec {
     const fn switch(self, label: &'static str) -> Self {
         Self {
             switch: Some(label),
+            ..self
+        }
+    }
+
+    /// A switch whose key names the opt-out: the switch is on while the key
+    /// is `false`, so turning it off writes `true`.
+    const fn switch_on_when_false(self, label: &'static str) -> Self {
+        Self {
+            switch: Some(label),
+            switch_on_when: false,
             ..self
         }
     }
@@ -170,7 +185,10 @@ setting_keys! {
     ToolsLongRunning = tools.long_running => SECURITY,
     SandboxDisable = sandbox.disable => SECURITY.cli_only(),
     SandboxTmpAccess = sandbox.tmp_access => SECURITY,
-    SandboxDisableTemp = sandbox.disable_temp => SECURITY,
+    // R5.2.5: temp is on by default; the key is the expert opt-out, so the
+    // setup view's switch reads it inverted.
+    SandboxDisableTemp = sandbox.disable_temp
+        => SECURITY.switch_on_when_false("temporary files"),
     SandboxDefer = sandbox.defer => SECURITY,
     SandboxTaskVault = sandbox.task_vault => SECURITY,
     SandboxScopes = sandbox.scopes => SECURITY,
@@ -283,6 +301,22 @@ impl SettingKey {
         self.spec().switch
     }
 
+    /// The boolean value of this key that turns its switch on — `true` for
+    /// all but an opt-out key such as `sandbox.disable_temp`, whose switch
+    /// ("temporary files") is on while the key is `false`. Turning the switch
+    /// off writes the negation.
+    pub const fn switch_on_value(self) -> bool {
+        self.spec().switch_on_when
+    }
+
+    /// Whether this key's switch is on in `s`: `None` for a key that is not
+    /// a switch. The one reading of a switch, so an inverted key cannot be
+    /// read the wrong way round by a second caller.
+    pub fn switch_is_on(self, s: &AhmaSettings) -> Option<bool> {
+        self.switch_label()?;
+        Some(self.value(s) == Some(toml::Value::Boolean(self.switch_on_value())))
+    }
+
     /// Whether `settings show` and the startup report list it: every key but
     /// the ledger keys, which their own commands list (SPEC R-CFG5.1).
     pub const fn in_settings_report(self) -> bool {
@@ -351,6 +385,25 @@ mod tests {
                 assert!(!k.in_settings_report(), "{k}");
             }
         }
+    }
+
+    /// SPEC R5.2.5, R-SETUP.4.1: "temporary files" is a switch that is on by
+    /// default, and it is on while `disable_temp` is `false`.
+    #[test]
+    fn the_temporary_files_switch_reads_disable_temp_inverted() {
+        let k = SettingKey::SandboxDisableTemp;
+        assert_eq!(k.switch_label(), Some("temporary files"));
+        assert!(!k.switch_on_value());
+        let mut s = AhmaSettings::default();
+        assert_eq!(k.switch_is_on(&s), Some(true), "on by default");
+        s.sandbox.disable_temp = true;
+        assert_eq!(k.switch_is_on(&s), Some(false), "the opt-out turns it off");
+
+        // Every other switch is on when its key is `true`.
+        let keychain = SettingKey::SandboxAllowKeychain;
+        assert!(keychain.switch_on_value());
+        assert_eq!(keychain.switch_is_on(&AhmaSettings::default()), Some(true));
+        assert_eq!(SettingKey::ToolsTimeoutSecs.switch_is_on(&s), None);
     }
 
     #[test]

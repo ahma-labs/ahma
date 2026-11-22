@@ -184,13 +184,12 @@ pub async fn create_in_process_mcp_with_broker<C: ClientHandler>(
 }
 
 /// [`create_in_process_mcp_with_broker`] over a sandbox the test built itself:
-/// its mode, its `tmp_access` request, and whether its scope is committed
-/// before the client connects. Nothing is committed here.
+/// its mode, its `tmp_access`, and whether its scope is committed before the
+/// client connects. Nothing is committed here.
 ///
-/// A committed scope is what `ahma serve --sandbox-scope` starts with, so the
-/// server asks its startup questions (`--tmp`, SPEC R5.3) from
-/// `notifications/initialized`; an uncommitted one with a client that answers
-/// `roots/list` goes through the roots commit path, as an IDE client does.
+/// A committed scope is what `ahma serve --sandbox-scope` starts with; an
+/// uncommitted one with a client that answers `roots/list` goes through the
+/// roots commit path, as an IDE client does.
 pub async fn create_in_process_mcp_with_broker_and_sandbox<C: ClientHandler>(
     client: C,
     sandbox: Sandbox,

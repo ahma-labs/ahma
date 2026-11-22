@@ -9,7 +9,7 @@
 //!
 //! The text is generated from the live session ([`HelpFacts`]), not recited:
 //! whether temp space is available, and where it is, differ by platform and by
-//! `--no-temp-files`, and a help text that is wrong about that is worse than none.
+//! `--disable-temp-files`, and a help text that is wrong about that is worse than none.
 
 use super::common;
 use crate::AhmaMcpService;
@@ -46,13 +46,14 @@ pub const TOPICS: &[(&str, &str)] = &[
 pub enum TempAccess {
     /// The kernel sandbox lets commands write these directories.
     Open(Vec<PathBuf>),
-    /// The session was started with `--no-temp-files`: every temp location is refused.
+    /// The session runs with `--disable-temp-files` / `[sandbox] disable_temp`:
+    /// every temp location is refused.
     Refused,
     /// ahma is not enforcing a filesystem boundary here (`--no-sandbox`, or a
     /// platform without one), so temp is writable and nothing is confining it.
     NotEnforced,
     /// The kernel lets commands write these directories unless the session
-    /// runs with `--no-temp-files`, and that setting cannot be read from here
+    /// runs with `--disable-temp-files`, and that setting cannot be read from here
     /// (`ahma explain` inside a hooked command, where `~/.ahma` is out of
     /// reach by design, SPEC R5.4.8).
     Unconfirmed(Vec<PathBuf>),
@@ -69,6 +70,11 @@ pub struct HelpFacts {
     pub tmpdir_env: Option<PathBuf>,
     /// The first (primary) write scope, when one is established.
     pub workspace: Option<PathBuf>,
+    /// Whether the temp directory is in ahma's own scope — what
+    /// `working_directory`, path arguments and the built-in file tools accept
+    /// (`[sandbox] tmp_access`, on by default; SPEC R5.2.5). `None` when it
+    /// cannot be known from here.
+    pub temp_in_scope: Option<bool>,
 }
 
 impl HelpFacts {
@@ -97,6 +103,7 @@ impl HelpFacts {
                 .filter(|v| !v.is_empty())
                 .map(|v| canon(PathBuf::from(v))),
             workspace: sandbox.scopes().first().cloned(),
+            temp_in_scope: Some(sandbox.tmp_in_scope()),
         }
     }
 
@@ -106,15 +113,20 @@ impl HelpFacts {
     pub fn for_cli(cwd: &Path) -> Self {
         let canon = |p: PathBuf| dunce::canonicalize(&p).unwrap_or(p);
         let roots = Self::kernel_temp_roots();
-        let disabled = ahma_common::config::settings_path()
+        // The temp settings, when the file can be read: `(disable_temp, tmp_access)`.
+        let settings = ahma_common::config::settings_path()
             .map(|p| match std::fs::read_to_string(&p) {
                 Ok(text) => ahma_common::config::AhmaSettings::parse(&text)
                     .ok()
-                    .map(|s| s.sandbox.disable_temp),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+                    .map(|s| (s.sandbox.disable_temp, s.sandbox.tmp_access)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let d = ahma_common::config::SandboxSettings::default();
+                    Some((d.disable_temp, d.tmp_access))
+                }
                 Err(_) => None,
             })
             .unwrap_or(None);
+        let disabled = settings.map(|(disabled, _)| disabled);
         let temp = match disabled {
             Some(true) => TempAccess::Refused,
             _ if roots.is_empty() => TempAccess::NotEnforced,
@@ -131,6 +143,7 @@ impl HelpFacts {
                 .ancestors()
                 .find(|d| d.join(".git").exists())
                 .map(Path::to_path_buf),
+            temp_in_scope: settings.map(|(disabled, tmp_access)| tmp_access && !disabled),
         }
     }
 
@@ -198,10 +211,11 @@ fn temp_headline(facts: &HelpFacts) -> String {
             format!("Temp space: AVAILABLE at {}", facts.temp_dir.display())
         }
         TempAccess::Refused => {
-            "Temp space: NOT AVAILABLE (this session was started with --no-temp-files)".to_string()
+            "Temp space: NOT AVAILABLE (the user turned temp off with --disable-temp-files)"
+                .to_string()
         }
         TempAccess::Unconfirmed(_) => format!(
-            "Temp space: probably AVAILABLE at {} (unless ahma runs with --no-temp-files, \
+            "Temp space: probably AVAILABLE at {} (unless ahma runs with --disable-temp-files, \
              which cannot be checked from here)",
             facts.temp_dir.display()
         ),
@@ -239,7 +253,7 @@ fn temp(facts: &HelpFacts) -> String {
         TempAccess::Refused => format!(
             "{headline}\n\
              \n\
-             The user chose --no-temp-files, which refuses every temp location, so do not try \
+             The user chose --disable-temp-files, which refuses every temp location, so do not try \
              /tmp, $TMPDIR or mktemp. Use a gitignored folder in the workspace for anything you \
              need to put somewhere (check .gitignore; a folder such as target/ or node_modules/ \
              is already covered for the tools that own it), and say so to the user if you need \
@@ -303,18 +317,30 @@ fn temp_open(facts: &HelpFacts) -> String {
          If a tool is not listed, run `<tool> --help` and look for an option naming a cache, temp \
          or output directory.\n\
          \n\
-         What temp is not: it is shared with every process on this machine, the operating system \
-         cleans it on its own schedule, and ahma's own file tools and working_directory still \
-         treat it as outside the workspace. Use it for what you can lose. A cache you want to \
+         What temp is not: it is shared with every process on this machine, and the operating \
+         system cleans it on its own schedule. Use it for what you can lose. A cache you want to \
          reuse next session belongs in a gitignored folder in the workspace, not here.\n",
     );
+    out.push_str(match facts.temp_in_scope {
+        Some(true) => {
+            "\nahma's own file tools and working_directory accept it too in this session.\n"
+        }
+        Some(false) => {
+            "\nahma's own file tools and working_directory treat it as outside the workspace in \
+             this session (the user set [sandbox] tmp_access = false): reach it from commands.\n"
+        }
+        None => {
+            "\nWhether ahma's own file tools and working_directory accept it depends on \
+             [sandbox] tmp_access (on by default), which cannot be read from here.\n"
+        }
+    });
     out
 }
 
 fn blocked(facts: &HelpFacts) -> String {
     let step2 = match &facts.temp {
-        TempAccess::Refused => "2. Point it somewhere writable. This session was started with \
-             --no-temp-files, so temp is not an option: use a gitignored folder in the workspace.\n"
+        TempAccess::Refused => "2. Point it somewhere writable. The user turned temp off with \
+             --disable-temp-files, so temp is not an option: use a gitignored folder in the workspace.\n"
             .to_string(),
         _ => format!(
             "2. Point it somewhere writable. Throwaway files and caches you will not reuse go in \
@@ -456,6 +482,7 @@ mod tests {
             temp_dir: PathBuf::from("/private/var/folders/ab/cd123/T"),
             tmpdir_env: Some(PathBuf::from("/private/var/folders/ab/cd123/T")),
             workspace: Some(PathBuf::from("/work/project")),
+            temp_in_scope: Some(true),
         }
     }
 
@@ -558,6 +585,7 @@ mod tests {
             temp_dir: PathBuf::from("/run/user/1000"),
             tmpdir_env: Some(PathBuf::from("/run/user/1000")),
             workspace: None,
+            temp_in_scope: Some(true),
         };
         let text = render(Some("temp"), &facts);
         assert!(text.contains("/run/user/1000"), "{text}");
@@ -575,7 +603,7 @@ mod tests {
     fn no_temp_files_is_stated_plainly_with_a_way_forward() {
         let text = render(Some("temp"), &refused_facts());
         assert!(text.contains("NOT AVAILABLE"), "{text}");
-        assert!(text.contains("--no-temp-files"), "{text}");
+        assert!(text.contains("--disable-temp-files"), "{text}");
         assert!(
             text.contains("gitignored folder in the workspace"),
             "{text}"
@@ -632,7 +660,7 @@ mod tests {
     fn blocked_in_a_no_temp_files_session_does_not_send_the_agent_to_temp() {
         let text = render(Some("blocked"), &refused_facts());
         assert!(!text.contains("mktemp -d"), "{text}");
-        assert!(text.contains("--no-temp-files"), "{text}");
+        assert!(text.contains("--disable-temp-files"), "{text}");
     }
 
     fn unconfirmed_facts() -> HelpFacts {
@@ -661,18 +689,41 @@ mod tests {
     }
 
     /// Inside a hooked command ahma cannot read its own settings, so it does
-    /// not know whether `--no-temp-files` is on: it says so instead of guessing.
+    /// not know whether `--disable-temp-files` is on: it says so instead of guessing.
     #[test]
     fn temp_that_cannot_be_confirmed_says_so_and_names_the_one_switch() {
         let text = render(Some("temp"), &unconfirmed_facts());
         assert!(text.contains("probably AVAILABLE"), "{text}");
-        assert!(text.contains("--no-temp-files"), "{text}");
+        assert!(text.contains("--disable-temp-files"), "{text}");
         assert!(
             text.contains("mktemp -d"),
             "the recipes still apply: {text}"
         );
         let start = render(Some("start"), &unconfirmed_facts());
         assert!(start.contains("Temp space: probably AVAILABLE"), "{start}");
+    }
+
+    /// SPEC R-HELP.2, R5.2.5: temp is in ahma's own scope by default, and
+    /// the text says whether it is in this session, or that it cannot know.
+    #[test]
+    fn temp_says_whether_ahmas_own_tools_accept_it() {
+        let text = render(Some("temp"), &open_facts());
+        assert!(text.contains("accept it too in this session"), "{text}");
+        assert!(!text.contains("outside the workspace in"), "{text}");
+
+        let out = HelpFacts {
+            temp_in_scope: Some(false),
+            ..open_facts()
+        };
+        let text = render(Some("temp"), &out);
+        assert!(text.contains("tmp_access = false"), "{text}");
+
+        let unknown = HelpFacts {
+            temp_in_scope: None,
+            ..unconfirmed_facts()
+        };
+        let text = render(Some("temp"), &unknown);
+        assert!(text.contains("cannot be read from here"), "{text}");
     }
 
     #[test]

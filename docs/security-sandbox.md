@@ -369,7 +369,7 @@ Common `mcp.json` for nested environments (VS Code with workspace scoping):
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["--tmp", "--log-monitor"]
+            "args": ["--log-monitor"]
         }
     }
 }
@@ -454,21 +454,24 @@ script proceeds. Prefer scripts that install into a workspace-local directory
 (`cargo install --root <workspace>/.tools`) when you want installs to land
 in-scope without any grant.
 
-## Temp Directory Access (`--tmp`)
+## Temp Directory Access (on by default; `disable_temp` turns it off)
 
-By default, the system temp directory is accessible only via platform-implicit rules. On macOS those include, for a workspace or grant on an external disk, that disk's own `/Volumes/<name>/.TemporaryItems/folders.<uid>`: Foundation saves a file atomically through a temp directory on the same volume, so without it Xcode and other Cocoa tools cannot save files even inside the workspace (SPEC R6.2.12). `--tmp` (or `[sandbox] tmp_access = true`) asks for it as an explicit read/write scope — useful for compilers and build tools that take a temp path as a working directory or argument.
+Compilers, package managers and scripts expect somewhere to put scratch files, so temp is available by default at both layers ahma controls (SPEC R5.2.5):
 
-Under `ahma serve` that is a **request, not a grant** (SPEC R5.2.5, R5.3). The temp directory is shared by every program on the machine, and an MCP config file is client-owned, so a `--tmp` in it is nobody's consent. Once the workspace scope is committed — after `notifications/sandbox/configured`, never delaying it — ahma asks you once, through the same question ladder as every grant: your client's own prompt if it supports elicitation, else an attached `ahma tui`, else nobody. The question names the literal canonical temp path, says nothing was blocked, and offers **deny, next command only, or this session only** — never "always" or 24 hours. A yes adds the directory to this session's live scope; a deny, a dismissed prompt, or nobody to ask leaves it out (fail closed). A dismissed prompt (`cancel`) is not recorded as a denial. `ahma tool run --tmp` and terminal hooks keep the old behaviour: you typed the flag (or set it in your own settings), so it is the answer.
+- **Commands** may write the system temp directories under the kernel sandbox: `/tmp` under Landlock, `/private/tmp` and `/private/var/folders` under Seatbelt. On macOS that also covers, for a workspace or grant on an external disk, that disk's own `/Volumes/<name>/.TemporaryItems/folders.<uid>`: Foundation saves a file atomically through a temp directory on the same volume, so without it Xcode and other Cocoa tools cannot save files even inside the workspace (SPEC R6.2.12).
+- **ahma's own tools** — `working_directory`, `format: path` arguments and the built-in file tools — accept the canonical temp directory (`std::env::temp_dir()`), because every commit adds it to the scope as an auxiliary scope after the workspace (`[sandbox] tmp_access`, on by default). Nothing is asked: the scope announced in `notifications/sandbox/configured` already holds it. It is never the sole or primary scope: with no workspace yet it waits, and a workspace that itself lies inside the temp directory does not widen to the whole of it (the hard denylist refuses a parent of the live scope, SPEC R-PERM.4.3).
 
-| Flag combination | Behavior |
-|-----------------|----------|
-| (default) | Temp access via platform rules |
-| `ahma serve … --tmp` | Asked once per session; temp dir in scope only after a yes |
-| `ahma tool run --tmp …` | Temp dir added as explicit scope |
-| `--disable-temp-files` | Temp access blocked entirely |
-| `--tmp --disable-temp-files` | `--disable-temp-files` wins (blocked) |
+**The opt-out is for experts who want temp closed:** `[sandbox] disable_temp = true` in `~/.ahma/settings.toml` (or `--disable-temp-files`) closes temp at every layer — the kernel rule, ahma's own scope (it overrides `tmp_access` and `--tmp`), and the native-edit guard. Expect tools that need scratch space to fail; point them at a gitignored folder in the workspace instead. In `ahma setup` it is the **temporary files** switch, on by default, which you turn off with `u`. A harness's own working set (Claude Code's `/tmp/claude-<uid>/`) stays writable either way (SPEC R5.5.7): it is the harness's bookkeeping, not shared temp.
 
-The scope summary shows where it stands: `tmp  : requested, awaiting consent`, `tmp  : granted (session)` or `tmp  : off` in text, and `tmp` (in scope), `tmp_requested` and `tmp_in_scope` in the `notifications/sandbox/configured` payload. With a workspace that itself lives inside the temp directory, the grant would widen the scope above the workspace, so it is refused and not asked.
+| Setting | Commands (kernel) | ahma's own tools (scope) | Native edits |
+|---------|-------------------|--------------------------|--------------|
+| (default) | temp writable | temp in scope | temp allowed |
+| `[sandbox] tmp_access = false` | temp writable | temp out of scope | temp allowed |
+| `[sandbox] disable_temp = true` / `--disable-temp-files` | blocked | blocked | blocked |
+
+`--tmp` is still accepted so existing MCP configurations keep working; it turns `tmp_access` on, and `disable_temp` still wins over it.
+
+The scope summary shows where it stands: `tmp  : in scope`, `tmp  : off`, or `tmp  : on, not in this scope (…)` before a workspace is set or when the workspace lies inside temp; the `notifications/sandbox/configured` payload carries `tmp` (in scope), `tmp_requested` and `tmp_in_scope`.
 
 **Security considerations**: `/tmp` is shared by all users and processes. Use `mktemp` with random suffixes to avoid TOCTOU attacks. Clean up sensitive temp files after use.
 

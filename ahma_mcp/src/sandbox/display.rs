@@ -151,12 +151,14 @@ pub struct ScopeView<'a> {
     pub write_scopes: &'a [PathBuf],
     /// Read-only directories granted beyond the write roots (e.g. livelog).
     pub read_scopes: &'a [PathBuf],
-    /// Whether the system temp directory is in the scope (granted, or seeded
-    /// by `ahma tool run --tmp`). Serialized as `tmp` and `tmp_in_scope`.
+    /// Whether the system temp directory is in the scope (admitted at the
+    /// commit, granted, or already inside a scope). Serialized as `tmp` and
+    /// `tmp_in_scope`.
     pub tmp_access: bool,
-    /// Whether `--tmp` / `[sandbox] tmp_access` asked for it. Under `serve`
-    /// that is a request a human answers (SPEC R5.2.5, R5.3), so it can be
-    /// `true` while [`Self::tmp_access`] is still `false`.
+    /// Whether `[sandbox] tmp_access` (on by default, and off whenever
+    /// `disable_temp` is set) wants it in the scope (SPEC R5.2.5). It can be
+    /// `true` while [`Self::tmp_access`] is `false`: before the workspace is
+    /// committed, or when the workspace lies inside the temp directory.
     pub tmp_requested: bool,
     /// Whether kernel enforcement is active (`false` == `--no-sandbox`).
     pub enforced: bool,
@@ -204,11 +206,12 @@ impl ScopeView<'_> {
         }
 
         out.push_str(match (self.tmp_requested, self.tmp_access) {
-            (true, true) => "  tmp  : granted (session)\n",
-            (true, false) => "  tmp  : requested, awaiting consent\n",
-            // In scope without --tmp: a grant on the temp dir, or a scope
+            // Admitted at the commit, a grant on the temp dir, or a scope
             // that already contains it.
-            (false, true) => "  tmp  : in scope\n",
+            (_, true) => "  tmp  : in scope\n",
+            (true, false) => {
+                "  tmp  : on, not in this scope (no workspace yet, or it lies inside temp)\n"
+            }
             (false, false) => "  tmp  : off\n",
         });
         out.push_str("  source: ");
@@ -336,10 +339,9 @@ mod tests {
             text.contains("ENFORCED"),
             "should show enforcement state:\n{text}"
         );
-        // --tmp was asked for and granted in this view
         assert!(
-            text.contains("tmp  : granted (session)"),
-            "should show the granted temp dir:\n{text}"
+            text.contains("tmp  : in scope"),
+            "should show the temp dir in scope:\n{text}"
         );
         assert!(
             text.contains("container"),
@@ -347,8 +349,8 @@ mod tests {
         );
     }
 
-    /// SPEC R5.4 / R5.3: a `--tmp` that was asked for but not (yet) granted
-    /// must not read as on — nor as never asked for.
+    /// SPEC R5.4 / R5.2.5: temp that is wanted but not (yet) in the scope
+    /// must not read as in scope — nor as off.
     #[test]
     fn render_text_tells_a_tmp_request_from_a_tmp_grant() {
         let writes = vec![p("/ws")];
@@ -369,8 +371,11 @@ mod tests {
                 .trim()
                 .to_string()
         };
-        assert_eq!(line(true, false), "tmp  : requested, awaiting consent");
-        assert_eq!(line(true, true), "tmp  : granted (session)");
+        assert_eq!(
+            line(true, false),
+            "tmp  : on, not in this scope (no workspace yet, or it lies inside temp)"
+        );
+        assert_eq!(line(true, true), "tmp  : in scope");
         assert_eq!(line(false, false), "tmp  : off");
         assert_eq!(line(false, true), "tmp  : in scope");
     }

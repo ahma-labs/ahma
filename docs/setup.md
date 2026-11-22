@@ -101,10 +101,13 @@ proposed changes, `Esc` closes.
 |---|---|---|
 | **Install** | MCP entries, hooks, skills, TLS: what is known about each and the command that (re)installs it | |
 | **Settings** | every setting with its value, where it comes from (`repo`, `you`, `default`) and whether it is a security setting; only the ones you changed unless you press `a`. A security key a repository's file tried to set is named as ignored | the explanation of the selected row is shown below the list; `e` changes it, `a` shows all |
-| **Allow & deny** | everything granted or switched on: folders, network hosts, web patterns, tool approvals, bundles, profiles, readers, switches (GPU, keychain, …) | `u` takes one back |
+| **Allow & deny** | everything granted or switched on: folders, network hosts, web patterns, tool approvals, bundles, profiles, readers, switches (temporary files, GPU, keychain, …) | `u` takes one back |
 
 A bundle, profile, reader or switch is taken back as a proposal, which appears as the change
-to answer. A grant, host, web pattern or tool approval is taken back with its own command
+to answer. A switch that is on by default is taken back by the value that turns it off:
+**temporary files** (on unless `[sandbox] disable_temp` is set) proposes `disable_temp = true`,
+which closes temp to commands, ahma's file tools and native edits
+([security-sandbox.md](security-sandbox.md#temp-directory-access-on-by-default-disable_temp-turns-it-off)). A grant, host, web pattern or tool approval is taken back with its own command
 (`ahma sandbox revoke`, `ahma network revoke`, …), which the view shows, because those
 commands check and audit it.
 

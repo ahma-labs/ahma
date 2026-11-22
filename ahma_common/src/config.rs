@@ -1374,14 +1374,21 @@ pub struct SandboxSettings {
     /// parses so an existing file does not abort startup, and a `true` value is
     /// warned about. Default: `false`
     pub disable: bool,
-    /// Ask for the system temp directory in the sandbox scope.
-    /// Useful for workflows that need scratch space (compilers, build systems).
-    /// Under `ahma serve` this is a request a human answers for the session
-    /// (SPEC R5.2.5, R5.3); `ahma tool run` and terminal hooks add it directly.
-    /// Default: `false`
+    /// Put the system temp directory in ahma's own scope — the scope that
+    /// `working_directory`, `format: path` arguments and the built-in file
+    /// tools are checked against — as an auxiliary scope after the workspace,
+    /// never as the primary one (SPEC R5.2.5). Commands may already write temp
+    /// at the kernel layer; this lets ahma's own tools follow them there.
+    /// Set `false` to keep the kernel temp rule for commands but refuse temp
+    /// paths in ahma's own tools. Ignored when [`Self::disable_temp`] is set.
+    /// Default: `true`
+    #[serde(default = "default_true")]
     pub tmp_access: bool,
-    /// Block all access to the system temp directory.
-    /// Takes precedence over `tmp_access`.
+    /// The expert opt-out for temp files: the system temp directory is closed
+    /// at every layer — the kernel rule that lets commands write it, ahma's own
+    /// scope (overriding [`Self::tmp_access`]), and the native-edit guard
+    /// (SPEC R5.2.5). For high-security setups that accept the breakage of
+    /// tools which need scratch space.
     /// Default: `false`
     pub disable_temp: bool,
     /// Defer sandbox lock until the MCP client provides `roots/list`.
@@ -1706,7 +1713,7 @@ impl Default for SandboxSettings {
     fn default() -> Self {
         Self {
             disable: false,
-            tmp_access: false,
+            tmp_access: true,
             disable_temp: false,
             defer: false,
             task_vault: None,
@@ -2878,13 +2885,13 @@ impl AhmaSettings {
             d.sandbox.disable.to_string(),
         );
         w.setting(
-            "Add the system temp dir to the sandbox scope.",
+            "Put the system temp dir in ahma's own scope (file tools, working_directory), after the workspace. Ignored when disable_temp is set.",
             "tmp_access",
             self.sandbox.tmp_access.to_string(),
             d.sandbox.tmp_access.to_string(),
         );
         w.setting(
-            "Block all access to the system temp dir (overrides tmp_access).",
+            "Close the system temp dir to commands, ahma's file tools and native edits (the expert opt-out; overrides tmp_access).",
             "disable_temp",
             self.sandbox.disable_temp.to_string(),
             d.sandbox.disable_temp.to_string(),
@@ -4639,7 +4646,7 @@ mod tests {
             },
             sandbox: SandboxSettings {
                 disable: true,
-                tmp_access: true,
+                tmp_access: false,
                 disable_temp: true,
                 defer: true,
                 task_vault: Some(PathBuf::from("/vaults/v1")),
@@ -5100,10 +5107,10 @@ mod tests {
         // One field changed from default → exactly that line is active; its
         // siblings stay commented.
         let mut s = AhmaSettings::default();
-        s.sandbox.tmp_access = true;
+        s.sandbox.tmp_access = false;
         let text = s.render_documented();
         assert!(
-            text.contains("\ntmp_access = true\n"),
+            text.contains("\ntmp_access = false\n"),
             "override is written active; got:\n{text}"
         );
         assert!(
@@ -5112,7 +5119,7 @@ mod tests {
         );
         // Round-trips back to the same override.
         let parsed: AhmaSettings = toml::from_str(&text).unwrap();
-        assert!(parsed.sandbox.tmp_access);
+        assert!(!parsed.sandbox.tmp_access);
         assert!(!parsed.sandbox.disable);
     }
 
@@ -5588,7 +5595,10 @@ default_model = "llama3.2"
     fn ahma_settings_default_sandbox_values() {
         let s = AhmaSettings::default();
         assert!(!s.sandbox.disable);
-        assert!(!s.sandbox.tmp_access);
+        assert!(
+            s.sandbox.tmp_access,
+            "temp is in ahma's scope by default (SPEC R5.2.5)"
+        );
         assert!(!s.sandbox.disable_temp);
         assert!(!s.sandbox.defer);
     }

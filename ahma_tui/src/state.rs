@@ -588,7 +588,8 @@ pub struct SandboxScopeInfo {
     pub write: Vec<String>,
     /// Read-only directories granted beyond the write roots.
     pub read: Vec<String>,
-    /// Whether the system temp directory was added via `--tmp`.
+    /// Whether the system temp directory is in the scope (`[sandbox]
+    /// tmp_access`, on by default; SPEC R5.2.5).
     pub tmp: bool,
     /// Whether kernel enforcement is active (`false` == `--no-sandbox`).
     pub enforced: bool,

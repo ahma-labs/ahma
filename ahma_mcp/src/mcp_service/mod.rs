@@ -1646,14 +1646,6 @@ impl ServerHandler for AhmaMcpService {
                 ahma_common::BUILD_ID.to_string(),
             );
 
-            // SPEC R5.3: a scope committed before any client connected (an
-            // explicit `--sandbox-scope` locks at startup) never passes through
-            // the commit paths that ask about `--tmp`, so it is asked here, now
-            // that there is a client to ask. Detached (R5.1.2).
-            if self.adapter.sandbox().is_committed() {
-                self.spawn_tmp_consent();
-            }
-
             if self.defer_sandbox {
                 tracing::info!("Sandbox deferred - waiting for roots/list_changed notification");
                 return;

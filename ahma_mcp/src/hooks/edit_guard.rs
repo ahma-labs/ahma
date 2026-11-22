@@ -318,10 +318,21 @@ fn scope_refusal(path: &Path, allowed: &[PathBuf]) -> String {
 }
 
 /// The directories a native edit may touch: the hook sandbox scope for `cwd`
-/// (the enclosing repository, SPEC R5.2.1), every `rw` grant in `granted`
-/// (saved, or for the session) that applies to that scope (R5.4.11), and the
-/// temp directory — the same set a hooked shell command may write.
-pub fn allowed_edit_scopes(cwd: &Path, granted: &[ResolvedGrant]) -> Vec<PathBuf> {
+/// (the enclosing repository, SPEC R5.2.1), the harness's own working set
+/// (R5.5.7), every `rw` grant in `granted` (saved, or for the session) that
+/// applies to that scope (R5.4.11), and the temp directory unless
+/// `disable_temp` (`[sandbox] disable_temp` / `--disable-temp-files`, R5.2.5)
+/// closed it — the same set a hooked shell command may write.
+///
+/// `disable_temp` does not remove the harness's working set, even where it
+/// lies under `/tmp`: R5.5.7 makes it writable without a grant because it is
+/// the harness's own bookkeeping, not the machine's shared temp space, and a
+/// hooked shell command keeps it as an explicit scope under the same setting.
+pub fn allowed_edit_scopes(
+    cwd: &Path,
+    granted: &[ResolvedGrant],
+    disable_temp: bool,
+) -> Vec<PathBuf> {
     let mut allowed = super::resolve_hook_sandbox_scopes(cwd);
     let applying: Vec<&ResolvedGrant> = granted.iter().filter(|g| g.applies_to(&allowed)).collect();
     // SPEC R5.5.7: the harness's own working set needs no grant.
@@ -332,8 +343,10 @@ pub fn allowed_edit_scopes(cwd: &Path, granted: &[ResolvedGrant]) -> Vec<PathBuf
             allowed.push(dunce::canonicalize(&raw).unwrap_or(raw));
         }
     }
-    let tmp = std::env::temp_dir();
-    allowed.push(dunce::canonicalize(&tmp).unwrap_or(tmp));
+    if !disable_temp {
+        let tmp = std::env::temp_dir();
+        allowed.push(dunce::canonicalize(&tmp).unwrap_or(tmp));
+    }
     allowed
 }
 
@@ -500,7 +513,7 @@ pub fn run(args: &HooksEditGuardArgs, cfg: &crate::shell::cli::AppConfig) -> Res
         granted.extend(crate::sandbox::session_grants_for(
             &super::resolve_hook_sandbox_scopes(&cwd),
         ));
-        allowed_edit_scopes(&cwd, &granted)
+        allowed_edit_scopes(&cwd, &granted, cfg.no_temp_files)
     });
     if let Some(decision) = decide(args.platform, &payload, &queue, allowed.as_deref()) {
         use std::io::Write;
@@ -1153,7 +1166,7 @@ mod scope_tests {
             "without the grant the cache is out of scope"
         );
         let allowed: Vec<PathBuf> = vec![repo.clone(), cache.clone()];
-        let computed = allowed_edit_scopes(&repo, &[ResolvedGrant::saved(&grant)]);
+        let computed = allowed_edit_scopes(&repo, &[ResolvedGrant::saved(&grant)], false);
         assert!(
             computed.contains(&cache),
             "an rw grant is in the allowed set: {computed:?}"
@@ -1178,7 +1191,7 @@ mod scope_tests {
             note: None,
             expires_at: None,
         };
-        let ro_allowed = allowed_edit_scopes(&repo, &[ResolvedGrant::saved(&ro)]);
+        let ro_allowed = allowed_edit_scopes(&repo, &[ResolvedGrant::saved(&ro)], false);
         assert!(
             !ro_allowed.contains(&cache),
             "an ro grant is not writable: {ro_allowed:?}"
@@ -1193,6 +1206,35 @@ mod scope_tests {
             )
             .is_some()
         );
+    }
+
+    /// SPEC R5.2.5: native edits follow hooked shell commands into temp, and
+    /// `disable_temp` — the expert opt-out — closes temp to them as it does to
+    /// commands. The harness's own working set stays (R5.5.7).
+    #[test]
+    fn disable_temp_closes_temp_to_native_edits() {
+        let td = tempdir().unwrap();
+        let repo = repo(td.path());
+        let temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+
+        let open = allowed_edit_scopes(&repo, &[], false);
+        assert!(
+            open.contains(&temp),
+            "temp is admitted by default: {open:?}"
+        );
+
+        let closed = allowed_edit_scopes(&repo, &[], true);
+        assert!(
+            !closed.contains(&temp),
+            "disable_temp keeps temp out: {closed:?}"
+        );
+        for dir in harness_owned_dirs_for_this_user() {
+            assert!(
+                closed.contains(&dir),
+                "the harness's own {} stays (R5.5.7): {closed:?}",
+                dir.display()
+            );
+        }
     }
 
     /// SPEC R5.4.11: a grant bound to one workspace widens only that
@@ -1215,12 +1257,12 @@ mod scope_tests {
             note: None,
             expires_at: None,
         };
-        let in_theirs = allowed_edit_scopes(&theirs, &[ResolvedGrant::saved(&grant)]);
+        let in_theirs = allowed_edit_scopes(&theirs, &[ResolvedGrant::saved(&grant)], false);
         assert!(
             in_theirs.contains(&cache),
             "the grant admits edits in the workspace it was made for: {in_theirs:?}"
         );
-        let in_mine = allowed_edit_scopes(&mine, &[ResolvedGrant::saved(&grant)]);
+        let in_mine = allowed_edit_scopes(&mine, &[ResolvedGrant::saved(&grant)], false);
         assert!(
             !in_mine.contains(&cache),
             "a grant bound to another workspace admits nothing here: {in_mine:?}"
