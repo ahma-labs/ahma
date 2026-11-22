@@ -1,10 +1,11 @@
-//! Tests for the temp directory as a sandbox scope (`--tmp`).
+//! Tests for the temp directory as a sandbox scope (`[sandbox] tmp_access`,
+//! on by default; SPEC R5.2.5).
 //!
 //! These tests verify:
 //! - A temp directory in the scope is canonicalized and validates cross-platform
-//! - A commit never re-adds it for `--tmp` (a request a human answers; the
-//!   asking is covered by `tmp_consent_test`)
-//! - Interaction with --disable-temp-files flag
+//! - A commit carries it as an auxiliary scope after the workspace (the
+//!   server end to end is covered by `tmp_scope_test`)
+//! - Interaction with the `--disable-temp-files` opt-out
 
 use ahma_mcp::sandbox::{Sandbox, SandboxMode, ScopeCommit};
 use tempfile::tempdir;
@@ -199,19 +200,19 @@ fn test_temp_dir_not_duplicated_in_scopes() {
     );
 }
 
-/// `--tmp` is a request, not a grant (SPEC R5.2.5, R5.3): the commit that
-/// replaces the provisional scope with the client's roots does not carry the
-/// temp directory over on the strength of `tmp_access`. It used to — that was
-/// the unprompted downgrade. Under `serve` a human is asked after the commit
-/// and a yes arrives as a live grant (see `tmp_consent_test`).
+/// SPEC R5.2.5: the commit that replaces the provisional scope with the
+/// client's roots carries the temp directory as an auxiliary scope, after the
+/// new workspace, on the strength of `tmp_access` — no question asked.
 #[test]
-fn test_commit_does_not_carry_temp_on_a_tmp_request() {
-    let project1 = tempdir().unwrap();
-    let project2 = tempdir().unwrap();
+fn test_commit_carries_temp_as_an_auxiliary_scope() {
+    // Outside the temp dir: a workspace inside it is refused the temp scope
+    // (it would widen above the workspace, R-PERM.4.3).
+    let project1 = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let project2 = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let temp_dir = std::env::temp_dir();
     let canonical_temp = dunce::canonicalize(&temp_dir).unwrap();
 
-    // A provisional scope that includes temp (as `ahma tool run --tmp` seeds it).
+    // A provisional scope that includes temp (as `ahma tool run` seeds it).
     let scopes = vec![project1.path().to_path_buf(), temp_dir.clone()];
     let sandbox = Sandbox::new(
         scopes,
@@ -236,16 +237,52 @@ fn test_commit_does_not_carry_temp_on_a_tmp_request() {
     );
 
     let updated_scopes = sandbox.scopes();
-    assert!(
-        !updated_scopes.iter().any(|s| s == &canonical_temp),
-        "the commit must not re-add the temp dir for --tmp. Scopes: {:?}",
+    let canonical_project2 = dunce::canonicalize(project2.path()).unwrap();
+    assert_eq!(
+        updated_scopes.first(),
+        Some(&canonical_project2),
+        "the new workspace is the primary scope: {:?}",
         updated_scopes.to_vec()
     );
-    assert!(sandbox.is_tmp_access(), "the request is still recorded");
-    let canonical_project2 = dunce::canonicalize(project2.path()).unwrap();
+    assert_eq!(
+        updated_scopes.last(),
+        Some(&canonical_temp),
+        "the commit carries the temp dir after the workspace: {:?}",
+        updated_scopes.to_vec()
+    );
+    assert!(sandbox.is_tmp_access());
+}
+
+/// `--disable-temp-files` wins over `tmp_access` at commit too: the temp dir
+/// is never added, and `tmp_access` reads as off.
+#[test]
+fn test_commit_never_carries_temp_with_disable_temp() {
+    let project = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let canonical_temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+    let sandbox = Sandbox::new(
+        Vec::new(),
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions {
+            tmp_access: true,
+            no_temp_files: true,
+            ..ahma_mcp::sandbox::SandboxOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        sandbox
+            .commit_scopes(vec![project.path().to_path_buf()])
+            .unwrap(),
+        ScopeCommit::Applied
+    );
     assert!(
-        updated_scopes.iter().any(|s| s == &canonical_project2),
-        "New project scope should be present"
+        !sandbox.is_tmp_access(),
+        "disable_temp overrides tmp_access"
+    );
+    assert!(
+        !sandbox.scopes().iter().any(|s| s == &canonical_temp),
+        "{:?}",
+        sandbox.scopes().to_vec()
     );
 }
 

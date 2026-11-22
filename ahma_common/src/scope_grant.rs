@@ -58,12 +58,14 @@ pub enum GrantReason {
     /// of the denial says so (SPEC R-DENY): the path and the access are exact,
     /// not read from the command's output.
     KernelRecord,
-    /// Nothing was blocked: the server was started with `--tmp` (or
-    /// `[sandbox] tmp_access = true`), which *asks* for the system temp
-    /// directory. Asking it is a scope downgrade (SPEC R5.2.5, R5.3), so the
-    /// directory joins the scope only on a human's answer, and only for this
-    /// session: the temp directory is shared by every program on the machine,
-    /// so a saved (`always` or 24-hour) answer is never offered or accepted
+    /// Nothing was blocked: a server started with `--tmp` (or
+    /// `[sandbox] tmp_access = true`) asked for the system temp directory.
+    /// Only an older server raises it: the temp directory is now in scope by
+    /// default with no question (SPEC R5.2.5). The variant stays so such a
+    /// request, relayed by the hub to this version's TUI, still renders and is
+    /// answered the way it always was — for this session only: the temp
+    /// directory is shared by every program on the machine, so a saved
+    /// (`always` or 24-hour) answer is never offered or accepted
     /// ([`GrantReason::offers_saved_tiers`]).
     StartupFlag,
     /// Nothing was blocked: the agent called `logs_approve` for a

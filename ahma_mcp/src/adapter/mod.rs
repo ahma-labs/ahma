@@ -730,8 +730,9 @@ impl Adapter {
 
     /// The question ladder this adapter raises grant questions through, when
     /// one is wired (server mode). For a question that is not about a refused
-    /// path — the `--tmp` request (SPEC R5.2.5, R5.3) — so it goes through the
-    /// same broker, dedup and budget as every other, never a second door.
+    /// path — `logs_approve` for an out-of-scope log target (SPEC R9.2) — so it
+    /// goes through the same broker, dedup and budget as every other, never a
+    /// second door.
     pub fn scope_grant_notifier(&self) -> Option<&Arc<dyn sandbox::ScopeGrantNotifier>> {
         self.scope_grant_notifier.as_ref()
     }

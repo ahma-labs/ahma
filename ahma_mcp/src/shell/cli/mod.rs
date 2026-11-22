@@ -185,9 +185,13 @@ pub struct AppConfig {
     /// Add the scratch_directory as a persistent secondary scope that survives
     /// roots/list updates. Set by --scratch (deprecated alias: --sandbox).
     pub use_scratch_dir: bool,
-    /// Add system temp dir to sandbox scopes (AHMA_TMP_ACCESS=1).
+    /// Put the system temp dir in ahma's own scope, after the workspace
+    /// (`[sandbox] tmp_access`, on by default; `--tmp`). Always `false` when
+    /// [`Self::no_temp_files`] is set (SPEC R5.2.5).
     pub tmp_access: bool,
-    /// Block writes to temp directories (AHMA_DISABLE_TEMP=1).
+    /// Close the temp directory at every layer: the kernel rule, ahma's own
+    /// scope and the native-edit guard (`--disable-temp-files`,
+    /// `[sandbox] disable_temp`; SPEC R5.2.5).
     pub no_temp_files: bool,
     /// Enable live-log monitoring mode (AHMA_LOG_MONITOR=1).
     pub log_monitor: bool,
@@ -384,7 +388,8 @@ struct SandboxPolicy {
 
 fn resolve_sandbox_policy(cfg: &AppConfig) -> SandboxPolicy {
     let no_sandbox = cfg.no_sandbox;
-    let tmp_access = cfg.tmp_access;
+    // The opt-out wins at every layer (SPEC R5.2.5), also for a hand-built config.
+    let tmp_access = cfg.tmp_access && !cfg.no_temp_files;
 
     let mode = if no_sandbox {
         tracing::warn!("Ahma sandbox disabled via --no-sandbox flag");
@@ -602,15 +607,14 @@ fn resolve_deferred_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     Ok(Some(Vec::new()))
 }
 
-/// Whether `--tmp` puts the temp directory straight into the scope this
-/// process starts with.
+/// Whether the temp directory is seeded into the scope this process starts
+/// with, before any commit.
 ///
-/// Only when a human ran a one-shot command — `ahma tool run`, or a terminal
-/// hook running one command under the user's own `[sandbox] tmp_access` —
-/// because there the flag *is* the human's answer and there is no session to
-/// ask in. A server (`serve`) records `--tmp` as a request and asks once the
-/// workspace scope is committed (SPEC R5.2.5, R5.3): an MCP config is
-/// client-owned (R5.4.2), so a `--tmp` in it is nobody's consent.
+/// Only for a one-shot command — `ahma tool run`, or a terminal hook running
+/// one command — whose scope may never pass through a commit. A server
+/// (`serve`) admits it at the commit instead ([`sandbox::Sandbox::admit_temp_scope`],
+/// SPEC R5.2.5), so a provisional scope that client roots replace does not
+/// carry it, and the scope it announces already does.
 fn seeds_temp_scope_at_startup(cfg: &AppConfig) -> bool {
     cfg.run_tool.is_some()
 }
@@ -626,31 +630,18 @@ fn add_temp_scope_if_requested(
     let mut scopes = scopes?;
 
     // The temp scope is auxiliary: it must only ever *augment* a real workspace
-    // scope, never stand in as the sole sandbox root. If the scope set is empty
-    // (deferred sandbox, or awaiting client `roots/list`), do NOT seed it with
-    // the temp dir — doing so would make the sandbox appear "already configured"
-    // and lock it to the temp directory, rejecting the actual workspace.
-    if scopes.is_empty() {
-        tracing::debug!("Skipping temp scope: no workspace scope yet");
-        return Some(scopes);
-    }
-
-    let temp_dir = std::env::temp_dir();
-    match dunce::canonicalize(&temp_dir) {
-        Ok(canonical_temp) if !scopes.contains(&canonical_temp) => {
-            tracing::info!(
-                "Adding temp directory to sandbox scopes via --tmp: {:?}",
-                canonical_temp
-            );
-            scopes.push(canonical_temp);
-        }
-        Ok(_) => {}
-        Err(_) => {
-            tracing::warn!(
-                "Could not canonicalize temp directory {:?}, skipping --tmp scope addition",
-                temp_dir
-            );
-        }
+    // scope, never stand in as the sole sandbox root, and never widen above a
+    // workspace that lies inside it. An empty scope set (deferred sandbox, or
+    // awaiting client `roots/list`) is not seeded — doing so would make the
+    // sandbox appear "already configured" and lock it to the temp directory,
+    // rejecting the actual workspace. The same rule as the commit's.
+    if let Some(temp) = sandbox::auxiliary_temp_scope(&scopes) {
+        tracing::info!(
+            "Adding the temp directory to the sandbox scope after the workspace \
+             ([sandbox] tmp_access): {:?}",
+            temp
+        );
+        scopes.push(temp);
     }
 
     Some(scopes)
@@ -1213,9 +1204,9 @@ pub struct Cli {
     #[arg(long = "tools-dir", global = true)]
     pub tools_dir: Option<PathBuf>,
 
-    /// Ask for the system temp directory in the sandbox scope, for tools that need scratch space outside the workspace (compilers, build systems).
-    /// A server (`serve`) treats this as a request: once the workspace scope is set, a human is asked once — in the client's own prompt, else the ahma TUI — whether to allow it for this session, and with nobody to ask it stays out.
-    /// `ahma tool run --tmp` adds it directly, since you typed it.
+    /// Put the system temp directory in ahma's own scope (file tools, working_directory), after the workspace.
+    /// This is already the default (`[sandbox] tmp_access = true`), so the flag only matters when your settings turn it off; it is kept so existing MCP configs keep working.
+    /// `--disable-temp-files` overrides it.
     #[arg(long = "tmp", global = true)]
     pub tmp: bool,
 
@@ -1366,7 +1357,8 @@ pub struct Cli {
     #[arg(long = "defer-sandbox", global = true)]
     pub defer_sandbox: bool,
 
-    /// Block all access to the system temp directory.
+    /// The expert opt-out for temp files: close the system temp directory to sandboxed commands, ahma's own file tools and native edits.
+    /// Temp is on by default because compilers, package managers and scripts expect scratch space; turn it off only when you accept that some of them fail. Same as `[sandbox] disable_temp = true`.
     #[arg(long = "disable-temp-files", global = true)]
     pub no_temp_files: bool,
 
@@ -2429,8 +2421,8 @@ pub enum PromptsCommand {
   # Serve over stdio and enable the git + github tool bundles
   ahma serve stdio --tools git,github
 
-  # Add temp directory to sandbox scope (for compilers / build tools)
-  ahma serve stdio --tmp
+  # Close the temp directory to commands and ahma's tools (high-security)
+  ahma serve stdio --disable-temp-files
 
   # Enable live log monitoring with a custom alert rate limit
   ahma serve stdio --log-monitor --monitor-rate-limit 30
@@ -2469,8 +2461,8 @@ pub enum ServeTransport {
   # Use a custom tools directory
   ahma serve stdio --tools-dir /path/to/.ahma
 
-  # Allow compilers / build tools access to the temp directory
-  ahma serve stdio --tmp
+  # Close the temp directory to commands and ahma's tools (high-security)
+  ahma serve stdio --disable-temp-files
 
   # Enable live log monitoring with reduced alert rate
   ahma serve stdio --log-monitor --monitor-rate-limit 30
@@ -2536,8 +2528,8 @@ pub enum ServeTransport {
   # Require at least HTTP/2 — reject HTTP/1.1 clients
   ahma serve http --disable-http1-1
 
-  # Extended timeout, temp access, and log monitoring
-  ahma serve http --timeout 600 --tmp --log-monitor")]
+  # Extended timeout and log monitoring
+  ahma serve http --timeout 600 --log-monitor")]
 pub struct HttpArgs {
     /// Host to bind the HTTP server on.
     #[arg(long, default_value = "127.0.0.1")]
@@ -3372,15 +3364,18 @@ fn parse_sandbox_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> S
     warn_retired_security_env!("AHMA_SANDBOX_DEFER");
     let defer_sandbox = cli.defer_sandbox || s.sandbox.defer;
 
-    // Security-tier: AHMA_TMP_ACCESS retired — warn and ignore.
-    warn_retired_security_env!("AHMA_TMP_ACCESS");
-    let tmp_access = cli.tmp || s.sandbox.tmp_access;
-
     let use_scratch_dir = cli.use_scratch || s.sandbox.use_scratch_directory;
 
     // Security-tier: AHMA_DISABLE_TEMP retired — warn and ignore.
     warn_retired_security_env!("AHMA_DISABLE_TEMP");
     let no_temp_files = cli.no_temp_files || s.sandbox.disable_temp;
+
+    // Security-tier: AHMA_TMP_ACCESS retired — warn and ignore.
+    warn_retired_security_env!("AHMA_TMP_ACCESS");
+    // SPEC R5.2.5: temp is in ahma's scope by default; `--tmp` is kept so an
+    // existing config keeps parsing, and `disable_temp` — the expert opt-out —
+    // closes it at this layer too, whatever asked for it.
+    let tmp_access = (cli.tmp || s.sandbox.tmp_access) && !no_temp_files;
 
     // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
     warn_retired_env!("AHMA_LOG_DIR");
@@ -4001,8 +3996,8 @@ pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::
     };
 
     let scopes = resolve_sandbox_scopes(cfg)?;
-    // A server asks about `--tmp` after its scope commits (SPEC R5.3); only a
-    // one-shot command a human ran takes the flag as its answer.
+    // A server admits the temp directory at its commit (SPEC R5.2.5); a
+    // one-shot command, which may never commit, seeds it here.
     let scopes = add_temp_scope_if_requested(
         scopes,
         policy.tmp_access && seeds_temp_scope_at_startup(cfg),
@@ -4532,8 +4527,9 @@ mod tests {
     #[test]
     fn test_add_temp_scope_with_tmp_adds_temp_dir() {
         init_test();
-        let tmp = tempdir().unwrap();
-        let scopes = Some(vec![tmp.path().to_path_buf()]);
+        // A workspace outside the temp dir: one inside it is refused (below).
+        let ws = dunce::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let scopes = Some(vec![ws.clone()]);
         let result = add_temp_scope_if_requested(scopes, true);
         assert!(result.is_some());
         let result = result.unwrap();
@@ -4544,6 +4540,22 @@ mod tests {
             "Expected temp dir in scopes: {:?}",
             result
         );
+        assert_eq!(result.first(), Some(&ws), "the workspace stays primary");
+    }
+
+    /// SPEC R-PERM.4.3: the seed obeys the denylist the commit does — a
+    /// workspace inside the temp dir does not widen to the whole of it.
+    #[test]
+    fn test_add_temp_scope_never_widens_above_a_workspace_inside_temp() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let ws = dunce::canonicalize(tmp.path()).unwrap();
+        let canonical_temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        if !ws.starts_with(&canonical_temp) {
+            return;
+        }
+        let result = add_temp_scope_if_requested(Some(vec![ws.clone()]), true);
+        assert_eq!(result, Some(vec![ws]));
     }
 
     #[test]
@@ -4576,13 +4588,13 @@ mod tests {
         );
     }
 
-    /// SPEC R5.2.5 / R5.3: only a one-shot command a human ran takes `--tmp`
-    /// as its own answer; a server asks.
+    /// SPEC R5.2.5: only a one-shot command, which may never commit, seeds
+    /// temp at startup; a server admits it at the commit.
     #[test]
     fn only_a_one_shot_command_seeds_temp_at_startup() {
         assert!(
             !seeds_temp_scope_at_startup(&make_cfg()),
-            "serve: --tmp is a request"
+            "serve: admitted at the commit"
         );
         let run = AppConfig {
             run_tool: Some("run_terminal_command".into()),
@@ -4590,43 +4602,60 @@ mod tests {
         };
         assert!(
             seeds_temp_scope_at_startup(&run),
-            "tool run: --tmp is the answer"
+            "tool run: seeded at startup"
         );
     }
 
-    /// A server started with `--tmp` and an explicit scope records the request
-    /// but starts without the temp directory: it is asked for once the scope
-    /// is committed, never assumed.
+    /// SPEC R5.2.5: a server with an explicit scope commits it at startup,
+    /// and the commit puts the temp directory after it — no question asked.
     #[test]
-    fn a_server_with_tmp_starts_without_the_temp_dir() {
+    fn a_server_with_an_explicit_scope_starts_with_the_temp_dir() {
         init_test();
-        let tmp = tempdir().unwrap();
+        let ws = dunce::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
         let canonical_temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
         let cfg = AppConfig {
             no_sandbox: true,
             tmp_access: true,
-            sandbox_scopes: vec![tmp.path().to_path_buf()],
+            sandbox_scopes: vec![ws.clone()],
             ..make_cfg()
         };
         let sandbox = initialize_sandbox(&cfg).unwrap().unwrap();
-        assert!(sandbox.is_tmp_access(), "the request is recorded");
+        assert!(sandbox.is_committed());
+        assert_eq!(sandbox.scopes().first(), Some(&ws));
         assert!(
-            !sandbox.scopes().contains(&canonical_temp),
-            "serve must not seed the temp dir: {:?}",
+            sandbox.scopes().contains(&canonical_temp),
+            "{:?}",
             sandbox.scopes().to_vec()
         );
     }
 
-    /// `ahma tool run --tmp` keeps today's behaviour: the human typed it.
+    /// SPEC R5.2.5: `--disable-temp-files` keeps it out, whatever asked for it.
+    #[test]
+    fn a_server_with_disable_temp_starts_without_the_temp_dir() {
+        init_test();
+        let ws = dunce::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let cfg = AppConfig {
+            no_sandbox: true,
+            tmp_access: true,
+            no_temp_files: true,
+            sandbox_scopes: vec![ws],
+            ..make_cfg()
+        };
+        let sandbox = initialize_sandbox(&cfg).unwrap().unwrap();
+        assert!(!sandbox.tmp_in_scope(), "{:?}", sandbox.scopes().to_vec());
+    }
+
+    /// `ahma tool run`, which may never commit, is seeded at startup.
     #[test]
     fn a_one_shot_run_with_tmp_starts_with_the_temp_dir() {
         init_test();
-        let tmp = tempdir().unwrap();
+        // Outside the temp dir: a workspace inside it is refused the temp scope.
+        let ws = dunce::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
         let canonical_temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
         let cfg = AppConfig {
             no_sandbox: true,
             tmp_access: true,
-            sandbox_scopes: vec![tmp.path().to_path_buf()],
+            sandbox_scopes: vec![ws],
             run_tool: Some("run_terminal_command".into()),
             ..make_cfg()
         };
@@ -5685,7 +5714,7 @@ mod tests {
         // whether or not each settings key reached the field it names.
         s.sandbox.disable = true;
         s.sandbox.defer = false;
-        s.sandbox.tmp_access = true;
+        s.sandbox.tmp_access = false;
         s.sandbox.use_scratch_directory = false;
         s.sandbox.disable_temp = true;
         s.logging.log_monitor = false;
@@ -5699,7 +5728,7 @@ mod tests {
             "sandbox.disable in a settings file must not disable the sandbox (R-CFG2.3)"
         );
         assert!(!resolved.defer_sandbox, "sandbox.defer → defer_sandbox");
-        assert!(resolved.tmp_access, "sandbox.tmp_access → tmp_access");
+        assert!(!resolved.tmp_access, "sandbox.tmp_access → tmp_access");
         assert!(
             !resolved.use_scratch_dir,
             "sandbox.use_scratch_directory → use_scratch_dir"
@@ -5714,6 +5743,37 @@ mod tests {
             resolved.package_cache_write,
             "package_cache_write follows settings when no CLI flag"
         );
+    }
+
+    /// SPEC R5.2.5: temp is in ahma's scope by default, `tmp_access = false`
+    /// takes it out of ahma's scope only, and `disable_temp` — the expert
+    /// opt-out — turns both layers off.
+    #[test]
+    fn temp_is_on_by_default_and_disable_temp_turns_it_off() {
+        let _guard = ENV_MUTEX.lock();
+        init_test();
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        let resolved = parse_sandbox_settings(&cli, &s);
+        assert!(resolved.tmp_access, "on by default");
+        assert!(!resolved.no_temp_files);
+
+        s.sandbox.tmp_access = false;
+        let resolved = parse_sandbox_settings(&cli, &s);
+        assert!(
+            !resolved.tmp_access,
+            "tmp_access = false: out of ahma's scope"
+        );
+        assert!(
+            !resolved.no_temp_files,
+            "…but commands keep the kernel rule"
+        );
+
+        s.sandbox.tmp_access = true;
+        s.sandbox.disable_temp = true;
+        let resolved = parse_sandbox_settings(&cli, &s);
+        assert!(resolved.no_temp_files);
+        assert!(!resolved.tmp_access, "disable_temp overrides tmp_access");
     }
 
     /// SPEC R-CFG2.3: disabling the sandbox is CLI-flag-only. A settings file —
@@ -5762,7 +5822,10 @@ mod tests {
         let s = ahma_common::config::AhmaSettings::default();
         let resolved = parse_sandbox_settings(&cli, &s);
         assert!(resolved.defer_sandbox);
-        assert!(resolved.tmp_access);
+        assert!(
+            !resolved.tmp_access,
+            "--disable-temp-files wins over --tmp (SPEC R5.2.5)"
+        );
         assert!(resolved.use_scratch_dir);
         assert!(resolved.no_temp_files);
         assert!(resolved.log_monitor);
@@ -6182,7 +6245,7 @@ mod tests {
         let file = tmp.path().join("settings.toml");
         std::fs::write(
             &file,
-            "[tools]\ntimeout_secs = 600\n[sandbox]\ntmp_access = true\n",
+            "[tools]\ntimeout_secs = 600\n[sandbox]\ntmp_access = false\n",
         )
         .unwrap();
         let cli = Cli::parse_from([

@@ -93,7 +93,9 @@ pub use command::{
     set_egress_proxy_env, set_secret_env_allow,
 };
 pub use confinement::outer_confinement;
-pub use core::{ContainerNarrowing, Enforcement, Sandbox, SandboxOptions, ScopeCommit};
+pub use core::{
+    ContainerNarrowing, Enforcement, Sandbox, SandboxOptions, ScopeCommit, auxiliary_temp_scope,
+};
 pub use core::{add_log_exception, approve_log_link, is_target_allowed, load_exceptions};
 pub use credential_reads::{
     default_credential_read_denies, effective_credential_read_denies, keychain_access_allowed,
@@ -134,7 +136,7 @@ pub use ssh_agent::{
 pub use types::{KernelPolicy, SandboxMode, ScopesGuard, WorkspaceAccess};
 
 /// The directories the kernel sandbox lets every command write for temp
-/// files, unless `--no-temp-files`: `/tmp` under Landlock, `/private/tmp` and
+/// files, unless `--disable-temp-files`: `/tmp` under Landlock, `/private/tmp` and
 /// `/private/var/folders` under Seatbelt; none where there is no boundary. The
 /// one list the Seatbelt and Landlock rules and `ahma_help` all read, so what
 /// the help says about temp cannot drift from what the kernel allows

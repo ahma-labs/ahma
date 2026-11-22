@@ -78,7 +78,7 @@ meant setting one changed the chat client's behaviour but not the server's.
 | `AHMA_SANDBOX_SCOPE` | `--sandbox-scope` CLI flag or `sandbox.scopes` in user settings.toml |
 | `AHMA_SANDBOX_DEFER` | `--defer-sandbox` CLI flag or `sandbox.defer = true` in settings.toml |
 | `AHMA_WORKING_DIRS` | `--working-dir` CLI flag or `sandbox.working_dirs` in settings.toml |
-| `AHMA_TMP_ACCESS` | `--tmp` CLI flag or `sandbox.tmp_access = true` in settings.toml |
+| `AHMA_TMP_ACCESS` | `sandbox.tmp_access` in settings.toml (on by default; `--tmp` still accepted) |
 | `AHMA_DISABLE_TEMP` | `--disable-temp-files` CLI flag or `sandbox.disable_temp = true` in settings.toml |
 | `AHMA_NO_PACKAGE_CACHE_WRITE` | `--no-package-cache-write` flag or `sandbox.package_cache_write = false` in settings.toml |
 | `AHMA_TASK_VAULT` | `--task-vault` CLI flag |

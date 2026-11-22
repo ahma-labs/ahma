@@ -343,12 +343,12 @@ pub struct SandboxScopeSummary {
     #[serde(default, deserialize_with = "lenient_display_paths")]
     pub read: Vec<String>,
     /// Whether the system temp directory is in the scope. Unchanged meaning
-    /// for readers that predate [`tmp_requested`](Self::tmp_requested): under
-    /// `serve`, `--tmp` is a request a human answers (SPEC R5.2.5, R5.3), so
-    /// this is `true` only once it was granted.
+    /// for readers that predate [`tmp_requested`](Self::tmp_requested): `true`
+    /// once a commit admitted it (SPEC R5.2.5), which it does by default.
     #[serde(default, deserialize_with = "lenient")]
     pub tmp: bool,
-    /// Whether `--tmp` / `[sandbox] tmp_access` asked for the temp directory.
+    /// Whether `[sandbox] tmp_access` (on by default, off under
+    /// `disable_temp`) wants the temp directory in the scope.
     /// Add-only (R24.5); absent from older producers.
     #[serde(
         default,

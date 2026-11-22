@@ -93,7 +93,7 @@ key, the value, the default and the source — the same source `--origin` report
 
 ```
 INFO  setting tools.timeout_secs = 600 (default 1800) from user (/home/me/.ahma/settings.toml) (SPEC R-CFG5.2)
-WARN  security-tier setting sandbox.tmp_access = true (default false) from user (/home/me/.ahma/settings.toml) (SPEC R-CFG5.2)
+WARN  security-tier setting sandbox.disable_temp = true (default false) from user (/home/me/.ahma/settings.toml) (SPEC R-CFG5.2)
 ```
 
 Security-tier settings (everything in `[sandbox]`, `[auth]`, `[web]`, `[network]`,
@@ -134,7 +134,7 @@ ahma --settings-path /path/to/my.toml serve stdio
 
 ## Priority order (highest wins)
 
-1. **CLI flags** (`--timeout 600`, `--tmp`, …)
+1. **CLI flags** (`--timeout 600`, `--disable-temp-files`, …)
 2. **`<workspace>/.ahma/settings.toml`** — preference keys only ([below](#project-settings-workspaceahmasettingstoml))
 3. **`~/.ahma/settings.toml`**
 4. **Compiled-in defaults**
@@ -188,7 +188,7 @@ Run `ahma settings init` to generate this file automatically.
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
-# tmp_access   = false    # ask for the system temp dir in scope (serve: you are asked once per session)
+# tmp_access   = true     # system temp dir in ahma's own scope (file tools, working_directory), after the workspace (R5.2.5)
 # allow_gpu    = false    # macOS: let sandboxed commands open the GPU (Metal); a capability, not a path (R6.2.7)
 # ssh_agent    = "broker" # SSH agent for commands: "broker" (asks first; macOS refuses a direct
 #                         # connect to your own agent), "passthrough" (your SSH_AUTH_SOCK, no
@@ -196,7 +196,7 @@ Run `ahma settings init` to generate this file automatically.
 # [permissions]
 # advisor              = true   # TUI: the selected model recommends an answer beside a grant prompt and each setup change (R-PERM.8, R-SETUP.4.9)
 # advisor_timeout_secs = 6      # how long to wait for it before showing the prompt without it
-# disable_temp = false    # block all access to system temp dir (overrides tmp_access)
+# disable_temp = false    # the expert opt-out: close temp to commands, ahma's tools and native edits (overrides tmp_access)
 # defer        = false    # defer sandbox lock until client provides roots/list
 # allow_git_hooks = false           # let tools write <git dir>/hooks/** (default: denied)
 # allow_project_tool_config = false # let tools write this workspace's .ahma/ (default: denied)
