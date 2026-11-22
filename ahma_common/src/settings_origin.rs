@@ -223,9 +223,9 @@ pub struct StartupLine {
 }
 
 /// Whether `key` holds a secret, whose value is never shown or logged: a
-/// startup log is a file that outlives the process ([`SettingKey::is_secret`]).
-fn is_secret(key: &str) -> bool {
-    SettingKey::from_dotted(key).is_some_and(SettingKey::is_secret)
+/// startup log is a file that outlives the process ([`SettingKey::is_redacted`]).
+fn is_redacted(key: &str) -> bool {
+    SettingKey::from_dotted(key).is_some_and(SettingKey::is_redacted)
 }
 
 /// Whether only a CLI flag can set `key` (SPEC R-CFG2.3). A file value parses
@@ -237,7 +237,11 @@ fn is_cli_only(key: &str) -> bool {
 
 /// `value` as every report shows it: a secret key's is `<redacted>`.
 pub fn shown_value<'a>(key: &str, value: &'a str) -> &'a str {
-    if is_secret(key) { "<redacted>" } else { value }
+    if is_redacted(key) {
+        "<redacted>"
+    } else {
+        value
+    }
 }
 
 /// One line per setting whose effective value differs from the compiled-in

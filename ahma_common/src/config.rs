@@ -4560,7 +4560,7 @@ mod tests {
             }
             let _ = writeln!(
                 got,
-                "{dotted} tier={:?} secret={} cli_only={} row={} ledger={}",
+                "{dotted} tier={:?} redacted={} cli_only={} row={} ledger={}",
                 settings_tier(&d.table, &d.key),
                 crate::settings_origin::shown_value(&dotted, "v") != "v",
                 crate::settings_origin::startup_deviation_lines(&[

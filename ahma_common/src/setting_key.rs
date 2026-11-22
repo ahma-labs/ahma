@@ -25,7 +25,7 @@ struct KeySpec {
     /// The dedicated command for a ledger key (SPEC R-CFG10.7).
     ledger: Option<&'static str>,
     /// Never shown or logged in clear (SPEC R-CFG5.1).
-    secret: bool,
+    redacted: bool,
     /// A file value is ignored; only a flag sets it (SPEC R-CFG2.3).
     cli_only: bool,
     /// Listed by the setup view as a switch that is on, with this label
@@ -37,7 +37,7 @@ struct KeySpec {
 const PREFERENCE: KeySpec = KeySpec {
     tier: SettingsTier::Preference,
     ledger: None,
-    secret: false,
+    redacted: false,
     cli_only: false,
     switch: None,
 };
@@ -57,9 +57,9 @@ const fn ledger(command: &'static str) -> KeySpec {
 }
 
 impl KeySpec {
-    const fn secret(self) -> Self {
+    const fn redacted(self) -> Self {
         Self {
-            secret: true,
+            redacted: true,
             ..self
         }
     }
@@ -206,7 +206,7 @@ setting_keys! {
     // call to a server it chose.
     HttpUnixSocketPath = http.unix_socket_path => SECURITY,
     AuthRequireTokenPath = auth.require_token_path => SECURITY,
-    AuthRequireToken = auth.require_token => SECURITY.secret(),
+    AuthRequireToken = auth.require_token => SECURITY.redacted(),
     AuthRateLimitRps = auth.rate_limit_rps => SECURITY,
     AuthRateLimitBurst = auth.rate_limit_burst => SECURITY,
     InstanceLabel = instance.label => PREFERENCE,
@@ -267,8 +267,8 @@ impl SettingKey {
     }
 
     /// Whether its value is shown as `<redacted>` in every report.
-    pub const fn is_secret(self) -> bool {
-        self.spec().secret
+    pub const fn is_redacted(self) -> bool {
+        self.spec().redacted
     }
 
     /// Whether only a CLI flag sets it: a file value parses but never takes
