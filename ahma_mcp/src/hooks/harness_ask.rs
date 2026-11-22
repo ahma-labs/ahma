@@ -194,11 +194,14 @@ pub(super) fn next_repo_step(
     let now = ahma_common::session_grants::now_secs();
     let scopes = super::resolve_hook_sandbox_scopes(cwd);
     let granted = granted_in(persistent, &scopes);
+    // `repo` is canonical; a grant's path is stored as typed (`~`, `..`, a
+    // symlink), so it is resolved the same way before the two are compared.
     let granted_by_a_human = |repo: &Path| {
         granted.iter().any(|g| {
+            let path = ahma_common::scope_grant::canonicalize_best_effort(&g.path);
             g.by.is_deliberate()
                 && g.applies_to(std::slice::from_ref(&workspace))
-                && (repo.starts_with(&g.path) || g.path.starts_with(repo))
+                && (repo.starts_with(&path) || path.starts_with(repo))
         })
     };
     // A tool's cache under a hidden folder of home (`~/.cargo/git/checkouts/…`).
@@ -1593,6 +1596,42 @@ mod tests {
             .map(|s| s.sandbox.persistent_scopes.iter().any(|s| s.path == other))
             .unwrap_or(false);
         assert!(!saved, "nothing saved for another repository");
+    }
+
+    /// SPEC R-PERM.11, R5.4.11: a grant's path is stored as the human typed it
+    /// (`ahma sandbox grant ../tools`), with `..`, `~` or a symlink in it, while
+    /// the repository a command names is canonical. The two are compared as
+    /// the same folder, so a repository a human already granted this
+    /// workspace is not asked about again.
+    #[test]
+    fn a_repository_granted_through_a_dotdot_path_is_not_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let other = dunce::canonicalize(&other).unwrap();
+        let cmd = format!("cd {} && ls", other.display());
+        assert!(
+            matches!(
+                next_repo_step(&ws, "session-ungranted", &cmd, &[]),
+                Some(RepoStep::Ask { .. })
+            ),
+            "ungranted, it asks"
+        );
+        let typed = ws.join("..").join("other");
+        let grant = PersistentScope {
+            path: typed,
+            access: ScopeAccess::Rw,
+            workspace: Some(ws.clone()),
+            granted_by: Some("cli".into()),
+            granted_at: None,
+            note: None,
+            expires_at: None,
+        };
+        let step = next_repo_step(&ws, "session-granted", &cmd, &[grant]);
+        assert_eq!(step, None, "granted through `ws/../other`");
     }
 
     /// SPEC R-PERM.10.3: a grant is kept only when the run shows it helped.

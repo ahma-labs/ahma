@@ -42,7 +42,8 @@ pub fn hook_grants(
 /// The sites a human allowed "this site, this session" for hooked commands
 /// working in `workspace`: the session grant files
 /// ([`ahma_common::open_url::active_sessions`]) whose harness process still
-/// lives and that were given in this repo (SPEC R-LINK.4).
+/// lives and that apply in this repo: given in it or in a repo enclosing it
+/// ([`ahma_common::open_url::OpenUrlSessionGrant::applies_in`], SPEC R-LINK.4).
 pub fn session_sites(workspace: &Path) -> Vec<HostPattern> {
     let Some(dir) = ahma_common::open_url::session_dir() else {
         return Vec::new();
@@ -50,7 +51,7 @@ pub fn session_sites(workspace: &Path) -> Vec<HostPattern> {
     let now = ahma_common::session_grants::now_secs();
     ahma_common::open_url::active_sessions(&dir, now, &crate::sandbox::pid_alive)
         .into_iter()
-        .filter(|g| workspace.starts_with(&g.workspace))
+        .filter(|g| g.applies_in(workspace))
         // Always one exact site: a session answer names the site asked about.
         .map(|g| HostPattern::Exact(g.site.to_ascii_lowercase()))
         .collect()
@@ -414,6 +415,59 @@ mod tests {
         assert!(
             matches!(elsewhere.decide(&link, false).await, LinkAnswer::Refuse(_)),
             "that repo only"
+        );
+    }
+
+    /// Records "github.com, this session" for `ws` (canonical, as the TUI
+    /// records it), owned by this test process.
+    fn record_github_session(ws: &Path) {
+        let grant = ahma_common::open_url::OpenUrlSessionGrant {
+            site: "github.com".into(),
+            workspace: ws.to_path_buf(),
+            owner_pid: std::process::id(),
+            granted_at: ahma_common::session_grants::now_secs(),
+            granted_by: Some("tui".into()),
+        };
+        let dir = ahma_common::open_url::session_dir().unwrap();
+        ahma_common::open_url::record_session(&dir, &grant, &ApproverSurface::Tui).unwrap();
+    }
+
+    /// SPEC R-LINK.4: a session grant applies to a command's workspace as
+    /// resolved paths, so the repo it was given in, spelled through `..`,
+    /// still opens the site's links.
+    #[test]
+    fn a_session_site_applies_through_a_dotdot_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = home.path().join("ws");
+        let beside = home.path().join("beside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&beside).unwrap();
+        record_github_session(&dunce::canonicalize(&ws).unwrap());
+        assert_eq!(
+            session_sites(&beside.join("..").join("ws")),
+            [HostPattern::Exact("github.com".into())]
+        );
+        assert!(session_sites(&beside).is_empty(), "that repo only");
+    }
+
+    /// SPEC R-LINK.4: the repo reached through a symlink is the repo
+    /// the session grant was given in.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_site_applies_through_a_symlinked_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let ws = home.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(&ws, &link).unwrap();
+        record_github_session(&dunce::canonicalize(&ws).unwrap());
+        assert_eq!(
+            session_sites(&link),
+            [HostPattern::Exact("github.com".into())]
         );
     }
 
