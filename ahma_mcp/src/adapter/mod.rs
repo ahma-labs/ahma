@@ -2574,6 +2574,7 @@ async fn run_session_operation(
     sandbox: &sandbox::Sandbox,
     session_id: &str,
     command_str: &str,
+    lease: Option<&str>,
     working_dir: &std::path::Path,
     limit: Duration,
     cancellation_token: &tokio_util::sync::CancellationToken,
@@ -2596,7 +2597,7 @@ async fn run_session_operation(
         sandbox,
         session_id,
         working_dir,
-        command_str,
+        crate::shell_session::SessionCommand::new(command_str).under_lease(lease),
         limit,
         &mut forward,
     );

@@ -31,6 +31,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+use crate::adapter::workspace_queue::HELD_LEASE_ENV;
 use crate::sandbox::Sandbox;
 use crate::shell_pool::{ProcessGroupGuard, kill_process_tree, platform_shell_program};
 
@@ -86,37 +87,75 @@ impl ShellSession {
         })
     }
 
-    /// Render the protocol block for one command.
-    fn protocol_block(command: &str, marker: &str) -> String {
+    /// Render the protocol block for one command. With a `lease` (the value
+    /// of [`HELD_LEASE_ENV`] for a command run under a workspace lease, SPEC
+    /// R2.7.7) the command sees it, and the shell gets back the value it had
+    /// before (`restore`: this process's own, or none) once the command ends:
+    /// the shell outlives the lease, and its next command may hold none.
+    fn protocol_block(
+        command: &str,
+        marker: &str,
+        lease: Option<&str>,
+        restore: Option<&str>,
+    ) -> String {
         #[cfg(windows)]
         {
+            let quote = |v: &str| format!("'{}'", v.replace('\'', "''"));
+            let (set, unset) = match lease {
+                Some(v) => (
+                    format!("$env:{HELD_LEASE_ENV} = {}\n", quote(v)),
+                    match restore {
+                        Some(r) => format!("$env:{HELD_LEASE_ENV} = {}\n", quote(r)),
+                        None => format!(
+                            "Remove-Item Env:{HELD_LEASE_ENV} -ErrorAction SilentlyContinue\n"
+                        ),
+                    },
+                ),
+                None => (String::new(), String::new()),
+            };
             // PowerShell `-Command -` evaluates input line by line; the
-            // command must therefore be single-line on Windows.
+            // command must therefore be single-line on Windows. The exit
+            // code is read right after the command, before the restore.
             format!(
-                "& {{ {command} }} 2>&1 | Out-String -Stream\nWrite-Output \"{marker}_$(if ($LASTEXITCODE -ne $null) {{ $LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }})__\"\n"
+                "{set}& {{ {command} }} 2>&1 | Out-String -Stream\n$__ahma_rc = $(if ($LASTEXITCODE -ne $null) {{ $LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }})\n{unset}Write-Output \"{marker}_${{__ahma_rc}}__\"\n"
             )
         }
         #[cfg(not(windows))]
         {
-            // Brace group so `a; b && c` style compounds are redirected as a
-            // whole; the marker line carries the group's exit code.
-            format!("{{ {command}\n}} 2>&1\nprintf '{marker}_%d__\\n' \"$?\"\n")
+            let quote = |v: &str| format!("'{}'", v.replace('\'', "'\\''"));
+            let Some(v) = lease else {
+                // Brace group so `a; b && c` style compounds are redirected as
+                // a whole; the marker line carries the group's exit code.
+                return format!("{{ {command}\n}} 2>&1\nprintf '{marker}_%d__\\n' \"$?\"\n");
+            };
+            let unset = match restore {
+                Some(r) => format!("export {HELD_LEASE_ENV}={}", quote(r)),
+                None => format!("unset {HELD_LEASE_ENV}"),
+            };
+            // The exit code is kept before the restore, which would reset `$?`.
+            format!(
+                "export {HELD_LEASE_ENV}={}\n{{ {command}\n}} 2>&1\n__ahma_rc=$?\n{unset}\nprintf '{marker}_%d__\\n' \"$__ahma_rc\"\n",
+                quote(v)
+            )
         }
     }
 
     /// Execute one command, streaming each output line through `on_line`.
     /// Returns the command's exit code, `None` when its end marker could not
-    /// be read.
+    /// be read. `lease` is the command's workspace lease (SPEC R2.7.7), if it
+    /// runs under one.
     async fn execute_streaming(
         &mut self,
         command: &str,
+        lease: Option<&str>,
         timeout: Duration,
         on_line: &mut (dyn FnMut(String) + Send),
     ) -> Result<Option<i32>, SessionError> {
         let nonce: u64 = rand::random();
         let marker = format!("__AHMA_SESSION_DONE_{nonce:016x}");
 
-        let block = Self::protocol_block(command, &marker);
+        let restore = std::env::var(HELD_LEASE_ENV).ok();
+        let block = Self::protocol_block(command, &marker, lease, restore.as_deref());
         self.stdin
             .write_all(block.as_bytes())
             .await
@@ -183,6 +222,27 @@ pub enum SessionError {
     Failed(anyhow::Error),
 }
 
+/// One command for a session: its line, and the value of [`HELD_LEASE_ENV`]
+/// when it runs under a workspace lease. The command sees the lease, and the
+/// shell, which outlives it, gets its own value back afterwards (SPEC R2.7.7).
+#[derive(Debug, Clone, Copy)]
+pub struct SessionCommand<'a> {
+    pub line: &'a str,
+    pub lease: Option<&'a str>,
+}
+
+impl<'a> SessionCommand<'a> {
+    /// `line`, run under no lease.
+    pub fn new(line: &'a str) -> Self {
+        Self { line, lease: None }
+    }
+
+    /// Run under `lease`, when it has one.
+    pub fn under_lease(self, lease: Option<&'a str>) -> Self {
+        Self { lease, ..self }
+    }
+}
+
 /// Manages all persistent shell sessions for one server instance.
 #[derive(Debug, Default)]
 pub struct ShellSessionManager {
@@ -208,7 +268,7 @@ impl ShellSessionManager {
         sandbox: &Sandbox,
         session_id: &str,
         working_dir: &Path,
-        command: &str,
+        command: SessionCommand<'_>,
         timeout: Duration,
         on_line: &mut (dyn FnMut(String) + Send),
     ) -> Result<Option<i32>, SessionError> {
@@ -233,7 +293,10 @@ impl ShellSessionManager {
         };
 
         let mut guard = session.lock().await;
-        match guard.execute_streaming(command, timeout, on_line).await {
+        match guard
+            .execute_streaming(command.line, command.lease, timeout, on_line)
+            .await
+        {
             Ok(code) => Ok(code),
             Err(e) => {
                 // The shell is in an unknown state — destroy the session.
@@ -316,7 +379,7 @@ mod tests {
                 sandbox,
                 session,
                 wd,
-                cmd,
+                SessionCommand::new(cmd),
                 Duration::from_secs(10),
                 &mut |line| lines.push(line),
             )
@@ -324,6 +387,44 @@ mod tests {
             .expect("session command should run")
             .expect("the session reports an exit code");
         (code, lines)
+    }
+
+    /// SPEC R2.7.7: a session command run under a lease sees it, keeps its
+    /// own exit code, and the shell, which outlives the lease, does not keep
+    /// it for its next command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lease_is_the_commands_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        let mgr = ShellSessionManager::new();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::remove_var(HELD_LEASE_ENV) };
+        let mut lines = Vec::new();
+        let code = mgr
+            .execute_streaming(
+                &sandbox,
+                "leased",
+                temp.path(),
+                SessionCommand::new(&format!("printf 'in=%s\\n' \"${HELD_LEASE_ENV}\"; false"))
+                    .under_lease(Some("0123456789abcdef")),
+                Duration::from_secs(10),
+                &mut |line| lines.push(line),
+            )
+            .await
+            .expect("session command should run");
+        assert_eq!(code, Some(1), "the command's own exit code: {lines:?}");
+        assert_eq!(lines, ["in=0123456789abcdef"]);
+        let (code, after) = run(
+            &mgr,
+            &sandbox,
+            "leased",
+            temp.path(),
+            &format!("printf 'after=%s\\n' \"${{{HELD_LEASE_ENV}-unset}}\""),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(after, ["after=unset"], "the lease ended with its command");
     }
 
     #[tokio::test]
@@ -428,7 +529,7 @@ mod tests {
                 &sandbox,
                 "dies",
                 temp.path(),
-                "exit 7",
+                SessionCommand::new("exit 7"),
                 Duration::from_secs(5),
                 &mut |_| {},
             )
