@@ -1324,7 +1324,8 @@ impl AhmaMcpService {
 
         let result = self
             .adapter
-            .execute_sync_in_dir(
+            .execute_sync_in_dir_as(
+                Some(&id),
                 base_command,
                 Some(arguments),
                 working_directory,
@@ -2196,8 +2197,6 @@ impl AhmaMcpService {
         arguments: serde_json::Map<String, Value>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        use std::sync::atomic::Ordering;
-
         let file_path_str = handlers::common::require_str(
             &arguments,
             "file_path",
@@ -2215,8 +2214,8 @@ impl AhmaMcpService {
 
         let llm_provider = self.parse_llm_provider(&arguments);
 
-        static NEXT_LOG_MON_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let op_id = format!("logmon_{}", NEXT_LOG_MON_ID.fetch_add(1, Ordering::SeqCst));
+        // An id like every other operation's (SPEC R-LIFECYCLE.4).
+        let op_id = crate::utils::operation::mint_id("log_monitor", "logmon");
         let operation = Operation::new_with_timeout(
             op_id.clone(),
             "log_monitor".to_string(),
@@ -2224,14 +2223,8 @@ impl AhmaMcpService {
             None,
             None,
         );
-        self.operation_monitor.add_operation(operation).await;
-
         let monitor = self.operation_monitor.clone();
-        let cancellation_token = monitor
-            .get_operation(&op_id)
-            .await
-            .unwrap()
-            .cancellation_token;
+        let cancellation_token = monitor.register(operation).await;
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
@@ -2591,10 +2584,9 @@ impl AhmaMcpService {
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let params_map = params.arguments.clone().unwrap_or_default();
-        let op_id = format!(
-            "livelog_{}",
-            crate::utils::operation::next_operation_number()
-        );
+        // An id like every other operation's (SPEC R-LIFECYCLE.4), still
+        // saying what it is.
+        let op_id = crate::utils::operation::mint_id(&config.name, "livelog");
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         self.register_progress_if_requested(

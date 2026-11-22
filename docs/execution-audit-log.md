@@ -30,7 +30,8 @@ no.
 One JSON object per line, `type`-tagged, with an RFC 3339 `timestamp` (UTC,
 written `+00:00`). It is the same envelope and the same field names the
 task-vault audit log uses, so a single
-reader parses both.
+reader parses both. A call both logs record carries the same `operation_id` in
+each, so they join on it.
 
 ### `tool_call`
 

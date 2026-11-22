@@ -652,7 +652,72 @@ async fn test_livelog_mcp_dispatch_returns_operation_id() -> Result<()> {
         response_text.contains("Operation ID"),
         "response should include an operation ID, got: {response_text}"
     );
+    // An operation id like any other (SPEC R-LIFECYCLE.4): it carries this
+    // process's generation, so after a restart it is recognisably foreign.
+    let op_id = operation_id_in(&response_text);
+    assert!(
+        ahma_mcp::utils::operation::id_generation(op_id).is_some(),
+        "a livelog's id carries the process generation, got: {op_id}"
+    );
 
+    Ok(())
+}
+
+/// The operation id a "started" reply names: the word after `Operation ID: `.
+fn operation_id_in(reply: &str) -> &str {
+    reply
+        .split("Operation ID: ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|id| id.trim_end_matches('.'))
+        .unwrap_or_else(|| panic!("no operation id in: {reply}"))
+}
+
+/// `log_monitor` names its operation as every other tool does (SPEC
+/// R-LIFECYCLE.4). It kept a counter of its own and issued `logmon_<n>`,
+/// which `await` could not tell from an id of an earlier process.
+#[tokio::test]
+async fn log_monitor_ids_carry_the_process_generation() -> Result<()> {
+    init_test_logging();
+    let temp_dir = tempdir()?;
+    let tools_dir = temp_dir.path().join(".ahma");
+    fs::create_dir_all(&tools_dir).await?;
+    let log = temp_dir.path().join("app.log");
+    fs::write(&log, "started\n").await?;
+    let mcp = create_in_process_mcp_from_dir(&tools_dir).await?;
+
+    let params = CallToolRequestParams::new(Cow::Borrowed("log_monitor")).with_arguments(
+        json!({"file_path": log.to_string_lossy()})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let result = mcp.client.call_tool(params).await?;
+    assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    let text = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let op_id = operation_id_in(&text);
+    assert!(
+        ahma_mcp::utils::operation::id_generation(op_id).is_some(),
+        "a log monitor's id carries the process generation, got: {op_id}"
+    );
+    assert!(
+        mcp.service
+            .operation_monitor
+            .get_operation(op_id)
+            .await
+            .is_some(),
+        "the id names the operation that runs: {op_id}"
+    );
+    mcp.service
+        .operation_monitor
+        .cancel_operation_with_reason(op_id, Some("test over".into()))
+        .await;
+    let _ = mcp.client.cancel().await;
     Ok(())
 }
 

@@ -918,7 +918,7 @@ A "host sandbox" is an outer kernel sandbox ahma runs inside (Cursor, Claude Cod
 - **R-HANDOFF.9**: **Build-time code execution is part of the agent's write set**: build scripts (`build.rs`) and procedural macros run at build time with the **full write set of the sandbox** — the workspace, the temp scopes, and every `rw` path an enabled profile granted. **Adding a dependency is adding code that runs locally**; the sandbox bounds *where* that code can write, never *whether* it runs. R5.4.5 relies on this bound (a build script cannot author a grant), and R-HANDOFF.8 is the case where it composes into cross-project persistence.
 - **R-HANDOFF.10**: **Every execution leaves durable provenance, on the default path and not only in a vault**: a trust handoff (R-HANDOFF.1) is discovered after the fact, and operation output says what a command printed, not that it ran.
   - ahma **must** write an append-only execution audit log on **every** execution path — synchronous, asynchronous, PTY and session — not only inside a task vault. Each execution records a `tool_call` **before** the process is spawned, and exactly one matching `tool_complete` on **every** terminal path (success, failure, timeout, cancellation, spawn error), so no panic, `SIGKILL` or power loss can leave the log without a record of what was asked for.
-  - Sandbox denials **must** land in the same log, whether refused by path validation or surfaced as a kernel denial at runtime (R5.4.7). The wire format **must** be the vault's (`ahma_mcp::vault::audit::AuditEvent`), so one reader parses both logs, and a test **must** assert the compatibility.
+  - Sandbox denials **must** land in the same log, whether refused by path validation or surfaced as a kernel denial at runtime (R5.4.7). The wire format **must** be the vault's (`ahma_mcp::vault::audit::AuditEvent`), so one reader parses both logs, and a test **must** assert the compatibility. A call both logs record **must** carry the same `operation_id` in each, on every path, so they join on it.
   - Recorded fields **must** be redacted through the *same* function operation output uses, and every free-form field **must** be individually bounded, which keeps one event one `write` syscall so concurrent `O_APPEND` writes do not interleave without a process-wide lock.
   - A deny-tier write the kernel did not stop (R6.1.7) **must** land in the same log as a `handoff_write` event, one per entry.
   - **An audit write failure must never fail the operation it records** (R-PERM.2.2, generalized), but **must** be reported at `warn` naming the path.
@@ -1716,6 +1716,8 @@ Operation ids are counters, and counters restart with the process that issues th
    `<generation>` is four random lowercase letters minted once per process. Without it,
    `op_3_cargo_build` issued after a restart or update could name a *different* operation
    than the one an agent is still awaiting, and `await` would return that one's result.
+   Every id, a `log_monitor` or livelog tool's included, is minted one way
+   (`utils::operation::mint_id`), from one counter per process.
 2. `await`, `status` and `cancel` on an id the process does not know say what happened to it,
    derived from the tag: another generation means ahma restarted or was updated since (or the
    id belongs to another session), so the work most likely finished and the agent should check
