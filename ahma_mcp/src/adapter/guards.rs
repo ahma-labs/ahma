@@ -5,14 +5,18 @@ use std::time::Instant;
 
 use super::{PublishEnding, audit, finish_handoff_watch, workspace_queue};
 use crate::operation_monitor::{CommandOutput, OperationMonitor, Terminal};
-use crate::sandbox::handoff_watch::HandoffWatch;
+use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch};
 
 /// What a running command holds until it has ended: its place in the
 /// workspace queue (SPEC R2.7.1), its mutex group gate (R2.7.2), the
 /// deny-tier watch (R6.1.7), its SSH key broker (R-CRED.1) and its link
 /// broker (R-LINK.1).
 ///
-/// [`RunGuards::end`] is the one way to end the operation, and it takes the
+/// The synchronous path holds them too ([`RunGuards::held`]). It has no
+/// operation to end, so it lets go of them with [`RunGuards::release`] — the
+/// same steps in the same order — and returns its result inline.
+///
+/// [`RunGuards::end`] is the one way to end an operation, and it takes the
 /// guards by value. Every ending therefore runs the same steps in the same
 /// order: the broker's refusals are told, the deny tier is compared, the
 /// workspace is handed on, and only then is the ending published and the end
@@ -49,19 +53,8 @@ impl RunGuards {
         admission: workspace_queue::Admission,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<Self> {
-        let mut guards = Self {
-            op_id: op_id.to_string(),
-            subject: subject.to_string(),
-            // From the task's start, so time spent queued is in the audit record.
-            started: Instant::now(),
-            lease: None,
-            mutex: None,
-            handoff: None,
-            #[cfg(unix)]
-            broker: None,
-            #[cfg(unix)]
-            links: None,
-        };
+        // From the task's start, so time spent queued is in the audit record.
+        let mut guards = Self::held(op_id, subject, None);
         match super::wait_for_lease(admission.into_ticket(), monitor, op_id, cancel).await {
             // Held until the operation ends: until its process tree is gone.
             Ok(lease) => guards.lease = lease,
@@ -77,6 +70,26 @@ impl RunGuards {
             return None;
         }
         Some(guards)
+    }
+
+    /// The guards of a run that holds `lease`, if it took one, with its clock
+    /// started now. The synchronous path makes its own here: it waits for
+    /// its turn itself, bounded by its own timeout
+    /// ([`super::Adapter::acquire_for_sync`]), and starts its clock after
+    /// that wait, so its audit record has never counted time queued.
+    pub(super) fn held(op_id: &str, subject: &str, lease: Option<workspace_queue::Lease>) -> Self {
+        Self {
+            op_id: op_id.to_string(),
+            subject: subject.to_string(),
+            started: Instant::now(),
+            lease,
+            mutex: None,
+            handoff: None,
+            #[cfg(unix)]
+            broker: None,
+            #[cfg(unix)]
+            links: None,
+        }
     }
 
     pub(super) fn lease(&self) -> Option<&workspace_queue::Lease> {
@@ -133,6 +146,11 @@ impl RunGuards {
         self.links = links;
     }
 
+    #[cfg(unix)]
+    pub(super) fn links(&self) -> Option<&crate::links::host::LinkLease> {
+        self.links.as_ref()
+    }
+
     /// Compare the deny tier with its inventory from before the spawn (SPEC
     /// R6.1.7) and put the report in `output` (`handoff_writes`,
     /// `handoff_alert`), raising the alert while the operation is still
@@ -170,6 +188,45 @@ impl RunGuards {
     /// whatever ending the run reached: one that had just exited on its own
     /// still ends cancelled, as when the monitor ended it itself.
     pub(super) async fn end(self, monitor: &OperationMonitor, ending: Terminal) {
+        // What the broker refused, one line each (SPEC R-CRED.10): before the
+        // terminal transition, so a waiter observes it deterministically
+        // rather than racing the broker thread's own alert.
+        #[cfg(unix)]
+        if let Some(broker) = &self.broker {
+            for refusal in super::broker_refusal_lines(broker) {
+                monitor.append_alert_unique(&self.op_id, refusal).await;
+            }
+        }
+        // And what the link broker refused, once each (SPEC R-LINK.6), so a
+        // tool that hid the helper's line still leaves it in the result.
+        #[cfg(unix)]
+        if let Some(links) = &self.links {
+            for refusal in links.refusal_lines() {
+                monitor.append_alert_unique(&self.op_id, refusal).await;
+            }
+        }
+        let op_id = self.op_id.clone();
+        // A report still to make goes to the log and the audit trail only:
+        // this ending has no result built to carry it.
+        let released = self.release().await;
+        let ending = monitor.take_stop_request(&op_id).await.unwrap_or(ending);
+        let (outcome, exit_code) = ending.publish(monitor, &op_id).await;
+        audit::record_tool_complete(
+            &op_id,
+            outcome,
+            released.started.elapsed().as_millis() as u64,
+            exit_code,
+        )
+        .await;
+    }
+
+    /// Let go of everything the run holds, in the one order every path
+    /// shares: compare the deny tier with its inventory from before the spawn
+    /// (SPEC R6.1.7), saying what changed to the log and the audit trail, then
+    /// hand on the brokers, the gate and, last, the workspace (R2.7.1). The
+    /// report comes back for a result with no operation to carry it: the
+    /// synchronous path leads its text with it.
+    pub(super) async fn release(self) -> Released {
         let Self {
             op_id,
             subject,
@@ -182,26 +239,10 @@ impl RunGuards {
             #[cfg(unix)]
             links,
         } = self;
-        // What the broker refused, one line each (SPEC R-CRED.10): before the
-        // terminal transition, so a waiter observes it deterministically
-        // rather than racing the broker thread's own alert.
-        #[cfg(unix)]
-        if let Some(broker) = &broker {
-            for refusal in super::broker_refusal_lines(broker) {
-                monitor.append_alert_unique(&op_id, refusal).await;
-            }
-        }
-        // And what the link broker refused, once each (SPEC R-LINK.6), so a
-        // tool that hid the helper's line still leaves it in the result.
-        #[cfg(unix)]
-        if let Some(links) = &links {
-            for refusal in links.refusal_lines() {
-                monitor.append_alert_unique(&op_id, refusal).await;
-            }
-        }
-        if let Some(watch) = handoff {
-            let _ = finish_handoff_watch(watch, &op_id, &subject).await;
-        }
+        let handoff = match handoff {
+            Some(watch) => finish_handoff_watch(watch, &op_id, &subject).await,
+            None => None,
+        };
         #[cfg(unix)]
         drop(broker);
         #[cfg(unix)]
@@ -209,16 +250,18 @@ impl RunGuards {
         // The gate was taken after the lease: handed on first.
         drop(mutex);
         drop(lease);
-        let ending = monitor.take_stop_request(&op_id).await.unwrap_or(ending);
-        let (outcome, exit_code) = ending.publish(monitor, &op_id).await;
-        audit::record_tool_complete(
-            &op_id,
-            outcome,
-            started.elapsed().as_millis() as u64,
-            exit_code,
-        )
-        .await;
+        Released { handoff, started }
     }
+}
+
+/// What a run's guards leave once they have been let go.
+pub(super) struct Released {
+    /// What changed in the deny tier while it ran (SPEC R6.1.7), already in
+    /// the log and the audit trail; `None` when nothing did, or nothing was
+    /// watched.
+    pub(super) handoff: Option<HandoffReport>,
+    /// When the run's clock started, for its audit record's duration.
+    pub(super) started: Instant,
 }
 
 #[cfg(test)]
