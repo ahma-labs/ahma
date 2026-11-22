@@ -91,7 +91,7 @@ pub(super) struct OpSink {
     warn_near_limit: bool,
     /// The bytes the command wrote, unbounded and unredacted, for a caller
     /// that waits for its result (SPEC R2.1): what it reads is what the
-    /// command printed, byte for byte, as the direct path gave it. `None`
+    /// command printed, byte for byte, as the command wrote it. `None`
     /// for a caller that collects the operation's bounded result instead.
     raw: Option<RawOutput>,
 }

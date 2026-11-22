@@ -33,6 +33,7 @@ mod file_tools_integration_test;
 mod freeform_args_test;
 mod full_system_integration_bug_test;
 mod generate_schema_test;
+mod hook_output_test;
 mod hub_lifecycle_test;
 mod link_broker_e2e_test;
 mod linux_legacy_kernel_sandbox_test;

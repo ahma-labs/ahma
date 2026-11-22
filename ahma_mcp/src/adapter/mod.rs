@@ -12,19 +12,14 @@
 //!
 //! ## How it Works: The Execution Paths
 //!
-//! To achieve high performance without sacrificing correctness, the adapter chooses
-//! between two primary execution paths:
-//!
-//! 1. **Performance Path (Async)**:
-//!    By default, tools execute asynchronously in a spawned task. Results are
-//!    tracked via the [`OperationMonitor`](crate::operation_monitor::OperationMonitor)
-//!    and pushed back via notifications.
-//!
-//! 2. **Correctness Path (Synchronous / Direct Spawn)**:
-//!    Some operations (like `cargo add` or configuration changes) require immediate
-//!    completion to prevent race conditions. When a tool is marked as `synchronous`
-//!    or when the `--sync` flag is active, the adapter spawns a direct process,
-//!    waiting for it to exit before returning.
+//! Every command runs one way: as a tracked operation in a spawned task
+//! (`drive`), its result held by the
+//! [`OperationMonitor`](crate::operation_monitor::OperationMonitor) and pushed
+//! back via notifications. Synchronous is only a waiting policy at the edge
+//! (SPEC R2.1): an MCP call that asks to wait waits for its operation within
+//! the client's budget, and a caller with no later call to collect a result
+//! with — a terminal hook, the CLI one-shot — waits for it to end
+//! ([`Adapter::run_to_completion`]).
 //!
 //! ## Key Design Trade-offs
 //!
@@ -132,36 +127,6 @@ fn printed_before_kill(raw: &sink::RawOutput) -> String {
         .join("\n")
 }
 
-/// Result of one prepared synchronous run: what the caller gets back, plus the
-/// two facts the audit log needs (how it ended, and with which exit code).
-struct SyncRun {
-    outcome: audit::Outcome,
-    exit_code: Option<i32>,
-    result: Result<String, anyhow::Error>,
-}
-
-impl SyncRun {
-    /// Lead the result with a trust-handoff alert (SPEC R6.1.7). A typed
-    /// sandbox denial keeps its type, because the MCP boundary turns it into a
-    /// structured `sandbox_denial` payload; the alert then reaches the log and
-    /// the audit trail only.
-    fn with_handoff_alert(mut self, alert: &str) -> Self {
-        self.result = with_handoff_alert(self.result, alert);
-        self
-    }
-
-    /// A run that never produced an exit status (spawn or sandbox-wrap failure).
-    fn failed(err: anyhow::Error) -> Self {
-        Self {
-            outcome: audit::Outcome::Failed,
-            exit_code: None,
-            result: Err(err),
-        }
-    }
-}
-
-type OutputReadTask = JoinHandle<std::io::Result<Vec<u8>>>;
-
 #[derive(Debug, Default)]
 struct BoundedLineCollector {
     lines: VecDeque<String>,
@@ -217,8 +182,8 @@ impl BoundedLineCollector {
 ///
 /// # Responsibilities
 ///
-/// *   **Command Execution**: Executes tools via standard process spawning (async tasks or
-///     synchronous direct spawns).
+/// *   **Command Execution**: Executes tools via standard process spawning, each one a
+///     tracked operation in its own task.
 /// *   **Resource Management**: Manages temporary files created for complex arguments and
 ///     ensures they are cleaned up.
 /// *   **Operation Tracking**: Uses `OperationMonitor` to track the status (running, completed,
@@ -261,7 +226,7 @@ pub struct Adapter {
     /// process. Disabled unless the embedder opts in
     /// ([`Self::with_workspace_queue`]); the `ahma` binary always does.
     workspace_queue: workspace_queue::WorkspaceQueue,
-    /// Told once when a synchronous call has to wait for its workspace (SPEC
+    /// Told once when a caller that waits has to wait for its workspace (SPEC
     /// R2.7.1): a terminal hook writes it to stderr, so the harness's own
     /// shell result explains the delay instead of hanging silently.
     queue_wait_notice: Option<QueueWaitNotice>,
@@ -370,7 +335,7 @@ impl Adapter {
         self
     }
 
-    /// Where a synchronous call says that it is waiting for its workspace
+    /// Where a caller that waits ([`Self::run_to_completion`]) says that it is waiting for its workspace
     /// (SPEC R2.7.1). Without one the wait is logged at `info`.
     pub fn with_queue_wait_notice(mut self, notice: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         self.queue_wait_notice = Some(QueueWaitNotice(notice));
@@ -806,206 +771,6 @@ impl Adapter {
             .await
     }
 
-    /// Synchronously executes a command and returns the result directly.
-    ///
-    /// This method bypasses the async operation queue and runs the command directly, waiting for it to complete.
-    /// It captures and returns the combined stdout and stderr.
-    ///
-    /// # Arguments
-    ///
-    /// * `command` - The command to execute (e.g., "ls", "grep").
-    /// * `args` - Optional map of arguments (see `prepare_command_and_args`).
-    /// * `working_dir` - Directory to execute the command in. Must be within allowed sandbox scopes.
-    /// * `timeout_seconds` - Optional timeout in seconds (overrides default).
-    /// * `subcommand_config` - Optional configuration for dealing with subcommands and aliases.
-    ///
-    /// # Returns
-    ///
-    /// Returns the command output (stdout + stderr) as a `String` if successful.
-    /// Returns an error if execution fails or times out.
-    ///
-    /// Not an `async fn` of its own: it hands back
-    /// [`Self::execute_sync_in_dir_as`]'s future rather than wrapping it in
-    /// another, which would nest every server future one level deeper.
-    pub fn execute_sync_in_dir(
-        &self,
-        command: &str,
-        args: Option<Map<String, serde_json::Value>>,
-        working_dir: &str,
-        timeout_seconds: Option<u64>,
-        subcommand_config: Option<&crate::config::SubcommandConfig>,
-    ) -> impl std::future::Future<Output = Result<String, anyhow::Error>> {
-        self.execute_sync_in_dir_as(
-            None,
-            command,
-            args,
-            working_dir,
-            timeout_seconds,
-            subcommand_config,
-        )
-    }
-
-    /// [`Self::execute_sync_in_dir`] as operation `id`: the id the caller
-    /// already recorded this call under (the task vault, progress), so the
-    /// execution audit log names it the same and the logs can be joined.
-    /// `None` mints one, from the one counter every id comes from.
-    #[tracing::instrument(skip(self, args, subcommand_config), fields(working_dir))]
-    pub async fn execute_sync_in_dir_as(
-        &self,
-        id: Option<&str>,
-        command: &str,
-        args: Option<Map<String, serde_json::Value>>,
-        working_dir: &str,
-        timeout_seconds: Option<u64>,
-        subcommand_config: Option<&crate::config::SubcommandConfig>,
-    ) -> Result<String, anyhow::Error> {
-        tracing::debug!(
-            "execute_sync_in_dir: command='{}', working_dir='{}'",
-            command,
-            working_dir,
-        );
-
-        // Validate working directory against sandbox scope.
-        let safe_wd = self.validate_working_dir(working_dir, command).await?;
-
-        // A whole-line `open <URL>` runs as the link helper (SPEC R-LINK.10).
-        // The audit keeps the line as written; everything else runs the
-        // helper's line.
-        #[cfg(unix)]
-        let substitute =
-            shell_command_line(args.as_ref()).and_then(|line| self.link_open_substitute(line));
-        #[cfg(unix)]
-        let (args, written, link_note) = match substitute {
-            Some((runs, said)) => {
-                let written = args.clone();
-                let mut args = args;
-                if let Some(map) = args.as_mut() {
-                    map.insert("command".to_string(), serde_json::Value::String(runs));
-                }
-                (args, written, Some(said))
-            }
-            None => (args, None, None),
-        };
-        #[cfg(not(unix))]
-        let (written, link_note): (Option<Map<String, serde_json::Value>>, Option<String>) =
-            (None, None);
-
-        let (program, args_vec) = self
-            .prepare_command_and_args(command, args.as_ref(), subcommand_config, &safe_wd)
-            .await?;
-
-        tracing::info!(
-            "Prepared command: program='{}', args={:?}",
-            program,
-            args_vec
-        );
-
-        // Provenance before execution (SPEC R-HANDOFF.10): the synchronous
-        // path has no operation, so the id is the caller's, or one minted
-        // here, so the `tool_call` and its `tool_complete` can be correlated.
-        let op_id = id.map_or_else(|| generate_id(command, command), str::to_string);
-        let safe_wd_str = safe_wd.to_string_lossy().into_owned();
-
-        // Workspace write queue (SPEC R2.7): the synchronous path — terminal
-        // hooks and CLI one-shots — queues exactly like an async operation, so
-        // a hooked `sed -i` never lands in the middle of an MCP
-        // `cargo nextest run`.
-        let (lane, queue_reason) =
-            self.resolve_lane_with_reason(args.as_ref(), subcommand_config, &safe_wd);
-        let title = shell_command_line(written.as_ref().or(args.as_ref()))
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{program} {}", args_vec.join(" ")));
-        let timeout =
-            self.sync_timeout(timeout_seconds.or_else(|| self.declared_timeout(args.as_ref())));
-        let soft_hold = self.soft_hold_for(args.as_ref(), subcommand_config, lane);
-        let admission = self.admit(lane, &safe_wd, &op_id, &title, queue_reason, soft_hold);
-        // Its own wait, not `RunGuards::begin`'s: bounded by the command's
-        // timeout, and a turn that never comes is an error returned here.
-        let lease = match admission.into_ticket() {
-            Some(ticket) => Some(self.acquire_for_sync(ticket, timeout).await?),
-            None => None,
-        };
-
-        // Sync only: the `tool_call` is written once the turn has come, so a
-        // call that gave up waiting leaves no record (the async path writes
-        // it before queueing).
-        audit::record_tool_call(
-            &op_id,
-            command,
-            written.as_ref().or(args.as_ref()),
-            &safe_wd_str,
-            &program,
-            &args_vec,
-        )
-        .await;
-
-        // SPEC R6.1.7: where the kernel does not hold the deny tier, take its
-        // inventory now and compare after the process is gone — before the
-        // lease is released, so the next command's writes are not this one's.
-        // Sync only: taken before the brokers are leased and the sandbox is
-        // built (the async path takes it just before the spawn).
-        let handoff = if self.watches_handoff(lane) {
-            Some(begin_handoff_watch(&self.sandbox, &safe_wd).await)
-        } else {
-            None
-        };
-
-        // What the call holds until the command has ended: the async path's
-        // guards, without an operation. The clock starts here, after the
-        // wait for the workspace. Sync only: no `tools.mutex_groups` gate
-        // (SPEC R2.7.2) and no drift report (R2.7.6).
-        let mut guards = guards::RunGuards::held(&op_id, command, lease);
-        guards.watch_handoff(handoff);
-        // The line it runs: for a whole-line `open <URL>`, the link helper's
-        // (SPEC R-LINK.10). Sync only: its brokers and the long-running check
-        // are matched on this line; the async path matches the line as written.
-        let line = shell_command_line(args.as_ref());
-        let piped = piped::PipedSpawn {
-            executor: self.command_executor.as_ref(),
-            sandbox: &self.sandbox,
-            #[cfg(unix)]
-            credential_brokers: self.credential_brokers.as_ref(),
-            #[cfg(unix)]
-            link_brokers: self.link_brokers.as_ref(),
-            program: &program,
-            args: &args_vec,
-            working_dir: &safe_wd,
-            lane,
-            line: line.unwrap_or(command),
-            keep_leftovers: line.is_some_and(|line| self.is_declared_long_running(line)),
-        }
-        .build(&mut guards);
-        let mut run = match piped {
-            Ok(piped) => {
-                self.run_sync_prepared(
-                    line.unwrap_or(command),
-                    &op_id,
-                    piped,
-                    &safe_wd,
-                    timeout,
-                    &guards,
-                )
-                .await
-            }
-            Err(e) => SyncRun::failed(e),
-        };
-        let released = guards.release().await;
-        if let Some(report) = released.handoff {
-            run = run.with_handoff_alert(&report.render_alert());
-        }
-        audit::record_tool_complete(
-            &op_id,
-            run.outcome,
-            released.started.elapsed().as_millis() as u64,
-            run.exit_code,
-        )
-        .await;
-        match link_note {
-            Some(line) => said_first(run.result, &line),
-            None => run.result,
-        }
-    }
-
     /// Whether a human declared this shell line long-running (SPEC R2.7.10):
     /// what it starts may stay running after it (R-PROC.5).
     fn is_declared_long_running(&self, line: &str) -> bool {
@@ -1018,241 +783,6 @@ impl Adapter {
         shell_command_line(args)
             .and_then(|line| lane::long_running_entry(line, self.workspace_queue.long_running()))
             .and_then(|entry| entry.timeout_secs)
-    }
-
-    /// The synchronous path's timeout: the caller's, else the pool default.
-    fn sync_timeout(&self, timeout_seconds: Option<u64>) -> Duration {
-        timeout_seconds
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| self.shell_pool.config().command_timeout)
-    }
-
-    /// Wait for a synchronous call's turn in its workspace (SPEC R2.7.1). The
-    /// synchronous path has no operation to show as queued, so the wait is
-    /// bounded by the command's own timeout and announced once; a turn that
-    /// never comes is an error saying the command did **not** run and who held
-    /// the workspace, never a silent hang until the caller gives up.
-    async fn acquire_for_sync(
-        &self,
-        ticket: workspace_queue::Ticket,
-        timeout: Duration,
-    ) -> Result<workspace_queue::Lease, anyhow::Error> {
-        let last_ahead = parking_lot::Mutex::new(Vec::new());
-        let announced = std::sync::atomic::AtomicBool::new(false);
-        let waiting = ticket.title().to_string();
-        let reason = ticket.reason().map(str::to_string);
-        let observe = |ahead: &[workspace_queue::HolderInfo]| {
-            *last_ahead.lock() = ahead.to_vec();
-            if !announced.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let line = format!(
-                    "ahma: {}",
-                    queued_message(Some(&waiting), reason.as_deref(), ahead)
-                );
-                match &self.queue_wait_notice {
-                    Some(notice) => (notice.0)(&line),
-                    None => tracing::info!("{line}"),
-                }
-            }
-        };
-        let cancel = tokio_util::sync::CancellationToken::new();
-        match tokio::time::timeout(timeout, ticket.acquire(&cancel, &observe)).await {
-            Ok(Ok(lease)) => Ok(lease),
-            Ok(Err(e)) => Err(anyhow::anyhow!("Not run: {e}")),
-            Err(_) => {
-                let ahead = last_ahead.lock().clone();
-                Err(anyhow::anyhow!(
-                    "Not run: the workspace stayed busy for its whole {}s timeout. {}. \
-                     Retry once that finishes, or cancel it.",
-                    timeout.as_secs(),
-                    queued_message(Some(&waiting), reason.as_deref(), &ahead)
-                ))
-            }
-        }
-    }
-
-    /// Spawn, wait for, and interpret one synchronous command, built by
-    /// [`piped::PipedSpawn::build`] as the async piped path builds its own.
-    /// `command` is the line it runs, which its failure is explained by;
-    /// `guards` hold its brokers, whose refusals its result says.
-    ///
-    /// Split out of [`Self::execute_sync_in_dir`] so that every terminal path —
-    /// spawn failure, timeout, non-zero exit, sandbox denial — funnels through a
-    /// single return value the caller can turn into exactly one `tool_complete`
-    /// audit event.  Recording completion at each `return` instead would be one
-    /// forgotten branch away from a `tool_call` that never closes.
-    async fn run_sync_prepared(
-        &self,
-        command: &str,
-        op_id: &str,
-        piped: piped::PipedCommand,
-        safe_wd: &std::path::Path,
-        timeout: Duration,
-        guards: &guards::RunGuards,
-    ) -> SyncRun {
-        #[cfg(not(unix))]
-        let _ = guards;
-        let piped::PipedCommand {
-            mut cmd,
-            denial_tag,
-        } = piped;
-        let spawned_at = Instant::now();
-
-        // Spawn manually (rather than `cmd.output()`) so a timeout can take down
-        // the whole process group — `cmd.output()` drops the future on timeout,
-        // and `kill_on_drop` then kills only the direct `sandbox-exec` child,
-        // orphaning `sh`/`cargo`/`rustc` descendants. `base_command` pipes
-        // stdout/stderr and makes the child a process-group leader.
-        // Match `cmd.output()`'s guarantee that stdout/stderr are captured.
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut guard = match ProcessGroupGuard::spawn(&mut cmd) {
-            Ok(guard) => guard,
-            Err(e) => {
-                return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
-            }
-        };
-
-        // Read stdout/stderr concurrently with `wait()` (not after `wait()`
-        // returns) so a chatty child can't fill the pipe buffer and deadlock —
-        // the same guarantee `wait_with_output()` gave us. We can no longer use
-        // `wait_with_output()` itself, though: it consumes `child` by value, and
-        // on timeout the cancelled future would drop (and silently orphan) the
-        // child instead of letting us route the kill through the shared
-        // `kill_process_tree` chokepoint below, so `child` has to stay owned
-        // here.
-        let (stdout_task, stderr_task) = Self::spawn_output_reader_tasks(guard.child_mut());
-
-        let wait_res = tokio::time::timeout(timeout, guard.child_mut().wait()).await;
-
-        let left_running;
-        let output = match wait_res {
-            Err(_) => {
-                // Kill the entire process group so build descendants don't
-                // orphan — the same cross-crate chokepoint
-                // (`shell_pool::kill_process_tree`) the async streaming path
-                // uses, which additionally confirms the reap and supports
-                // Windows Job Objects.
-                if !kill_process_tree(guard.child_mut()).await {
-                    tracing::warn!(
-                        "run_sync_prepared: operation {} timed out but its process did not reap cleanly",
-                        op_id
-                    );
-                }
-                // Keep what it printed: a command stopped at its limit is the
-                // one whose last lines say what it was stuck on.
-                let output = Self::output_after_kill(stdout_task, stderr_task).await;
-                return SyncRun {
-                    outcome: audit::Outcome::TimedOut,
-                    exit_code: None,
-                    result: Err(time_limit::LimitReached {
-                        limit_secs: timeout.as_secs(),
-                        output,
-                    }
-                    .into()),
-                };
-            }
-            Ok(Err(e)) => {
-                return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
-            }
-            Ok(Ok(status)) => {
-                // What the command left running ends with it (SPEC R-PROC.5).
-                left_running = sandbox::leftovers::note(&guard.end_leftovers().await);
-                let _ = guard.disarm();
-                // The child has exited, so its pipes are at (or imminently
-                // reaching) EOF; these joins are not a second wait for the
-                // process itself.
-                let stdout = stdout_task
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default();
-                let stderr = stderr_task
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default();
-                RawExit {
-                    status,
-                    stdout,
-                    stderr,
-                }
-            }
-        };
-
-        let explain = WaitedRun {
-            sandbox: &self.sandbox,
-            scope_grant_notifier: self.scope_grant_notifier.as_ref(),
-            op_id,
-            command,
-            working_dir: safe_wd,
-            guards,
-        };
-        let raw = sink::RawOutput {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            left_running,
-        };
-        let exit_code = output.status.code();
-        let result = waited_result(
-            &explain,
-            exit_code,
-            raw,
-            denial_tag.as_deref(),
-            spawned_at.elapsed(),
-        )
-        .await;
-        SyncRun {
-            outcome: if result.is_ok() {
-                audit::Outcome::Completed
-            } else {
-                audit::Outcome::Failed
-            },
-            exit_code,
-            result,
-        }
-    }
-
-    fn spawn_output_reader_tasks(
-        child: &mut tokio::process::Child,
-    ) -> (OutputReadTask, OutputReadTask) {
-        let stdout_pipe = child.stdout.take().expect("stdout piped");
-        let stderr_pipe = child.stderr.take().expect("stderr piped");
-        let stdout_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let mut stdout_pipe = stdout_pipe;
-            tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf).await?;
-            Ok(buf)
-        });
-        let stderr_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let mut stderr_pipe = stderr_pipe;
-            tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut buf).await?;
-            Ok(buf)
-        });
-        (stdout_task, stderr_task)
-    }
-
-    /// What a killed command had printed, stdout then stderr. Its pipes close
-    /// once the process tree is gone; a descendant that escaped the kill and
-    /// still holds one is not waited for.
-    async fn output_after_kill(stdout: OutputReadTask, stderr: OutputReadTask) -> String {
-        async fn drain(mut task: OutputReadTask) -> String {
-            match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
-                Ok(Ok(Ok(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
-                Ok(_) => String::new(),
-                Err(_) => {
-                    task.abort();
-                    String::new()
-                }
-            }
-        }
-        let (out, err) = tokio::join!(drain(stdout), drain(stderr));
-        [out, err]
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     /// Asynchronously starts a command, returning an operation ID immediately.
@@ -1435,10 +965,9 @@ impl Adapter {
         let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
         let safe_wd_str = safe_wd.to_string_lossy().into_owned();
 
-        // A whole-line `open <URL>` runs as the link helper (SPEC R-LINK.10),
-        // as on the synchronous path: the operation and the audit keep the
-        // line as written, the process runs the helper's line, and the
-        // operation says so in one alert.
+        // A whole-line `open <URL>` runs as the link helper (SPEC R-LINK.10):
+        // the operation and the audit keep the line as written, the process
+        // runs the helper's line, and the operation says so in one alert.
         #[cfg(unix)]
         let (run_args, link_note) = match shell_command_line(args.as_ref())
             .and_then(|line| self.link_open_substitute(line))
@@ -1741,13 +1270,6 @@ impl Adapter {
 // ---------------------------------------------------------------------------
 // Extracted execution helpers (batch vs streaming)
 // ---------------------------------------------------------------------------
-
-/// What a synchronous run's process left: how it exited and what it wrote.
-struct RawExit {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
 
 /// What a caller that waits for its command is told, and with what (SPEC
 /// R2.1): its result is explained here, once, whichever way it ran.
@@ -2197,7 +1719,7 @@ impl Drop for StopOnDrop {
     }
 }
 
-/// Where a synchronous call announces a wait for its workspace; see
+/// Where a caller that waits announces a wait for its workspace; see
 /// [`Adapter::with_queue_wait_notice`].
 #[derive(Clone)]
 struct QueueWaitNotice(Arc<dyn Fn(&str) + Send + Sync>);
@@ -3162,7 +2684,7 @@ async fn record_failure_diagnostics(
     // An out-of-scope runtime denial cannot be returned as a typed McpError on
     // the async path (the result is delivered later as text), so attach the
     // grant -> restart -> retry remediation as an operation alert. Mirrors the
-    // typed `RuntimeDenial` the sync path returns.
+    // typed `RuntimeDenial` a waiting caller gets (`explain_failed_run`).
     let mut explained = false;
     match out_of_scope_runtime_denial(sandbox, stderr_str, stdout_str, working_dir) {
         Some((target, access)) => {
@@ -3632,7 +3154,8 @@ mod tests {
             &ExecutionMode::Synchronous,
         );
         let out = adapter
-            .execute_sync_in_dir(
+            .run_to_completion(
+                None,
                 crate::shell_pool::platform_shell_program(),
                 Some(shell_args("open 'HTTPS://Example.com/z?a=1&b=2'")),
                 &ws.to_string_lossy(),
@@ -4052,7 +3575,8 @@ mod tests {
             &ExecutionMode::Synchronous,
         );
         let err = adapter
-            .execute_sync_in_dir(
+            .run_to_completion(
+                None,
                 crate::shell_pool::platform_shell_program(),
                 Some(shell_args(line)),
                 &td.path().to_string_lossy(),
@@ -4069,55 +3593,6 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("exceeded timeout limit"), "{text}");
         assert!(text.contains("before-the-limit"), "{text}");
-    }
-
-    /// SPEC R2.7.1: the synchronous path (terminal hooks, CLI one-shots)
-    /// waits for the workspace no longer than its
-    /// own timeout, says it is waiting, and — if the turn never comes — reports
-    /// that the command did not run and who held the workspace.
-    #[tokio::test]
-    async fn a_sync_call_waits_for_the_workspace_no_longer_than_its_timeout() {
-        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
-        let notices = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
-        let sink = notices.clone();
-        let adapter = adapter
-            .with_workspace_queue(workspace_queue::WorkspaceQueue::with_lock_dir(
-                true,
-                Some(td.path().join("locks")),
-            ))
-            .with_queue_wait_notice(Arc::new(move |line: &str| {
-                sink.lock().push(line.to_string())
-            }));
-        let key = adapter.workspace_key_for(td.path());
-        let _held = adapter
-            .workspace_queue()
-            .enqueue(
-                &key,
-                workspace_queue::HolderInfo::new("op_holder", "cargo nextest run"),
-            )
-            .unwrap()
-            .acquire(&tokio_util::sync::CancellationToken::new(), &|_| {})
-            .await
-            .unwrap();
-
-        let started = Instant::now();
-        let err = adapter
-            .execute_sync_in_dir("echo", None, &td.path().to_string_lossy(), Some(1), None)
-            .await
-            .expect_err("the workspace never frees up, so the command must not run");
-        let text = err.to_string();
-        assert!(text.contains("Not run"), "{text}");
-        assert!(text.contains("op_holder"), "names the holder: {text}");
-        assert!(
-            started.elapsed()
-                < ahma_common::timeouts::TestTimeouts::get(
-                    ahma_common::timeouts::TimeoutCategory::Quick
-                ),
-            "bounded by its own one-second timeout"
-        );
-        let notices = notices.lock();
-        assert_eq!(notices.len(), 1, "one notice per wait: {notices:?}");
-        assert!(notices[0].contains("op_holder"), "{notices:?}");
     }
 
     /// SPEC R2.7.10: a command the human declared long-running takes no
@@ -4187,7 +3662,8 @@ mod tests {
             let dir = td.path().to_string_lossy().into_owned();
             async move {
                 adapter
-                    .execute_sync_in_dir(
+                    .run_to_completion(
+                        None,
                         crate::shell_pool::platform_shell_program(),
                         Some(shell_args(line)),
                         &dir,
@@ -4256,7 +3732,8 @@ mod tests {
 
         let line = "python3 -c pass";
         let _ = adapter
-            .execute_sync_in_dir(
+            .run_to_completion(
+                None,
                 crate::shell_pool::platform_shell_program(),
                 Some(shell_args(line)),
                 &td.path().to_string_lossy(),
@@ -4406,7 +3883,8 @@ mod tests {
         let quick =
             ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
         let wd = td.path().to_string_lossy().into_owned();
-        let run = adapter.execute_sync_in_dir(
+        let run = adapter.run_to_completion(
+            None,
             crate::shell_pool::platform_shell_program(),
             Some(shell_args(&line)),
             &wd,
@@ -4526,98 +4004,5 @@ mod tests {
         let adapter = Adapter::new(monitor, shell_pool, sandbox).unwrap();
         // Shutdown with no active tasks should complete without error
         adapter.shutdown().await;
-    }
-
-    /// SPEC R2.7.7: a synchronous command run under a workspace lease
-    /// inherits it, as an async one does, so an ahma it starts (a hooked
-    /// `cargo` that runs `ahma`) does not wait for the lease its own caller
-    /// holds.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_sync_command_inherits_its_workspace_lease() {
-        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
-        let locks = tempfile::tempdir().unwrap();
-        let adapter = adapter.with_workspace_queue(workspace_queue::WorkspaceQueue::with_lock_dir(
-            true,
-            Some(locks.path().to_path_buf()),
-        ));
-        let scope = dunce::canonicalize(td.path()).unwrap();
-        let held = workspace_queue::child_lease_env(&adapter.workspace_key_for(&scope));
-        // Writes a file, so it runs in the exclusive lane, under a lease.
-        let line = "touch out.txt; printf 'lease=%s\\n' \"$AHMA_HELD_WORKSPACE_LEASE\"";
-        let config = crate::AhmaMcpService::build_shell_subcommand_config(
-            Some(30),
-            &ExecutionMode::Synchronous,
-        );
-        let out = adapter
-            .execute_sync_in_dir(
-                crate::shell_pool::platform_shell_program(),
-                Some(shell_args(line)),
-                &scope.to_string_lossy(),
-                Some(30),
-                Some(&config),
-            )
-            .await
-            .expect("the command succeeds");
-        assert!(out.contains(&format!("lease={held}")), "{out}");
-    }
-
-    /// The synchronous path does not wait for a `tools.mutex_groups` gate
-    /// (SPEC R2.7.2), where the async paths do: a held group does not stop a
-    /// sync command in it. Pinned as it is today, so a change to it is a
-    /// decision, made in its own PR with its SPEC text, not a side effect of
-    /// sharing the spawn with the async path.
-    #[tokio::test]
-    async fn the_sync_path_does_not_wait_for_a_mutex_group() {
-        let td = tempfile::tempdir().unwrap();
-        let locks = tempfile::tempdir().unwrap();
-        let scope = dunce::canonicalize(td.path()).unwrap();
-        let group = ahma_common::config::MutexGroupConfig {
-            name: "echo".to_string(),
-            prefixes: vec!["echo".to_string()],
-            max_wait_secs: 0,
-        };
-        let registry = Arc::new(CommandMutexRegistry::from_config_with_lock_dir(
-            std::slice::from_ref(&group),
-            Some(locks.path().to_path_buf()),
-        ));
-        let adapter = Adapter::new_with_registry(
-            Arc::new(OperationMonitor::new(
-                crate::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(30)),
-            )),
-            Arc::new(ShellPoolManager::new(
-                crate::shell_pool::ShellPoolConfig::default(),
-            )),
-            Arc::new(
-                crate::sandbox::Sandbox::new(
-                    vec![scope.clone()],
-                    crate::sandbox::SandboxMode::Test,
-                    Default::default(),
-                )
-                .unwrap(),
-            ),
-            registry.clone(),
-        )
-        .unwrap();
-        // Another command holds the group in this workspace throughout.
-        let _held = registry
-            .acquire(&group, &adapter.workspace_key_for(&scope))
-            .await
-            .expect("the group is free");
-        let config = crate::AhmaMcpService::build_shell_subcommand_config(
-            Some(30),
-            &ExecutionMode::Synchronous,
-        );
-        let out = adapter
-            .execute_sync_in_dir(
-                crate::shell_pool::platform_shell_program(),
-                Some(shell_args("echo not-gated")),
-                &scope.to_string_lossy(),
-                Some(30),
-                Some(&config),
-            )
-            .await
-            .expect("a held group does not stop a sync command");
-        assert!(out.contains("not-gated"), "{out}");
     }
 }

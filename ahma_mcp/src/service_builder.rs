@@ -88,8 +88,9 @@ impl<'a> ServiceBuilder<'a> {
             sandbox,
             guidance: Some(GuidanceConfig::default()),
             skip_availability_probes: config.skip_availability_probes,
-            // The legacy direct path, only for CLI one-shot mode. The server's
-            // sync/async policy is `config.execution_mode`, read per call.
+            // CLI one-shot mode: wait for each operation with no client budget
+            // (SPEC R2.1). The server's sync/async policy is
+            // `config.execution_mode`, read per call.
             force_synchronous: false,
             defer_sandbox: config.defer_sandbox,
             monitor_rate_limit: config.monitor_rate_limit_secs,

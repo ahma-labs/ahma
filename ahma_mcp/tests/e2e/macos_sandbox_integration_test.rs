@@ -847,7 +847,7 @@ async fn test_a_refusal_is_reported_from_the_kernels_record() {
     );
     args.insert("c_flag".into(), serde_json::json!(true));
     let err = adapter
-        .execute_sync_in_dir("bash", Some(args), &wd, Some(30), Some(&shell))
+        .run_to_completion(None, "bash", Some(args), &wd, Some(30), Some(&shell))
         .await
         .expect_err("the write is refused");
     // From the kernel's record when it arrives; macOS drops some under load
@@ -881,7 +881,7 @@ async fn test_a_refusal_is_reported_from_the_kernels_record() {
     );
     args.insert("c_flag".into(), serde_json::json!(true));
     let err = adapter
-        .execute_sync_in_dir("bash", Some(args), &wd, Some(30), Some(&shell))
+        .run_to_completion(None, "bash", Some(args), &wd, Some(30), Some(&shell))
         .await
         .expect_err("it fails");
     assert!(

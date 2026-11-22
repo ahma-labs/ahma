@@ -5,16 +5,12 @@ use std::time::Instant;
 
 use super::{PublishEnding, audit, finish_handoff_watch, workspace_queue};
 use crate::operation_monitor::{CommandOutput, OperationMonitor, Terminal};
-use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch};
+use crate::sandbox::handoff_watch::HandoffWatch;
 
 /// What a running command holds until it has ended: its place in the
 /// workspace queue (SPEC R2.7.1), its mutex group gate (R2.7.2), the
 /// deny-tier watch (R6.1.7), its SSH key broker (R-CRED.1) and its link
 /// broker (R-LINK.1).
-///
-/// The synchronous path holds them too ([`RunGuards::held`]). It has no
-/// operation to end, so it lets go of them with [`RunGuards::release`] — the
-/// same steps in the same order — and returns its result inline.
 ///
 /// [`RunGuards::end`] is the one way to end an operation, and it takes the
 /// guards by value. Every ending therefore runs the same steps in the same
@@ -74,11 +70,8 @@ impl RunGuards {
     }
 
     /// The guards of a run that holds `lease`, if it took one, with its clock
-    /// started now. The synchronous path makes its own here: it waits for
-    /// its turn itself, bounded by its own timeout
-    /// ([`super::Adapter::acquire_for_sync`]), and starts its clock after
-    /// that wait, so its audit record has never counted time queued.
-    pub(super) fn held(op_id: &str, subject: &str, lease: Option<workspace_queue::Lease>) -> Self {
+    /// started now.
+    fn held(op_id: &str, subject: &str, lease: Option<workspace_queue::Lease>) -> Self {
         Self {
             op_id: op_id.to_string(),
             subject: subject.to_string(),
@@ -224,10 +217,8 @@ impl RunGuards {
     /// Let go of everything the run holds, in the one order every path
     /// shares: compare the deny tier with its inventory from before the spawn
     /// (SPEC R6.1.7), saying what changed to the log and the audit trail, then
-    /// hand on the brokers, the gate and, last, the workspace (R2.7.1). The
-    /// report comes back for a result with no operation to carry it: the
-    /// synchronous path leads its text with it.
-    pub(super) async fn release(self) -> Released {
+    /// hand on the brokers, the gate and, last, the workspace (R2.7.1).
+    async fn release(self) -> Released {
         let Self {
             op_id,
             subject,
@@ -240,10 +231,9 @@ impl RunGuards {
             #[cfg(unix)]
             links,
         } = self;
-        let handoff = match handoff {
-            Some(watch) => finish_handoff_watch(watch, &op_id, &subject).await,
-            None => None,
-        };
+        if let Some(watch) = handoff {
+            finish_handoff_watch(watch, &op_id, &subject).await;
+        }
         #[cfg(unix)]
         drop(broker);
         #[cfg(unix)]
@@ -251,18 +241,14 @@ impl RunGuards {
         // The gate was taken after the lease: handed on first.
         drop(mutex);
         drop(lease);
-        Released { handoff, started }
+        Released { started }
     }
 }
 
 /// What a run's guards leave once they have been let go.
-pub(super) struct Released {
-    /// What changed in the deny tier while it ran (SPEC R6.1.7), already in
-    /// the log and the audit trail; `None` when nothing did, or nothing was
-    /// watched.
-    pub(super) handoff: Option<HandoffReport>,
+struct Released {
     /// When the run's clock started, for its audit record's duration.
-    pub(super) started: Instant,
+    started: Instant,
 }
 
 #[cfg(test)]

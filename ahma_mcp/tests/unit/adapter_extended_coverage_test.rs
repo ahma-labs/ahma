@@ -70,7 +70,8 @@ async fn exec_echo_sync(
     let adapter = create_test_adapter().await;
     let temp = tempdir().unwrap();
     adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "echo",
             args,
             temp.path().to_str().unwrap(),
@@ -237,7 +238,8 @@ async fn test_execute_sync_command_failure() {
 
     // Running a command that doesn't exist should fail
     let result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "nonexistent_command_12345",
             None,
             temp.path().to_str().unwrap(),
@@ -256,7 +258,8 @@ async fn test_execute_sync_timeout() {
 
     // Very short timeout should cause timeout error
     let result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "sleep 10",
             None,
             temp.path().to_str().unwrap(),
@@ -422,7 +425,7 @@ async fn test_empty_command_error() {
 
     // Empty command should fail with a proper error, not panic
     let result = adapter
-        .execute_sync_in_dir("", None, temp.path().to_str().unwrap(), None, None)
+        .run_to_completion(None, "", None, temp.path().to_str().unwrap(), None, None)
         .await;
 
     assert!(result.is_err());
@@ -524,7 +527,8 @@ async fn test_path_option_validation() {
     args.insert("path_opt".to_string(), Value::String(".".to_string()));
 
     let result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "echo",
             Some(args),
             temp.path().to_str().unwrap(),
@@ -782,7 +786,8 @@ async fn test_sync_execution_stdout_only() {
     let temp = tempdir().unwrap();
 
     let result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "echo hello",
             None,
             temp.path().to_str().unwrap(),
@@ -805,7 +810,8 @@ async fn test_sync_command_exit_code_failure() {
 
     // Use a command that returns a non-zero exit code
     let result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "false", // 'false' command always returns exit code 1
             None,
             temp.path().to_str().unwrap(),
@@ -895,7 +901,8 @@ async fn test_file_arg_creates_temp_file() {
 
     // Using cat to read the temp file that should be created
     let _result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "cat",
             Some(args),
             temp.path().to_str().unwrap(),

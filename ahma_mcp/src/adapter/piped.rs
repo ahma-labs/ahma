@@ -1,17 +1,15 @@
-//! The one way a piped command's process is made ready to spawn, for the
-//! synchronous path and for [`super::drive`]'s piped runner alike.
+//! The one way a piped command's process is made ready to spawn, for
+//! [`super::drive`]'s piped runner.
 //!
-//! Both paths used to write the same steps out by hand — lease the link
-//! broker, build the sandboxed command, stamp the workspace lease, keep what a
-//! declared long-running command leaves behind, point it at its SSH key and
-//! link brokers, read its kernel-denial tag — and each new step had to be
-//! added twice. [`PipedSpawn::build`] does them once, in one order, and puts
-//! what the command holds until it ends in its [`RunGuards`].
-//!
-//! What still differs by path is the caller's: what it does with the brokers'
-//! refusals (an alert while an async command runs; lines in a synchronous
-//! call's result) and with the denial tag (remembered under the operation id;
-//! read back inline).
+//! The synchronous path and the async one used to write the same steps out by
+//! hand — lease the link broker, build the sandboxed command, stamp the
+//! workspace lease, keep what a declared long-running command leaves behind,
+//! point it at its SSH key and link brokers, read its kernel-denial tag — and
+//! each new step had to be added twice. [`PipedSpawn::build`] does them once,
+//! in one order, and puts what the command holds until it ends in its
+//! [`RunGuards`]. Since there is one execution path (SPEC R2.1), what the
+//! brokers refused is an alert while the command runs, and also lines in the
+//! result of a caller that waits for it.
 
 use std::path::Path;
 
@@ -37,9 +35,9 @@ pub(super) struct PipedSpawn<'a> {
     pub(super) working_dir: &'a Path,
     /// A read-only command is built for the read-only lane (SPEC R2.7.4).
     pub(super) lane: workspace_queue::Lane,
-    /// What its brokers are leased for (SPEC R-CRED.1, R-LINK.1). The
-    /// caller says which line: the async path the line as written, the
-    /// synchronous path the line it runs.
+    /// What its brokers are leased for (SPEC R-CRED.1, R-LINK.1): the line
+    /// as the caller wrote it, not the link helper's line a whole-line
+    /// `open <URL>` runs as.
     pub(super) line: &'a str,
     /// A human declared it long-running (SPEC R2.7.10), so what it starts may
     /// stay running after it (R-PROC.5).

@@ -56,65 +56,79 @@ async fn waited(adapter: &Adapter, dir: &Path, line: &str, limit: u64) -> Result
         .await
 }
 
-/// What a caller reads from a result, typed errors included.
-fn reads(result: &Result<String>) -> String {
-    match result {
-        Ok(out) => format!("ok: {out:?}"),
-        Err(e) => {
-            let kind = if let Some(stopped) = e.downcast_ref::<time_limit::LimitReached>() {
-                format!(
-                    "limit {}s, printed {:?}",
-                    stopped.limit_secs, stopped.output
-                )
-            } else if let Some(denial) = e.downcast_ref::<sandbox::SandboxError>() {
-                format!("sandbox {denial:?}")
-            } else {
-                "untyped".to_string()
-            };
-            // The message chain, not `{e:?}`: under `RUST_BACKTRACE` the debug
-            // form carries a backtrace whose frames differ by call path.
-            format!("err ({kind}): {e:#}")
-        }
-    }
-}
-
-/// SPEC R2.1: a caller that waits reads what it read from the direct path,
-/// byte for byte — a missing last newline, a `\r\n`, bytes that are not UTF-8,
-/// an exit code, a refusal its own output names (typed, for the hook to read)
-/// and a time limit (typed, with what it printed).
+/// SPEC R2.1: a caller that waits reads what the command printed, byte for
+/// byte — a missing last newline, a `\r\n`, bytes that are not UTF-8
+/// (replaced) — and, for a failure, the error the direct execution path
+/// returned before it was removed: the exit code with the output, a refusal
+/// its own output names as the typed runtime denial a hook reads, a time limit
+/// as the typed `LimitReached` with what it printed. Pinned from the direct
+/// path's results. A shell call's stderr is merged into its stdout.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_waited_result_reads_as_the_direct_path_read() {
     let (_td, scope) = scope();
     let adapter = adapter_in(&scope);
+    for (line, printed) in [
+        ("printf 'out\\n'; printf 'err\\n' >&2", "out\nerr\n"),
+        ("printf 'no newline'", "no newline"),
+        ("true", ""),
+        ("printf 'a\\r\\nb\\r\\n'", "a\r\nb\r\n"),
+        ("printf 'bad \\377 byte\\n'", "bad \u{fffd} byte\n"),
+    ] {
+        let out = waited(&adapter, &scope, line, 30).await;
+        assert_eq!(out.ok().as_deref(), Some(printed), "{line}");
+    }
+
+    let failed = waited(&adapter, &scope, "printf 'out\\n'; exit 3", 30)
+        .await
+        .expect_err("exit 3");
+    assert!(failed.downcast_ref::<sandbox::SandboxError>().is_none());
+    assert_eq!(
+        failed.to_string(),
+        "Command failed with exit code 3: stderr: , stdout: out\n"
+    );
+
     let outside = crate::test_utils::path_helpers::test_out_of_scope_path();
     let refused = format!(
         "printf 'touch: {}: Operation not permitted\\n' >&2; exit 1",
         outside.display()
     );
-    let cases: Vec<(&str, u64)> = vec![
-        ("printf 'out\\n'; printf 'err\\n' >&2", 30),
-        ("printf 'no newline'", 30),
-        ("true", 30),
-        ("printf 'a\\r\\nb\\r\\n'", 30),
-        ("printf 'bad \\377 byte\\n'", 30),
-        ("printf 'out\\n'; printf 'err\\n' >&2; exit 3", 30),
-        (&refused, 30),
-        ("printf 'before the limit\\n'; sleep 30", 1),
-    ];
-    for (line, limit) in cases {
-        let direct = adapter
-            .execute_sync_in_dir(
-                crate::shell_pool::platform_shell_program(),
-                Some(shell_args(line)),
-                &scope.to_string_lossy(),
-                Some(limit),
-                Some(&shell_config(limit)),
-            )
-            .await;
-        let waited = waited(&adapter, &scope, line, limit).await;
-        assert_eq!(reads(&waited), reads(&direct), "{line}");
-    }
+    let denied = waited(&adapter, &scope, &refused, 30)
+        .await
+        .expect_err("refused");
+    let Some(sandbox::SandboxError::RuntimeDenial {
+        path,
+        access,
+        details,
+        ..
+    }) = denied.downcast_ref::<sandbox::SandboxError>()
+    else {
+        panic!("a typed runtime denial: {denied:?}");
+    };
+    assert_eq!(path.as_path(), outside.parent().unwrap());
+    assert_eq!(*access, ahma_common::config::ScopeAccess::Rw);
+    assert_eq!(
+        details,
+        &format!(
+            "Command failed with exit code 1: stderr: , stdout: touch: {}: Operation not \
+             permitted\n",
+            outside.display()
+        )
+    );
+
+    let stopped = waited(
+        &adapter,
+        &scope,
+        "printf 'before the limit\\n'; sleep 30",
+        1,
+    )
+    .await
+    .expect_err("stopped at its limit");
+    let Some(limit) = stopped.downcast_ref::<time_limit::LimitReached>() else {
+        panic!("a typed time limit: {stopped:?}");
+    };
+    assert_eq!(limit.limit_secs, 1);
+    assert_eq!(limit.output, "before the limit\n");
 }
 
 /// SPEC R2.1: the command a caller waits for is an operation like any

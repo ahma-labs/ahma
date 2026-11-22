@@ -49,7 +49,7 @@ async fn adapter_uses_global_sandbox_scope_not_adapter_root_path() {
     // Prior to the fix, this would fail with:
     //   "Path ... is outside the sandbox root <adapter_root>"
     let out = adapter
-        .execute_sync_in_dir("pwd", None, &work_dir, Some(5), None)
+        .run_to_completion(None, "pwd", None, &work_dir, Some(5), None)
         .await
         .expect("pwd should succeed under global sandbox scope");
 
@@ -117,7 +117,7 @@ async fn adapter_sync_denial_on_symlinked_target_returns_runtime_denial() {
     let cmd = "cmd /c fail.bat";
 
     let res = adapter
-        .execute_sync_in_dir(cmd, None, &ws_canon.to_string_lossy(), Some(5), None)
+        .run_to_completion(None, cmd, None, &ws_canon.to_string_lossy(), Some(5), None)
         .await;
 
     assert!(res.is_err(), "command must fail");
@@ -192,7 +192,8 @@ async fn adapter_sync_refused_setuid_exec_is_a_note_not_a_grant() {
     )
     .unwrap();
     let res = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "sh fail.sh",
             None,
             &ws_canon.to_string_lossy(),

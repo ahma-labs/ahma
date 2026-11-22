@@ -106,17 +106,17 @@ async fn a_refused_signature_is_an_alert_on_the_running_operation() {
     assert!(!ws.path().join("msg.sig").exists(), "nothing was signed");
 }
 
-/// The synchronous path (terminal hooks, `ahma tool run`, sync-mode
-/// `run_terminal_command`) is served the same broker, and has no operation
-/// to raise an alert on: what the broker refused is in the error the call
-/// returns, one line each (SPEC R-CRED.10).
+/// A caller that waits for its command (terminal hooks, `ahma tool run`) is
+/// served the same broker, and reads what it refused in the error the call
+/// returns, one line each, besides the operation's alerts (SPEC R-CRED.10).
 #[tokio::test]
-async fn the_synchronous_path_returns_a_refused_signature_with_its_error() {
+async fn a_waiting_caller_reads_a_refused_signature_in_its_error() {
     let Some((_home, ws, adapter, _monitor)) = signing_fixture() else {
         return;
     };
     let err = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "ssh-keygen -Y sign -n file -f key.pub msg",
             None,
             ws.path().to_str().unwrap(),

@@ -461,8 +461,7 @@ fn prepare(
             executor,
             scope_grant_notifier,
         } => {
-            // Built as the synchronous path builds its command: brokers
-            // matched on the line as the caller wrote it.
+            // Brokers matched on the line as the caller wrote it.
             let piped = PipedSpawn {
                 executor: executor.as_ref(),
                 sandbox: &deps.sandbox,
@@ -479,10 +478,10 @@ fn prepare(
             }
             .build(guards)
             .map_err(|e| format!("Failed to create sandboxed command: {e}"))?;
-            // Async only: what its brokers refuse, and what the link broker
-            // asks while the command waits, is an alert while it still runs
-            // (SPEC R-CRED.10, R-LINK.6). The synchronous path has no
-            // operation to alert, and says them in its result.
+            // What its brokers refuse, and what the link broker asks while
+            // the command waits, is an alert while it still runs (SPEC
+            // R-CRED.10, R-LINK.6); a caller that waits also reads them in
+            // its result (`waited_result`).
             #[cfg(unix)]
             if let Some(broker) = guards.broker() {
                 super::alert_broker_refusals(broker, &deps.monitor, op_id);
@@ -492,8 +491,7 @@ fn prepare(
                 super::watch_links(links, &deps.monitor, op_id);
             }
             // The tag the kernel's records of its denials carry (SPEC
-            // R-DENY.1), remembered for a failure to read them back; the
-            // synchronous path reads them back inline.
+            // R-DENY.1), remembered for a failure to read them back.
             if let Some(tag) = piped.denial_tag {
                 sandbox::kernel_denials::remember_tag(op_id, tag);
             }
@@ -674,7 +672,7 @@ impl ExplainExit {
                 deps.monitor.append_alert(op_id, note).await;
             }
         } else {
-            // The async twin of the scan in `execute_sync_in_dir`.
+            // The alerts' twin of a waiting caller's `explain_failed_run`.
             record_failure_diagnostics(
                 &deps.sandbox,
                 self.scope_grant_notifier.as_ref(),

@@ -2074,7 +2074,10 @@ async fn execute_with_signal_forwarding(
         timeout,
         &crate::adapter::ExecutionMode::Synchronous,
     );
-    let exec = adapter.execute_sync_in_dir(
+    // A tracked operation this process waits for, however long it takes
+    // (SPEC R2.1): the harness owns the call's lifetime (R-SETUP.2.1).
+    let exec = adapter.run_to_completion(
+        None,
         crate::shell_pool::platform_shell_program(),
         Some(adapter_args),
         cwd,
@@ -2083,9 +2086,10 @@ async fn execute_with_signal_forwarding(
     );
 
     // Cancelling the hook must take the whole command tree with it. Dropping the
-    // `execute_sync_in_dir` future drops the `ProcessGroupGuard` inside
-    // `run_sync_prepared`, whose `Drop` issues `kill(-pgid)` — that is what reaps
-    // `sandbox-exec → sh → cargo → cargo-nextest` instead of orphaning it.
+    // `run_to_completion` future cancels its operation, whose executor kills
+    // the process group — that is what reaps `sandbox-exec → sh → cargo →
+    // cargo-nextest` instead of orphaning it. The kill runs on the runtime, so
+    // it is waited for (`stop_then_die`) before this process dies.
     //
     // Then die the way we were asked to. `tokio::signal` replaces the process-wide
     // disposition and never restores it, so simply returning here would leave this
@@ -2106,13 +2110,13 @@ async fn execute_with_signal_forwarding(
                     Some(s) => s.recv().await,
                     None => std::future::pending().await,
                 }
-            } => die_by_signal(libc::SIGINT),
+            } => stop_then_die(adapter, libc::SIGINT).await,
             _ = async {
                 match &mut sigterm {
                     Some(s) => s.recv().await,
                     None => std::future::pending().await,
                 }
-            } => die_by_signal(libc::SIGTERM),
+            } => stop_then_die(adapter, libc::SIGTERM).await,
         }
     }
     #[cfg(not(unix))]
@@ -2141,6 +2145,16 @@ fn trial_outcome(result: &Result<String>) -> harness_ask::TrialOutcome {
         }
         _ => TrialOutcome::Failed,
     }
+}
+
+/// Stop the hooked command — its operation was cancelled when its wait was
+/// dropped — and wait, bounded, for its process tree to be gone, then die by
+/// `signo` ([`die_by_signal`]). Dying first would leave the kill undone: it
+/// runs on this process's runtime.
+#[cfg(unix)]
+async fn stop_then_die(adapter: &crate::adapter::Adapter, signo: i32) -> Result<String> {
+    adapter.shutdown().await;
+    die_by_signal(signo)
 }
 
 /// Terminate this process with `signo` the way it would have terminated had the

@@ -267,7 +267,7 @@ fn progress_enabled(force: bool, client_type: crate::client_type::McpClientType)
 /// request not to; `None` when nothing was said, so the server's mode decides.
 ///
 /// Only the wait is the caller's to choose. Every call runs its command as a
-/// tracked operation; the one direct path left is the CLI one-shot's
+/// tracked operation; waiting with no client budget is the CLI one-shot's
 /// (`force_synchronous`), which is not a tool call's to ask for.
 pub(crate) fn wait_asked_for(
     synchronous: Option<bool>,
@@ -802,7 +802,7 @@ impl AhmaMcpService {
         let Some(audit_log_path) = self.task_vault_audit_log_path() else {
             return;
         };
-        // Sync paths complete directly — drop any pending subscriber tracking.
+        // A one-shot completes directly — drop any pending subscriber tracking.
         // Scoped so the guard is released before the `.await`: a `parking_lot`
         // guard is `!Send`, so holding one across an await point would make this
         // whole future `!Send`.
@@ -1315,8 +1315,9 @@ impl AhmaMcpService {
     /// The CLI one-shot (`force_synchronous`, SPEC R2.1): the command runs as
     /// a tracked operation and this call waits for it to end, however long it
     /// takes — a one-shot has no later call to collect it with. What comes back
-    /// is what the command printed, or its error, typed as the direct path
-    /// typed it, for the caller to render as the CLI always has. A tool call
+    /// is what the command printed, or its error, typed
+    /// ([`crate::adapter::Adapter::run_to_completion`]), for the caller to
+    /// render as the CLI always has. A tool call
     /// that asks to wait — `synchronous: true`, `blocking: true` — waits on its
     /// operation within the client's budget instead ([`Self::call_wait`]).
     #[allow(clippy::too_many_arguments)]

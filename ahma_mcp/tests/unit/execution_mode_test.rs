@@ -426,15 +426,17 @@ async fn cancelling_a_sync_flagged_request_cancels_its_operation() -> Result<()>
     Ok(())
 }
 
-/// What a sync-flagged call answers when it finishes in time: the direct
-/// path's output, unchanged, under the identity line every inline result
-/// leads with (SPEC R2.6.2).
+/// What a sync-flagged call answers when it finishes in time: what the
+/// command printed — as a caller that waits for it to end reads it
+/// (`run_to_completion`, the hooks' and the CLI one-shot's wait) — under the
+/// identity line every inline result leads with (SPEC R2.6.2).
 #[tokio::test]
 async fn a_sync_flagged_result_is_the_direct_output_under_the_identity_line() -> Result<()> {
     let line = "echo first-line; echo second-line";
     let (mcp, temp) = flagged_server().await?;
     let wd = temp.path().to_string_lossy().into_owned();
-    // The direct path, as `run_terminal_command` configures it.
+    // What the command printed, waited for as `run_terminal_command`
+    // configures it.
     let shell = ahma_mcp::AhmaMcpService::build_shell_subcommand_config(
         None,
         &ahma_mcp::adapter::ExecutionMode::Synchronous,
@@ -442,7 +444,8 @@ async fn a_sync_flagged_result_is_the_direct_output_under_the_identity_line() ->
     let direct = mcp
         .service
         .adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             ahma_mcp::shell_pool::platform_shell_program(),
             json!({ "c_flag": true, "command": line })
                 .as_object()
@@ -463,8 +466,9 @@ async fn a_sync_flagged_result_is_the_direct_output_under_the_identity_line() ->
             identity.starts_with('\u{2713}') && identity.contains("exit 0"),
             "{tool}: the first line says how it ended: {identity}"
         );
-        // A tracked operation keeps each line and joins them with `\n`; the direct
-        // path passed a Windows `\r\n` through. The lines are what must match.
+        // The inline result keeps each line and joins them with `\n`; a
+        // waiting caller reads a Windows `\r\n` as printed. The lines are what
+        // must match.
         assert_eq!(
             body.lines().collect::<Vec<_>>(),
             direct.trim_end().lines().collect::<Vec<_>>(),
