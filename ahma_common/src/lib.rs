@@ -69,6 +69,7 @@ pub mod open_url;
 /// Transport-agnostic MCP peer factory abstraction (P6).
 pub mod peer_factory;
 pub mod permissions;
+pub mod pid_alive;
 pub mod process_guard;
 pub mod prompts;
 pub mod sandbox_state;

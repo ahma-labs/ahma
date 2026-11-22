@@ -11,21 +11,9 @@ use ahma_common::config::ScopeAccess;
 use ahma_common::grant::ResolvedGrant;
 use ahma_common::session_grants::{self, SessionGrant};
 
-/// Whether `pid` is alive. `kill(pid, 0)` on Unix: success or `EPERM` (alive,
-/// another user's) both mean alive. Off Unix the age bound alone applies.
-pub fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: signal 0 performs only the permission check; nothing is sent.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
-}
+/// Whether `pid` is alive, on every platform: the one probe
+/// ([`ahma_common::pid_alive::pid_alive`]).
+pub use ahma_common::pid_alive::pid_alive;
 
 /// Record a human-approved `session`-tier grant so hooked commands and native
 /// edits in `workspace` honour it for as long as `owner_pid` lives (at most
@@ -98,7 +86,8 @@ mod tests {
     #[test]
     fn this_process_is_alive_and_a_bogus_pid_is_not() {
         assert!(super::pid_alive(std::process::id()));
-        #[cfg(unix)]
+        // On every platform: off Unix this once answered `true` for any pid,
+        // so a session grant outlived its owner (SPEC R-PERM.4.4).
         assert!(!super::pid_alive(u32::MAX - 7));
     }
 }
