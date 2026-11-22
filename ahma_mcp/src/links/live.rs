@@ -426,16 +426,19 @@ impl PeerLinkAsker {
 }
 
 /// The form: one titled single-select, deny first and the default, every
-/// answer labelled in words (SPEC R-PERM.3.4, R5.3.1: Enter alone never
-/// opens a link).
-fn link_form_schema(choices: &[LinkChoice]) -> rmcp::model::ElicitationSchema {
+/// answer labelled in words naming the site it saves (SPEC R-PERM.3.4,
+/// R5.3.1: Enter alone never opens a link).
+fn link_form_schema(
+    question: &LinkQuestion,
+    choices: &[LinkChoice],
+) -> rmcp::model::ElicitationSchema {
     use rmcp::model::{
         ConstTitle, ElicitationSchema, EnumSchema, PrimitiveSchemaDefinition,
         SingleSelectEnumSchema, TitledSingleSelectEnumSchema,
     };
     let one_of: Vec<ConstTitle> = choices
         .iter()
-        .map(|c| ConstTitle::new(c.value(), c.label()))
+        .map(|c| ConstTitle::new(c.value(), question.label(*c)))
         .collect();
     let mut select = TitledSingleSelectEnumSchema::new(one_of);
     select.title = Some("Your decision".into());
@@ -488,7 +491,7 @@ impl LinkAsker for PeerLinkAsker {
         let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
             meta: None,
             message: question.text(),
-            requested_schema: link_form_schema(choices),
+            requested_schema: link_form_schema(question, choices),
         });
         let sent = tokio::time::timeout(
             budget,
@@ -733,9 +736,10 @@ mod tests {
     }
 
     /// SPEC R-LINK.6: the question offers, deny first, deny · this time ·
-    /// always for this site — all repos · this repo only · any site, and
-    /// carries the site, the address and the guidance (R-LINK.7); while the
-    /// command waits, its operation is told where the question went.
+    /// always for this site — this repo only · all repos · any site — this
+    /// repo only, and carries the site, the address and the guidance
+    /// (R-LINK.7); while the command waits, its operation is told where the
+    /// question went.
     #[tokio::test]
     async fn a_live_question_offers_the_answers_in_order_with_the_guidance() {
         let asker = Scripted::new(vec![LinkAskOutcome::Answered(LinkChoice::Once)]);
@@ -749,9 +753,9 @@ mod tests {
             &[
                 LinkChoice::Deny,
                 LinkChoice::Once,
-                LinkChoice::AlwaysSiteAllRepos,
                 LinkChoice::AlwaysSiteThisRepo,
-                LinkChoice::AlwaysAny,
+                LinkChoice::AlwaysSiteAllRepos,
+                LinkChoice::AlwaysAnyThisRepo,
             ]
         );
         assert!(text.contains("Site: github.com"), "{text}");
@@ -827,6 +831,77 @@ mod tests {
         assert!(audit.contains("\"always\""), "{audit}");
         assert!(audit.contains("\"harness\""), "{audit}");
         assert!(audit.contains("docs.rs in "), "{audit}");
+    }
+
+    /// SPEC R-LINK.6, R-LINK.4: "always for any site" is saved for this repo
+    /// only — any site for every repo is a CLI act — and opens any public
+    /// site here without asking again.
+    #[tokio::test]
+    async fn any_site_is_saved_for_this_repo_only() {
+        let asker = Scripted::new(vec![LinkAskOutcome::Answered(
+            LinkChoice::AlwaysAnyThisRepo,
+        )]);
+        let f = Fixture::new(Some(asker.clone()));
+        let consent = f.consent();
+        for link in ["https://github.com/a", "https://docs.rs/x"] {
+            assert_eq!(consent.decide(&target(link), false).await, LinkAnswer::Open);
+        }
+        assert_eq!(asker.asked(), 1);
+        let saved = ahma_common::config::AhmaSettings::load_from_result(&f.settings)
+            .unwrap()
+            .open_url;
+        assert!(saved.allow.is_empty(), "not every repo");
+        assert_eq!(saved.repos.len(), 1);
+        assert_eq!(saved.repos[0].workspace, f.ws());
+        assert_eq!(saved.repos[0].allow, ["*"]);
+    }
+
+    /// SPEC R-PERM.3.4, R-LINK.6: the form is one single-select, deny the
+    /// default, each answer titled with the site it saves, in order.
+    #[test]
+    fn the_form_titles_name_the_site_in_order() {
+        let question = match policy::decide(
+            &target("https://api.github.com/x"),
+            false,
+            &LinkGrants::default(),
+            &Egress::Open,
+        ) {
+            LinkDecision::Ask(q) => q,
+            other => panic!("{other:?}"),
+        };
+        let schema = link_form_schema(&question, &question.choices(Surface::Live));
+        let json = serde_json::to_value(&schema).unwrap();
+        let select = &json["properties"]["decision"];
+        assert_eq!(select["default"], "deny");
+        let titles: Vec<(String, String)> = select["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| {
+                (
+                    o["const"].as_str().unwrap().to_string(),
+                    o["title"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let want = [
+            ("deny", "Deny"),
+            ("once", "This time"),
+            (
+                "always-site-this-repo",
+                "Always for api.github.com — this repo only",
+            ),
+            (
+                "always-site-all-repos",
+                "Always for api.github.com — all repos",
+            ),
+            (
+                "always-any-site-this-repo",
+                "Always for any site — this repo only",
+            ),
+        ]
+        .map(|(v, t)| (v.to_string(), t.to_string()));
+        assert_eq!(titles, want);
     }
 
     /// SPEC R-LINK.6: a deny is remembered for the session — the site is not
@@ -999,11 +1074,13 @@ mod tests {
         );
     }
 
-    /// SPEC R-LINK.4: "always (any site)" is offered only where it would
+    /// SPEC R-LINK.4: "always for any site" is offered only where it would
     /// cover the link — never for a local host.
     #[tokio::test]
     async fn any_site_is_not_offered_for_a_local_host() {
-        let asker = Scripted::new(vec![LinkAskOutcome::Answered(LinkChoice::AlwaysAny)]);
+        let asker = Scripted::new(vec![LinkAskOutcome::Answered(
+            LinkChoice::AlwaysAnyThisRepo,
+        )]);
         let f = Fixture::new(Some(asker.clone()));
         let LinkAnswer::Refuse(_) = f
             .consent()
@@ -1013,7 +1090,7 @@ mod tests {
             panic!("an answer it did not offer is a deny");
         };
         let shown = asker.shown.lock().clone();
-        assert!(!shown[0].1.contains(&LinkChoice::AlwaysAny));
+        assert!(!shown[0].1.contains(&LinkChoice::AlwaysAnyThisRepo));
         assert!(!f.settings.exists(), "nothing saved");
     }
 }

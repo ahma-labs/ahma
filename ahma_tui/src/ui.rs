@@ -4732,8 +4732,8 @@ fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area:
             let key = crate::state::LinkAskGate::key_for(*choice)?;
             let (key_style, label) = match choice {
                 LinkChoice::Deny => (theme.failed().bold(), "Deny (default)".to_string()),
-                LinkChoice::Session => (theme.pending().bold(), choice.label().to_string()),
-                _ => (theme.success().bold(), choice.label().to_string()),
+                LinkChoice::Session => (theme.pending().bold(), question.label(*choice)),
+                _ => (theme.success().bold(), question.label(*choice)),
             };
             Some(vec![
                 Span::styled(format!("[{key}] "), key_style),
@@ -4754,7 +4754,7 @@ fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area:
             gate.ask.save_line(choice),
         )
     {
-        if choice == LinkChoice::AlwaysAny {
+        if choice == LinkChoice::AlwaysAnyThisRepo {
             notes.push(Line::from(Span::styled(
                 format!("  {}", ahma_common::open_url::ANY_SITE_WARNING),
                 theme.pending(),

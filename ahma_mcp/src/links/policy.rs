@@ -31,7 +31,7 @@ const SHOWN_ADDRESS_CHARS: usize = 300;
 
 /// Said when the link is to this machine or the local network.
 pub const LOCAL_NOTE: &str = "This address is on your own machine or local network, where a \
-     link can make a local service act for you. \"Always (any site)\" never covers it.";
+     link can make a local service act for you. \"Always for any site\" never covers it.";
 
 /// Said under `--restrict-network` for a host outside the egress allow list.
 pub fn outside_egress_note(host: &str) -> String {
@@ -328,6 +328,10 @@ pub enum LinkDecision {
 }
 
 /// One answer a human may give (SPEC R-LINK.6).
+///
+/// The narrowest lasting answer is this site in this repo; every other
+/// lasting answer widens it on exactly one axis — every repo, or any site.
+/// A grant wider on both is given only with the CLI (R-LINK.11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkChoice {
     Deny,
@@ -335,16 +339,14 @@ pub enum LinkChoice {
     Once,
     /// This site, for this session (the harness process, or the MCP session).
     Session,
-    /// This site, saved for every repo: `[open_url] allow` gains the site.
-    /// Of the two "always for this site" answers it is listed first, and is
-    /// the default.
-    AlwaysSiteAllRepos,
     /// This site, saved for this repo only: this repo's `[open_url] repos`
-    /// entry gains the site.
+    /// entry gains the site. The first lasting answer, and the usual one.
     AlwaysSiteThisRepo,
-    /// Any public site, saved for every repo: `[open_url] allow` gains `*`.
-    /// There is no per-repo "any site".
-    AlwaysAny,
+    /// This site, saved for every repo: `[open_url] allow` gains the site.
+    AlwaysSiteAllRepos,
+    /// Any public site, saved for this repo only: this repo's `[open_url]
+    /// repos` entry gains `*`. Any site for every repo is CLI-only.
+    AlwaysAnyThisRepo,
 }
 
 impl LinkChoice {
@@ -353,21 +355,24 @@ impl LinkChoice {
         LinkChoice::Deny,
         LinkChoice::Once,
         LinkChoice::Session,
-        LinkChoice::AlwaysSiteAllRepos,
         LinkChoice::AlwaysSiteThisRepo,
-        LinkChoice::AlwaysAny,
+        LinkChoice::AlwaysSiteAllRepos,
+        LinkChoice::AlwaysAnyThisRepo,
     ];
 
     /// The value a form sends for this answer (an elicitation's single
-    /// select, SPEC R-PERM.3.4): stable, never shown.
+    /// select, SPEC R-PERM.3.4): stable, never shown. A value an older build
+    /// sent with another meaning (`always-site` was every repo,
+    /// `always-any-site` any site in every repo) is no longer one of these,
+    /// so it reads as a deny ([`Self::from_value`]).
     pub fn value(self) -> &'static str {
         match self {
             LinkChoice::Deny => "deny",
             LinkChoice::Once => "once",
             LinkChoice::Session => "session",
-            LinkChoice::AlwaysSiteAllRepos => "always-site",
             LinkChoice::AlwaysSiteThisRepo => "always-site-this-repo",
-            LinkChoice::AlwaysAny => "always-any-site",
+            LinkChoice::AlwaysSiteAllRepos => "always-site-all-repos",
+            LinkChoice::AlwaysAnyThisRepo => "always-any-site-this-repo",
         }
     }
 
@@ -383,14 +388,16 @@ impl LinkChoice {
             .unwrap_or(LinkChoice::Deny)
     }
 
+    /// The answer in words, naming no site ([`LinkQuestion::label`] names
+    /// it).
     pub fn label(self) -> &'static str {
         match self {
             LinkChoice::Deny => "deny",
             LinkChoice::Once => "this time",
             LinkChoice::Session => "this site, this session",
-            LinkChoice::AlwaysSiteAllRepos => "always for this site — all repos",
             LinkChoice::AlwaysSiteThisRepo => "always for this site — this repo only",
-            LinkChoice::AlwaysAny => "always (any site)",
+            LinkChoice::AlwaysSiteAllRepos => "always for this site — all repos",
+            LinkChoice::AlwaysAnyThisRepo => "always for any site — this repo only",
         }
     }
 }
@@ -443,32 +450,45 @@ impl LinkQuestion {
     }
 
     /// The answers `surface` offers, deny first (R-PERM.3.4), then the one
-    /// that remembers nothing or least, then "always for this site" for all
-    /// repos before this repo only. "Always (any site)" only where it would
-    /// cover this link: never for a local host, never for one outside the
-    /// egress allow list.
+    /// that remembers nothing or least, then the lasting ones, narrowest
+    /// first: this site in this repo (the usual one), this site in every
+    /// repo, then any site in this repo — only where it would cover this
+    /// link: never for a local host, never for one outside the egress allow
+    /// list.
     pub fn choices(&self, surface: Surface) -> Vec<LinkChoice> {
         let any = !self.local && !self.outside_egress;
         let all = match surface {
             Surface::Live | Surface::HarnessDialog => vec![
                 LinkChoice::Deny,
                 LinkChoice::Once,
-                LinkChoice::AlwaysSiteAllRepos,
                 LinkChoice::AlwaysSiteThisRepo,
-                LinkChoice::AlwaysAny,
+                LinkChoice::AlwaysSiteAllRepos,
+                LinkChoice::AlwaysAnyThisRepo,
             ],
             Surface::TuiForHarness => vec![
                 LinkChoice::Deny,
                 LinkChoice::Session,
-                LinkChoice::AlwaysSiteAllRepos,
                 LinkChoice::AlwaysSiteThisRepo,
-                LinkChoice::AlwaysAny,
+                LinkChoice::AlwaysSiteAllRepos,
+                LinkChoice::AlwaysAnyThisRepo,
             ],
             Surface::Browser => vec![LinkChoice::Deny, LinkChoice::Once, LinkChoice::Session],
         };
         all.into_iter()
-            .filter(|c| any || *c != LinkChoice::AlwaysAny)
+            .filter(|c| any || *c != LinkChoice::AlwaysAnyThisRepo)
             .collect()
+    }
+
+    /// How every surface shows `choice` for this question: the answer in
+    /// words with the site it names (`Always for github.com — this repo
+    /// only`), so the human sees what would be saved.
+    pub fn label(&self, choice: LinkChoice) -> String {
+        let host = &self.host;
+        match choice {
+            LinkChoice::AlwaysSiteThisRepo => format!("Always for {host} — this repo only"),
+            LinkChoice::AlwaysSiteAllRepos => format!("Always for {host} — all repos"),
+            other => capitalised(other.label()),
+        }
     }
 
     /// The question's body, the same at every surface (SPEC R-LINK.7),
@@ -546,22 +566,23 @@ pub enum Effect {
 /// `workspace` (its canonical root, which the broker supplies).
 pub fn effect(choice: LinkChoice, host: &str, workspace: &Path) -> Effect {
     let exact = || HostPattern::Exact(host.to_ascii_lowercase());
+    let here = || OpenUrlBinding::Repo(workspace.to_path_buf());
     match choice {
         LinkChoice::Deny => Effect::Refuse {
             remember_deny: true,
         },
         LinkChoice::Once => Effect::OpenOnce,
         LinkChoice::Session => Effect::Session(exact()),
+        LinkChoice::AlwaysSiteThisRepo => Effect::Persist(exact(), here()),
         LinkChoice::AlwaysSiteAllRepos => Effect::Persist(exact(), OpenUrlBinding::AllRepos),
-        LinkChoice::AlwaysSiteThisRepo => {
-            Effect::Persist(exact(), OpenUrlBinding::Repo(workspace.to_path_buf()))
-        }
-        LinkChoice::AlwaysAny => Effect::Persist(HostPattern::Any, OpenUrlBinding::AllRepos),
+        LinkChoice::AlwaysAnyThisRepo => Effect::Persist(HostPattern::Any, here()),
     }
 }
 
 /// The `ahma permissions grant open-url` line that saves what `choice`
-/// would (SPEC R-LINK.11): `None` for an answer that saves nothing.
+/// would (SPEC R-LINK.11): `None` for an answer that saves nothing. It names
+/// its binding (`--workspace '<repo>'` or `--all-repos`), so it means the same
+/// whatever directory a human runs it in.
 pub fn grant_command(choice: LinkChoice, host: &str, workspace: &Path) -> Option<String> {
     let Effect::Persist(pattern, binding) = effect(choice, host, workspace) else {
         return None;
@@ -571,9 +592,12 @@ pub fn grant_command(choice: LinkChoice, host: &str, workspace: &Path) -> Option
         line.push(' ');
         line.push_str(site);
     }
-    if let OpenUrlBinding::Repo(repo) = &binding {
-        line.push_str(" --workspace ");
-        line.push_str(&sh_single_quote(&repo.to_string_lossy()));
+    match &binding {
+        OpenUrlBinding::Repo(repo) => {
+            line.push_str(" --workspace ");
+            line.push_str(&sh_single_quote(&repo.to_string_lossy()));
+        }
+        OpenUrlBinding::AllRepos => line.push_str(" --all-repos"),
     }
     Some(line)
 }
@@ -590,6 +614,7 @@ pub fn harness_dialog_answers(question: &LinkQuestion, workspace: &Path) -> Vec<
         .into_iter()
         .filter_map(|choice| {
             let label = choice.label();
+            let shown = question.label(choice);
             Some(match choice {
                 LinkChoice::Deny => format!(
                     "No — {label}: ahma does not ask about {host} again in this Claude Code \
@@ -602,13 +627,13 @@ pub fn harness_dialog_answers(question: &LinkQuestion, workspace: &Path) -> Vec<
                 // The dialog keeps nothing for the session (its yes is "this time").
                 LinkChoice::Session => return None,
                 lasting => {
-                    let usual = if lasting == LinkChoice::AlwaysSiteAllRepos {
+                    let usual = if lasting == LinkChoice::AlwaysSiteThisRepo {
                         " (the usual lasting answer)"
                     } else {
                         ""
                     };
                     let grant = grant_command(lasting, host, workspace)?;
-                    format!("{}{usual}: a human runs `{grant}`.", capitalised(label))
+                    format!("{shown}{usual}: a human runs `{grant}`.")
                 }
             })
         })
@@ -856,7 +881,10 @@ mod tests {
                 panic!("{link}: `*` must not cover a local host");
             };
             assert!(q.local);
-            assert!(!q.choices(Surface::Live).contains(&LinkChoice::AlwaysAny));
+            assert!(
+                !q.choices(Surface::Live)
+                    .contains(&LinkChoice::AlwaysAnyThisRepo)
+            );
         }
         let localhost = LinkGrants {
             always: vec![pat("localhost")],
@@ -873,17 +901,22 @@ mod tests {
             "a host grant of its own covers a local host, on every port"
         );
         let wild = LinkGrants {
-            always: vec![pat("*.github.io")],
+            always: vec![pat("*.github.com")],
             ..Default::default()
         };
         assert_eq!(
-            decide(&t("https://me.github.io/"), false, &wild, &Egress::Open),
+            decide(&t("https://api.github.com/"), false, &wild, &Egress::Open),
             LinkDecision::Open
         );
-        assert!(matches!(
-            decide(&t("https://evilgithub.io/"), false, &wild, &Egress::Open),
-            LinkDecision::Ask(_)
-        ));
+        for other in ["https://evilgithub.com/", "https://github.com/"] {
+            assert!(
+                matches!(
+                    decide(&t(other), false, &wild, &Egress::Open),
+                    LinkDecision::Ask(_)
+                ),
+                "{other}: one label, not the domain itself"
+            );
+        }
     }
 
     #[test]
@@ -904,7 +937,10 @@ mod tests {
         };
         assert!(q.outside_egress);
         assert!(q.text().contains("not on your network allow list"));
-        assert!(!q.choices(Surface::Live).contains(&LinkChoice::AlwaysAny));
+        assert!(
+            !q.choices(Surface::Live)
+                .contains(&LinkChoice::AlwaysAnyThisRepo)
+        );
         // A host the human named is their decision, egress or not.
         let named = LinkGrants {
             always: vec![pat("paste.example")],
@@ -949,9 +985,9 @@ mod tests {
             [
                 Deny,
                 Once,
-                AlwaysSiteAllRepos,
                 AlwaysSiteThisRepo,
-                AlwaysAny
+                AlwaysSiteAllRepos,
+                AlwaysAnyThisRepo
             ]
         );
         assert_eq!(
@@ -959,9 +995,9 @@ mod tests {
             [
                 Deny,
                 Session,
-                AlwaysSiteAllRepos,
                 AlwaysSiteThisRepo,
-                AlwaysAny
+                AlwaysSiteAllRepos,
+                AlwaysAnyThisRepo
             ]
         );
         // R-GUI.9: a browser surface saves nothing.
@@ -972,18 +1008,18 @@ mod tests {
             [
                 Deny,
                 Once,
-                AlwaysSiteAllRepos,
                 AlwaysSiteThisRepo,
-                AlwaysAny
+                AlwaysSiteAllRepos,
+                AlwaysAnyThisRepo
             ]
         );
     }
 
     /// SPEC R-LINK.6, R-LINK.11: Claude Code's dialog is yes or no, so it
     /// says what each answer is there, in order: no denies, yes is this time,
-    /// and each lasting answer is the exact grant a human runs — all repos
-    /// first, then this repo, then any site only where it would cover the
-    /// link.
+    /// and each lasting answer is the exact grant a human runs, naming its
+    /// binding — this repo first, then all repos, then any site in this repo
+    /// only where it would cover the link.
     #[test]
     fn the_harness_dialog_names_every_answer_in_order() {
         let ws = Path::new("/w/my repo");
@@ -1000,20 +1036,23 @@ mod tests {
         assert!(answers[0].starts_with("No — deny"), "{}", answers[0]);
         assert!(answers[1].starts_with("Yes — this time"), "{}", answers[1]);
         assert!(
-            answers[2].starts_with("Always for this site — all repos (the usual")
-                && answers[2].contains("`ahma permissions grant open-url github.com`"),
+            answers[2].starts_with("Always for github.com — this repo only (the usual")
+                && answers[2].contains(
+                    "`ahma permissions grant open-url github.com --workspace '/w/my repo'`"
+                ),
             "{}",
             answers[2]
         );
         assert!(
-            answers[3]
-                .contains("`ahma permissions grant open-url github.com --workspace '/w/my repo'`"),
+            answers[3].starts_with("Always for github.com — all repos:")
+                && answers[3].contains("`ahma permissions grant open-url github.com --all-repos`"),
             "{}",
             answers[3]
         );
         assert!(
-            answers[4].starts_with("Always (any site)")
-                && answers[4].contains("`ahma permissions grant open-url`"),
+            answers[4].starts_with("Always for any site — this repo only")
+                && answers[4]
+                    .contains("`ahma permissions grant open-url --workspace '/w/my repo'`"),
             "{}",
             answers[4]
         );
@@ -1028,7 +1067,7 @@ mod tests {
         let answers = harness_dialog_answers(&local, ws);
         assert_eq!(answers.len(), 4, "no any-site answer for a local host");
         assert!(
-            answers[2].contains("grant open-url localhost`"),
+            answers[3].contains("grant open-url localhost --all-repos`"),
             "{answers:#?}"
         );
         assert_eq!(grant_command(LinkChoice::Once, "github.com", ws), None);
@@ -1066,8 +1105,87 @@ mod tests {
         }
     }
 
+    fn ask(link: &str) -> LinkQuestion {
+        match decide(&t(link), false, &LinkGrants::default(), &Egress::Open) {
+            LinkDecision::Ask(q) => q,
+            other => panic!("{link}: {other:?}"),
+        }
+    }
+
+    /// SPEC R-LINK.6: the three example links, on every surface. The first
+    /// lasting answer is this site in this repo; each other one widens it on
+    /// one axis; any site is for this repo only.
     #[test]
-    fn deny_comes_first_and_all_repos_before_this_repo_on_every_surface() {
+    fn the_three_examples_offer_this_repo_first() {
+        use LinkChoice::*;
+        let ws = Path::new("/Users/me/proj");
+        for (link, host) in [
+            ("https://github.com/o/r/pull/1", "github.com"),
+            ("https://api.github.com/x", "api.github.com"),
+            ("https://someone.github.io/page", "someone.github.io"),
+        ] {
+            let q = ask(link);
+            assert_eq!(
+                q.choices(Surface::Live),
+                [
+                    Deny,
+                    Once,
+                    AlwaysSiteThisRepo,
+                    AlwaysSiteAllRepos,
+                    AlwaysAnyThisRepo
+                ],
+                "{link}"
+            );
+            assert_eq!(
+                q.choices(Surface::TuiForHarness),
+                [
+                    Deny,
+                    Session,
+                    AlwaysSiteThisRepo,
+                    AlwaysSiteAllRepos,
+                    AlwaysAnyThisRepo
+                ],
+                "{link}"
+            );
+            let titles: Vec<String> = q
+                .choices(Surface::Live)
+                .into_iter()
+                .map(|c| q.label(c))
+                .collect();
+            assert_eq!(
+                titles,
+                [
+                    "Deny".to_string(),
+                    "This time".into(),
+                    format!("Always for {host} — this repo only"),
+                    format!("Always for {host} — all repos"),
+                    "Always for any site — this repo only".into(),
+                ],
+                "{link}"
+            );
+            let dialog = harness_dialog_answers(&q, ws);
+            assert_eq!(
+                dialog[2..],
+                [
+                    format!(
+                        "Always for {host} — this repo only (the usual lasting answer): a human \
+                         runs `ahma permissions grant open-url {host} --workspace '/Users/me/proj'`."
+                    ),
+                    format!(
+                        "Always for {host} — all repos: a human runs `ahma permissions grant \
+                         open-url {host} --all-repos`."
+                    ),
+                    "Always for any site — this repo only: a human runs `ahma permissions grant \
+                     open-url --workspace '/Users/me/proj'`."
+                        .to_string(),
+                ],
+                "{link}"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_comes_first_and_this_repo_before_all_repos_on_every_surface() {
         // Local and outside-egress questions too, where "any site" drops out.
         let questions = [
             ("https://github.com/", None),
@@ -1094,13 +1212,13 @@ mod tests {
                 assert_eq!(c.first(), Some(&LinkChoice::Deny), "{link} {surface:?}");
                 let at = |want| c.iter().position(|x| *x == want);
                 match (
-                    at(LinkChoice::AlwaysSiteAllRepos),
                     at(LinkChoice::AlwaysSiteThisRepo),
+                    at(LinkChoice::AlwaysSiteAllRepos),
                 ) {
-                    (Some(all), Some(this)) => {
-                        assert!(all < this, "{link} {surface:?}: {c:?}");
+                    (Some(this), Some(all)) => {
+                        assert!(this < all, "{link} {surface:?}: {c:?}");
                         // Directly after deny and this time / this session.
-                        assert_eq!(all, 2, "{link} {surface:?}: {c:?}");
+                        assert_eq!(this, 2, "{link} {surface:?}: {c:?}");
                     }
                     (None, None) => assert_eq!(surface, Surface::Browser),
                     other => panic!("{link} {surface:?}: one site variant alone: {other:?}"),
@@ -1112,26 +1230,21 @@ mod tests {
     #[test]
     fn the_labels_say_site_and_name_which_repos() {
         use LinkChoice::*;
-        let labels: Vec<_> = [
-            Deny,
-            Once,
-            Session,
-            AlwaysSiteAllRepos,
-            AlwaysSiteThisRepo,
-            AlwaysAny,
-        ]
-        .map(LinkChoice::label)
-        .into();
+        let labels: Vec<_> = LinkChoice::ALL.map(LinkChoice::label).into();
         assert_eq!(
             labels,
             [
                 "deny",
                 "this time",
                 "this site, this session",
-                "always for this site — all repos",
                 "always for this site — this repo only",
-                "always (any site)",
+                "always for this site — all repos",
+                "always for any site — this repo only",
             ]
+        );
+        assert_eq!(
+            LinkChoice::ALL[3..],
+            [AlwaysSiteThisRepo, AlwaysSiteAllRepos, AlwaysAnyThisRepo]
         );
         assert!(labels.iter().all(|l| !l.contains("host")), "{labels:?}");
     }
@@ -1147,10 +1260,10 @@ mod tests {
             effect(LinkChoice::AlwaysSiteThisRepo, "GitHub.com", ws),
             Effect::Persist(pat("github.com"), OpenUrlBinding::Repo(ws.to_path_buf()))
         );
-        // "Any site" is all-repos only, whichever repo asked.
+        // "Any site" is this repo only; any site for every repo is CLI-only.
         assert_eq!(
-            effect(LinkChoice::AlwaysAny, "github.com", ws),
-            Effect::Persist(HostPattern::Any, OpenUrlBinding::AllRepos)
+            effect(LinkChoice::AlwaysAnyThisRepo, "github.com", ws),
+            Effect::Persist(HostPattern::Any, OpenUrlBinding::Repo(ws.to_path_buf()))
         );
         assert_eq!(
             effect(LinkChoice::Session, "GitHub.com", ws),
@@ -1199,7 +1312,7 @@ mod tests {
         let settings = OpenUrlSettings {
             allow: vec![
                 "https://github.com/o/r".into(), // a URL pasted where a site belongs
-                "*.github.io".into(),
+                "*.github.com".into(),
             ],
             repos: vec![OpenUrlRepo {
                 workspace: PathBuf::from("/w/a"),
@@ -1212,7 +1325,7 @@ mod tests {
             vec![pat("example.org")],
             vec!["evil.example".into()],
         );
-        assert_eq!(g.always, [pat("*.github.io"), pat("docs.rs")]);
+        assert_eq!(g.always, [pat("*.github.com"), pat("docs.rs")]);
         assert_eq!(g.session, [pat("example.org")]);
         assert_eq!(g.denied, ["evil.example"]);
         // The dropped entry grants nothing.
@@ -1301,6 +1414,14 @@ mod tests {
             assert_eq!(read, choice, "{} round-trips", choice.value());
         }
         assert_eq!(LinkChoice::from_value(" ONCE ", &offered), LinkChoice::Once);
+        // An older build's values meant every repo; they are no answer now.
+        for old in ["always-site", "always-any-site"] {
+            assert_eq!(
+                LinkChoice::from_value(old, &LinkChoice::ALL),
+                LinkChoice::Deny,
+                "{old}"
+            );
+        }
         for unread in ["", "yes", "always-any-site", "session", "🤷"] {
             assert_eq!(
                 LinkChoice::from_value(unread, &offered),

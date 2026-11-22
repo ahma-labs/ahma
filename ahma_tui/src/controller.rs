@@ -965,7 +965,7 @@ mod tests {
         let id = link_gate(&mut state, "localhost", true);
         read_link(&mut state);
         assert_eq!(
-            link(&mut state, &id, LinkChoice::AlwaysAny),
+            link(&mut state, &id, LinkChoice::AlwaysAnyThisRepo),
             Err(Refused::NotOffered),
             "any site never covers a local site"
         );
@@ -991,9 +991,9 @@ mod tests {
         gui.link_ask.as_mut().unwrap().shown_at =
             std::time::Instant::now() - GRANT_ARMING_DELAY * 2;
         for saving in [
-            LinkChoice::AlwaysSiteAllRepos,
             LinkChoice::AlwaysSiteThisRepo,
-            LinkChoice::AlwaysAny,
+            LinkChoice::AlwaysSiteAllRepos,
+            LinkChoice::AlwaysAnyThisRepo,
         ] {
             assert_eq!(link(&mut gui, &id, saving), Err(Refused::NotAllowed));
             assert_eq!(link(&mut gui, &id, saving), Err(Refused::NotAllowed));

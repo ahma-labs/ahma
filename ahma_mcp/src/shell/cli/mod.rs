@@ -1639,20 +1639,23 @@ pub enum PermissionsCommand {
         #[arg(long = "expiring", value_name = "DURATION")]
         expiring: Option<String>,
     },
-    /// Grant a permission by kind and subject. `ssh-sign` lets the SSH key broker sign with one key for one destination in one workspace (SPEC R-CRED.3). `open-url [SITE]` lets commands ahma runs open http and https links on SITE in your default browser without asking, in every repo, or with `--this-repo` in this repo only (no SITE: any public site, never localhost or a private address); opening a link sends its whole address to that website, in the browser where you are signed in, and an address can carry data from your project, so allow only sites you trust: one site is safer than any site, and one repo safer than all repos; ahma never opens files or apps this way (SPEC R-LINK). Other kinds have their own commands (`ahma sandbox grant`, `ahma network allow`, `ahma egress allow`). Previews the exact settings line and requires `--yes` to write. Examples: `ahma permissions grant ssh-sign "SHA256:abc… for host:SHA256:def…" --yes`, as a refusal names it; `ahma permissions grant open-url github.com --yes`.
+    /// Grant a permission by kind and subject. `ssh-sign` lets the SSH key broker sign with one key for one destination in one workspace (SPEC R-CRED.3). `open-url [SITE]` lets commands ahma runs open http and https links on SITE in your default browser without asking, in the git repository enclosing the current directory, in the one `--workspace DIR` names, or with `--all-repos` in every repo; outside a git repository name one of them, or nothing is written (no SITE: any public site, never localhost or a private address); opening a link sends its whole address to that website, in the browser where you are signed in, and an address can carry data from your project, so allow only sites you trust: one site is safer than any site, and one repo safer than all repos; ahma never opens files or apps this way (SPEC R-LINK). Other kinds have their own commands (`ahma sandbox grant`, `ahma network allow`, `ahma egress allow`). Previews the exact settings line and requires `--yes` to write. Examples: `ahma permissions grant ssh-sign "SHA256:abc… for host:SHA256:def…" --yes`, as a refusal names it; `ahma permissions grant open-url github.com --yes` (this repo), `ahma permissions grant open-url docs.rs --all-repos --yes`.
     Grant {
         /// Kind of permission: `ssh-sign` or `open-url`.
         #[arg(value_name = "KIND")]
         kind: String,
-        /// For `ssh-sign`: `<key fingerprint> for <destination>`, the destination being `host:<host key fingerprint>` or `sshsig:<namespace>`. For `open-url`: a site (`github.com`), a one-label wildcard (`*.github.io`), or nothing for any public site.
+        /// For `ssh-sign`: `<key fingerprint> for <destination>`, the destination being `host:<host key fingerprint>` or `sshsig:<namespace>`. For `open-url`: a site (`github.com`), a one-label wildcard (`*.github.com`), or nothing for any public site.
         #[arg(value_name = "SUBJECT")]
         subject: Option<String>,
-        /// The workspace whose commands may use it. For `ssh-sign`, defaults to the git repository enclosing the current directory; for `open-url`, binds the grant to that repo instead of every repo.
+        /// The workspace whose commands may use it. For `ssh-sign`, defaults to the git repository enclosing the current directory; for `open-url`, binds the grant to that repo rather than the one enclosing the current directory.
         #[arg(long = "workspace", value_name = "PATH", conflicts_with = "this_repo")]
         workspace: Option<PathBuf>,
-        /// For `open-url`: allow the site in the git repository enclosing the current directory only, rather than in every repo.
+        /// For `open-url`: allow the site in the git repository enclosing the current directory only. This is the default; accepted so older scripts keep working.
         #[arg(long = "this-repo")]
         this_repo: bool,
+        /// For `open-url`: allow the site in every repo (`[open_url] allow`) instead of only the git repository enclosing the current directory. Wider than one repo: an address can carry data from any project.
+        #[arg(long = "all-repos", conflicts_with_all = ["workspace", "this_repo"])]
+        all_repos: bool,
         /// Grant it for this long (`8h`, `7d`) instead of until revoked.
         #[arg(long = "for", value_name = "DURATION")]
         lease: Option<String>,
@@ -1680,8 +1683,8 @@ pub enum PermissionsCommand {
         /// For `open-url`: revoke only the grant bound to the git repository enclosing the current directory.
         #[arg(long = "this-repo", conflicts_with = "global")]
         this_repo: bool,
-        /// For `fs-scope`: revoke the legacy global grant, the one that applies to every workspace. For `open-url`: revoke only the grant for all repos.
-        #[arg(long = "global")]
+        /// For `fs-scope`: revoke the legacy global grant, the one that applies to every workspace. For `open-url`: revoke only the grant for all repos (`--all-repos` is the same).
+        #[arg(long = "global", visible_alias = "all-repos")]
         global: bool,
         /// Apply the previewed change (without this, nothing is written).
         #[arg(long = "yes", short = 'y')]

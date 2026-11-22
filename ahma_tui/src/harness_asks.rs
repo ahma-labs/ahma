@@ -911,8 +911,8 @@ mod tests {
         /// harness lives and no grant covers the site, with the question every
         /// surface shows (ending with the guidance, R-LINK.7) and this
         /// surface's answers, deny first: this site for this session, then
-        /// always for this site in all repos before this repo, then any site
-        /// only where it would cover the link.
+        /// always for this site in this repo before all repos, then any site
+        /// in this repo only where it would cover the link.
         #[test]
         fn a_hooked_link_refusal_is_listed_with_session_and_always() {
             let f = link_fixture("github.com", false);
@@ -926,9 +926,9 @@ mod tests {
                 [
                     Deny,
                     Session,
-                    AlwaysSiteAllRepos,
                     AlwaysSiteThisRepo,
-                    AlwaysAny
+                    AlwaysSiteAllRepos,
+                    AlwaysAnyThisRepo
                 ]
             );
             let text = ask.question().text();
@@ -944,7 +944,7 @@ mod tests {
             let local = link_fixture("localhost", true);
             assert_eq!(
                 waiting(&local)[0].choices(),
-                [Deny, Session, AlwaysSiteAllRepos, AlwaysSiteThisRepo],
+                [Deny, Session, AlwaysSiteThisRepo, AlwaysSiteAllRepos],
                 "no any-site answer for a local site"
             );
 
@@ -970,6 +970,42 @@ mod tests {
             );
         }
 
+        /// SPEC R-LINK.6: the three example links in the TUI, with their keys,
+        /// in order: this site in this repo is the first lasting answer, and
+        /// any site is for this repo only.
+        #[test]
+        fn the_three_examples_offer_this_repo_first_in_the_tui() {
+            for host in ["github.com", "api.github.com", "someone.github.io"] {
+                let f = link_fixture(host, false);
+                let ask = waiting(&f).remove(0);
+                let q = ask.question();
+                let shown: Vec<(char, String)> = ask
+                    .choices()
+                    .into_iter()
+                    .map(|c| (crate::state::LinkAskGate::key_for(c).unwrap(), q.label(c)))
+                    .collect();
+                assert_eq!(
+                    shown,
+                    [
+                        ('n', "Deny".to_string()),
+                        ('s', "This site, this session".into()),
+                        ('r', format!("Always for {host} — this repo only")),
+                        ('a', format!("Always for {host} — all repos")),
+                        ('*', "Always for any site — this repo only".into()),
+                    ],
+                    "{host}"
+                );
+                assert_eq!(
+                    ask.save_line(AlwaysAnyThisRepo).unwrap(),
+                    format!(
+                        "adds \"*\" to [open_url] repos for {} (this repo only) in \
+                         ~/.ahma/settings.toml",
+                        f.ws.display()
+                    )
+                );
+            }
+        }
+
         /// SPEC R-LINK.6, R-GUI.9: a surface that may not save (`ahma web`,
         /// `ahma desktop`) gives what both rules allow — deny and this site for
         /// this session; not "this time", since nothing waits — and names each
@@ -984,7 +1020,7 @@ mod tests {
                 assert_eq!(ask.grant_command(Session), None, "nothing saved");
                 assert_eq!(
                     ask.grant_command(AlwaysSiteAllRepos).as_deref(),
-                    Some(format!("ahma permissions grant open-url {host}").as_str())
+                    Some(format!("ahma permissions grant open-url {host} --all-repos").as_str())
                 );
                 let this_repo = ask.grant_command(AlwaysSiteThisRepo).unwrap();
                 assert!(
@@ -1029,6 +1065,15 @@ mod tests {
             assert!(saved.open_url.allow.is_empty());
             assert_eq!(saved.open_url.allowed_in(&f.ws), ["github.com"]);
             assert!(!dialog_asks(&f));
+
+            let any = link_fixture("example.com", false);
+            answer(&any, AlwaysAnyThisRepo);
+            let saved = ahma_common::config::AhmaSettings::load_from_result(&any.settings).unwrap();
+            assert!(
+                saved.open_url.allow.is_empty(),
+                "any site is never for all repos"
+            );
+            assert_eq!(saved.open_url.allowed_in(&any.ws), ["*"]);
 
             let g = link_fixture("docs.rs", false);
             answer(&g, AlwaysSiteAllRepos);

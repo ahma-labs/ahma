@@ -185,7 +185,7 @@ same names.
 | `net-host` | a host sandboxed commands may reach under `--restrict-network` | a prompt, `ahma network allow` | `[network].allow` |
 | `tool` | a tool the agent may run in a workspace without asking again | a tool-approval prompt | `[permissions].tool_approvals` |
 | `log-target` | a file outside the workspace that a `.ahma/logs/*.log` symlink points at, readable (never writable) by live-log monitoring | a human's `always` answer to the question `logs_approve` raises, or `a` on the log in `ahma tui` | `[log_targets].approvals` |
-| `open-url` | a site whose http and https links commands ahma runs may open in your default browser, in every repo or in one | `ahma permissions grant open-url [SITE]` (*experimental*: hooked commands on macOS and Linux, [open-links.md](open-links.md)) | `[open_url]` |
+| `open-url` | a site whose http and https links commands ahma runs may open in your default browser, in one repo (the default) or in every repo | `ahma permissions grant open-url [SITE]` (*experimental*: hooked commands on macOS and Linux, [open-links.md](open-links.md)) | `[open_url]` |
 
 `tool` and `log-target` grants are bound to the workspace they were granted in, and so
 is an `fs-scope` grant unless it was made `--global`; `web-domain` and `net-host` grants
@@ -498,7 +498,8 @@ ahma permissions revoke tool cargo_build       # per-workspace tool approval
 ahma permissions list --kind log-target        # log files outside the workspace that live-log may read
 ahma permissions revoke log-target /var/log/app.log --workspace ~/code/proj
 ahma permissions grant open-url github.com              # preview: the line, and what to weigh
-ahma permissions grant open-url github.com --this-repo --yes
+ahma permissions grant open-url github.com --yes        # this repo (run inside it)
+ahma permissions grant open-url docs.rs --all-repos --yes  # every repo
 ahma permissions revoke open-url github.com --yes       # every repo, and each repo's own
 
 ahma sandbox grant ~/cache [--read-only]       # kind-scoped shortcut, bound to this workspace
