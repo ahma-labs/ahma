@@ -1,5 +1,6 @@
 use crate::bridge::{MCP_SESSION_ID_HEADER, session_id_from_headers};
 use crate::error::BridgeError;
+use crate::inbound::Inbound;
 use crate::session::{McpRoot, SessionManager};
 use ahma_common::mcp_methods::{
     INITIALIZE_METHOD, INITIALIZED_METHOD, ROOTS_LIST_CHANGED_METHOD, ROOTS_LIST_METHOD,
@@ -414,11 +415,13 @@ async fn handle_post_request(
     session_query: String,
 ) -> Response {
     let session_id = session_id_from_headers(&headers).map(String::from);
-    let method = payload.get("method").and_then(|m| m.as_str());
+    // Classified once; every routing decision below matches on this.
+    let inbound = Inbound::classify(&payload);
+    let method = inbound.method();
 
     tracing::Span::current().record("method", method.unwrap_or(""));
     tracing::Span::current().record("session_id", session_id.as_deref().unwrap_or(""));
-    debug!(method = ?method, session_id = ?session_id, has_id = payload.get("id").is_some(), "Incoming MCP request");
+    debug!(method = ?method, session_id = ?session_id, kind = inbound.kind(), "Incoming MCP request");
 
     if method == Some(INITIALIZE_METHOD) {
         terminate_session_being_reinitialized(&session_manager, session_id.as_deref()).await;
@@ -446,7 +449,7 @@ async fn handle_post_request(
         });
         return json_response(serde_json::json!({
             "jsonrpc": "2.0",
-            "id": payload_id(&payload),
+            "id": inbound.reply_id(),
             "result": result,
         }));
     }
@@ -455,7 +458,7 @@ async fn handle_post_request(
         debug!("subscriptions/listen request received; returning success");
         return json_response(serde_json::json!({
             "jsonrpc": "2.0",
-            "id": payload_id(&payload),
+            "id": inbound.reply_id(),
             "result": {},
         }));
     }
@@ -465,7 +468,7 @@ async fn handle_post_request(
             "Request without session ID for non-initialize method: {:?}",
             method
         );
-        return missing_session_id_response(payload_id(&payload));
+        return missing_session_id_response(inbound.reply_id());
     };
 
     if method == Some(SAMPLING_CREATE_MESSAGE_METHOD) {
@@ -478,7 +481,7 @@ async fn handle_post_request(
         .await;
     }
 
-    handle_existing_session_request(&session_manager, &session_id, method, &payload, mode).await
+    handle_existing_session_request(&session_manager, &session_id, inbound, &payload, mode).await
 }
 
 /// An `initialize` that carries a live session id restarts that session: the
@@ -759,11 +762,11 @@ async fn handle_roots_changed_request(
 async fn handle_existing_session_request(
     session_manager: &Arc<SessionManager>,
     session_id: &str,
-    method: Option<&str>,
+    inbound: Inbound<'_>,
     payload: &Value,
     mode: ResponseMode,
 ) -> Response {
-    let is_initialized_notification = method == Some(INITIALIZED_METHOD);
+    let is_initialized_notification = inbound.method() == Some(INITIALIZED_METHOD);
     if is_initialized_notification {
         debug!(session_id = %session_id, "Received notifications/initialized");
     }
@@ -779,7 +782,7 @@ async fn handle_existing_session_request(
     if let Some(response) = gate_session_request(
         session_manager,
         session_id,
-        method,
+        inbound,
         payload,
         is_initialized_notification,
     )
@@ -791,7 +794,7 @@ async fn handle_existing_session_request(
     forward_request(
         session_manager,
         session_id,
-        method,
+        inbound,
         payload,
         is_initialized_notification,
         mode,
@@ -808,9 +811,8 @@ async fn check_initialization_required(
     method: Option<&str>,
     request_id: Value,
     is_initialized_notification: bool,
-    is_client_response: bool,
 ) -> Option<Response> {
-    if is_initialized_notification || is_client_response {
+    if is_initialized_notification {
         return None;
     }
 
@@ -820,12 +822,6 @@ async fn check_initialization_required(
     }
 
     wait_for_initialization(&session, session_id, method, request_id).await
-}
-
-fn is_client_response(method: Option<&str>, payload: &Value) -> bool {
-    method.is_none()
-        && payload.get("id").is_some()
-        && (payload.get("result").is_some() || payload.get("error").is_some())
 }
 
 fn build_handshake_timeout_response(
@@ -1013,36 +1009,36 @@ async fn wait_for_initialization(
     None
 }
 
-/// Handles a client response (e.g. to `roots/list`).
+/// Handles a client response (e.g. to `roots/list`): the classified
+/// [`Inbound::Response`]'s `id` and `result`, and the `payload` they came from,
+/// which is what is delivered or forwarded.
 async fn handle_client_response(
     session_manager: &SessionManager,
     session_id: &str,
+    id: &Value,
+    result: Option<&Value>,
     payload: &Value,
 ) -> Response {
-    let response_id = payload.get("id");
-    let has_result = payload.get("result").is_some();
-    let has_error = payload.get("error").is_some();
-
-    let mut is_roots_list = false;
-    if let Some(id_val) = response_id {
-        let id = crate::session::RpcId::of(id_val);
-        match match_client_response_id(session_manager, session_id, &id, payload) {
-            ClientResponseMatch::Routed(response) => return response,
-            ClientResponseMatch::RootsList => is_roots_list = true,
-            ClientResponseMatch::None => {}
-        }
-    }
+    let is_roots_list = match match_client_response_id(
+        session_manager,
+        session_id,
+        &crate::session::RpcId::of(id),
+        payload,
+    ) {
+        ClientResponseMatch::Routed(response) => return response,
+        ClientResponseMatch::RootsList => true,
+        ClientResponseMatch::None => false,
+    };
 
     debug!(
         session_id = %session_id,
-        response_id = ?response_id,
-        has_result = has_result,
-        has_error = has_error,
+        response_id = %id,
+        has_result = result.is_some(),
         "Received client response (SSE callback), forwarding to subprocess"
     );
 
     // Check if this is a roots/list response - extract roots and lock sandbox
-    if is_roots_list && let Some(result) = payload.get("result") {
+    if is_roots_list && let Some(result) = result {
         try_lock_sandbox_from_roots(session_manager, session_id, result).await;
     }
 
@@ -1053,7 +1049,7 @@ async fn handle_client_response(
             "Failed to forward client response: {}", e
         );
         return error_response(
-            payload_id(payload),
+            id.clone(),
             RpcErrorCode::Internal,
             &format!("Failed to forward response: {}", e),
         );
@@ -1274,42 +1270,49 @@ async fn mark_session_initialized(
 /// side effects (roots lock, initialized flag) and the error/timeout semantics
 /// are identical; only the encoding of each outcome differs by `mode`:
 ///
-/// * JSON: every outcome is a JSON body (requests and notifications alike).
-/// * SSE, request (has `id`): an SSE stream that starts at once and carries
+/// * JSON, [`Inbound::Request`]: a JSON body.
+/// * SSE, [`Inbound::Request`]: an SSE stream that starts at once and carries
 ///   the session's broadcast events live, then the response event (RB.3).
-/// * SSE, notification (no `id`): HTTP 202 Accepted, per MCP Streamable HTTP
-///   spec §3.2.1 — returning an SSE stream here makes rmcp clients calling
-///   `expect_accepted_or_json()` reject the response with
+/// * Either transport, [`Inbound::Notification`]: HTTP 202 Accepted, per MCP
+///   Streamable HTTP spec §3.2.1 — returning an SSE stream here makes rmcp
+///   clients calling `expect_accepted_or_json()` reject the response with
 ///   `UnexpectedServerResponse`, tearing down the proxy transport.
 async fn forward_request(
     session_manager: &Arc<SessionManager>,
     session_id: &str,
-    method: Option<&str>,
+    inbound: Inbound<'_>,
     payload: &Value,
     is_initialized_notification: bool,
     mode: ResponseMode,
 ) -> Response {
-    // A JSON-RPC notification (no `id`) gets no response object. Per MCP
-    // Streamable HTTP, the server MUST answer HTTP 202 Accepted with no body.
-    // The JSON path used to fall through to the request pipeline, whose
-    // notification handling synthesized `{"jsonrpc":"2.0","result":null}` and
-    // returned it as HTTP 200 — an id-less "response" that is not even valid
-    // JSON-RPC. The SSE path was already correct; this shares its helper.
-    if payload.get("id").is_none() {
-        return forward_notification(
-            session_manager,
-            session_id,
-            method,
-            payload,
-            is_initialized_notification,
-        )
-        .await;
-    }
+    let (id, method) = match inbound {
+        Inbound::Request { id, method } => (id, method),
+        // A JSON-RPC notification (no `id`) gets no response object. Per MCP
+        // Streamable HTTP, the server MUST answer HTTP 202 Accepted with no
+        // body. The JSON path used to fall through to the request pipeline,
+        // whose notification handling synthesized `{"jsonrpc":"2.0","result":null}`
+        // and returned it as HTTP 200 — an id-less "response" that is not even
+        // valid JSON-RPC. The SSE path was already correct; this shares its
+        // helper.
+        Inbound::Notification { method } => {
+            return forward_notification(
+                session_manager,
+                session_id,
+                method,
+                payload,
+                is_initialized_notification,
+            )
+            .await;
+        }
+        // The gate answers every client response before anything is
+        // forwarded; one handed here directly is answered the same way.
+        Inbound::Response { id, result } => {
+            return handle_client_response(session_manager, session_id, id, result, payload).await;
+        }
+    };
 
-    // `payload` is a request (has an `id`) by construction here —
-    // notifications already returned above.
     let Ok(sse_subscription) = capture_sse_subscription(session_manager, session_id, mode) else {
-        return session_not_found_response(payload_id(payload));
+        return session_not_found_response(id.clone());
     };
 
     let request_timeout = forwarded_request_timeout(session_manager, method, payload);
@@ -1325,7 +1328,7 @@ async fn forward_request(
             return with_session_header(
                 error_response_with_status(
                     StatusCode::BAD_REQUEST,
-                    payload_id(payload),
+                    id.clone(),
                     RpcErrorCode::InvalidRequest,
                     &e.to_string(),
                 ),
@@ -1335,7 +1338,7 @@ async fn forward_request(
         Err(e) => {
             error!(session_id = %session_id, "Failed to send request: {}", e);
             return error_response(
-                payload_id(payload),
+                id.clone(),
                 RpcErrorCode::Internal,
                 &format!("Failed to send request: {}", e),
             );
@@ -1388,7 +1391,7 @@ async fn forward_request(
             .1
         })
     };
-    let request_id = payload_id(payload);
+    let request_id = id.clone();
     let answer = async move {
         answer.await.unwrap_or_else(|e| {
             json_rpc_error_value(
@@ -1740,22 +1743,28 @@ fn build_interleaved_sse_stream(
 async fn gate_session_request(
     session_manager: &SessionManager,
     session_id: &str,
-    method: Option<&str>,
+    inbound: Inbound<'_>,
     payload: &Value,
     is_initialized_notification: bool,
 ) -> Option<Response> {
     // Every error below answers *this* request, so it carries this id.
-    let request_id = payload_id(payload);
+    let request_id = inbound.reply_id();
 
     // Validate session exists
     if let Some(response) = check_session_exists(session_manager, session_id, request_id.clone()) {
         return Some(response);
     }
 
-    // Client responses (result/error with an id, no method) are consumed here.
-    if is_client_response(method, payload) {
-        return Some(handle_client_response(session_manager, session_id, payload).await);
-    }
+    // Client responses are consumed here: none of the gates below applies to
+    // an answer, and it is never forwarded as a request.
+    let method = match inbound {
+        Inbound::Response { id, result } => {
+            return Some(
+                handle_client_response(session_manager, session_id, id, result, payload).await,
+            );
+        }
+        Inbound::Request { method, .. } | Inbound::Notification { method } => method,
+    };
 
     // Roots changed check
     if method == Some(ROOTS_LIST_CHANGED_METHOD)
@@ -1778,15 +1787,13 @@ async fn gate_session_request(
         return Some(response);
     }
 
-    // Wait for MCP initialization if needed. Client responses returned above,
-    // so `is_client_response` is `false` here by construction.
+    // Wait for MCP initialization if needed.
     if let Some(response) = check_initialization_required(
         session_manager,
         session_id,
         method,
         request_id,
         is_initialized_notification,
-        false,
     )
     .await
     {
@@ -2100,38 +2107,6 @@ mod tests {
     fn validate_initialize_payload_accepts_valid() {
         let payload = json!({"params": {"protocolVersion": "2025-03-26"}});
         assert!(validate_initialize_payload(&payload).is_none());
-    }
-
-    // ─── is_client_response ─────────────────────────────────────────────
-
-    #[test]
-    fn is_client_response_true_for_result_without_method() {
-        let payload = json!({"id": 1, "result": {}});
-        assert!(is_client_response(None, &payload));
-    }
-
-    #[test]
-    fn is_client_response_true_for_error_without_method() {
-        let payload = json!({"id": 1, "error": {"code": -1}});
-        assert!(is_client_response(None, &payload));
-    }
-
-    #[test]
-    fn is_client_response_false_when_method_present() {
-        let payload = json!({"id": 1, "result": {}});
-        assert!(!is_client_response(Some("tools/call"), &payload));
-    }
-
-    #[test]
-    fn is_client_response_false_without_result_or_error() {
-        let payload = json!({"id": 1});
-        assert!(!is_client_response(None, &payload));
-    }
-
-    #[test]
-    fn is_client_response_false_without_id() {
-        let payload = json!({"result": {}});
-        assert!(!is_client_response(None, &payload));
     }
 
     // ─── get_conflict_message / handshake_timeout_message ───────────────
@@ -2680,7 +2655,9 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
-        let resp = handle_client_response(&mgr, &id, &payload).await;
+        let resp =
+            handle_client_response(&mgr, &id, &payload["id"], payload.get("result"), &payload)
+                .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
     }
@@ -2692,7 +2669,9 @@ mod tests {
         // Force the forward to fail.
         mgr.get_session(&id).unwrap().set_terminated(true);
         let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
-        let resp = handle_client_response(&mgr, &id, &payload).await;
+        let resp =
+            handle_client_response(&mgr, &id, &payload["id"], payload.get("result"), &payload)
+                .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32603);
     }
@@ -2792,7 +2771,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("notifications/initialized"),
+            Inbound::classify(&payload),
             &payload,
             true,
             ResponseMode::Sse,
@@ -3251,7 +3230,9 @@ mod tests {
             .insert(crate::session::RpcId::of(&json!("route-xyz")), tx);
 
         let payload = json!({"jsonrpc": "2.0", "id": "route-xyz", "result": {"v": 9}});
-        let resp = handle_client_response(&mgr, &id, &payload).await;
+        let resp =
+            handle_client_response(&mgr, &id, &payload["id"], payload.get("result"), &payload)
+                .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         // The routed sender received the payload.
         let received = rx.await.expect("sender delivered");
@@ -3275,7 +3256,9 @@ mod tests {
             "id": "rl-7",
             "result": {"roots": [{"uri": path_to_file_uri(temp.path())}]}
         });
-        let resp = handle_client_response(&mgr, &id, &payload).await;
+        let resp =
+            handle_client_response(&mgr, &id, &payload["id"], payload.get("result"), &payload)
+                .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert!(matches!(
             mgr.get_session(&id).unwrap().current_sandbox_state(),
@@ -3327,7 +3310,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("notifications/initialized"),
+            Inbound::classify(&payload),
             &payload,
             true,
             ResponseMode::Json,
@@ -3354,7 +3337,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("tools/call"),
+            Inbound::classify(&payload),
             &payload,
             false,
             ResponseMode::Json,
@@ -3385,7 +3368,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("tools/call"),
+            Inbound::classify(&payload),
             &payload,
             false,
             ResponseMode::Json,
@@ -3422,7 +3405,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("notifications/initialized"),
+            Inbound::classify(&payload),
             &payload,
             true,
             ResponseMode::Json,
@@ -3446,7 +3429,7 @@ mod tests {
         let resp = handle_existing_session_request(
             &mgr,
             &id,
-            Some("tools/call"),
+            Inbound::classify(&payload),
             &payload,
             ResponseMode::Json,
         )
@@ -3542,8 +3525,14 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
-        let resp =
-            handle_existing_session_request(&mgr, &id, None, &payload, ResponseMode::Json).await;
+        let resp = handle_existing_session_request(
+            &mgr,
+            &id,
+            Inbound::classify(&payload),
+            &payload,
+            ResponseMode::Json,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
@@ -3554,7 +3543,7 @@ mod tests {
         let resp = handle_existing_session_request(
             &mgr,
             "missing",
-            Some("tools/list"),
+            Inbound::classify(&payload),
             &payload,
             ResponseMode::Json,
         )
@@ -3574,22 +3563,10 @@ mod tests {
                 &id,
                 Some("notifications/initialized"),
                 json!(1),
-                true,
-                false
+                true
             )
             .await
             .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn check_initialization_required_none_for_client_response() {
-        let mgr = keepalive_manager();
-        let id = mgr.create_session().await.expect("create session");
-        assert!(
-            check_initialization_required(&mgr, &id, None, json!(1), false, true)
-                .await
-                .is_none()
         );
     }
 
@@ -3597,16 +3574,9 @@ mod tests {
     async fn check_initialization_required_none_for_unknown_session() {
         let mgr = keepalive_manager();
         assert!(
-            check_initialization_required(
-                &mgr,
-                "missing",
-                Some("tools/list"),
-                json!(1),
-                false,
-                false
-            )
-            .await
-            .is_none()
+            check_initialization_required(&mgr, "missing", Some("tools/list"), json!(1), false)
+                .await
+                .is_none()
         );
     }
 
@@ -3620,7 +3590,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            check_initialization_required(&mgr, &id, Some("tools/list"), json!(1), false, false)
+            check_initialization_required(&mgr, &id, Some("tools/list"), json!(1), false)
                 .await
                 .is_none()
         );
@@ -3704,9 +3674,15 @@ mod tests {
     async fn sse_gating_returns_404_for_unknown_session() {
         let mgr = keepalive_manager();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let resp = gate_session_request(&mgr, "missing", Some("tools/list"), &payload, false)
-            .await
-            .expect("should gate");
+        let resp = gate_session_request(
+            &mgr,
+            "missing",
+            Inbound::classify(&payload),
+            &payload,
+            false,
+        )
+        .await
+        .expect("should gate");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -3715,7 +3691,7 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
-        let resp = gate_session_request(&mgr, &id, None, &payload, false)
+        let resp = gate_session_request(&mgr, &id, Inbound::classify(&payload), &payload, false)
             .await
             .expect("client response is handled in gating");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -3727,7 +3703,7 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
-        let resp = gate_session_request(&mgr, &id, Some("tools/call"), &payload, false)
+        let resp = gate_session_request(&mgr, &id, Inbound::classify(&payload), &payload, false)
             .await
             .expect("tools/call gated");
         assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -3747,7 +3723,7 @@ mod tests {
             .unwrap();
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
         assert!(
-            gate_session_request(&mgr, &id, Some("ping"), &payload, false)
+            gate_session_request(&mgr, &id, Inbound::classify(&payload), &payload, false)
                 .await
                 .is_none()
         );
@@ -3802,7 +3778,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             "missing",
-            Some("tools/list"),
+            Inbound::classify(&payload),
             &payload,
             false,
             ResponseMode::Sse,
@@ -3821,7 +3797,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("tools/list"),
+            Inbound::classify(&payload),
             &payload,
             false,
             ResponseMode::Sse,
@@ -3843,7 +3819,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("notifications/initialized"),
+            Inbound::classify(&payload),
             &payload,
             true,
             ResponseMode::Sse,
@@ -3873,7 +3849,7 @@ mod tests {
         let resp = forward_request(
             &mgr,
             &id,
-            Some("tools/call"),
+            Inbound::classify(&payload),
             &payload,
             false,
             ResponseMode::Sse,
@@ -3921,7 +3897,7 @@ mod tests {
             forward_request(
                 &mgr,
                 &id,
-                Some("tools/call"),
+                Inbound::classify(&payload),
                 &payload,
                 false,
                 ResponseMode::Sse,
