@@ -37,26 +37,6 @@ mod ffi {
     pub fn confinement_query() -> c_int {
         SANDBOX_FILTER_NONE | SANDBOX_CHECK_NO_REPORT
     }
-
-    /// `EPERM` on Darwin (`<sys/errno.h>`).
-    const EPERM: c_int = 1;
-
-    unsafe extern "C" {
-        /// `int kill(pid_t pid, int sig)`; with `sig` 0 it sends nothing and
-        /// only says whether `pid` could be signalled.
-        fn kill(pid: c_int, sig: c_int) -> c_int;
-    }
-
-    /// Whether a process holds `pid`: `kill(pid, 0)` succeeds, or is refused
-    /// with `EPERM` (another user's process, or one a sandbox may not
-    /// signal). A pid of 0 or below names a process group, never one process.
-    pub fn pid_exists(pid: c_int) -> bool {
-        // SAFETY: signal 0 performs only the existence and permission check;
-        // nothing is sent.
-        pid > 0
-            && (unsafe { kill(pid, 0) } == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(EPERM))
-    }
 }
 
 /// Whether process `pid` runs inside a Seatbelt sandbox. Any pid may be
@@ -64,16 +44,16 @@ mod ffi {
 /// off macOS, and for a pid no process holds.
 #[cfg(target_os = "macos")]
 pub fn pid_is_confined(pid: u32) -> bool {
-    let Ok(pid) = std::ffi::c_int::try_from(pid) else {
+    let Ok(c_pid) = std::ffi::c_int::try_from(pid) else {
         return false;
     };
     // SAFETY: a NULL operation takes no filter argument; no pointer is retained.
     let confined =
-        unsafe { ffi::sandbox_check(pid, std::ptr::null(), ffi::confinement_query()) == 1 };
+        unsafe { ffi::sandbox_check(c_pid, std::ptr::null(), ffi::confinement_query()) == 1 };
     // `sandbox_check` answers 1 for a pid no process holds too, so the answer
     // counts only for a process that is there: else `ahma doctor` names an
     // exited (or soon reused) pid as a sandboxed leftover to kill.
-    confined && ffi::pid_exists(pid)
+    confined && crate::pid_alive::pid_alive(pid)
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -152,9 +152,8 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
     GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    OpenProcess, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 #[cfg(target_os = "windows")]
@@ -1645,22 +1644,8 @@ fn derive_container_sid(name: &str) -> anyhow::Result<OwnedSid> {
 /// grants are swept one run later, never that a live session is stripped.
 #[cfg(target_os = "windows")]
 fn process_is_running(pid: u32) -> bool {
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let mut code: u32 = 0;
-        let running = GetExitCodeProcess(handle, &mut code) != FALSE && code == STILL_ACTIVE;
-        let _ = CloseHandle(handle);
-        running
-    }
+    ahma_common::pid_alive::pid_alive(pid)
 }
-
-/// `STILL_ACTIVE` (`STATUS_PENDING`) — the exit code Windows reports for a process
-/// that has not exited.
-#[cfg(target_os = "windows")]
-const STILL_ACTIVE: u32 = 259;
 
 // ---------------------------------------------------------------------------
 // The launcher

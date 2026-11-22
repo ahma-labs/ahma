@@ -87,6 +87,9 @@ A rule that binds two surfaces lives here (or in the SPEC it cites), never as a 
   grants, and every reading for the exec-config deny rules, R-HANDOFF.2.1),
   and the one declaration of macOS `sandbox_check` with its flags (is a process sandboxed;
   may it register a Mach name).
+- `pid_alive`: the one probe for whether a pid is held by a running process, on every
+  platform (`kill(pid, 0)` on Unix, `OpenProcess` on Windows). Every grant bounded by its
+  owner's life (root SPEC R-PERM.4.4) and the Seatbelt confinement check use it.
 - `BUILD_ID`: the git hash of the build, used to detect a stale same-version bridge.
 
 **Shared definitions**
