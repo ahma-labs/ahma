@@ -384,7 +384,7 @@ mod unix {
         sink.started().await;
         let deadline = tokio::time::Instant::now() + limit;
         // Warned once at 80% of the limit, as a piped command is (SPEC R2.6.6).
-        let mut near_limit = crate::adapter::time_limit::NearLimit::starting_now(limit);
+        let mut near_limit = sink.near_limit(limit);
 
         let exit_status: Option<i32> = loop {
             tokio::select! {

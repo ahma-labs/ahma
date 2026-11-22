@@ -85,6 +85,10 @@ pub(super) struct OpSink {
     stdout: BoundedLineCollector,
     stderr: BoundedLineCollector,
     log_monitor: Option<LogMonitor>,
+    /// Whether the command is warned once at 80% of its limit (SPEC R2.6.6):
+    /// its path's decision ([`super::drive`]), which the runner reads through
+    /// [`Self::near_limit`].
+    warn_near_limit: bool,
 }
 
 impl OpSink {
@@ -97,6 +101,7 @@ impl OpSink {
             stdout: BoundedLineCollector::default(),
             stderr: BoundedLineCollector::default(),
             log_monitor: None,
+            warn_near_limit: true,
         }
     }
 
@@ -105,6 +110,23 @@ impl OpSink {
     pub(super) fn watch_log(mut self, config: Option<LogMonitorConfig>) -> Self {
         self.log_monitor = config.map(LogMonitor::new);
         self
+    }
+
+    /// Whether the command is warned near its limit; it is unless told not.
+    pub(super) fn warn_near_limit(mut self, warn: bool) -> Self {
+        self.warn_near_limit = warn;
+        self
+    }
+
+    /// The runner's near-limit warning for `limit`, measured from now: one
+    /// that never fires when this command is not to be warned.
+    pub(super) fn near_limit(&self, limit: Duration) -> super::time_limit::NearLimit {
+        let near = super::time_limit::NearLimit::starting_now(limit);
+        if self.warn_near_limit {
+            near
+        } else {
+            near.spent()
+        }
     }
 
     /// The operation this sink writes to, for a log line.
