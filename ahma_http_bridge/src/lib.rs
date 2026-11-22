@@ -71,6 +71,7 @@
 pub mod bridge;
 /// Error types for bridge operations.
 pub mod error;
+pub(crate) mod inbound;
 /// Peer connection abstraction (transport port for bridge sessions).
 pub mod peer;
 /// QUIC / HTTP/3 server support.
