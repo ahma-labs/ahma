@@ -44,6 +44,7 @@
 //!   printed; the audit log is what tells you that it happened.
 
 pub mod audit;
+mod drive;
 pub mod executor;
 mod guards;
 pub mod lane;
@@ -64,9 +65,7 @@ pub use preparer::{
 pub use pty_exec::pty_available;
 pub use types::{AsyncExecOptions, ExecutionMode};
 
-use crate::operation_monitor::{
-    CommandOutput, Operation, OperationMonitor, OperationStatus, Stream, Terminal,
-};
+use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus, Stream, Terminal};
 use crate::retry::{self, RetryConfig};
 use crate::sandbox;
 use crate::sandbox::handoff_watch::{HandoffReport, HandoffWatch, HandoffWatchMode};
@@ -1607,8 +1606,6 @@ impl Adapter {
         let op_id = id
             .map(|s| s.to_string())
             .unwrap_or_else(|| generate_id(tool_name, command));
-        let op_id_clone = op_id.clone();
-        let wd = safe_wd_str.clone();
 
         let timeout = timeout.or_else(|| self.declared_timeout(args.as_ref()));
         let timeout_duration = timeout.map(Duration::from_secs);
@@ -1659,61 +1656,44 @@ impl Adapter {
         );
         let workspace = self.workspace_key_for(&safe_wd);
         let drift_root = workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd);
-        let display_command = shell_command_line(args.as_ref())
+        // The command line as the caller wrote it (for a shell tool, the shell
+        // string; `command` is then just the shell program).
+        let line = shell_command_line(args.as_ref())
             .map(str::to_string)
             .unwrap_or_else(|| command.to_string());
-        let cancellation_token = self.monitor.register(operation).await;
-        if let Some(said) = link_note {
-            self.monitor.append_alert(&op_id, said).await;
-        }
 
-        // Durable provenance, written *before* the task is spawned. Doing it here
-        // rather than inside the task is the point: nothing between this line and
-        // the process exiting — a panic, a SIGKILL, a hang, a machine losing
-        // power — can leave the log without a record of what was asked for.
-        audit::record_tool_call(
-            &op_id,
-            tool_name,
-            args.as_ref(),
-            &safe_wd_str,
-            &program_with_subcommand,
-            &args_vec,
-        )
-        .await;
-
-        let monitor = self.monitor.clone();
-        let sandbox = self.sandbox.clone(); // Clone ARC to pass to task
-        let command = command.to_string();
-        let wd_clone = wd.clone();
-
-        let run = run_async_operation(AsyncOperationRun {
-            op_id,
-            cancellation_token,
-            command,
-            program: program_with_subcommand,
-            args_vec,
-            working_dir: wd_clone,
-            limit: command_limit(&self.shell_pool, timeout),
-            log_monitor_config,
-            monitor,
-            sandbox,
-            command_executor: self.command_executor.clone(),
-            mutex_registry: self.mutex_registry.clone(),
-            scope_grant_notifier: self.scope_grant_notifier.clone(),
-            admission,
-            workspace,
-            drift_root,
-            display_command,
+        let prepared = drive::Prepared {
+            call: drive::AuditCall {
+                tool: tool_name.to_string(),
+                args,
+                working_dir: safe_wd_str,
+                program: program_with_subcommand.clone(),
+                argv: args_vec.clone(),
+            },
+            link_note,
+            subject: command.to_string(),
+            line,
+            // A service is expected to write while it runs (SPEC R2.7.6).
+            drift: (lane != workspace_queue::Lane::Service).then_some(DriftProbe {
+                root: drift_root,
+                lane,
+            }),
             watch_handoff: self.watches_handoff(lane),
-            keep_leftovers,
-            #[cfg(unix)]
-            credential_brokers: self.credential_brokers.clone(),
-            #[cfg(unix)]
-            link_brokers: self.link_brokers.clone(),
-        });
-        self.spawn_operation_task(&op_id_clone, run).await;
-
-        Ok(op_id_clone)
+            limit: command_limit(&self.shell_pool, timeout),
+            run: drive::Run::Piped {
+                program: program_with_subcommand,
+                args: args_vec,
+                log_monitor: log_monitor_config,
+                keep_leftovers,
+                executor: self.command_executor.clone(),
+                scope_grant_notifier: self.scope_grant_notifier.clone(),
+            },
+            op_id,
+            admission,
+            working_dir: safe_wd,
+            workspace,
+        };
+        Ok(self.drive(operation, prepared).await)
     }
 
     /// Start `command_str` asynchronously inside a pseudo-terminal (PTY).
@@ -1767,123 +1747,35 @@ impl Adapter {
         operation.cwd = Some(safe_wd.to_string_lossy().into_owned());
         operation.command = Some(command_str.to_string());
         operation.output_file = Some(spill::operation_spill_path(&op_id));
-        let cancellation_token = self.monitor.register(operation).await;
-        if let Some(said) = link_note {
-            self.monitor.append_alert(&op_id, said).await;
-        }
-
-        let audit_argv = [command_str.to_string()];
-        audit::record_tool_call(
-            &op_id,
-            tool_name,
-            None,
-            &safe_wd.to_string_lossy(),
-            "[pty]",
-            &audit_argv,
-        )
-        .await;
-
-        let limit = command_limit(&self.shell_pool, timeout);
-        let monitor = self.monitor.clone();
-        let sandbox = self.sandbox.clone();
-        let command_str = command_str.to_string();
-        let op_id_task = op_id.clone();
-        let tool_task = tool_name.to_string();
-        #[cfg(unix)]
-        let credential_brokers = self.credential_brokers.clone();
-        #[cfg(unix)]
-        let link_brokers = self.link_brokers.clone();
-        let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
-        let keep_leftovers = self.is_declared_long_running(&command_str);
-        // Its mutex group (SPEC R2.7.2), keyed like the lease and matched on
-        // the line the caller wrote, as for a piped command.
-        let mutex_registry = self.mutex_registry.clone();
         let workspace = self.workspace_key_for(&safe_wd);
-        // Drift (SPEC R2.7.6): this command is exclusive, never a service.
-        let drift = DriftProbe {
-            root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
-            lane: workspace_queue::Lane::Exclusive,
+        let prepared = drive::Prepared {
+            call: drive::AuditCall {
+                tool: tool_name.to_string(),
+                args: None,
+                working_dir: safe_wd.to_string_lossy().into_owned(),
+                program: "[pty]".to_string(),
+                argv: vec![command_str.to_string()],
+            },
+            link_note,
+            subject: tool_name.to_string(),
+            line: command_str.to_string(),
+            // This command is exclusive, never a service (SPEC R2.7.6).
+            drift: Some(DriftProbe {
+                root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
+                lane: workspace_queue::Lane::Exclusive,
+            }),
+            watch_handoff: self.watches_handoff(workspace_queue::Lane::Exclusive),
+            limit: command_limit(&self.shell_pool, timeout),
+            run: drive::Run::Pty {
+                line: run_line,
+                keep_leftovers: self.is_declared_long_running(command_str),
+            },
+            op_id,
+            admission,
+            working_dir: safe_wd,
+            workspace,
         };
-
-        let task = async move {
-            let Some(guards) = guards::RunGuards::begin(
-                &monitor,
-                &op_id_task,
-                &tool_task,
-                admission,
-                &cancellation_token,
-            )
-            .await
-            else {
-                return;
-            };
-            // Its mutex group (SPEC R2.7.2), as for a piped command.
-            let Some(mut guards) = guards
-                .gate(&monitor, &mutex_registry, &command_str, &workspace)
-                .await
-            else {
-                return;
-            };
-            // As on the piped path: after the queue and the gate, before the spawn.
-            let started = Instant::now();
-            if watch_handoff {
-                guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
-            }
-            // Its SSH key broker (SPEC R-CRED.1), as for any other command: a
-            // refused signature is an alert on this operation (R-CRED.10). Held
-            // until the PTY process is gone.
-            #[cfg(unix)]
-            guards.hold_broker(
-                credential_brokers
-                    .as_ref()
-                    .and_then(|f| f.lease_for_command(&safe_wd, Some(&command_str)))
-                    .inspect(|broker| alert_broker_refusals(broker, &monitor, &op_id_task)),
-            );
-            // And its link broker (SPEC R-LINK.1): what it refuses, and what
-            // it asks a human while the command waits, is an alert on this
-            // operation (R-LINK.6).
-            #[cfg(unix)]
-            let links = link_brokers
-                .as_ref()
-                .and_then(|f| f.lease_for_command(&safe_wd, Some(&command_str)))
-                .inspect(|links| watch_links(links, &monitor, &op_id_task));
-            #[cfg_attr(not(unix), allow(unused_mut))]
-            let mut brokers = pty_exec::BrokerEnv::default();
-            #[cfg(unix)]
-            {
-                if let Some(broker) = guards.broker() {
-                    brokers.push("SSH_AUTH_SOCK", broker.socket().as_os_str().to_os_string());
-                }
-                if let Some(links) = &links {
-                    brokers.links_served = true;
-                    for (key, value) in links.env() {
-                        brokers.push(key, value);
-                    }
-                }
-                guards.hold_links(links);
-            }
-            let mut sink = sink::OpSink::new(monitor.clone(), &op_id_task, sink::Shape::Pty);
-            let end = pty_exec::run_pty_operation(
-                &sandbox,
-                &run_line,
-                &safe_wd,
-                limit,
-                &cancellation_token,
-                &mut sink,
-                &brokers,
-                keep_leftovers,
-            )
-            .await;
-            let finished = sink.close(end).await;
-            // The PTY process is gone: the result carries the drift and
-            // deny-tier reports, as a piped command's does.
-            let finished =
-                carry_run_reports(finished, &drift, started, &mut guards, &monitor).await;
-            guards.end(&monitor, finished).await;
-        };
-        self.spawn_operation_task(&op_id, task).await;
-
-        Ok(op_id)
+        Ok(self.drive(operation, prepared).await)
     }
 
     /// Start `command_str` asynchronously in the persistent shell session
@@ -1925,85 +1817,35 @@ impl Adapter {
         // observers (TUI task tree) render them as children of the session.
         .with_parent(format!("session:{session_id}"));
         operation.output_file = Some(spill::operation_spill_path(&op_id));
-        let cancellation_token = self.monitor.register(operation).await;
-
-        let audit_argv = [command_str.to_string()];
-        audit::record_tool_call(
-            &op_id,
-            tool_name,
-            None,
-            &safe_wd.to_string_lossy(),
-            &format!("[session {session_id}]"),
-            &audit_argv,
-        )
-        .await;
-
-        let limit = command_limit(&self.shell_pool, timeout);
-        let monitor = self.monitor.clone();
-        let sandbox = self.sandbox.clone();
-        let sessions = self.shell_sessions.clone();
-        let session_id = session_id.to_string();
-        let command_str = command_str.to_string();
-        let op_id_task = op_id.clone();
-        let tool_task = tool_name.to_string();
-        let watch_handoff = self.watches_handoff(workspace_queue::Lane::Exclusive);
-        let mutex_registry = self.mutex_registry.clone();
         let workspace = self.workspace_key_for(&safe_wd);
-        // Drift (SPEC R2.7.6): this command is exclusive, never a service.
-        let drift = DriftProbe {
-            root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
-            lane: workspace_queue::Lane::Exclusive,
+        let prepared = drive::Prepared {
+            call: drive::AuditCall {
+                tool: tool_name.to_string(),
+                args: None,
+                working_dir: safe_wd.to_string_lossy().into_owned(),
+                program: format!("[session {session_id}]"),
+                argv: vec![command_str.to_string()],
+            },
+            link_note: None,
+            subject: tool_name.to_string(),
+            line: command_str.to_string(),
+            // This command is exclusive, never a service (SPEC R2.7.6).
+            drift: Some(DriftProbe {
+                root: workspace_queue::drift_root(&workspace, &self.sandbox.scopes(), &safe_wd),
+                lane: workspace_queue::Lane::Exclusive,
+            }),
+            watch_handoff: self.watches_handoff(workspace_queue::Lane::Exclusive),
+            limit: command_limit(&self.shell_pool, timeout),
+            run: drive::Run::Session {
+                id: session_id.to_string(),
+                sessions: self.shell_sessions.clone(),
+            },
+            op_id,
+            admission,
+            working_dir: safe_wd,
+            workspace,
         };
-
-        let task = async move {
-            let Some(guards) = guards::RunGuards::begin(
-                &monitor,
-                &op_id_task,
-                &tool_task,
-                admission,
-                &cancellation_token,
-            )
-            .await
-            else {
-                return;
-            };
-            // Its mutex group (SPEC R2.7.2), as for a piped command.
-            let Some(mut guards) = guards
-                .gate(&monitor, &mutex_registry, &command_str, &workspace)
-                .await
-            else {
-                return;
-            };
-            // As on the piped path: after the queue and the gate, before the spawn.
-            let started = Instant::now();
-            if watch_handoff {
-                guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
-            }
-            let mut sink = sink::OpSink::new(
-                monitor.clone(),
-                &op_id_task,
-                sink::Shape::Session(session_id.clone()),
-            );
-            let end = run_session_operation(
-                &sessions,
-                &sandbox,
-                &session_id,
-                &command_str,
-                &safe_wd,
-                limit,
-                &cancellation_token,
-                &mut sink,
-            )
-            .await;
-            let finished = sink.close(end).await;
-            // The command has ended (the session's shell lives on): as for PTY.
-            let finished =
-                carry_run_reports(finished, &drift, started, &mut guards, &monitor).await;
-            guards.end(&monitor, finished).await;
-        };
-        self.spawn_operation_task(&op_id, task).await;
-
-        Ok(op_id)
+        Ok(self.drive(operation, prepared).await)
     }
 
     /// Parses the command string and arguments into a program and argument list.
@@ -2121,45 +1963,6 @@ fn command_limit(shell_pool: &ShellPoolManager, timeout_secs: Option<u64>) -> Du
         .unwrap_or_else(|| shell_pool.config().command_timeout)
 }
 
-/// Context for a single background async operation task.
-struct AsyncOperationRun {
-    op_id: String,
-    cancellation_token: tokio_util::sync::CancellationToken,
-    command: String,
-    program: String,
-    args_vec: Vec<String>,
-    working_dir: String,
-    /// Its time limit ([`command_limit`]).
-    limit: Duration,
-    log_monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
-    monitor: Arc<OperationMonitor>,
-    sandbox: Arc<sandbox::Sandbox>,
-    command_executor: Arc<dyn executor::CommandExecutor>,
-    mutex_registry: Arc<CommandMutexRegistry>,
-    scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
-    /// Its lane and, if exclusive, its place in line (SPEC R2.7).
-    admission: workspace_queue::Admission,
-    /// The workspace key (SPEC R2.7.2): the mutex groups' key.
-    workspace: std::path::PathBuf,
-    /// Where the drift probe walks: the workspace, clipped to the sandbox
-    /// scope (SPEC R2.7.6).
-    drift_root: std::path::PathBuf,
-    /// The command line as the caller wrote it (for a shell tool, the shell
-    /// string — `command` is then just the shell program).
-    display_command: String,
-    /// Inventory the trust-handoff deny tier around the run (SPEC R6.1.7).
-    watch_handoff: bool,
-    /// A human declared this command long-running (SPEC R2.7.10), so what it
-    /// starts may stay running after it (R-PROC.5).
-    keep_leftovers: bool,
-    /// Gives the command an SSH key broker (SPEC R-CRED.1).
-    #[cfg(unix)]
-    credential_brokers: Option<Arc<dyn crate::credentials::ssh_agent::consent::BrokerFactory>>,
-    /// Gives the command a link broker (SPEC R-LINK.1).
-    #[cfg(unix)]
-    link_brokers: Option<Arc<dyn crate::links::host::LinkBrokerFactory>>,
-}
-
 /// Report each signature `broker` refuses as an alert on operation `op_id`
 /// while it still runs (SPEC R-CRED.10).
 #[cfg(unix)]
@@ -2192,175 +1995,6 @@ fn watch_links(
         let (monitor, op_id, line) = (monitor.clone(), op_id.clone(), line.to_string());
         runtime.spawn(async move { monitor.append_alert_unique(&op_id, line).await });
     }));
-}
-
-async fn run_async_operation(ctx: AsyncOperationRun) {
-    let AsyncOperationRun {
-        op_id,
-        cancellation_token,
-        command,
-        program,
-        args_vec,
-        working_dir,
-        limit,
-        log_monitor_config,
-        monitor,
-        sandbox,
-        command_executor,
-        mutex_registry,
-        scope_grant_notifier,
-        admission,
-        workspace,
-        drift_root,
-        display_command,
-        watch_handoff,
-        keep_leftovers,
-        #[cfg(unix)]
-        credential_brokers,
-        #[cfg(unix)]
-        link_brokers,
-    } = ctx;
-
-    // Timed from the moment the task starts, so queueing behind a command mutex
-    // group is visible in the audit record rather than silently excluded.
-    // ── Workspace write queue (SPEC R2.7) ──────────────────────────────────
-    // Wait for every exclusive operation that arrived earlier in this
-    // workspace — in this process or any other — before starting. The lease is
-    // held until the operation ends, i.e. until the process tree is gone.
-    let lane = admission.lane();
-    let Some(guards) =
-        guards::RunGuards::begin(&monitor, &op_id, &command, admission, &cancellation_token).await
-    else {
-        return;
-    };
-
-    // Lifecycle events (Started / terminal) are emitted by the OperationMonitor
-    // at each state transition — the single emission point for the unified
-    // event stream (SPEC R15).  MCP progress notifications are pushed by the
-    // `progress_push` forwarder subscribed to that stream.
-
-    // ── Command mutex group gate (SPEC R2.7.2) ─────────────────────────────
-    // Held by the guards for the whole run and handed on with the lease.
-    let Some(mut guards) = guards
-        .gate(&monitor, &mutex_registry, &display_command, &workspace)
-        .await
-    else {
-        return;
-    };
-
-    let start_time = Instant::now();
-    let wd_path = std::path::PathBuf::from(&working_dir);
-    // Its link broker (SPEC R-LINK.1), leased before its sandbox is built in
-    // either lane: having one is what lets this command, and no other, reach
-    // the broker directory. Held until the command has ended.
-    #[cfg(unix)]
-    let links = link_brokers
-        .as_ref()
-        .and_then(|f| f.lease_for_command(&wd_path, Some(&display_command)));
-    #[cfg(unix)]
-    let served_links = links.is_some();
-    #[cfg(not(unix))]
-    let served_links = false;
-    let built = build_for_this_command(served_links, || {
-        if lane == workspace_queue::Lane::ReadOnly {
-            command_executor.build_read_only_command(&sandbox, &program, &args_vec, &wd_path)
-        } else {
-            build_sandboxed_command(
-                command_executor.as_ref(),
-                &sandbox,
-                &program,
-                &args_vec,
-                &wd_path,
-            )
-        }
-    });
-    let mut proc_cmd = match built {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            let why = format!("Failed to create sandboxed command: {}", e);
-            guards.end(&monitor, failed(why)).await;
-            return;
-        }
-    };
-
-    stamp_lease(&mut proc_cmd, guards.lease());
-    if keep_leftovers {
-        sandbox::leftovers::keep(&mut proc_cmd);
-    }
-    // The command's SSH key broker (SPEC R-CRED.1): a refused signature is an
-    // alert on this operation while it still runs (R-CRED.10). Held until the
-    // command has finished.
-    #[cfg(unix)]
-    guards.hold_broker(
-        credential_brokers
-            .as_ref()
-            .and_then(|f| f.lease_for_command(&wd_path, Some(&display_command)))
-            .inspect(|broker| {
-                proc_cmd.env("SSH_AUTH_SOCK", broker.socket());
-                alert_broker_refusals(broker, &monitor, &op_id);
-            }),
-    );
-    // The link broker's helper and socket (SPEC R-LINK.1); what it refuses
-    // and what it asks while the command waits is an alert (R-LINK.6).
-    #[cfg(unix)]
-    guards.hold_links(links.inspect(|links| {
-        for (key, value) in links.env() {
-            proc_cmd.env(key, value);
-        }
-        watch_links(links, &monitor, &op_id);
-    }));
-    // The tag the kernel's records of this operation's denials carry
-    // (SPEC R-DENY.1), for the failure path to read them back.
-    if let Some(tag) = sandbox::kernel_denials::tag_of(proc_cmd.as_std().get_args()) {
-        sandbox::kernel_denials::remember_tag(&op_id, tag);
-    }
-
-    let drift = (lane != workspace_queue::Lane::Service).then_some(DriftProbe {
-        root: drift_root,
-        lane,
-    });
-
-    // SPEC R6.1.7: the "before" inventory of the deny tier, taken as late as
-    // possible — after the queue and the mutex gate, just before the spawn.
-    if watch_handoff {
-        guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &wd_path).await));
-    }
-
-    // Single execution path: stream stdout/stderr line-by-line for every
-    // operation (SPEC R15.2).  Lines flow through the OperationMonitor, which
-    // appends to the tail buffer and emits `OutputLine` on the unified event
-    // stream — so the TUI and hub subscribers see output as it is produced.
-    // Log-monitor alerting only runs when a config was provided.
-    let mut sink = sink::OpSink::new(monitor.clone(), &op_id, sink::Shape::Piped)
-        .watch_log(log_monitor_config);
-    let end = execute_with_streaming(
-        &mut proc_cmd,
-        limit,
-        start_time,
-        cpu_probe_threshold(monitor.idle_timeout()),
-        &cancellation_token,
-        &mut sink,
-    )
-    .await;
-    match sink.close(end).await {
-        Terminal::Exited(output) => {
-            finalize_streaming_operation(
-                *output,
-                start_time,
-                &monitor,
-                &op_id,
-                &sandbox,
-                scope_grant_notifier.as_ref(),
-                &command,
-                &wd_path,
-                drift.as_ref(),
-                guards,
-            )
-            .await
-        }
-        // A timeout, a cancel or a failure to spawn: no result to add to.
-        ending => guards.end(&monitor, ending).await,
-    }
 }
 
 /// The shell command line of a `run_terminal_command`-style call (`command`
@@ -2851,32 +2485,6 @@ impl DriftProbe {
 
 /// Acquire the command's mutex-group gate, if the command belongs to one.
 ///
-/// A PTY or session command's ending with what its result owes beyond the
-/// output, as a piped command's result has it: the files that changed in its
-/// workspace while it ran (SPEC R2.7.6). Only an ending that carries output
-/// (`Exited`) has a place for it.
-/// A PTY or session command's ending with what its result owes beyond the
-/// output, as a piped command's result has it, in the same order: the files
-/// that changed in its workspace while it ran (SPEC R2.7.6), then the
-/// deny-tier report and its alert (R6.1.7). Only an ending that carries output
-/// (`Exited`) has a place for them; any other leaves the watch for
-/// `RunGuards::end`, which reports it to the log and the audit trail.
-async fn carry_run_reports(
-    ending: Terminal,
-    drift: &DriftProbe,
-    started: Instant,
-    guards: &mut guards::RunGuards,
-    monitor: &OperationMonitor,
-) -> Terminal {
-    let mut output = match ending {
-        Terminal::Exited(output) => output,
-        other => return other,
-    };
-    output.changed_during_run = drift.report(started.elapsed()).await;
-    guards.report_handoff_in(&mut output, monitor).await;
-    Terminal::Exited(output)
-}
-
 /// The gate every async path waits for, through [`guards::RunGuards::gate`].
 ///
 /// Returns `Ok(None)` when the command isn't gated by any group, `Ok(Some(permit))`
@@ -2976,7 +2584,7 @@ async fn run_session_operation(
     sink.started().await;
     // Warned once at 80% of the limit, as a piped command is (SPEC R2.6.6).
     // The session enforces the limit itself (`ShellSession::execute_streaming`).
-    let mut near_limit = time_limit::NearLimit::starting_now(limit);
+    let mut near_limit = sink.near_limit(limit);
 
     // The session protocol streams lines through a sync callback; forward
     // them over a channel so the async side can append/spill as they arrive.
@@ -3115,7 +2723,7 @@ async fn execute_with_streaming(
     let timeout_deadline = tokio::time::Instant::now() + limit;
     // Warn once at 80% of the limit (SPEC R2.6.6), so a healthy job near it
     // is not stopped without notice.
-    let mut near_limit = time_limit::NearLimit::starting_now(limit);
+    let mut near_limit = sink.near_limit(limit);
 
     let mut still_running_interval = tokio::time::interval(Duration::from_secs(10));
     still_running_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3517,63 +3125,6 @@ async fn alert_out_of_scope_denial(
         remediation
     );
     op_monitor.append_alert(op_id, remediation).await;
-}
-
-/// End a piped command that exited: add what only the caller knows to its
-/// `output` (failure diagnostics, drift, the deny-tier report), then end it
-/// through its guards.
-#[allow(clippy::too_many_arguments)]
-async fn finalize_streaming_operation(
-    mut output: CommandOutput,
-    start_time: Instant,
-    op_monitor: &Arc<OperationMonitor>,
-    op_id: &str,
-    sandbox: &Arc<sandbox::Sandbox>,
-    scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
-    tool: &str,
-    working_dir: &Path,
-    drift: Option<&DriftProbe>,
-    mut guards: guards::RunGuards,
-) {
-    let success = output.exit_code == Some(0);
-    if success {
-        // Nothing to read back for an operation that succeeded.
-        let _ = sandbox::kernel_denials::take_tag(op_id);
-    }
-
-    // A failed async command may have hit a runtime sandbox denial the kernel did
-    // not name; scan stderr and (best-effort) offer to grant an out-of-scope path.
-    // This is the async-path twin of the scan in `execute_sync_in_dir`.
-    if !success {
-        record_failure_diagnostics(
-            sandbox,
-            scope_grant_notifier,
-            op_monitor,
-            op_id,
-            tool,
-            &output.stdout,
-            &output.stderr,
-            Some(working_dir),
-        )
-        .await;
-    } else if let Some(note) = sandbox::gpu_fallback_note(&output.stderr, &output.stdout) {
-        // The async twin of the success note in `explain_ungrantable_failure`.
-        op_monitor.append_alert(op_id, note).await;
-    }
-
-    output.changed_during_run = match drift {
-        Some(probe) => probe.report(start_time.elapsed()).await,
-        None => None,
-    };
-    // The process tree is gone: the deny-tier report (SPEC R6.1.7) goes in
-    // the result, and its alert out before the terminal transition.
-    guards.report_handoff_in(&mut output, op_monitor).await;
-    // The process tree is gone and the drift probe has looked: the guards
-    // hand the workspace on, then publish. The terminal event carries the
-    // result to all subscribers (MCP progress push, hub, TUI).
-    guards
-        .end(op_monitor, Terminal::Exited(Box::new(output)))
-        .await;
 }
 
 /// The ending of an operation cancelled before or while it ran.

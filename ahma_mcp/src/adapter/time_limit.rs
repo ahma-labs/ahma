@@ -66,6 +66,12 @@ impl NearLimit {
         }
     }
 
+    /// Already spent: it never warns.
+    pub(crate) fn spent(mut self) -> Self {
+        self.warned = true;
+        self
+    }
+
     /// When to warn.
     pub(crate) fn at(&self) -> tokio::time::Instant {
         self.at
