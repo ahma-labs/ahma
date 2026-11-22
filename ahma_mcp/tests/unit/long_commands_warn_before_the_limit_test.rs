@@ -68,7 +68,8 @@ async fn a_command_stopped_at_its_limit_says_how_to_raise_it() {
     )));
     let adapter = adapter_in(temp.path(), monitor);
     let err = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "sleep 10",
             None,
             temp.path().to_str().unwrap(),

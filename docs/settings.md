@@ -271,9 +271,9 @@ One call can wait regardless of the mode: an MTDF tool marked `"synchronous": tr
 unadvertised `execution_mode: "Synchronous"` waits exactly as `sync` mode does —
 still a tracked operation, still bounded by the client's request budget.
 `"synchronous": false` or `"blocking": false` returns after the adaptive window even
-in `sync` mode. `ahma tool run` (the CLI one-shot) is an operation too, and waits
-for it with no budget: a one-shot has nothing to `await` with later. Only a terminal
-hook still runs a command without an operation.
+in `sync` mode. `ahma tool run` (the CLI one-shot) and a terminal hook run their
+command as an operation too, and wait for it with no budget: they have nothing to
+`await` with later.
 
 | Key (`[tools]`) | Default | Effect |
 |---|---|---|

@@ -266,16 +266,18 @@ async fn tool_call_and_tool_complete_pair_for_a_successful_command() {
     );
 }
 
-/// The synchronous path mints its own id so its call and completion can still be
-/// correlated; a failure must be recorded as one, not omitted.
+/// A caller that waits (`run_to_completion`) gets an operation id minted for
+/// it, so its call and completion can still be correlated; a failure must be
+/// recorded as one, not omitted.
 #[tokio::test]
-async fn the_synchronous_path_records_a_failed_command() {
+async fn a_waited_command_records_a_failed_command() {
     let (_dir, scope) = scope_dir();
     let adapter = test_adapter(&scope);
 
     let before = read_events().await.len();
     let result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "ahma_audit_nonexistent_command",
             None,
             scope.to_str().unwrap(),
@@ -300,12 +302,12 @@ async fn the_synchronous_path_records_a_failed_command() {
     assert_eq!(complete["success"], false);
 }
 
-/// The synchronous path returns how a command ended inline, as the error of
-/// the call, and audits the same ending under the id the caller gave it: a
+/// A caller that waits gets how a command ended inline, as the error of
+/// the call, and the same ending is audited under the id the caller gave it: a
 /// non-zero exit is `failed` with its exit code in both, and a command stopped
 /// at its time limit is `timed_out` with no exit code (SPEC R-HANDOFF.10).
 #[tokio::test]
-async fn the_synchronous_path_returns_its_ending_inline_and_audits_the_same_one() {
+async fn a_waited_command_returns_its_ending_inline_and_audits_the_same_one() {
     use ahma_mcp::adapter::ExecutionMode;
     let (_dir, scope) = scope_dir();
     let adapter = test_adapter(&scope);
@@ -320,7 +322,7 @@ async fn the_synchronous_path_returns_its_ending_inline_and_audits_the_same_one(
                 &ExecutionMode::Synchronous,
             );
             adapter
-                .execute_sync_in_dir_as(
+                .run_to_completion(
                     Some(id),
                     ahma_mcp::shell_pool::platform_shell_program(),
                     Some(args),
@@ -642,7 +644,8 @@ async fn an_unwritable_audit_log_does_not_fail_the_operation() {
     let (_dir, scope) = scope_dir();
     let adapter = test_adapter(&scope);
     let result = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             "echo",
             None,
             scope.to_str().unwrap(),

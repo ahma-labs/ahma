@@ -250,16 +250,17 @@ async fn a_command_that_touches_nothing_raises_no_alert() {
     assert!(handoff_records(&op.id).await.is_empty());
 }
 
-/// The synchronous path (terminal hooks, `ahma tool run`, sync-mode
-/// `run_terminal_command`) leads its returned text with the same alert.
+/// A caller that waits for its command (terminal hooks, `ahma tool run`) reads
+/// the same alert leading its returned text.
 #[tokio::test]
-async fn the_synchronous_path_leads_its_result_with_the_alert() {
+async fn a_waiting_caller_reads_the_alert_first() {
     let (_dir, root) = workspace();
     let (adapter, _monitor) = adapter(&root, HandoffWatchMode::Always);
     let sc = AhmaMcpService::build_shell_subcommand_config(None, &ExecutionMode::Synchronous);
 
     let output = adapter
-        .execute_sync_in_dir(
+        .run_to_completion(
+            None,
             platform_shell_program(),
             Some(shell_args(create_hook_cmd())),
             root.to_str().unwrap(),
