@@ -37,11 +37,17 @@ fn hooked(home: &Path, ws: &Path, command: &str, timeout_ms: Option<u64>) -> Ans
         .expect("run ahma hooks run-shell");
     Answer {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        // A nested run says once that the outer sandbox is the control
-        // (SPEC R7.6); that line depends on where the test runs.
+        // A nested run says once which sandbox is in effect (SPEC R7.6,
+        // `ActiveSandbox::disclosure_line`, always "Sandbox: …"); that line
+        // depends on where the test runs — inside an outer ahma in CI's
+        // confined job — so it is not part of what is pinned here.
         stderr: String::from_utf8_lossy(&out.stderr)
             .lines()
-            .filter(|l| !l.contains("outer sandbox") && !l.contains("another sandbox"))
+            .filter(|l| {
+                !l.starts_with("Sandbox: ")
+                    && !l.contains("outer sandbox")
+                    && !l.contains("another sandbox")
+            })
             .map(|l| format!("{l}\n"))
             .collect(),
         code: out.status.code(),
