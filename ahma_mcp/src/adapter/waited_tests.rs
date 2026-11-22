@@ -71,7 +71,9 @@ fn reads(result: &Result<String>) -> String {
             } else {
                 "untyped".to_string()
             };
-            format!("err ({kind}): {e:?}")
+            // The message chain, not `{e:?}`: under `RUST_BACKTRACE` the debug
+            // form carries a backtrace whose frames differ by call path.
+            format!("err ({kind}): {e:#}")
         }
     }
 }
