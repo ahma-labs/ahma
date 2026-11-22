@@ -293,6 +293,8 @@ enum Ready {
         id: String,
         command: String,
         sessions: Arc<ShellSessionManager>,
+        /// Its workspace lease, for the command to inherit (SPEC R2.7.7).
+        lease: Option<String>,
     },
 }
 
@@ -388,11 +390,18 @@ fn prepare(
             line: runs,
             keep_leftovers,
         } => {
-            // Not stamped with its lease (SPEC R2.7.7), unlike a piped command.
             #[cfg_attr(not(unix), allow(unused_mut))]
             let mut brokers = pty_exec::BrokerEnv::default();
             #[cfg(unix)]
             {
+                // An ahma it starts does not wait for the lease it runs under
+                // (SPEC R2.7.7), as for a piped command.
+                if let Some(lease) = guards.lease() {
+                    brokers.push(
+                        workspace_queue::HELD_LEASE_ENV,
+                        workspace_queue::child_lease_env(lease.key()).into(),
+                    );
+                }
                 // Its SSH key broker (SPEC R-CRED.1), as for a piped command.
                 guards.hold_broker(
                     deps.credential_brokers
@@ -425,13 +434,17 @@ fn prepare(
                 keep_leftovers,
             })
         }
-        // No broker and no lease stamp: a session's commands share one
-        // long-lived shell, which no per-command lease or environment can
-        // reach. What it leaves running stays with the session's shell.
+        // No broker: a session's commands share one long-lived shell, which
+        // no per-command broker socket can reach. Its lease is set for this
+        // command alone by the session protocol (SPEC R2.7.7). What it leaves
+        // running stays with the session's shell.
         Run::Session { id, sessions } => Ok(Ready::Session {
             id,
             command: line.to_string(),
             sessions,
+            lease: guards
+                .lease()
+                .map(|lease| workspace_queue::child_lease_env(lease.key())),
         }),
     }
 }
@@ -497,12 +510,14 @@ impl Ready {
                 id,
                 command,
                 sessions,
+                lease,
             } => {
                 run_session_operation(
                     sessions,
                     &deps.sandbox,
                     id,
                     command,
+                    lease.as_deref(),
                     working_dir,
                     limit,
                     cancel,
@@ -797,6 +812,64 @@ mod tests {
                 assert_eq!(kinds, ["tool_call", "tool_complete"], "{case}: {events:?}");
                 assert_eq!(events[1]["outcome"], outcome, "{case}: {events:?}");
             }
+        }
+    }
+
+    /// SPEC R2.7.7: a command run under a workspace lease inherits it, on
+    /// every path, so an ahma it starts does not wait for the lease its
+    /// ancestor holds (which would deadlock until the command's limit).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_path_passes_its_lease_to_the_command() {
+        let td = tempfile::tempdir().unwrap();
+        let locks = tempfile::tempdir().unwrap();
+        let scope = dunce::canonicalize(td.path()).unwrap();
+        let dir = scope.to_str().unwrap();
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::get(TimeoutCategory::ToolCall),
+        )));
+        let sandbox = Arc::new(
+            sandbox::Sandbox::new(
+                vec![scope.clone()],
+                sandbox::SandboxMode::Test,
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let adapter = Adapter::new(
+            monitor.clone(),
+            Arc::new(ShellPoolManager::new(
+                crate::shell_pool::ShellPoolConfig::default(),
+            )),
+            sandbox,
+        )
+        .unwrap()
+        .with_workspace_queue(workspace_queue::WorkspaceQueue::with_lock_dir(
+            true,
+            Some(locks.path().to_path_buf()),
+        ));
+        let held = workspace_queue::child_lease_env(&adapter.workspace_key_for(&scope));
+        // Writes a file, so it runs in the exclusive lane, under a lease.
+        let line = "touch out.txt; printf 'lease=%s\\n' \"$AHMA_HELD_WORKSPACE_LEASE\"";
+
+        let mut paths = vec![Runner::Piped, Runner::Session];
+        if pty_available() {
+            paths.push(Runner::Pty);
+        }
+        for path in paths {
+            let id = start(&adapter, path, dir, line, 30).await;
+            let op = monitor.wait_for_operation(&id).await.expect("in history");
+            let stdout = op
+                .result
+                .as_ref()
+                .and_then(|r| r["stdout"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                stdout.contains(&format!("lease={held}")),
+                "{path:?}: {stdout:?} {:?}",
+                op.result
+            );
         }
     }
 }
