@@ -16,15 +16,13 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
 
 #[cfg(unix)]
 use anyhow::Result;
 
 #[cfg(test)]
 use super::PublishEnding;
-use crate::operation_monitor::OperationMonitor;
-use crate::operation_monitor::{Stream, Terminal};
+use super::sink::{OpSink, RunEnd};
 use crate::sandbox::Sandbox;
 
 /// Returns `true` when a pseudo-terminal can be allocated in this process.
@@ -81,9 +79,10 @@ impl BrokerEnv {
 
 /// Run `command_str` under a PTY through the standard operation lifecycle.
 ///
-/// Mirrors `execute_with_streaming`: emits output lines via the monitor and
-/// spills the complete output. Returns how it ended without publishing it:
-/// the caller releases the workspace first, then publishes (SPEC R2.7.1).
+/// Mirrors `execute_with_streaming`: writes each output line to `sink`, which
+/// also spills the complete output. Returns how it ended, and has no way to
+/// publish that: the caller releases the workspace first, then publishes
+/// (SPEC R2.7.1).
 #[cfg_attr(windows, allow(unused_variables))]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_pty_operation(
@@ -92,15 +91,14 @@ pub(super) async fn run_pty_operation(
     working_dir: &Path,
     limit: std::time::Duration,
     cancellation_token: &tokio_util::sync::CancellationToken,
-    op_id: &str,
-    monitor: &Arc<OperationMonitor>,
+    sink: &mut OpSink,
     brokers: &BrokerEnv,
     keep_leftovers: bool,
-) -> Terminal {
+) -> RunEnd {
     #[cfg(windows)]
     {
-        let _ = (brokers, monitor, op_id);
-        Terminal::Failed(
+        let _ = (brokers, sink);
+        RunEnd::Failed(
             "pty: true is not yet supported on Windows (ConPTY integration pending). \
              Run the command without the pty parameter."
                 .to_string(),
@@ -114,8 +112,7 @@ pub(super) async fn run_pty_operation(
         working_dir,
         limit,
         cancellation_token,
-        op_id,
-        monitor,
+        sink,
         brokers,
         keep_leftovers,
     )
@@ -125,7 +122,7 @@ pub(super) async fn run_pty_operation(
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use crate::adapter::spill;
+    use crate::operation_monitor::Stream;
     use crate::shell_pool::platform_shell_program;
     use std::io::{BufRead, BufReader, Read};
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -357,17 +354,10 @@ mod unix {
     /// of file, or until it has been quiet for [`QUIET_AFTER_EXIT`].
     async fn drain_after_exit(
         line_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-        mut keep: impl FnMut(String) -> String,
-        spill_writer: &mut spill::SpillWriter,
-        monitor: &Arc<OperationMonitor>,
-        op_id: &str,
+        sink: &mut OpSink,
     ) {
         while let Ok(Some(line)) = tokio::time::timeout(QUIET_AFTER_EXIT, line_rx.recv()).await {
-            let safe = keep(line);
-            spill_writer.write_line(&safe, Stream::Stdout).await;
-            monitor
-                .append_output_line(op_id, safe, Stream::Stdout)
-                .await;
+            sink.line(Stream::Stdout, &line).await;
         }
     }
 
@@ -378,21 +368,20 @@ mod unix {
         working_dir: &Path,
         limit: Duration,
         cancellation_token: &tokio_util::sync::CancellationToken,
-        op_id: &str,
-        monitor: &Arc<OperationMonitor>,
+        sink: &mut OpSink,
         brokers: &BrokerEnv,
         keep_leftovers: bool,
-    ) -> Terminal {
+    ) -> RunEnd {
         let start_time = Instant::now();
 
         let (mut killer, mut line_rx, mut exit_rx) =
             match setup_pty(sandbox, command_str, working_dir, brokers, keep_leftovers) {
                 Ok(parts) => parts,
-                Err(e) => return Terminal::Failed(format!("Failed to start PTY command: {e}")),
+                Err(e) => return RunEnd::Failed(format!("Failed to start PTY command: {e}")),
             };
 
-        let mut spill_writer = spill::SpillWriter::create(op_id).await;
-        let mut collected = crate::adapter::BoundedLineCollector::default();
+        // The command is running: its spill file exists from now on.
+        sink.started().await;
         let deadline = tokio::time::Instant::now() + limit;
         // Warned once at 80% of the limit, as a piped command is (SPEC R2.6.6).
         let mut near_limit = crate::adapter::time_limit::NearLimit::starting_now(limit);
@@ -402,32 +391,27 @@ mod unix {
                 biased;
 
                 _ = cancellation_token.cancelled() => {
-                    tracing::info!("PTY operation {} cancelled", op_id);
+                    tracing::info!("PTY operation {} cancelled", sink.op_id());
                     killer.kill();
-                    spill_writer.finish().await;
-                    return Terminal::Cancelled("Operation was cancelled".to_string());
+                    return RunEnd::Cancelled;
                 }
 
                 _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
-                    monitor.append_alert(op_id, near_limit.alert()).await;
+                    sink.alert(near_limit.alert()).await;
                 }
 
                 _ = tokio::time::sleep_until(deadline) => {
-                    tracing::warn!("PTY operation {} timed out", op_id);
+                    tracing::warn!("PTY operation {} timed out", sink.op_id());
                     killer.kill();
-                    spill_writer.finish().await;
                     // Says how to raise the limit, as the piped path does (SPEC R2.6.6).
-                    return crate::adapter::timed_out(start_time.elapsed().as_millis() as u64);
+                    return RunEnd::TimedOut { ran_for: start_time.elapsed() };
                 }
 
                 line = line_rx.recv() => {
                     match line {
-                        Some(line) => {
-                            let safe = crate::log_monitor::redact_sensitive_line(&line);
-                            spill_writer.write_line(&safe, Stream::Stdout).await;
-                            collected.push(safe.clone());
-                            monitor.append_output_line(op_id, safe, Stream::Stdout).await;
-                        }
+                        // A PTY merges stderr into the terminal stream by
+                        // construction.
+                        Some(line) => sink.line(Stream::Stdout, &line).await,
                         None => {
                             // Reader thread finished (PTY master returned
                             // EOF/EIO after child exit) — all output has been
@@ -453,28 +437,11 @@ mod unix {
         // names it (SPEC R-PROC.5). Before the drain: a process it left running
         // holds the terminal open.
         let stopped = killer.end_leftovers().await;
-        drain_after_exit(
-            &mut line_rx,
-            |line| {
-                let safe = crate::log_monitor::redact_sensitive_line(&line);
-                collected.push(safe.clone());
-                safe
-            },
-            &mut spill_writer,
-            monitor,
-            op_id,
-        )
-        .await;
-        spill_writer.finish().await;
+        drain_after_exit(&mut line_rx, sink).await;
         if let Some(line) = crate::sandbox::leftovers::note(&stopped) {
-            monitor.append_alert(op_id, line).await;
+            sink.alert(line).await;
         }
-
-        // A PTY merges stderr into the terminal stream by construction.
-        Terminal::Exited(Box::new(crate::operation_monitor::CommandOutput {
-            pty: Some(true),
-            ..collected.merged_output(exit_status, op_id)
-        }))
+        RunEnd::Exited(exit_status)
     }
 }
 
@@ -536,6 +503,36 @@ mod tests {
         )))
     }
 
+    /// Run a PTY command as the adapter does, through a sink on `monitor`,
+    /// and return its ending unpublished.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    async fn run_pty(
+        sandbox: &Sandbox,
+        command_str: &str,
+        working_dir: &std::path::Path,
+        limit: std::time::Duration,
+        cancellation_token: &CancellationToken,
+        op_id: &str,
+        monitor: &Arc<OperationMonitor>,
+        brokers: &BrokerEnv,
+        keep_leftovers: bool,
+    ) -> crate::operation_monitor::Terminal {
+        let mut sink = OpSink::new(monitor.clone(), op_id, crate::adapter::sink::Shape::Pty);
+        let end = run_pty_operation(
+            sandbox,
+            command_str,
+            working_dir,
+            limit,
+            cancellation_token,
+            &mut sink,
+            brokers,
+            keep_leftovers,
+        )
+        .await;
+        sink.close(end).await
+    }
+
     /// SPEC R-PROC.5: a terminal command that leaves a process running has it
     /// stopped when it ends, and the operation names it, as on the plain
     /// path; a command a human declared long-running keeps what it started.
@@ -571,7 +568,7 @@ mod tests {
                     None,
                 ))
                 .await;
-            run_pty_operation(
+            run_pty(
                 &sandbox,
                 "sh leaves.sh",
                 temp.path(),
@@ -651,7 +648,7 @@ mod tests {
             .await;
         let token = CancellationToken::new();
 
-        run_pty_operation(
+        run_pty(
             &sandbox,
             "echo hello",
             temp.path(),
@@ -708,7 +705,7 @@ mod tests {
             .await;
         let broker = temp.path().join("broker.sock");
 
-        run_pty_operation(
+        run_pty(
             &sandbox,
             "echo \"sock=$SSH_AUTH_SOCK\"",
             temp.path(),
@@ -765,7 +762,7 @@ mod tests {
         let token = CancellationToken::new();
 
         // `exit 3` is portable across the POSIX shells used on Unix.
-        run_pty_operation(
+        run_pty(
             &sandbox,
             "exit 3",
             temp.path(),
@@ -814,7 +811,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        run_pty_operation(
+        run_pty(
             &sandbox,
             "sleep 30",
             temp.path(),
@@ -860,7 +857,7 @@ mod tests {
             .await;
         let token = CancellationToken::new();
 
-        run_pty_operation(
+        run_pty(
             &sandbox,
             "sleep 30",
             temp.path(),
@@ -910,7 +907,7 @@ mod tests {
         let token = CancellationToken::new();
         let missing = temp.path().join("does-not-exist-subdir");
 
-        run_pty_operation(
+        run_pty(
             &sandbox,
             "echo nope",
             &missing,

@@ -50,6 +50,7 @@ pub mod lane;
 pub mod mutex_groups;
 mod preparer;
 mod pty_exec;
+mod sink;
 pub mod spill;
 pub(crate) mod time_limit;
 mod types;
@@ -1636,7 +1637,6 @@ impl Adapter {
         .await;
 
         let monitor = self.monitor.clone();
-        let shell_pool = self.shell_pool.clone();
         let sandbox = self.sandbox.clone(); // Clone ARC to pass to task
         let command = command.to_string();
         let wd_clone = wd.clone();
@@ -1648,10 +1648,9 @@ impl Adapter {
             program: program_with_subcommand,
             args_vec,
             working_dir: wd_clone,
-            timeout_secs: timeout,
+            limit: command_limit(&self.shell_pool, timeout),
             log_monitor_config,
             monitor,
-            shell_pool,
             sandbox,
             command_executor: self.command_executor.clone(),
             mutex_registry: self.mutex_registry.clone(),
@@ -1818,18 +1817,19 @@ impl Adapter {
                 }
                 guards.hold_links(links);
             }
-            let finished = pty_exec::run_pty_operation(
+            let mut sink = sink::OpSink::new(monitor.clone(), &op_id_task, sink::Shape::Pty);
+            let end = pty_exec::run_pty_operation(
                 &sandbox,
                 &run_line,
                 &safe_wd,
                 limit,
                 &cancellation_token,
-                &op_id_task,
-                &monitor,
+                &mut sink,
                 &brokers,
                 keep_leftovers,
             )
             .await;
+            let finished = sink.close(end).await;
             // The PTY process is gone: the result carries the drift and
             // deny-tier reports, as a piped command's does.
             let finished =
@@ -1885,7 +1885,7 @@ impl Adapter {
         )
         .await;
 
-        let timeout_duration = command_limit(&self.shell_pool, timeout);
+        let limit = command_limit(&self.shell_pool, timeout);
         let monitor = self.monitor.clone();
         let sandbox = self.sandbox.clone();
         let sessions = self.shell_sessions.clone();
@@ -1933,18 +1933,23 @@ impl Adapter {
             if watch_handoff {
                 guards.watch_handoff(Some(begin_handoff_watch(&sandbox, &safe_wd).await));
             }
-            let finished = run_session_operation(
+            let mut sink = sink::OpSink::new(
+                monitor.clone(),
+                &op_id_task,
+                sink::Shape::Session(session_id.clone()),
+            );
+            let end = run_session_operation(
                 &sessions,
                 &sandbox,
                 &session_id,
                 &command_str,
                 &safe_wd,
-                timeout_duration,
+                limit,
                 &cancellation_token,
-                &op_id_task,
-                &monitor,
+                &mut sink,
             )
             .await;
+            let finished = sink.close(end).await;
             // The command has ended (the session's shell lives on): as for PTY.
             let finished =
                 carry_run_reports(finished, &drift, started, &mut guards, &monitor).await;
@@ -2034,10 +2039,11 @@ impl From<&Terminal> for audit::Outcome {
     }
 }
 
-/// Publishing how a command ended. A PTY or session runner returns its
-/// [`Terminal`] without publishing it: the caller first gives up the workspace
-/// lease and the guards around the run, then publishes, so a caller woken by
-/// the terminal state never finds the workspace still held (SPEC R2.7.1).
+/// Publishing how a command ended. A runner cannot publish: it returns a
+/// [`sink::RunEnd`] and writes through a [`sink::OpSink`], which holds the
+/// monitor privately. The caller first gives up the workspace lease and the
+/// guards around the run, then publishes, so a caller woken by the terminal
+/// state never finds the workspace still held (SPEC R2.7.1).
 pub(crate) trait PublishEnding {
     /// Finish the operation, and return what the audit record of the call's
     /// end carries.
@@ -2060,23 +2066,6 @@ impl PublishEnding for Terminal {
     }
 }
 
-impl BoundedLineCollector {
-    /// The result of a command whose output is one merged stream (a PTY, a
-    /// session): `stderr` is empty and has no counts of its own.
-    fn merged_output(&self, exit_code: Option<i32>, op_id: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: self.rendered_output(),
-            exit_code,
-            stdout_truncated_lines: self.dropped_lines(),
-            stdout_truncated_bytes: self.dropped_bytes(),
-            output_file: spill::operation_spill_path(op_id)
-                .to_string_lossy()
-                .into_owned(),
-            ..CommandOutput::default()
-        }
-    }
-}
-
 /// A command's time limit: its own `timeout_seconds` when it asked for one,
 /// else the configured default. One `Duration` from here on; the paths used
 /// to carry it as milliseconds in some places and seconds in others.
@@ -2094,10 +2083,10 @@ struct AsyncOperationRun {
     program: String,
     args_vec: Vec<String>,
     working_dir: String,
-    timeout_secs: Option<u64>,
+    /// Its time limit ([`command_limit`]).
+    limit: Duration,
     log_monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
     monitor: Arc<OperationMonitor>,
-    shell_pool: Arc<ShellPoolManager>,
     sandbox: Arc<sandbox::Sandbox>,
     command_executor: Arc<dyn executor::CommandExecutor>,
     mutex_registry: Arc<CommandMutexRegistry>,
@@ -2169,10 +2158,9 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         program,
         args_vec,
         working_dir,
-        timeout_secs,
+        limit,
         log_monitor_config,
         monitor,
-        shell_pool,
         sandbox,
         command_executor,
         mutex_registry,
@@ -2283,8 +2271,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         sandbox::kernel_denials::remember_tag(&op_id, tag);
     }
 
-    let limit = command_limit(&shell_pool, timeout_secs);
-
     let drift = (lane != workspace_queue::Lane::Service).then_some(DriftProbe {
         root: drift_root,
         lane,
@@ -2301,22 +2287,36 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // appends to the tail buffer and emits `OutputLine` on the unified event
     // stream — so the TUI and hub subscribers see output as it is produced.
     // Log-monitor alerting only runs when a config was provided.
-    execute_with_streaming(
+    let mut sink = sink::OpSink::new(monitor.clone(), &op_id, sink::Shape::Piped)
+        .watch_log(log_monitor_config);
+    let end = execute_with_streaming(
         &mut proc_cmd,
         limit,
-        log_monitor_config,
-        &cancellation_token,
-        &op_id,
         start_time,
-        &monitor,
-        &sandbox,
-        scope_grant_notifier.as_ref(),
-        &command,
-        &wd_path,
-        drift.as_ref(),
-        guards,
+        cpu_probe_threshold(monitor.idle_timeout()),
+        &cancellation_token,
+        &mut sink,
     )
     .await;
+    match sink.close(end).await {
+        Terminal::Exited(output) => {
+            finalize_streaming_operation(
+                *output,
+                start_time,
+                &monitor,
+                &op_id,
+                &sandbox,
+                scope_grant_notifier.as_ref(),
+                &command,
+                &wd_path,
+                drift.as_ref(),
+                guards,
+            )
+            .await
+        }
+        // A timeout, a cancel or a failure to spawn: no result to add to.
+        ending => guards.end(&monitor, ending).await,
+    }
 }
 
 /// The shell command line of a `run_terminal_command`-style call (`command`
@@ -2914,8 +2914,8 @@ fn combine_stdout_stderr(stdout: String, stderr: String) -> String {
     }
 }
 
-/// Run one command in a persistent shell session through the standard
-/// operation lifecycle (streamed lines, spill file, single terminal event).
+/// Run one command in a persistent shell session, writing its output to
+/// `sink`, and say how it ended. Publishing the ending is the caller's.
 #[allow(clippy::too_many_arguments)]
 async fn run_session_operation(
     sessions: &crate::shell_session::ShellSessionManager,
@@ -2923,16 +2923,16 @@ async fn run_session_operation(
     session_id: &str,
     command_str: &str,
     working_dir: &std::path::Path,
-    timeout: Duration,
+    limit: Duration,
     cancellation_token: &tokio_util::sync::CancellationToken,
-    op_id: &str,
-    monitor: &Arc<OperationMonitor>,
-) -> Terminal {
-    let mut spill_writer = spill::SpillWriter::create(op_id).await;
-    let mut collected = BoundedLineCollector::default();
+    sink: &mut sink::OpSink,
+) -> sink::RunEnd {
+    // The spill file exists from the start, as for the other paths, even if
+    // the session's shell cannot be started.
+    sink.started().await;
     // Warned once at 80% of the limit, as a piped command is (SPEC R2.6.6).
     // The session enforces the limit itself (`ShellSession::execute_streaming`).
-    let mut near_limit = time_limit::NearLimit::starting_now(timeout);
+    let mut near_limit = time_limit::NearLimit::starting_now(limit);
 
     // The session protocol streams lines through a sync callback; forward
     // them over a channel so the async side can append/spill as they arrive.
@@ -2945,7 +2945,7 @@ async fn run_session_operation(
         session_id,
         working_dir,
         command_str,
-        timeout,
+        limit,
         &mut forward,
     );
     tokio::pin!(exec);
@@ -2955,7 +2955,7 @@ async fn run_session_operation(
             biased;
 
             _ = cancellation_token.cancelled() => {
-                tracing::info!("Session operation {} cancelled", op_id);
+                tracing::info!("Session operation {} cancelled", sink.op_id());
                 // Remove the session from the map WITHOUT acquiring the per-session
                 // lock.  The exec future (pinned above) holds that lock; calling
                 // close_session here would deadlock.  Instead we evict the session
@@ -2964,20 +2964,17 @@ async fn run_session_operation(
                 // Arc ref-count reaches zero — at which point kill_on_drop(true) on
                 // the child kills the shell and its children.
                 sessions.remove_session(session_id).await;
-                spill_writer.finish().await;
-                return Terminal::Cancelled("Operation was cancelled".to_string());
+                return sink::RunEnd::Cancelled;
             }
 
             _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
-                monitor.append_alert(op_id, near_limit.alert()).await;
+                sink.alert(near_limit.alert()).await;
             }
 
             line = line_rx.recv() => {
+                // Session output is a single merged stream (per-command 2>&1).
                 if let Some(line) = line {
-                    let safe = crate::log_monitor::redact_sensitive_line(&line);
-                    spill_writer.write_line(&safe, Stream::Stdout).await;
-                    collected.push(safe.clone());
-                    monitor.append_output_line(op_id, safe, Stream::Stdout).await;
+                    sink.line(Stream::Stdout, &line).await;
                 }
                 // None can only happen after exec completes (sender dropped);
                 // the exec branch below handles termination.
@@ -2989,77 +2986,63 @@ async fn run_session_operation(
 
     // Drain any lines still buffered in the channel.
     while let Ok(line) = line_rx.try_recv() {
-        let safe = crate::log_monitor::redact_sensitive_line(&line);
-        spill_writer.write_line(&safe, Stream::Stdout).await;
-        collected.push(safe.clone());
-        monitor
-            .append_output_line(op_id, safe, Stream::Stdout)
-            .await;
+        sink.line(Stream::Stdout, &line).await;
     }
-    spill_writer.finish().await;
 
-    finalize_session_result(exec_result, &collected, session_id, op_id)
+    session_end(exec_result)
 }
 
-/// How a session-protocol command ended, from its terminal result.
-fn finalize_session_result(
+/// How a session-protocol command ended, from what the session reported.
+fn session_end(
     exec_result: Result<Option<i32>, crate::shell_session::SessionError>,
-    collected: &BoundedLineCollector,
-    session_id: &str,
-    op_id: &str,
-) -> Terminal {
+) -> sink::RunEnd {
+    use crate::shell_session::SessionError;
     match exec_result {
-        // Session output is a single merged stream (per-command 2>&1).
-        Ok(exit_code) => Terminal::Exited(Box::new(CommandOutput {
-            session_id: Some(session_id.to_string()),
-            ..collected.merged_output(exit_code, op_id)
-        })),
-        // Says how to raise the limit, as the piped path does (SPEC R2.6.6).
-        Err(crate::shell_session::SessionError::TimedOut(limit)) => {
-            timed_out(limit.as_millis() as u64)
+        Ok(exit_code) => sink::RunEnd::Exited(exit_code),
+        // The session stops the command at the limit, so the limit is how
+        // long it ran. Says how to raise it, as the piped path does (SPEC
+        // R2.6.6).
+        Err(SessionError::TimedOut(limit)) => sink::RunEnd::TimedOut { ran_for: limit },
+        Err(e @ (SessionError::ShellExited | SessionError::Failed(_))) => {
+            sink::RunEnd::Failed(e.to_string())
         }
-        Err(e) => Terminal::Failed(e.to_string()),
     }
 }
 
-/// The ending of a command stopped at its time limit, saying how to raise it.
-fn timed_out(duration_ms: u64) -> Terminal {
+/// The ending of a command stopped at its time limit after `ran_for`, saying
+/// how to raise the limit.
+fn timed_out(ran_for: Duration) -> Terminal {
+    let ran_for_ms = ran_for.as_millis() as u64;
     Terminal::TimedOut(format!(
         "Operation timed out after {}ms (exceeded timeout limit). {}",
-        duration_ms,
-        time_limit::how_to_raise(duration_ms.div_ceil(1000))
+        ran_for_ms,
+        time_limit::how_to_raise(ran_for_ms.div_ceil(1000))
     ))
 }
 
-/// Execute a command with line-by-line streaming and optional log monitoring.
+/// Run a piped command with line-by-line streaming, writing each line to
+/// `sink`, and say how it ended.
 ///
 /// This is the single execution path for async operations.  Instead of
 /// buffering all output, it spawns the process and reads stdout/stderr
-/// concurrently via `BufReader::lines()`.  Each line is appended to the
-/// operation's tail buffer (which emits `OutputLine` on the unified event
-/// stream).  When `monitor_config` is `Some`, each line is additionally fed
-/// through a `LogMonitor` which checks for error/warning patterns and emits
-/// `Alert` events.
+/// concurrently via `BufReader::lines()`.  Each line goes to the sink, which
+/// appends it to the operation's tail (emitting `OutputLine` on the unified
+/// event stream) and, when a log monitor is configured, checks it for
+/// error/warning patterns.
 ///
-/// Ends the operation through `guards`, which also writes the single
+/// It has no way to end the operation: the caller adds what it knows to the
+/// result, then ends it through its guards, which also write the single
 /// `tool_complete` audit event that pairs with the `tool_call` written before
-/// the task was spawned.
-#[allow(clippy::too_many_arguments)]
+/// the task was spawned. `started` is when the run began, for how long a
+/// timed-out command ran.
 async fn execute_with_streaming(
     proc_cmd: &mut tokio::process::Command,
     limit: Duration,
-    monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
+    started: Instant,
+    cpu_probe_after: Option<Duration>,
     cancellation_token: &tokio_util::sync::CancellationToken,
-    op_id: &str,
-    start_time: Instant,
-    op_monitor: &Arc<OperationMonitor>,
-    sandbox: &Arc<sandbox::Sandbox>,
-    scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
-    tool: &str,
-    working_dir: &Path,
-    drift: Option<&DriftProbe>,
-    guards: guards::RunGuards,
-) {
+    sink: &mut sink::OpSink,
+) -> sink::RunEnd {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Ensure stdin/stdout/stderr are strictly isolated (should already be set by sandbox)
@@ -3070,31 +3053,20 @@ async fn execute_with_streaming(
     let mut guard = match ProcessGroupGuard::spawn(proc_cmd) {
         Ok(guard) => guard,
         Err(e) => {
-            guards
-                .end(
-                    op_monitor,
-                    failed(format!("Failed to spawn process: {}", e)),
-                )
-                .await;
-            return;
+            let why = format!("Failed to spawn process: {}", e);
+            tracing::error!("{}", why);
+            return sink::RunEnd::Failed(why);
         }
     };
+    // Full-output spill file: the complete record of this operation's output,
+    // queryable with file tools long after the bounded tail has rolled over.
+    sink.started().await;
 
     let stdout = guard.child_mut().stdout.take().expect("stdout piped");
     let stderr = guard.child_mut().stderr.take().expect("stderr piped");
 
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
-
-    let mut log_monitor = monitor_config.map(crate::log_monitor::LogMonitor::new);
-
-    // Full-output spill file: the complete record of this operation's output,
-    // queryable with file tools long after the bounded tail has rolled over.
-    let mut spill = spill::SpillWriter::create(op_id).await;
-
-    // Collected output for the final result (bounded to prevent unbounded memory growth).
-    let mut collected_stdout = BoundedLineCollector::default();
-    let mut collected_stderr = BoundedLineCollector::default();
 
     let timeout_deadline = tokio::time::Instant::now() + limit;
     // Warn once at 80% of the limit (SPEC R2.6.6), so a healthy job near it
@@ -3131,7 +3103,6 @@ async fn execute_with_streaming(
     let child_pid = guard.child_ref().id();
     let mut last_output_at = tokio::time::Instant::now();
     let mut last_cpu_ms: Option<u64> = None;
-    let cpu_probe_after = cpu_probe_threshold(op_monitor.idle_timeout());
 
     loop {
         tokio::select! {
@@ -3140,36 +3111,31 @@ async fn execute_with_streaming(
 
             // Check cancellation
             _ = cancellation_token.cancelled() => {
-                tracing::info!("Operation {} cancelled during streaming", op_id);
+                tracing::info!("Operation {} cancelled during streaming", sink.op_id());
                 if !kill_process_tree(guard.child_mut()).await {
-                    tracing::warn!("Operation {} cancelled but its process did not reap cleanly", op_id);
+                    tracing::warn!("Operation {} cancelled but its process did not reap cleanly", sink.op_id());
                 }
-                spill.finish().await;
-                guards.end(op_monitor, cancelled()).await;
-                return;
+                return sink::RunEnd::Cancelled;
             }
 
             _ = tokio::time::sleep_until(near_limit.at()), if near_limit.pending() => {
-                op_monitor.append_alert(op_id, near_limit.alert()).await;
+                sink.alert(near_limit.alert()).await;
             }
 
             // Timeout
             _ = tokio::time::sleep_until(timeout_deadline) => {
-                tracing::warn!("Operation {} timed out during streaming", op_id);
+                tracing::warn!("Operation {} timed out during streaming", sink.op_id());
                 if !kill_process_tree(guard.child_mut()).await {
-                    tracing::warn!("Operation {} timed out but its process did not reap cleanly", op_id);
+                    tracing::warn!("Operation {} timed out but its process did not reap cleanly", sink.op_id());
                 }
-                spill.finish().await;
-                let duration_ms = start_time.elapsed().as_millis() as u64;
-                guards.end(op_monitor, timed_out(duration_ms)).await;
-                return;
+                return sink::RunEnd::TimedOut { ran_for: started.elapsed() };
             }
 
             _ = still_running_interval.tick() => {
                 elapsed_secs += 10;
                 let elapsed_msg = format!("still running ({}s elapsed)", elapsed_secs);
-                tracing::info!("Operation {}: {}", op_id, elapsed_msg);
-                op_monitor.note_progress(op_id, elapsed_msg);
+                tracing::info!("Operation {}: {}", sink.op_id(), elapsed_msg);
+                sink.progress(elapsed_msg);
 
                 // Silent for a while? Ask whether the process tree is still working
                 // before the idle watchdog is allowed to call it wedged.
@@ -3197,12 +3163,12 @@ async fn execute_with_streaming(
                         tracing::debug!(
                             "Operation {}: silent for {}s but its process tree consumed CPU \
                              ({}ms -> {}ms) — still working, not stalled",
-                            op_id,
+                            sink.op_id(),
                             last_output_at.elapsed().as_secs(),
                             last_cpu_ms.unwrap_or(0),
                             cpu_ms
                         );
-                        op_monitor.note_liveness(op_id).await;
+                        sink.alive().await;
                     }
                     last_cpu_ms = Some(cpu_ms);
                 }
@@ -3228,7 +3194,7 @@ async fn execute_with_streaming(
                 } else {
                     stderr_done = true;
                 }
-                handle_stream_line(result, Stream::Stderr, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, &mut spill).await;
+                handle_stream_line(result, Stream::Stderr, sink).await;
             }
 
             // Read stdout line
@@ -3239,7 +3205,7 @@ async fn execute_with_streaming(
                 } else {
                     stdout_done = true;
                 }
-                handle_stream_line(result, Stream::Stdout, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, &mut spill).await;
+                handle_stream_line(result, Stream::Stdout, sink).await;
             }
         }
 
@@ -3252,85 +3218,41 @@ async fn execute_with_streaming(
                 // says so (SPEC R-PROC.5). Before the drain: a job it left in
                 // the background holds these pipes open.
                 if let Some(line) = sandbox::leftovers::note(&guard.end_leftovers().await) {
-                    op_monitor.append_alert(op_id, line).await;
+                    sink.alert(line).await;
                 }
-                drain_remaining_stream_lines(
-                    &mut stderr_reader,
-                    &mut stdout_reader,
-                    &mut collected_stdout,
-                    &mut collected_stderr,
-                    &mut log_monitor,
-                    op_id,
-                    op_monitor,
-                    &mut spill,
-                )
-                .await;
+                drain_remaining_stream_lines(&mut stderr_reader, &mut stdout_reader, sink).await;
                 break;
             }
             Ok(None) => {
                 // Process still running, continue loop
             }
             Err(e) => {
-                tracing::warn!("Error checking child status for {}: {}", op_id, e);
+                tracing::warn!("Error checking child status for {}: {}", sink.op_id(), e);
                 break;
             }
         }
     }
 
-    spill.finish().await;
     let mut child = guard.disarm().unwrap();
-
-    finalize_streaming_operation(
-        &mut child,
-        start_time,
-        &collected_stdout,
-        &collected_stderr,
-        op_monitor,
-        op_id,
-        sandbox,
-        scope_grant_notifier,
-        tool,
-        working_dir,
-        drift,
-        guards,
-    )
-    .await
+    let exit_status = child.wait().await;
+    tracing::debug!(
+        "Operation {} process exited after {}ms",
+        sink.op_id(),
+        started.elapsed().as_millis()
+    );
+    sink::RunEnd::Exited(exit_status.ok().and_then(|s| s.code()))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn drain_remaining_stream_lines(
     stderr_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStderr>>,
     stdout_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
-    collected_stdout: &mut BoundedLineCollector,
-    collected_stderr: &mut BoundedLineCollector,
-    log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
-    op_id: &str,
-    op_monitor: &Arc<OperationMonitor>,
-    spill: &mut spill::SpillWriter,
+    sink: &mut sink::OpSink,
 ) {
     while let Ok(Some(line)) = stderr_reader.next_line().await {
-        process_streaming_line(
-            &line,
-            Stream::Stderr,
-            collected_stderr,
-            log_monitor,
-            op_id,
-            op_monitor,
-            spill,
-        )
-        .await;
+        sink.line(Stream::Stderr, &line).await;
     }
     while let Ok(Some(line)) = stdout_reader.next_line().await {
-        process_streaming_line(
-            &line,
-            Stream::Stdout,
-            collected_stdout,
-            log_monitor,
-            op_id,
-            op_monitor,
-            spill,
-        )
-        .await;
+        sink.line(Stream::Stdout, &line).await;
     }
 }
 
@@ -3553,12 +3475,13 @@ async fn alert_out_of_scope_denial(
     op_monitor.append_alert(op_id, remediation).await;
 }
 
+/// End a piped command that exited: add what only the caller knows to its
+/// `output` (failure diagnostics, drift, the deny-tier report), then end it
+/// through its guards.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_streaming_operation(
-    child: &mut tokio::process::Child,
+    mut output: CommandOutput,
     start_time: Instant,
-    collected_stdout: &BoundedLineCollector,
-    collected_stderr: &BoundedLineCollector,
     op_monitor: &Arc<OperationMonitor>,
     op_id: &str,
     sandbox: &Arc<sandbox::Sandbox>,
@@ -3568,18 +3491,11 @@ async fn finalize_streaming_operation(
     drift: Option<&DriftProbe>,
     mut guards: guards::RunGuards,
 ) {
-    let exit_status = child.wait().await;
-    let duration_ms = start_time.elapsed().as_millis() as u64;
-    tracing::debug!("Operation {} process exited after {}ms", op_id, duration_ms);
-    let exit_code = exit_status.as_ref().ok().and_then(|s| s.code());
-    let success = exit_status.as_ref().is_ok_and(|s| s.success());
+    let success = output.exit_code == Some(0);
     if success {
         // Nothing to read back for an operation that succeeded.
         let _ = sandbox::kernel_denials::take_tag(op_id);
     }
-
-    let stdout_str = collected_stdout.rendered_output();
-    let stderr_str = collected_stderr.rendered_output();
 
     // A failed async command may have hit a runtime sandbox denial the kernel did
     // not name; scan stderr and (best-effort) offer to grant an out-of-scope path.
@@ -3591,36 +3507,19 @@ async fn finalize_streaming_operation(
             op_monitor,
             op_id,
             tool,
-            &stdout_str,
-            &stderr_str,
+            &output.stdout,
+            &output.stderr,
             Some(working_dir),
         )
         .await;
-    } else if let Some(note) = sandbox::gpu_fallback_note(&stderr_str, &stdout_str) {
+    } else if let Some(note) = sandbox::gpu_fallback_note(&output.stderr, &output.stdout) {
         // The async twin of the success note in `explain_ungrantable_failure`.
         op_monitor.append_alert(op_id, note).await;
     }
 
-    let changed_during_run = match drift {
+    output.changed_during_run = match drift {
         Some(probe) => probe.report(start_time.elapsed()).await,
         None => None,
-    };
-
-    let mut output = CommandOutput {
-        stdout: stdout_str,
-        stderr: stderr_str,
-        exit_code,
-        stdout_truncated_lines: collected_stdout.dropped_lines(),
-        stderr_truncated_lines: Some(collected_stderr.dropped_lines()),
-        stdout_truncated_bytes: collected_stdout.dropped_bytes(),
-        stderr_truncated_bytes: Some(collected_stderr.dropped_bytes()),
-        // Complete output record — query with file tools (tail/grep) when the
-        // inline stdout/stderr above was truncated.
-        output_file: spill::operation_spill_path(op_id)
-            .to_string_lossy()
-            .into_owned(),
-        changed_during_run,
-        ..CommandOutput::default()
     };
     // The process tree is gone: the deny-tier report (SPEC R6.1.7) goes in
     // the result, and its alert out before the terminal transition.
@@ -3640,77 +3539,55 @@ fn cancelled() -> Terminal {
 
 /// Handle one result from a `next_line()` call inside the streaming select loop.
 ///
-/// Dispatches to `process_streaming_line` on success, ignores closed-stream
-/// signals (`Ok(None)`), and logs a warning on read errors.
+/// Writes a line to the sink, ignores closed-stream signals (`Ok(None)`), and
+/// logs a warning on read errors.
 async fn handle_stream_line(
     result: Result<Option<String>, std::io::Error>,
     stream: Stream,
-    collector: &mut BoundedLineCollector,
-    log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
-    op_id: &str,
-    op_monitor: &Arc<OperationMonitor>,
-    spill: &mut spill::SpillWriter,
+    sink: &mut sink::OpSink,
 ) {
     match result {
-        Ok(Some(line)) => {
-            process_streaming_line(
-                &line,
-                stream,
-                collector,
-                log_monitor,
-                op_id,
-                op_monitor,
-                spill,
-            )
-            .await;
-        }
+        Ok(Some(line)) => sink.line(stream, &line).await,
         Ok(None) => {}
         Err(e) => {
-            tracing::warn!("Error reading {} for {}: {}", stream.name(), op_id, e);
+            tracing::warn!(
+                "Error reading {} for {}: {}",
+                stream.name(),
+                sink.op_id(),
+                e
+            );
         }
-    }
-}
-
-/// Redact, collect, and optionally record a log-monitor alert for a single streamed line.
-///
-/// `op_monitor.append_output_line` is the single emission point for
-/// `OutputLine` events on the unified stream; `append_alert` likewise emits
-/// `Alert` — no direct dispatcher access is needed here.
-async fn process_streaming_line(
-    line: &str,
-    stream: Stream,
-    collector: &mut BoundedLineCollector,
-    log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
-    op_id: &str,
-    op_monitor: &Arc<OperationMonitor>,
-    spill: &mut spill::SpillWriter,
-) {
-    let safe_line = crate::log_monitor::redact_sensitive_line(line);
-
-    // The spill file records every redacted line — the faithful full record,
-    // independent of the bounded tail.
-    spill.write_line(&safe_line, stream).await;
-
-    collector.push(safe_line.clone());
-    op_monitor
-        .append_output_line(op_id, safe_line, stream)
-        .await;
-
-    if let Some(log_monitor) = log_monitor
-        && let Some(snapshot) = log_monitor.process_line(line, stream.is_stderr())
-    {
-        // The full notification snapshot (trigger + recent context) is stored
-        // and emitted as a single `Alert` event so every subscriber — MCP
-        // progress push, hub, TUI — gets the same rich content.
-        op_monitor
-            .append_alert(op_id, snapshot.format_for_notification())
-            .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's error is read by its kind, never its text: a time limit
+    /// is a timeout that ran for the limit, anything else a failure carrying
+    /// the error's message, and an exit keeps its code (or lack of one).
+    #[test]
+    fn a_session_result_is_classified_by_its_kind() {
+        use crate::shell_session::SessionError;
+        use sink::RunEnd;
+        let limit = Duration::from_secs(7);
+        assert_eq!(session_end(Ok(Some(0))), RunEnd::Exited(Some(0)));
+        assert_eq!(session_end(Ok(None)), RunEnd::Exited(None));
+        assert_eq!(
+            session_end(Err(SessionError::TimedOut(limit))),
+            RunEnd::TimedOut { ran_for: limit }
+        );
+        assert_eq!(
+            session_end(Err(SessionError::ShellExited)),
+            RunEnd::Failed("session shell exited unexpectedly (EOF)".into())
+        );
+        // A failure whose text says "timed out" is still a failure.
+        assert_eq!(
+            session_end(Err(SessionError::Failed(anyhow::anyhow!("read timed out")))),
+            RunEnd::Failed("read timed out".into())
+        );
+    }
 
     /// SPEC R6.2.7: a command that succeeded but quietly ran on the CPU still
     /// gets the GPU note, and only that note — a test suite that prints
