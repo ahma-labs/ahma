@@ -43,6 +43,8 @@ use dunce;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+pub use crate::setting_key::SettingKey;
+
 // ---------------------------------------------------------------------------
 // Env-var interpolation
 // ---------------------------------------------------------------------------
@@ -2220,18 +2222,18 @@ pub struct SettingsPreview {
     pub text: String,
     /// Which kind of settings file this is.
     pub file: SettingsFile,
-    table: String,
-    field: String,
+    /// The setting it changes.
+    pub key: SettingKey,
 }
 
 /// One setting changed by [`AhmaSettings::set_in_file`]: its value before and
-/// after, as TOML text, `None` for an optional key with no value. Code
-/// matches on `None`; only what a person reads says `(unset)`, so no
-/// comparison depends on that spelling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// after, `None` for an optional key with no value. Code matches on the value;
+/// only what a person reads says `(unset)` ([`before_text`](Self::before_text)),
+/// so no comparison depends on that spelling.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SettingsEdit {
-    pub before: Option<String>,
-    pub after: Option<String>,
+    pub before: Option<toml::Value>,
+    pub after: Option<toml::Value>,
 }
 
 /// How an unset value reads to a person.
@@ -2243,14 +2245,24 @@ impl SettingsEdit {
         self.before != self.after
     }
 
+    /// The value before as TOML text, `None` when unset.
+    pub fn before_toml(&self) -> Option<String> {
+        self.before.as_ref().map(ToString::to_string)
+    }
+
+    /// The value after as TOML text, `None` when unset.
+    pub fn after_toml(&self) -> Option<String> {
+        self.after.as_ref().map(ToString::to_string)
+    }
+
     /// The value before, as a person reads it.
-    pub fn before_text(&self) -> &str {
-        self.before.as_deref().unwrap_or(UNSET_TEXT)
+    pub fn before_text(&self) -> String {
+        self.before_toml().unwrap_or_else(|| UNSET_TEXT.to_string())
     }
 
     /// The value after, as a person reads it.
-    pub fn after_text(&self) -> &str {
-        self.after.as_deref().unwrap_or(UNSET_TEXT)
+    pub fn after_text(&self) -> String {
+        self.after_toml().unwrap_or_else(|| UNSET_TEXT.to_string())
     }
 }
 
@@ -3278,16 +3290,8 @@ impl AhmaSettings {
             .map_err(|e| anyhow::anyhow!("the file written does not parse: {}", e.summary()))?;
         Ok(SettingsEdit {
             before: preview.edit.before,
-            after: Self::value_text(&written, &preview.table, &preview.field),
+            after: preview.key.value(&written),
         })
-    }
-
-    /// The TOML text of `table.field` in `settings`, or `None` when unset.
-    fn value_text(settings: &Self, table: &str, field: &str) -> Option<String> {
-        toml::Value::try_from(settings)
-            .ok()
-            .and_then(|v| v.get(table)?.get(field).cloned())
-            .map(|v| v.to_string())
     }
 
     /// Every check [`set_in_file`](Self::set_in_file) makes, and the file it
@@ -3365,6 +3369,11 @@ impl AhmaSettings {
                 e.message().trim()
             )
         })?;
+        // An unknown key has a tier only in a security table, and each of those
+        // rejects unknown fields, so a name that got here is a known key.
+        let Some(setting) = SettingKey::from_parts(table, field) else {
+            anyhow::bail!("unknown setting `{key}`. `ahma settings explain` lists every setting.");
+        };
 
         let text = match file {
             SettingsFile::User => updated.render_documented(),
@@ -3372,13 +3381,12 @@ impl AhmaSettings {
         };
         Ok(SettingsPreview {
             edit: SettingsEdit {
-                before: Self::value_text(&current, table, field),
-                after: Self::value_text(&updated, table, field),
+                before: setting.value(&current),
+                after: setting.value(&updated),
             },
             text,
             file,
-            table: table.to_string(),
-            field: field.to_string(),
+            key: setting,
         })
     }
 
@@ -3641,7 +3649,7 @@ impl SettingsDoc {
     /// Emit a section banner (`# ── Title ──…`) followed by its `[table]` header.
     fn section(&mut self, title: &str, table: &str) {
         self.table = table.to_string();
-        if self.project && SECURITY_TABLES.contains(&table) {
+        if self.project && SettingKey::is_security_table(table) {
             return;
         }
         let prefix = format!("# ── {title} ");
@@ -3804,23 +3812,7 @@ pub fn setting_changes(
 /// domain patterns) and writes an audit record. `ahma settings set` does neither,
 /// so it refuses these keys and names the command instead (SPEC R-CFG11.3).
 pub fn ledger_key_command(table: &str, key: &str) -> Option<&'static str> {
-    Some(match (table, key) {
-        ("sandbox", "persistent_scopes") => {
-            "`ahma sandbox grant <path>` (and `ahma sandbox revoke`); it checks the path against the hard denylist"
-        }
-        ("sandbox", "ssh_sign")
-        | ("permissions", "tool_approvals")
-        | ("log_targets", "approvals") => {
-            "`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved"
-        }
-        ("network", "allow") => "`ahma network allow <host>` / `ahma network revoke <host>`",
-        ("open_url", "allow") | ("open_url", "repos") => {
-            "`ahma permissions grant open-url <site>` / `ahma permissions revoke open-url <site>`"
-        }
-        ("web", "always_allow") => "`ahma egress allow <domain>` / `ahma egress revoke <domain>`",
-        ("web", "never_allow") => "`ahma egress deny <domain>` / `ahma egress revoke <domain>`",
-        _ => return None,
-    })
+    SettingKey::from_parts(table, key)?.ledger_command()
 }
 
 /// How a human changes `table.key` (SPEC R-CFG11): the dedicated command for a
@@ -4006,16 +3998,6 @@ fn undo_with_flag(flag: &str, key: &str, before: Option<&str>) -> String {
     }
 }
 
-/// The entries of a TOML list value, each as TOML text; `None` for anything
-/// that is not a list.
-fn list_entries(value: &str) -> Option<Vec<toml::Value>> {
-    let table: toml::Table = toml::from_str(&format!("v = {value}")).ok()?;
-    match table.get("v")? {
-        toml::Value::Array(entries) => Some(entries.clone()),
-        _ => None,
-    }
-}
-
 /// What `ahma settings set`/`unset` prints (SPEC R-CFG10.8): the value before
 /// and after, then in sentences what the setting does, where the change
 /// applies, which list entries are gone, and the command that undoes it.
@@ -4053,10 +4035,9 @@ pub fn describe_setting_change(
     if !changed {
         return out;
     }
-    if let (Some(before), Some(after)) = (
-        edit.before.as_deref().and_then(list_entries),
-        edit.after.as_deref().and_then(list_entries),
-    ) {
+    if let (Some(toml::Value::Array(before)), Some(toml::Value::Array(after))) =
+        (&edit.before, &edit.after)
+    {
         let gone: Vec<String> = before
             .iter()
             .filter(|entry| !after.contains(entry))
@@ -4074,7 +4055,7 @@ pub fn describe_setting_change(
     let _ = writeln!(
         out,
         "To undo: {}",
-        undo_with_flag(&reach.flag(path), key, edit.before.as_deref())
+        undo_with_flag(&reach.flag(path), key, edit.before_toml().as_deref())
     );
     out
 }
@@ -4415,20 +4396,25 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
     }
 
-    /// A fully non-default settings value for round-trip / completeness testing.
-    /// Every field is set to something other than its compiled-in default so that
-    /// a missing field in [`AhmaSettings::render_documented`] would surface as a
-    /// lost value when this round-trips through TOML.
-    /// Every key is in every list it must be in, and in no list it must not be.
-    /// Written against the hand-maintained lists before the SettingKey schema
-    /// so existing drift is visible first; one schema replacing them must keep it green.
+    /// The settings file's keys, the fields of `AhmaSettings` and
+    /// [`SettingKey::ALL`] are one set, in one order — so a key cannot be added
+    /// in one place only — and every classification read from the `SettingKey`
+    /// table agrees with the SPEC.
     #[test]
     fn every_setting_key_appears_in_every_list_it_must() {
         use std::collections::BTreeSet;
-        let documented: BTreeSet<String> = setting_docs().iter().map(SettingDoc::dotted).collect();
+        let documented: Vec<String> = setting_docs().iter().map(SettingDoc::dotted).collect();
 
-        // 1. The documented keys are exactly the fields. `all_non_default_settings` is a
-        //    struct literal (a new field does not compile until it is set) with every
+        // 1. The documented keys are exactly SettingKey::ALL, in file order.
+        let all: Vec<String> = SettingKey::ALL.iter().map(|k| k.to_string()).collect();
+        assert_eq!(
+            documented, all,
+            "render_documented and SettingKey::ALL disagree on the keys or their order"
+        );
+        let documented: BTreeSet<String> = documented.into_iter().collect();
+
+        // 2. ... and exactly the fields. `all_non_default_settings` is a struct
+        //    literal (a new field does not compile until it is set) with every
         //    Option `Some`, so serialising it names every field.
         let full = toml::Value::try_from(all_non_default_settings()).unwrap();
         let full = full.as_table().unwrap();
@@ -4444,66 +4430,24 @@ mod tests {
             documented, fields,
             "render_documented and AhmaSettings disagree on the key set"
         );
-
-        // 2. Every hand list names only real keys.
+        for &k in SettingKey::ALL {
+            assert_eq!(
+                k.value(&all_non_default_settings()).as_ref(),
+                full.get(k.table()).and_then(|t| t.get(k.field())),
+                "SettingKey::{k:?} reads a different field than `{k}`"
+            );
+        }
         let rows = crate::settings_origin::setting_rows(
             &AhmaSettings::default(),
             &AhmaSettings::default(),
         );
-        let lists: [(&str, Vec<String>); 5] = [
-            (
-                "SECURITY_KEYS",
-                SECURITY_KEYS
-                    .iter()
-                    .map(|(t, k)| format!("{t}.{k}"))
-                    .collect(),
-            ),
-            (
-                "OPTIONAL_PREFERENCE_KEYS",
-                OPTIONAL_PREFERENCE_KEYS
-                    .iter()
-                    .map(|(t, k)| format!("{t}.{k}"))
-                    .collect(),
-            ),
-            (
-                "SECRET_KEYS",
-                crate::settings_origin::SECRET_KEYS
-                    .iter()
-                    .map(|k| k.to_string())
-                    .collect(),
-            ),
-            (
-                "CLI_ONLY_KEYS",
-                crate::settings_origin::CLI_ONLY_KEYS
-                    .iter()
-                    .map(|k| k.to_string())
-                    .collect(),
-            ),
-            (
-                "setting_rows",
-                rows.iter().map(|r| r.key.to_string()).collect(),
-            ),
-        ];
-        for (list, keys) in lists {
-            let unknown: Vec<&String> = keys.iter().filter(|k| !documented.contains(*k)).collect();
-            assert!(
-                unknown.is_empty(),
-                "{list} names keys that are not settings: {unknown:?}"
-            );
-        }
-        for t in SECURITY_TABLES {
-            assert!(
-                documented.iter().any(|k| k.starts_with(&format!("{t}."))),
-                "SECURITY_TABLES names {t}, which has no key"
-            );
-        }
 
         // 3. The classifications agree with each other and with the SPEC.
         for d in setting_docs() {
             let (t, k) = (d.table.as_str(), d.key.as_str());
             let tier = settings_tier(t, k);
             assert!(tier.is_some(), "{t}.{k} has no tier (R-CFG2.1)");
-            if SECURITY_TABLES.contains(&t) {
+            if SettingKey::is_security_table(t) {
                 assert_eq!(
                     tier,
                     Some(SettingsTier::Security),
@@ -4543,7 +4487,7 @@ mod tests {
         );
 
         // 4. Each provenance row reads the field its key names: setting that one key
-        //    in a file moves exactly that row (catches `row!("a.b", a.c)`).
+        //    in a file moves exactly that row (catches a `debug_value` arm reading another field).
         for row in &rows {
             let (t, k) = row.key.split_once('.').unwrap();
             let one: toml::Table = [(
@@ -4593,6 +4537,72 @@ mod tests {
         );
     }
 
+    /// Every per-key classification, pinned as text before the `SettingKey`
+    /// schema replaced the hand-kept lists, so the move provably changed no
+    /// answer: tier, ledger command, redaction, CLI-only, the `settings show`
+    /// row order, and the tier an unknown key gets in each table.
+    #[test]
+    fn every_setting_classification_is_pinned() {
+        use std::fmt::Write as _;
+        let rows: Vec<&str> = crate::settings_origin::setting_rows(
+            &AhmaSettings::default(),
+            &AhmaSettings::default(),
+        )
+        .into_iter()
+        .map(|r| r.key)
+        .collect();
+        let mut got = String::new();
+        let mut tables: Vec<String> = Vec::new();
+        for d in setting_docs() {
+            let dotted = d.dotted();
+            if !tables.contains(&d.table) {
+                tables.push(d.table.clone());
+            }
+            let _ = writeln!(
+                got,
+                "{dotted} tier={:?} redacted={} cli_only={} row={} ledger={}",
+                settings_tier(&d.table, &d.key),
+                crate::settings_origin::shown_value(&dotted, "v") != "v",
+                crate::settings_origin::startup_deviation_lines(&[
+                    crate::settings_origin::SettingOrigin {
+                        key: rows
+                            .iter()
+                            .find(|r| **r == dotted)
+                            .copied()
+                            .unwrap_or("x.y"),
+                        value: "a".into(),
+                        default: "b".into(),
+                        source: crate::settings_origin::SettingSource::Default,
+                    }
+                ])
+                .is_empty()
+                    && rows.contains(&dotted.as_str()),
+                rows.iter()
+                    .position(|r| *r == dotted)
+                    .map_or("-".to_string(), |i| i.to_string()),
+                ledger_key_command(&d.table, &d.key).unwrap_or("-"),
+            );
+        }
+        tables.extend(["daemon".to_string(), "not_a_table".to_string()]);
+        for t in &tables {
+            let _ = writeln!(
+                got,
+                "{t}.<unknown> tier={:?}",
+                settings_tier(t, "no_such_key")
+            );
+        }
+        let want = include_str!("testdata/setting_classification.txt");
+        assert_eq!(
+            got, want,
+            "a setting's classification changed; review it and update \
+             testdata/setting_classification.txt:\n{got}"
+        );
+    }
+
+    /// A fully non-default settings value for round-trip / completeness testing.
+    /// Every field is set to something other than its compiled-in default so that
+    /// a missing field in [`AhmaSettings::render_documented`] would surface as a
+    /// lost value when this round-trips through TOML.
     fn all_non_default_settings() -> AhmaSettings {
         AhmaSettings {
             lmstudio: LmStudioSettings {
@@ -4774,7 +4784,7 @@ mod tests {
         let edit =
             AhmaSettings::set_in_file(&path, "tools.source_readers", Some("['scripts/t.sh']"))
                 .unwrap();
-        assert_eq!(edit.after.as_deref(), Some("[\"scripts/t.sh\"]"));
+        assert_eq!(edit.after_toml().as_deref(), Some("[\"scripts/t.sh\"]"));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("this repository's ahma settings"), "{text}");
         assert!(!text.contains("Ahma user settings"), "{text}");
@@ -4917,11 +4927,10 @@ mod tests {
             .iter()
             .map(|d| (d.table.clone(), d.key.clone()))
             .collect();
-        for (table, key) in known_settings_keys().iter().cloned().chain(
-            OPTIONAL_PREFERENCE_KEYS
-                .iter()
-                .map(|(t, k)| (t.to_string(), k.to_string())),
-        ) {
+        for (table, key) in SettingKey::ALL
+            .iter()
+            .map(|k| (k.table().to_string(), k.field().to_string()))
+        {
             assert!(
                 documented.contains(&(table.clone(), key.clone())),
                 "{table}.{key} is a setting but render_documented never describes it"
@@ -4934,10 +4943,8 @@ mod tests {
                 d.dotted()
             );
         }
-        // Collected, not asserted one at a time: a key whose default is `None`
-        // is absent from the derived key set, so it needs a hand entry in
-        // OPTIONAL_PREFERENCE_KEYS (or a Security rule), or a repository file's
-        // copy of it is reported "unrecognised". Name them all at once.
+        // Collected, not asserted one at a time: a documented key with no tier
+        // would be reported "unrecognised" in a repository file. Name them all.
         let untiered: Vec<String> = setting_docs()
             .iter()
             .filter(|d| settings_tier(&d.table, &d.key).is_none())
@@ -4945,7 +4952,7 @@ mod tests {
             .collect();
         assert!(
             untiered.is_empty(),
-            "documented but classified as unknown (add to OPTIONAL_PREFERENCE_KEYS): {untiered:?}"
+            "documented but classified as unknown (add to the SettingKey table): {untiered:?}"
         );
     }
 
@@ -5728,8 +5735,8 @@ timeout_secs = 600
         std::fs::write(&path, AhmaSettings::default().render_documented()).unwrap();
 
         let edit = AhmaSettings::set_in_file(&path, "tools.timeout_secs", Some("90000")).unwrap();
-        assert_eq!(edit.before.as_deref(), Some("1800"));
-        assert_eq!(edit.after.as_deref(), Some("90000"));
+        assert_eq!(edit.before_toml().as_deref(), Some("1800"));
+        assert_eq!(edit.after_toml().as_deref(), Some("90000"));
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             text.matches("\n[tools]").count(),
@@ -5751,7 +5758,7 @@ timeout_secs = 600
 
         let edit = AhmaSettings::set_in_file(&path, "tools.timeout_secs", None).unwrap();
         assert_eq!(
-            edit.after.as_deref(),
+            edit.after_toml().as_deref(),
             Some("1800"),
             "unset returns the default"
         );
@@ -5762,7 +5769,7 @@ timeout_secs = 600
 
         // A string value needs no TOML quoting on the command line.
         let edit = AhmaSettings::set_in_file(&path, "logging.target", Some("stderr")).unwrap();
-        assert_eq!(edit.after.as_deref(), Some("\"stderr\""));
+        assert_eq!(edit.after_toml().as_deref(), Some("\"stderr\""));
     }
 
     /// R-CFG10.2: what `set` refuses, it refuses before writing anything.
@@ -6379,129 +6386,26 @@ pub enum SettingsTier {
     Preference,
 }
 
-/// Whole tables whose every key is Security-tier.
-///
-/// Table granularity rather than per-field metadata, because that is the
-/// granularity the rejection actually operates at: the project file is parsed to
-/// a `toml::Value` and filtered *before* deserialization, so a key that never
-/// reaches a Rust field still has to be classified. It is also the safer default
-/// — a new key added to `[sandbox]` is Security-tier without anyone remembering,
-/// which is the direction an omission should fail in.
-const SECURITY_TABLES: &[&str] = &[
-    // Scopes, temp access, package-cache write, task vault, the trust-handoff
-    // escape hatches, the credential deny set — all of R-CFG2.1's named list.
-    "sandbox",
-    // Token, token path, rate limits.
-    "auth",
-    // Egress policy for ahma's own HTTP tools; a project file must not be able
-    // to add a domain to `always_allow` (SPEC R-WEB).
-    "web",
-    // Subprocess egress restriction and its allowlist.
-    "network",
-    // The grant ledger itself. A project file proposing grants would be the
-    // whole R5.4.5 gate bypassed in one line.
-    "permissions",
-    // Approved log targets are ledger grants too: each one widens what the
-    // sandbox may read. A cloned repository must not be able to approve a log
-    // symlink of its own pointing at `~/.ssh/id_ed25519`.
-    "log_targets",
-    // A cloned repository must not be able to let its commands open links in
-    // the human's signed-in browser (SPEC R-LINK.4).
-    "open_url",
-];
-
-/// Individual Security-tier keys inside otherwise-Preference tables.
-///
-/// Kept short on purpose: a table that accumulates these is a table that should
-/// be split.
-const SECURITY_KEYS: &[(&str, &str)] = &[
-    // R-CFG2.1 names session isolation and the socket path is what selects it:
-    // a project file pointing the bridge at another socket redirects every tool
-    // call to a server it chose.
-    ("http", "unix_socket_path"),
-    // R2.7.10: a declared long-running command runs without the workspace
-    // lease, beside every other writer; a cloned repository must not be able
-    // to declare its own.
-    ("tools", "long_running"),
-];
-
 /// The tier of `table.key`, or `None` if the key is not known to this build.
+///
+/// A known key's tier is the one its [`SettingKey`] row states. An unknown key
+/// in a table whose every key is Security-tier is Security too — the table is
+/// what makes it dangerous, not the name, so an omission fails closed.
 ///
 /// `None` is not "Preference by default": an unknown key in a project file is
 /// reported and dropped, because a build that does not recognise a key cannot
 /// know whether honoring it would be safe.
 pub fn settings_tier(table: &str, key: &str) -> Option<SettingsTier> {
-    if SECURITY_TABLES.contains(&table) {
-        return Some(SettingsTier::Security);
+    match SettingKey::from_parts(table, key) {
+        Some(setting) => Some(setting.tier()),
+        None => SettingKey::is_security_table(table).then_some(SettingsTier::Security),
     }
-    if SECURITY_KEYS.contains(&(table, key)) {
-        return Some(SettingsTier::Security);
-    }
-    if known_settings_keys().contains(&(table.to_string(), key.to_string()))
-        || OPTIONAL_PREFERENCE_KEYS.contains(&(table, key))
-    {
-        return Some(SettingsTier::Preference);
-    }
-    None
 }
 
-/// Preference-tier keys that [`known_settings_keys`] cannot see.
-///
-/// TOML has no null, so `toml` omits an `Option` field that is `None` — and every
-/// key here is `None` in a default `AhmaSettings`, which is exactly why deriving
-/// the set from the defaults misses them. Listing them by hand is the small cost
-/// of not adding a schema dependency to the foundation crate; both halves of
-/// `optional_preference_keys_are_real_and_still_optional` keep the list honest,
-/// by proving each name deserializes *and* that it is still absent from the
-/// derived set (so an entry cannot rot into redundancy when a field stops being
-/// optional).
-///
-/// Security-tier optional keys need no entry: their whole table is Security, or
-/// they are named in [`SECURITY_KEYS`].
-const OPTIONAL_PREFERENCE_KEYS: &[(&str, &str)] = &[
-    ("tools", "request_budget_override_secs"),
-    // A context-window budget for the chat agent; `None` until set, so the
-    // derived set cannot see it. Missing here, a repository's own copy of it
-    // was refused as "unrecognised" (found by the settings-description test).
-    ("tools", "context_length"),
-    ("tools", "tools_dir"),
-    ("agent", "provider"),
-    ("agent", "model"),
-    ("agent", "provider_url"),
-];
-
-/// Every `(table, key)` a default [`AhmaSettings`] serialises to.
-///
-/// Derived from the type rather than hand-listed, so it cannot drift: adding a
-/// field makes it known and removing one makes it unknown, with nobody needing
-/// to remember. It is also what makes "unrecognised key" a real answer rather
-/// than "any key in a table I know about" — R-CFG6.2 requires unknown keys be
-/// reported, and that needs the actual field set.
-fn known_settings_keys() -> &'static std::collections::HashSet<(String, String)> {
-    static KEYS: std::sync::OnceLock<std::collections::HashSet<(String, String)>> =
-        std::sync::OnceLock::new();
-    KEYS.get_or_init(compute_known_settings_keys)
-}
-
-/// Compute the `(table, key)` set backing [`known_settings_keys`].
-///
-/// Split out so the guard clauses below stay flat: a nested `if let` inside a
-/// `for` inside a nested `if let` is the same logic, just harder to scan.
-fn compute_known_settings_keys() -> std::collections::HashSet<(String, String)> {
-    let mut out = std::collections::HashSet::new();
-    // Serialising the defaults cannot fail for any value the type can hold.
-    let Ok(toml::Value::Table(tables)) = toml::Value::try_from(AhmaSettings::default()) else {
-        return out;
-    };
-    for (table, contents) in tables {
-        let Some(keys) = contents.as_table() else {
-            continue;
-        };
-        for key in keys.keys() {
-            out.insert((table.clone(), key.clone()));
-        }
-    }
-    out
+/// [`settings_tier`] of a dotted `table.key`.
+pub fn dotted_settings_tier(dotted: &str) -> Option<SettingsTier> {
+    let (table, key) = dotted.split_once('.')?;
+    settings_tier(table, key)
 }
 
 #[cfg(test)]
@@ -6539,9 +6443,7 @@ mod tier_tests {
         assert!(
             unclassified.is_empty(),
             "settings keys with no trust tier: {unclassified:?}\n\
-             Add the table to SECURITY_TABLES, or the key to SECURITY_KEYS. Preference-tier \
-             keys are derived from the type itself, so this can only fail for a key in a \
-             table that is neither. A key with no tier cannot be safely read from a project \
+             Add the key to the `SettingKey` table in setting_key.rs. A key with no tier cannot be safely read from a project \
              settings file (SPEC R-CFG2.2), so it is dropped — which is safe, but silent \
              if nobody notices."
         );
@@ -6607,29 +6509,27 @@ mod tier_tests {
         }
     }
 
-    /// Both halves matter. The first proves the listed names are real keys — a
-    /// typo here would silently classify a nonexistent key. The second proves
-    /// they are still optional: if a field stops being `Option`, the derived set
-    /// starts covering it and the entry becomes dead weight that outlives its
-    /// reason.
+    /// TOML has no null, so a default `AhmaSettings` omits every `Option` key
+    /// that is `None`; a classification derived from the defaults could not see
+    /// them, and a repository's `tools.context_length` was once refused as
+    /// "unrecognised" for that reason. Each such key is still known, and a
+    /// preference among them is accepted from a project file.
     #[test]
-    fn optional_preference_keys_are_real_and_still_optional() {
-        for (table, key) in OPTIONAL_PREFERENCE_KEYS {
-            let doc = format!("[{table}]\n{key} = \"probe\"\n");
-            let parsed: Result<AhmaSettings, _> = toml::from_str(&doc);
-            let numeric = format!("[{table}]\n{key} = 1\n");
-            let parsed_numeric: Result<AhmaSettings, _> = toml::from_str(&numeric);
-            assert!(
-                parsed.is_ok() || parsed_numeric.is_ok(),
-                "{table}.{key} is listed as an optional preference key but no \
-                 AhmaSettings accepts it — the name is wrong or the field is gone"
-            );
-            assert!(
-                !known_settings_keys().contains(&((*table).to_string(), (*key).to_string())),
-                "{table}.{key} now serialises by default, so the derived set already \
-                 covers it — remove it from OPTIONAL_PREFERENCE_KEYS"
-            );
+    fn optional_keys_a_default_omits_still_have_a_tier() {
+        let defaults = AhmaSettings::default();
+        let omitted: Vec<SettingKey> = SettingKey::ALL
+            .iter()
+            .copied()
+            .filter(|k| k.value(&defaults).is_none())
+            .collect();
+        assert!(omitted.contains(&SettingKey::ToolsContextLength));
+        for k in omitted {
+            assert_eq!(settings_tier(k.table(), k.field()), Some(k.tier()), "{k}");
         }
+        let project: toml::Table =
+            toml::from_str("[tools]\ncontext_length = 8192\n[agent]\nmodel = \"m\"\n").unwrap();
+        let load = classify_project_settings(project);
+        assert!(!load.has_rejections(), "{load:?}");
     }
 
     #[test]
@@ -6805,6 +6705,11 @@ mod project_settings_tests {
     use super::*;
     use std::io::Write;
 
+    /// `text` read as one TOML value, as `settings set` reads a value.
+    fn toml_value(text: &str) -> toml::Value {
+        toml::from_str::<toml::Table>(&format!("v = {text}")).unwrap()["v"].clone()
+    }
+
     /// SPEC R2.7.10: a long-running command runs without the workspace lease,
     /// so only the user's own file may declare one; a cloned repository's file
     /// is refused and named.
@@ -6865,8 +6770,8 @@ mod project_settings_tests {
         let old = r#"{ command = "coach_eval run", timeout_secs = 14400 }"#;
         let new = r#"{ command = "scripts/audition", timeout_secs = 86400 }"#;
         let edit = SettingsEdit {
-            before: Some(format!("[{old}]")),
-            after: Some(format!("[{new}]")),
+            before: Some(toml_value(&format!("[{old}]"))),
+            after: Some(toml_value(&format!("[{new}]"))),
         };
         let text = describe_setting_change(
             "tools.long_running",
@@ -6914,8 +6819,8 @@ mod project_settings_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.toml");
         let edit = SettingsEdit {
-            before: Some("1800".into()),
-            after: Some("90000".into()),
+            before: Some(toml_value("1800")),
+            after: Some(toml_value("90000")),
         };
         let project = describe_setting_change(
             "tools.timeout_secs",
@@ -7004,13 +6909,41 @@ mod project_settings_tests {
         );
     }
 
+    /// An optional key with no value is `None` in the edit, and reads
+    /// `(unset)` only where a person reads it.
+    #[test]
+    fn an_unset_value_is_none_and_reads_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.toml");
+        let set = AhmaSettings::set_in_file(&file, "tools.context_length", Some("8192")).unwrap();
+        assert_eq!(set.before, None);
+        assert_eq!(set.after, Some(toml::Value::Integer(8192)));
+        let text = describe_setting_change(
+            "tools.context_length",
+            &set,
+            &file,
+            SettingsReach::OnlyThisFile,
+        );
+        assert!(text.contains("\n  was: (unset)\n  now: 8192\n"), "{text}");
+        assert!(
+            text.contains("To undo: ahma settings unset --path"),
+            "{text}"
+        );
+        let unset = AhmaSettings::set_in_file(&file, "tools.context_length", None).unwrap();
+        assert_eq!(unset.after, None);
+        assert_eq!(
+            (unset.before_text(), unset.after_text()),
+            ("8192".to_string(), UNSET_TEXT.to_string())
+        );
+    }
+
     #[test]
     fn an_unchanged_setting_says_nothing_changed() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.toml");
         let edit = SettingsEdit {
-            before: Some("90000".into()),
-            after: Some("90000".into()),
+            before: Some(toml_value("90000")),
+            after: Some(toml_value("90000")),
         };
         let text = describe_setting_change(
             "tools.timeout_secs",

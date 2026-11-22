@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use ahma_common::approver::ApproverSurface;
 use ahma_common::config::{
-    AhmaSettings, ScopeAccess, SettingsFile, SettingsTier, ledger_key_command, settings_tier,
-    undo_command,
+    AhmaSettings, ScopeAccess, SettingKey, SettingsFile, SettingsTier, ledger_key_command,
+    settings_tier, undo_command,
 };
 use ahma_common::doctor::Fix;
 use ahma_common::scope_grant::{GrantRisk, NewGrant, classify_grant_risk, persist_grant};
@@ -506,7 +506,7 @@ fn validate_set(
             preview.edit.before_text(),
             preview.edit.after_text()
         ),
-        undo: undo_command(file, key, preview.edit.before.as_deref()),
+        undo: undo_command(file, key, preview.edit.before_toml().as_deref()),
         already: !preview.edit.changed(),
     })
 }
@@ -730,8 +730,8 @@ fn write_setting(
             surface,
             file.label(),
             key,
-            edit.before.as_deref(),
-            edit.after.as_deref(),
+            edit.before_toml().as_deref(),
+            edit.after_toml().as_deref(),
         ));
     }
     Ok(format!(
@@ -1170,6 +1170,18 @@ fn list_entry_undo(key: &str, item: &str) -> Undo {
     })
 }
 
+/// The switches the setup view lists when they are on, in its order: every
+/// key with a [`SettingKey::switch_label`], each once (a test holds the two
+/// equal, so a new switch cannot be left out of the view).
+const SWITCH_ORDER: [SettingKey; 6] = [
+    SettingKey::SandboxAllowGpu,
+    SettingKey::SandboxAllowKeychain,
+    SettingKey::SandboxSignalOtherProcesses,
+    SettingKey::SandboxAllowGitHooks,
+    SettingKey::SandboxAllowProjectToolConfig,
+    SettingKey::NetworkRestrict,
+];
+
 fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
     let mut out = Vec::new();
     for g in &s.sandbox.persistent_scopes {
@@ -1258,40 +1270,19 @@ fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
             undo: Undo::Command("ahma settings unset tools.long_running".into()),
         });
     }
-    for (on, key, what) in [
-        (s.sandbox.allow_gpu, "sandbox.allow_gpu", "the GPU (Metal)"),
-        (
-            s.sandbox.allow_keychain,
-            "sandbox.allow_keychain",
-            "the login keychain",
-        ),
-        (
-            s.sandbox.signal_other_processes,
-            "sandbox.signal_other_processes",
-            "signalling other processes",
-        ),
-        (
-            s.sandbox.allow_git_hooks,
-            "sandbox.allow_git_hooks",
-            "writing git hooks",
-        ),
-        (
-            s.sandbox.allow_project_tool_config,
-            "sandbox.allow_project_tool_config",
-            "writing .ahma/ tool configs",
-        ),
-        (
-            s.network.restrict,
-            "network.restrict",
-            "egress restricted to the allow list",
-        ),
-    ] {
-        if on {
+    // Every switch that is on ([`SettingKey::switch_label`]), in the order the
+    // setup view has always listed them.
+    let defaults = AhmaSettings::default();
+    for setting in SWITCH_ORDER {
+        let Some(what) = setting.switch_label() else {
+            continue;
+        };
+        let is_on = |s: &AhmaSettings| setting.value(s) == Some(toml::Value::Boolean(true));
+        let key = setting.as_str();
+        if is_on(s) {
             // Back to the default is `unset`, unless the default is itself on
             // (the login keychain): then only `false` turns it off.
-            let on_by_default = ahma_common::config::setting_docs()
-                .iter()
-                .any(|d| d.dotted() == key && d.default == "true");
+            let on_by_default = is_on(&defaults);
             let undo = if on_by_default {
                 Change::Set {
                     file: SettingsFile::User,
@@ -1680,6 +1671,20 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The setup view lists exactly the keys that are switches, each once.
+    #[test]
+    fn the_setup_view_lists_every_switch_once() {
+        let mut listed: Vec<&str> = SWITCH_ORDER.iter().map(|k| k.as_str()).collect();
+        let mut switches: Vec<&str> = SettingKey::ALL
+            .iter()
+            .filter(|k| k.switch_label().is_some())
+            .map(|k| k.as_str())
+            .collect();
+        listed.sort_unstable();
+        switches.sort_unstable();
+        assert_eq!(listed, switches);
+    }
 
     struct Fixture {
         _home: tempfile::TempDir,
