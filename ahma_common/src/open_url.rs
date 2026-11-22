@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::approver::ApproverSurface;
+use crate::grant::GrantedBy;
 use crate::permissions::{AuditAction, AuditEntry, GrantKind, GrantTier};
 
 /// The words every decision about opening links carries (SPEC R-LINK.7): the
@@ -308,9 +309,10 @@ pub struct OpenUrlSessionGrant {
     pub owner_pid: u32,
     /// Unix seconds when it was given.
     pub granted_at: u64,
-    /// Where it was given (`"tui"`, `"web"`, `"desktop"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_by: Option<String>,
+    /// Where it was given, stored as the surface's name (`"tui"`, `"web"`,
+    /// `"desktop"`).
+    #[serde(default, skip_serializing_if = "GrantedBy::is_unmarked")]
+    pub granted_by: GrantedBy,
 }
 
 impl OpenUrlSessionGrant {
@@ -558,8 +560,46 @@ mod tests {
             workspace: PathBuf::from(ws),
             owner_pid: pid,
             granted_at: at,
-            granted_by: Some("tui".into()),
+            granted_by: crate::approver::ApproverSurface::Tui.into(),
         }
+    }
+
+    /// A link session grant's file holds where it was given as the text it
+    /// always has, and one naming a surface this build does not know still
+    /// loads, as given (the record denies unknown fields, not unknown makers).
+    #[test]
+    fn a_link_session_grant_holds_where_it_was_given_as_the_text_it_always_has() {
+        use crate::approver::ApproverSurface;
+        use crate::grant::GrantedBy;
+        for (surface, text) in [
+            (ApproverSurface::Tui, "tui"),
+            (ApproverSurface::Web, "web"),
+            (ApproverSurface::Desktop, "desktop"),
+        ] {
+            let mut g = session("github.com", "/w/a", 7, 1_000);
+            g.granted_by = surface.into();
+            let stored = serde_json::to_value(&g).unwrap();
+            assert_eq!(stored["granted_by"], text);
+            assert_eq!(
+                serde_json::from_value::<OpenUrlSessionGrant>(stored).unwrap(),
+                g
+            );
+        }
+        let mut stored = serde_json::to_value(session("github.com", "/w/a", 7, 1_000)).unwrap();
+        stored["granted_by"] = "a surface from a newer ahma".into();
+        let read: OpenUrlSessionGrant = serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            read.granted_by,
+            GrantedBy::Named("a surface from a newer ahma".into())
+        );
+        let mut unmarked = read;
+        unmarked.granted_by = GrantedBy::Unmarked;
+        let stored = serde_json::to_value(&unmarked).unwrap();
+        assert!(stored.get("granted_by").is_none(), "no maker, no key");
+        assert_eq!(
+            serde_json::from_value::<OpenUrlSessionGrant>(stored).unwrap(),
+            unmarked
+        );
     }
 
     /// SPEC R-LINK.4, R-PERM.4.4: "this site, this session" for a hooked

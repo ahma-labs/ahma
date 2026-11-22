@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use ahma_common::config::ScopeAccess;
-use ahma_common::grant::ResolvedGrant;
+use ahma_common::grant::{GrantedBy, ResolvedGrant};
 use ahma_common::session_grants::{self, SessionGrant};
 
 /// Whether `pid` is alive, on every platform: the one probe
@@ -26,7 +26,7 @@ pub fn record_session_grant(
     access: ScopeAccess,
     workspace: Option<&Path>,
     owner_pid: u32,
-    granted_by: &str,
+    granted_by: GrantedBy,
 ) -> Option<std::path::PathBuf> {
     let Some(workspace) = workspace else {
         tracing::debug!(
@@ -42,7 +42,7 @@ pub fn record_session_grant(
         workspace: dunce::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()),
         owner_pid,
         granted_at: session_grants::now_secs(),
-        granted_by: Some(granted_by.to_string()),
+        granted_by,
     };
     match session_grants::record(&dir, &grant) {
         Ok(file) => {

@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::grant::GrantedBy;
+
 /// A destination prefix for a server, by host key fingerprint.
 pub const HOST_PREFIX: &str = "host:";
 /// A destination prefix for an `ssh-keygen -Y sign` namespace.
@@ -43,9 +45,10 @@ pub struct SshSignGrant {
     /// When it lapses (a lease), Unix seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
-    /// Who made it (`"harness dialog"`, `"tui"`, `"cli"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_by: Option<String>,
+    /// Who made it, stored as the text it always was (`"harness dialog"`,
+    /// `"tui"`, `"cli"`).
+    #[serde(default, skip_serializing_if = "GrantedBy::is_unmarked")]
+    pub granted_by: GrantedBy,
     /// For the session tier, the process whose life bounds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_pid: Option<u32>,
@@ -309,9 +312,41 @@ mod tests {
             workspace: PathBuf::from("/ws/repo"),
             granted_at: 1_000,
             expires_at,
-            granted_by: Some("test".into()),
+            granted_by: crate::grant::GrantedBy::Named("test".into()),
             owner_pid,
         }
+    }
+
+    /// Who made an ssh-sign grant is stored as the text it always has, in the
+    /// session file (JSON) and in `[[sandbox.ssh_sign]]` (TOML), and a record
+    /// naming a maker this build does not know still loads, as made.
+    #[test]
+    fn an_ssh_sign_grant_holds_its_maker_as_the_text_it_always_has() {
+        use crate::approver::ApproverSurface;
+        use crate::grant::GrantedBy;
+        for (by, text) in [
+            (GrantedBy::from(ApproverSurface::Cli), "cli"),
+            (GrantedBy::from(ApproverSurface::Tui), "tui"),
+            (GrantedBy::HarnessDialog, "harness dialog"),
+            (GrantedBy::Named("a newer maker".into()), "a newer maker"),
+        ] {
+            let mut g = grant(Some(7), None);
+            g.granted_by = by;
+            let json = serde_json::to_value(&g).unwrap();
+            assert_eq!(json["granted_by"], text);
+            assert_eq!(serde_json::from_value::<SshSignGrant>(json).unwrap(), g);
+            let toml_text = toml::to_string(&g).unwrap();
+            assert!(
+                toml_text.contains(&format!("granted_by = \"{text}\"")),
+                "{toml_text}"
+            );
+            assert_eq!(toml::from_str::<SshSignGrant>(&toml_text).unwrap(), g);
+        }
+        let mut g = grant(None, None);
+        g.granted_by = GrantedBy::Unmarked;
+        let toml_text = toml::to_string(&g).unwrap();
+        assert!(!toml_text.contains("granted_by"), "{toml_text}");
+        assert_eq!(toml::from_str::<SshSignGrant>(&toml_text).unwrap(), g);
     }
 
     #[test]

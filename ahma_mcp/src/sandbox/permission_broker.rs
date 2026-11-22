@@ -571,7 +571,7 @@ fn apply_live_scope_grant(
                     access,
                     workspace,
                     std::process::id(),
-                    &surface.to_string(),
+                    surface.into(),
                 );
             }
         }

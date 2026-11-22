@@ -1647,7 +1647,9 @@ fn register_hook_with_hub(
         operation_monitor,
         ahma_common::hub::InstanceMode::Hook.as_str(),
         cwd.to_string(),
-        "hook",
+        // Its label, and so its operations' origin: the TUI files an operation
+        // from this origin with the hooks after the instance has gone.
+        ahma_common::hub::InstanceMode::Hook.as_str(),
         None,
         None,
     ))

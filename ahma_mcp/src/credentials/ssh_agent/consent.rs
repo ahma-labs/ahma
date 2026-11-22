@@ -417,7 +417,7 @@ mod tests {
                 workspace: ws.clone(),
                 granted_at: ahma_common::session_grants::now_secs(),
                 expires_at: None,
-                granted_by: Some("test".into()),
+                granted_by: ahma_common::grant::GrantedBy::Named("test".into()),
                 owner_pid: None,
             },
             &ahma_common::approver::ApproverSurface::Cli,

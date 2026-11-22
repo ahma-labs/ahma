@@ -126,8 +126,9 @@ fn section_key_for_op(
         // The chat agent's own tool session: its work is the chat's work.
         Some(id) if agent_instances.contains(id) => LOCAL_GROUP.to_string(),
         // A hook whose instance has already gone still belongs with the hooks:
-        // the operation carries its own origin, which outlives the registration.
-        _ if op.origin.as_deref() == Some("hook") => HOOKS_KEY.to_string(),
+        // the operation carries its own origin, which outlives the registration
+        // (a hook registers with its kind as its label, and so its origin).
+        _ if op.origin.as_deref() == Some(InstanceMode::Hook.as_str()) => HOOKS_KEY.to_string(),
         Some(id) => id.to_string(),
         None => LOCAL_GROUP.to_string(),
     }

@@ -3534,7 +3534,7 @@ fn toml_ssh_sign(v: &[crate::ssh_sign::SshSignGrant]) -> String {
             if let Some(at) = g.expires_at {
                 parts.push(format!("expires_at = {at}"));
             }
-            push_opt_str_field(&mut parts, "granted_by", &g.granted_by);
+            push_opt_str_field(&mut parts, "granted_by", &g.granted_by.label());
             if let Some(pid) = g.owner_pid {
                 parts.push(format!("owner_pid = {pid}"));
             }

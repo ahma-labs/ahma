@@ -399,7 +399,7 @@ mod tests {
             workspace: ws.clone(),
             owner_pid: std::process::id(),
             granted_at: ahma_common::session_grants::now_secs(),
-            granted_by: Some("tui".into()),
+            granted_by: ahma_common::approver::ApproverSurface::Tui.into(),
         };
         let dir = ahma_common::open_url::session_dir().unwrap();
         ahma_common::open_url::record_session(&dir, &grant, &ApproverSurface::Tui).unwrap();
@@ -426,7 +426,7 @@ mod tests {
             workspace: ws.to_path_buf(),
             owner_pid: std::process::id(),
             granted_at: ahma_common::session_grants::now_secs(),
-            granted_by: Some("tui".into()),
+            granted_by: ahma_common::approver::ApproverSurface::Tui.into(),
         };
         let dir = ahma_common::open_url::session_dir().unwrap();
         ahma_common::open_url::record_session(&dir, &grant, &ApproverSurface::Tui).unwrap();

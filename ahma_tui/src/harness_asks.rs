@@ -292,7 +292,7 @@ pub fn answer_in(
                     access,
                     Some(&ask.workspace),
                     ask.harness_pid,
-                    &surface.to_string(),
+                    surface.into(),
                 );
                 audit(
                     ask,
@@ -539,7 +539,7 @@ pub fn answer_link_in(
                     workspace: ask.workspace.clone(),
                     owner_pid: ask.harness_pid,
                     granted_at: now,
-                    granted_by: Some(surface.to_string()),
+                    granted_by: surface.into(),
                 },
                 surface,
             )?;
@@ -1010,7 +1010,7 @@ mod tests {
             });
             assert_eq!(grants.len(), 1, "{grants:?}");
             assert!(grants[0].covers("github.com", &f.ws));
-            assert_eq!(grants[0].granted_by.as_deref(), Some("tui"));
+            assert_eq!(grants[0].granted_by.as_str(), Some("tui"));
             assert!(waiting(&f).is_empty(), "answered");
             assert!(!dialog_asks(&f), "the dialog does not ask it too");
             assert_eq!(

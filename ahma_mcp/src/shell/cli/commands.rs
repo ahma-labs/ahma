@@ -836,7 +836,10 @@ fn run_sandbox_grant_session(
         workspace: workspace.clone(),
         owner_pid,
         granted_at: ahma_common::session_grants::now_secs(),
-        granted_by: Some(by.unwrap_or_else(|| "cli".to_string())),
+        granted_by: by.map_or_else(
+            || ApproverSurface::Cli.into(),
+            |by| ahma_common::grant::GrantedBy::parse(Some(&by)),
+        ),
     };
     ahma_common::session_grants::record(&store, &grant)?;
     ahma_common::permissions::append_audit(
@@ -885,7 +888,7 @@ fn run_sandbox_list(file: &std::path::Path) -> Result<()> {
                 g.access.short(),
                 g.workspace.display(),
                 g.owner_pid,
-                g.granted_by.as_deref().unwrap_or("?")
+                g.granted_by.as_str().unwrap_or("?")
             );
         }
         println!();
@@ -1376,7 +1379,7 @@ fn grant_permission(
         workspace: workspace.clone(),
         granted_at: now,
         expires_at,
-        granted_by: Some("cli".into()),
+        granted_by: ApproverSurface::Cli.into(),
         owner_pid: None,
     };
     let line = format!(
@@ -4009,7 +4012,7 @@ mod tests {
                 workspace: ws.clone(),
                 owner_pid: std::process::id(),
                 granted_at: ahma_common::session_grants::now_secs(),
-                granted_by: Some("tui".into()),
+                granted_by: ApproverSurface::Tui.into(),
             },
             &ApproverSurface::Tui,
         )
