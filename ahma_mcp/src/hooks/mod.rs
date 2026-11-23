@@ -1372,7 +1372,7 @@ async fn run_exec(args: HooksExecArgs, cfg: &AppConfig) -> Result<()> {
         let _ = ensure_antigravity_global_permission_grants(&env);
     }
 
-    let decision = compute_exec_decision(&stdin, args.scope, &env);
+    let decision = compute_exec_decision(&stdin, args.scope, &env, args.platform);
     let decision = ask_first_if_refused_before(decision, &stdin, &args, &env, cfg);
     let decision = explain_sudo_elsewhere(decision, &stdin, &args);
     // SPEC R5.4.10 / R-HANDOFF.10: every decision leaves a trace. A pass-through
@@ -1552,7 +1552,11 @@ fn unsandboxable_decision(reason: &str, consented: bool) -> HooksDecision {
 /// Says what ahma's sandbox will and will not confine for the commands of this
 /// session, in the model's own context and the user's terminal, so neither has to
 /// infer it from a denial later. Pure: the scopes are resolved by the caller.
-pub fn hook_scope_disclosure(scopes: &[PathBuf]) -> String {
+///
+/// `asks` is whether this harness's hook contract has `ask` (Claude Code): there
+/// a refused command that is run again raises the harness's own dialog
+/// (R-PERM.10), and the agent must be told so, or it concludes it cannot ask.
+pub fn hook_scope_disclosure(scopes: &[PathBuf], asks: bool) -> String {
     let listed = if scopes.is_empty() {
         "(none)".to_string()
     } else {
@@ -1577,13 +1581,22 @@ pub fn hook_scope_disclosure(scopes: &[PathBuf]) -> String {
     } else {
         ""
     };
+    let how_to_ask = if asks {
+        "If a command fails because the sandbox refused a path, run that same command once more, \
+         unchanged and without a pipe such as `| tail` or `| grep` that hides its failure: \
+         Claude Code then asks the human in its own dialog whether to grant it. Never pass \
+         `--approve-grant` yourself."
+    } else {
+        "To allow one, ask the human — they approve it in the ahma TUI."
+    };
     format!(
         "Sandbox: this shell command runs inside ahma's kernel sandbox (terminal hook). \
          Writes are confined to: {listed}, plus any persistent grants in ~/.ahma/settings.toml.\
-         {no_project} {reads} A write outside the scope fails; to allow one, ask the human — they \
-         approve it in the ahma TUI or run `ahma sandbox grant <dir>`. You cannot widen the scope \
-         yourself, and a harness's own sandbox switch (Claude Code's `dangerouslyDisableSandbox`) \
-         turns off that harness's sandbox, not this one."
+         {no_project} {reads} A write outside the scope fails. {how_to_ask} Before asking, run \
+         `ahma explain blocked` for what to try first; a human can also run `ahma sandbox grant \
+         <dir>`. You cannot widen the scope without the human, and a harness's own sandbox switch \
+         (Claude Code's `dangerouslyDisableSandbox`) turns off that harness's sandbox, not this \
+         one."
     )
 }
 
@@ -2706,7 +2719,12 @@ fn next_prior_step(
 ///    guidance until the user runs `ahma hooks approve-unsandboxed`, after which it
 ///    runs unsandboxed with a loud, counted warning. ahma never silently runs a
 ///    command unsandboxed while it believes it is active.
-fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment) -> HooksDecision {
+fn compute_exec_decision(
+    input: &Value,
+    scope: HookScope,
+    env: &HookEnvironment,
+    platform: HookPlatform,
+) -> HooksDecision {
     if let Some(err) = unusable_settings()
         && let Some(refusal) = unusable_settings_decision(input, is_ahma_hooks_active(), err)
     {
@@ -2732,7 +2750,10 @@ fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment)
         if consent::HookDisclosureStore::current()
             .should_disclose(session_key, &scope_fingerprint(&scopes))
         {
-            *disclosure = Some(hook_scope_disclosure(&scopes));
+            *disclosure = Some(hook_scope_disclosure(
+                &scopes,
+                platform == HookPlatform::Claude,
+            ));
         }
     }
     decision
@@ -6624,7 +6645,7 @@ mod tests {
             "cwd": cwd.to_string_lossy(),
             "tool_input": {"command": "cargo build"}
         });
-        let first = compute_exec_decision(&input, HookScope::User, &env);
+        let first = compute_exec_decision(&input, HookScope::User, &env, HookPlatform::Claude);
         match &first {
             HooksDecision::AllowRewrite {
                 wrapped_command,
@@ -6640,12 +6661,16 @@ mod tests {
                     line.contains(&canon_cwd.display().to_string()),
                     "names the scope: {line}"
                 );
-                assert!(line.contains("ask the human"), "{line}");
+                assert!(
+                    line.contains("cannot widen the scope without the human"),
+                    "{line}"
+                );
+                assert!(line.contains("asks the human in its own dialog"), "{line}");
             }
             other => panic!("marker {marker} must not stop the rewrite, got {other:?}"),
         }
         // Same session, same scope: rewritten again, but silent this time.
-        let second = compute_exec_decision(&input, HookScope::User, &env);
+        let second = compute_exec_decision(&input, HookScope::User, &env, HookPlatform::Claude);
         match second {
             HooksDecision::AllowRewrite { disclosure, .. } => {
                 assert!(
@@ -6711,18 +6736,44 @@ mod tests {
 
     #[test]
     fn hook_scope_disclosure_names_scopes_and_the_human_grant_path() {
-        let line = hook_scope_disclosure(&[PathBuf::from("/w/repo")]);
-        assert!(line.contains("/w/repo"));
-        assert!(line.contains("ahma sandbox grant"));
-        assert!(line.contains("cannot widen"));
-        assert!(
-            line.contains("dangerouslyDisableSandbox"),
-            "the agent learns its harness's switch does not turn ahma off: {line}"
-        );
-        assert!(hook_scope_disclosure(&[]).contains("(none)"));
+        for asks in [true, false] {
+            let line = hook_scope_disclosure(&[PathBuf::from("/w/repo")], asks);
+            assert!(line.contains("/w/repo"));
+            assert!(line.contains("ahma sandbox grant"));
+            assert!(line.contains("ahma explain blocked"), "{line}");
+            assert!(line.contains("cannot widen"));
+            assert!(
+                line.contains("dangerouslyDisableSandbox"),
+                "the agent learns its harness's switch does not turn ahma off: {line}"
+            );
+        }
+        assert!(hook_scope_disclosure(&[], true).contains("(none)"));
         assert_ne!(
             scope_fingerprint(&[PathBuf::from("/a")]),
             scope_fingerprint(&[PathBuf::from("/b")])
+        );
+    }
+
+    /// SPEC R5.4.10, R-PERM.10: an agent told only "ask the human" concluded it
+    /// could not ask, and worked around a refusal instead. Where the hook can
+    /// answer `ask`, the disclosure must say how to reach that dialog — and that
+    /// a pipe such as `| tail` hides the failure that arms it.
+    #[test]
+    fn hook_scope_disclosure_teaches_the_rerun_dialog_only_where_it_exists() {
+        let claude = hook_scope_disclosure(&[PathBuf::from("/w/repo")], true);
+        assert!(
+            claude.contains("run that same command once more"),
+            "{claude}"
+        );
+        assert!(claude.contains("| tail"), "{claude}");
+        assert!(claude.contains("dialog"), "{claude}");
+        assert!(claude.contains("--approve-grant"), "{claude}");
+
+        let other = hook_scope_disclosure(&[PathBuf::from("/w/repo")], false);
+        assert!(!other.contains("dialog"), "{other}");
+        assert!(
+            !other.contains("run that same command once more"),
+            "{other}"
         );
     }
 
