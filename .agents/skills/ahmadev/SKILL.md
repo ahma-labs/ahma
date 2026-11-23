@@ -1111,9 +1111,12 @@ Upgrades workspace Rust dependencies (Cargo.toml + Cargo.lock) using two safety 
    **14 days** (configurable). This avoids the window where most upstream supply-chain
    attacks and accidental breaking changes are discovered.
 
-2. **Advisory filter** — the candidate must not be flagged by `cargo deny check advisories`,
-   which checks the [RustSec Advisory Database](https://rustsec.org/). The workspace
-   already has `deny.toml` configured.
+2. **Advisory filter** — an applied upgrade must not be flagged by `cargo deny check advisories`
+   (the [RustSec Advisory Database](https://rustsec.org/), configured in `deny.toml`). It runs
+   twice: on the current lockfile, to report what an upgrade would fix, and on the rewritten one
+   after applying, where a flagged new version fails the run. If cargo-deny cannot complete (for
+   example it cannot open `~/.cargo/advisory-dbs`) the command stops instead of calling
+   anything clean.
 
 Pre-release versions (e.g. `1.0.0-alpha.1`) and yanked crates are always skipped.
 
@@ -1177,7 +1180,7 @@ cargo deny --version
 ```
 cargo upgrade --dry-run           ← discover available bumps (cargo-edit)
 crates.io API /crates/<n>/<v>     ← fetch publish date per candidate
-cargo deny check advisories       ← collect RustSec advisory hits
+cargo deny check advisories       ← report what the current Cargo.lock is flagged for
 ```
 
 Then for each passing candidate:
@@ -1188,6 +1191,7 @@ cargo update -p <name> --precise <ver>  ← pin version in Cargo.lock
 
 Finally:
 ```
+cargo deny check advisories       ← re-check the rewritten Cargo.lock; a flagged upgrade fails
 cargo check --workspace           ← verify workspace still compiles
 ```
 

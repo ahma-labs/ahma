@@ -787,7 +787,22 @@ fn safe_update(args: &[String]) {
     }
 
     // --- Step 2: collect known-vulnerable (crate, version) pairs from cargo-deny ---
+    // This scans the *current* lockfile, which says what an upgrade would fix;
+    // the candidates' own new versions are checked after they are applied
+    // (Step 5b), the only place they appear in a lockfile.
     let vulnerable_pairs = parse_deny_advisories(&root);
+    if !vulnerable_pairs.is_empty() {
+        let mut current: Vec<_> = vulnerable_pairs
+            .iter()
+            .map(|(n, v)| format!("{n} {v}"))
+            .collect();
+        current.sort();
+        println!(
+            "cargo-deny flags the current Cargo.lock: {} (an upgrade below may fix it; one \
+             held by the age gate is not applied).",
+            current.join(", ")
+        );
+    }
 
     // --- Step 3: evaluate each candidate (includes a resolvability pre-check) ---
     let (rows, to_apply) = evaluate_candidates(&root, &candidates, &vulnerable_pairs, &opts);
@@ -818,6 +833,25 @@ fn safe_update(args: &[String]) {
         .iter()
         .map(|up| apply_upgrade(&root, up, direct_upgrades.contains(&up.name)))
         .collect();
+
+    // --- Step 5b: the advisory check, on the versions this run wrote ---
+    let flagged = newly_flagged(&results, &parse_deny_advisories(&root));
+    if !flagged.is_empty() {
+        eprintln!("ERROR: cargo-deny flags upgrade(s) this run applied:");
+        for r in &flagged {
+            eprintln!("  {} {} -> {}", r.name, r.old_ver, r.new_ver);
+        }
+        eprintln!(
+            "Revert with `git checkout -- Cargo.toml Cargo.lock`, then re-run with \
+             `--exclude {}`.",
+            flagged
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        process::exit(1);
+    }
 
     // --- Step 6: verify workspace still compiles ---
     verify_workspace_compiles(&root);
@@ -1618,57 +1652,92 @@ fn is_prerelease(ver: &str) -> bool {
     ver.split('+').next().unwrap_or(ver).contains('-')
 }
 
-/// Run `cargo deny check advisories --format json` and return a set of
-/// `(crate_name, version)` pairs that have known advisories.
+/// Run `cargo deny --format json check advisories` against the workspace's
+/// current `Cargo.lock` and return the `(crate, version)` pairs it fails on.
 ///
-/// We intentionally use a broad match: if *any* version of a crate has an advisory
-/// that mentions the candidate version, we skip it.  This is conservative but safe.
+/// Exits the process when cargo-deny did not complete (it could not open or
+/// fetch its advisory database, or did not run at all): an advisory check
+/// that did not happen must never read as "advisory-clean".
 fn parse_deny_advisories(root: &Path) -> std::collections::HashSet<(String, String)> {
     let output = std::process::Command::new("cargo")
-        .args(["deny", "check", "advisories", "--format", "json"])
+        .args(["deny", "--format", "json", "check", "advisories"])
         .current_dir(root)
         .output()
         .unwrap_or_else(|e| {
             eprintln!("ERROR: failed to run `cargo deny check advisories`: {e}");
             process::exit(1);
         });
+    // cargo-deny exits non-zero when it finds an advisory; that is a result,
+    // not a failure. Its records go to stderr; stdout stays empty.
+    parse_deny_report(&String::from_utf8_lossy(&output.stderr)).unwrap_or_else(|e| {
+        eprintln!(
+            "ERROR: `cargo deny check advisories` did not complete, so no candidate can be \
+             called advisory-clean:\n  {e}\nIf it is the advisory database under \
+             ~/.cargo/advisory-dbs, ahma's rust profile makes it writable; otherwise a human \
+             can run `ahma sandbox grant ~/.cargo/advisory-dbs`."
+        );
+        process::exit(1);
+    })
+}
 
-    // cargo-deny exits non-zero when advisories are found; that's expected.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .filter_map(advisory_pair_from_ndjson_line)
+/// The upgrades this run applied whose new version cargo-deny flags in the
+/// rewritten `Cargo.lock`. A failed upgrade wrote nothing, so it is not counted.
+fn newly_flagged<'a>(
+    results: &'a [ApplyResult],
+    after: &std::collections::HashSet<(String, String)>,
+) -> Vec<&'a ApplyResult> {
+    results
+        .iter()
+        .filter(|r| r.error.is_none() && after.contains(&(r.name.clone(), r.new_ver.clone())))
         .collect()
 }
 
-fn advisory_pair_from_ndjson_line(line: &str) -> Option<(String, String)> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
+/// Read cargo-deny's `--format json` records (one JSON object per line, on
+/// **stderr**) into the `(crate, version)` pairs of its error-severity
+/// findings, the ones that make `cargo deny check` fail.
+///
+/// `Err` unless the run ended in its `summary` record: without one cargo-deny
+/// stopped early (a database lock or fetch error), and an empty set would
+/// falsely mean "no advisories". The error carries cargo-deny's own error line.
+fn parse_deny_report(stderr: &str) -> Result<std::collections::HashSet<(String, String)>, String> {
+    let mut flagged = std::collections::HashSet::new();
+    let mut completed = false;
+    let mut first_error: Option<&str> = None;
+    for line in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            if first_error.is_none() && (line.contains("[ERROR]") || line.starts_with("error")) {
+                first_error = Some(line);
+            }
+            continue;
+        };
+        match record.get("type").and_then(|t| t.as_str()) {
+            Some("summary") => completed = true,
+            Some("diagnostic")
+                if record.pointer("/fields/severity").and_then(|s| s.as_str()) == Some("error") =>
+            {
+                let graphs = record
+                    .pointer("/fields/graphs")
+                    .and_then(|g| g.as_array())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for krate in graphs.iter().filter_map(|g| g.get("Krate")) {
+                    if let (Some(name), Some(version)) = (
+                        krate.get("name").and_then(|n| n.as_str()),
+                        krate.get("version").and_then(|v| v.as_str()),
+                    ) {
+                        flagged.insert((name.to_string(), version.to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    let kind = v.get("type").and_then(|t| t.as_str())?;
-    if kind != "advisory" && kind != "diagnostic" {
-        return None;
-    }
-    extract_advisory_crate_ver(&v)
-}
-
-fn extract_advisory_crate_ver(v: &serde_json::Value) -> Option<(String, String)> {
-    let name = v
-        .pointer("/fields/advisory/affected/functions/0/crate/name")
-        .or_else(|| v.pointer("/fields/krate/name"))
-        .or_else(|| v.pointer("/krate/name"))
-        .or_else(|| v.pointer("/package/name"))
-        .and_then(|n| n.as_str());
-    let ver = v
-        .pointer("/fields/krate/version")
-        .or_else(|| v.pointer("/krate/version"))
-        .or_else(|| v.pointer("/package/version"))
-        .and_then(|n| n.as_str());
-    match (name, ver) {
-        (Some(n), Some(ver_str)) => Some((n.to_string(), ver_str.to_string())),
-        _ => None,
+    if completed {
+        Ok(flagged)
+    } else {
+        Err(first_error
+            .unwrap_or("cargo-deny printed no summary record (did it run?)")
+            .to_string())
     }
 }
 
@@ -2173,6 +2242,81 @@ mod clean_stale_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// cargo-deny's `--format json` output, as captured on 2026-11-23: every
+    /// record goes to **stderr** (stdout is empty), the crate sits under
+    /// `fields.graphs[].Krate`, and a run that completed ends in a `summary`.
+    const DENY_SUMMARY: &str = r#"{"fields":{"advisories":{"errors":1,"helps":0,"notes":2,"warnings":3}},"type":"summary"}"#;
+    const DENY_VULNERABILITY: &str = r#"{"fields":{"advisory":{"id":"RUSTSEC-2026-0594","package":"cookie"},"code":"vulnerability","graphs":[{"Krate":{"name":"cookie","version":"0.18.2"}}],"labels":[{"column":1,"line":89,"message":"security vulnerability detected","span":"cookie 0.18.2 registry+https://github.com/rust-lang/crates.io-index"}],"message":"Private cookie nonces can repeat in processes that fork","severity":"error"},"type":"diagnostic"}"#;
+    const DENY_IGNORED_NOTE: &str = r#"{"fields":{"code":"advisory-not-detected","graphs":[],"labels":[],"message":"advisory was not encountered","severity":"warning"},"type":"diagnostic"}"#;
+    const DENY_UNMAINTAINED_WARNING: &str = r#"{"fields":{"advisory":{"id":"RUSTSEC-2024-0001","package":"oldcrate"},"code":"unmaintained","graphs":[{"Krate":{"name":"oldcrate","version":"1.0.0"}}],"message":"unmaintained","severity":"warning"},"type":"diagnostic"}"#;
+
+    /// The advisory filter read stdout, where cargo-deny writes nothing, and
+    /// looked for the crate at paths its records do not use: it never saw an
+    /// advisory. It must read the records cargo-deny actually writes.
+    #[test]
+    fn deny_report_finds_the_flagged_crate_in_cargo_denys_real_records() {
+        let stderr = [
+            DENY_IGNORED_NOTE,
+            DENY_VULNERABILITY,
+            DENY_UNMAINTAINED_WARNING,
+            DENY_SUMMARY,
+        ]
+        .join("\n");
+        let flagged = super::parse_deny_report(&stderr).expect("a completed run");
+        assert_eq!(
+            flagged,
+            std::collections::HashSet::from([("cookie".to_string(), "0.18.2".to_string())]),
+            "only error-severity findings fail `cargo deny`, so only they block"
+        );
+        assert!(
+            super::parse_deny_report(DENY_SUMMARY)
+                .expect("a clean run")
+                .is_empty()
+        );
+    }
+
+    /// The filter failed open: a cargo-deny that could not open its database
+    /// printed no records, which read as "no advisories", and every candidate
+    /// passed as advisory-clean. A run without its summary is not a result.
+    #[test]
+    fn deny_report_without_a_summary_is_an_error_not_a_clean_bill() {
+        let lock = "2026-11-23 15:54:04 [ERROR] failed to acquire advisory database lock: \
+                    file lock error: failed to obtain lock file '/Users/me/.cargo/advisory-dbs/\
+                    db.lock': attempted to take an exclusive lock on a read-only path";
+        let err = super::parse_deny_report(lock).expect_err("no summary, no verdict");
+        assert!(err.contains("advisory database lock"), "{err}");
+        assert!(super::parse_deny_report("").is_err());
+    }
+
+    /// A candidate's *new* version is only in the lockfile after it is applied,
+    /// so that is where the advisory check has to look: an applied upgrade the
+    /// re-check flags fails the run. A crate still flagged at a version this
+    /// run did not write (an upgrade the age gate held back) is not this run's.
+    #[test]
+    fn an_applied_upgrade_the_recheck_flags_is_reported() {
+        let applied = |name: &str, new_ver: &str, error: Option<&str>| super::ApplyResult {
+            name: name.to_string(),
+            old_ver: "0.0.1".to_string(),
+            new_ver: new_ver.to_string(),
+            error: error.map(str::to_string),
+        };
+        let results = vec![
+            applied("serde", "1.0.300", None),
+            applied("bad", "2.0.0", None),
+            applied("failed", "3.0.0", Some("did not resolve")),
+        ];
+        let after = std::collections::HashSet::from([
+            ("bad".to_string(), "2.0.0".to_string()),
+            ("failed".to_string(), "3.0.0".to_string()),
+            ("cookie".to_string(), "0.18.2".to_string()),
+        ]);
+        let flagged: Vec<_> = super::newly_flagged(&results, &after)
+            .into_iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(flagged, vec!["bad"]);
+    }
 
     #[test]
     fn publish_age_days_truncates_like_chrono() {
