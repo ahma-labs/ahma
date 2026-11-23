@@ -3,10 +3,13 @@
 //! Run via: `cargo xtask <subcommand>`
 //!
 //! Subcommands:
-//!   bump-version X.Y.Z      Update the workspace version across all version-bearing files.
-//!   bump-android-version    Increment the Android Play versionCode and sync versionName from Cargo.
-//!   safe-update [options]   Upgrade workspace deps that are ≥14 days old and have no known advisories.
-//!   clean-stale [options]   Prune target/ build artifacts, by age or against a size ceiling.
+//!
+//! ```text
+//! bump-version X.Y.Z      Update the workspace version across all version-bearing files.
+//! bump-android-version    Increment the Android Play versionCode and sync versionName from Cargo.
+//! safe-update [options]   Upgrade workspace deps that are ≥14 days old and have no known advisories.
+//! clean-stale [options]   Prune target/ build artifacts, by age or against a size ceiling.
+//! ```
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1608,8 +1611,11 @@ fn upgrade_from_arrow_line(line: &str, re: &regex::Regex) -> Option<Upgrade> {
 }
 
 /// Return `true` if the semver string has a pre-release component (e.g. `1.0.0-alpha.1`).
+///
+/// Build metadata (everything after `+`, e.g. `1.2.2+spec-1.1.0`) is stripped
+/// first: a hyphen there does not make a version a pre-release.
 fn is_prerelease(ver: &str) -> bool {
-    ver.contains('-')
+    ver.split('+').next().unwrap_or(ver).contains('-')
 }
 
 /// Run `cargo deny check advisories --format json` and return a set of
@@ -2184,6 +2190,17 @@ mod tests {
                 .unwrap_err()
                 .starts_with("date parse error for 'not a date'")
         );
+    }
+
+    /// A hyphen in SemVer *build metadata* (`+spec-1.1.0`, as every `toml`
+    /// crate release carries) is not a pre-release: treating it as one made
+    /// `safe-update` skip the whole `toml` family forever.
+    #[test]
+    fn is_prerelease_ignores_hyphens_in_build_metadata() {
+        assert!(super::is_prerelease("1.0.0-alpha.1"));
+        assert!(super::is_prerelease("1.0.0-rc.1+build-5"));
+        assert!(!super::is_prerelease("1.2.2+spec-1.1.0"));
+        assert!(!super::is_prerelease("1.2.2"));
     }
 
     /// A re-run at the current version must still repair a stale lockfile:
