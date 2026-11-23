@@ -385,6 +385,8 @@ By default, ahma grants **write access** to the package-manager fetch directorie
 | `~/.cargo/git/` | Read + Write |
 | `~/.cargo/.package-cache` | Read + Write |
 | `~/.cargo/.package-cache-mutate` | Read + Write |
+| `~/.cargo/advisory-dbs/` (cargo-deny) | Read + Write |
+| `~/.cargo/advisory-db/` (cargo-audit) | Read + Write |
 | `~/.cargo/bin/` | Read only |
 | `~/.cargo/config.toml` | Read only |
 | `~/.cargo/credentials.toml` | Read only |

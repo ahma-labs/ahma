@@ -1117,6 +1117,27 @@ mod tests {
         );
     }
 
+    /// cargo-deny (`advisory-dbs`) and cargo-audit (`advisory-db`) keep the
+    /// RustSec database in the cargo home and take a write lock to refresh it.
+    /// Without these rules `cargo deny check` fails in the sandbox on
+    /// "…lock on a read-only path", and the only fix offered was a grant.
+    /// Like the other caches they are data, and read-only when
+    /// `package_cache_write` is off.
+    #[test]
+    fn the_rust_profile_lets_the_advisory_databases_refresh() {
+        let cargo = super::resolve_path("${CARGO_HOME:-~/.cargo}").unwrap();
+        for (write, want) in [(true, ProfileAccess::Rw), (false, ProfileAccess::Rx)] {
+            let rules = resolved_rules(&names(), write);
+            for db in ["advisory-dbs", "advisory-db"] {
+                let got = rules
+                    .iter()
+                    .find(|r| r.profile == "rust" && r.path == cargo.join(db))
+                    .map(|r| r.access);
+                assert_eq!(got, Some(want), "{db} with package_cache_write={write}");
+            }
+        }
+    }
+
     #[test]
     fn no_profile_ever_makes_credentials_or_bin_writable() {
         // The single most important property of the rust profile. Granting all of
