@@ -441,10 +441,10 @@ struct Reading {
     changes_dir: bool,
     /// Files `tee` writes, as written.
     tee_files: Vec<String>,
-    /// Some program is `git fetch` or `git push` ([`git_sync`]): it writes the
-    /// repository's metadata, so never the read-only lane, and `Some(true)`
-    /// when a push may run a hook.
-    syncs: Option<bool>,
+    /// Some program is `git fetch`, `push`, `add` or `commit` ([`git_sync`]):
+    /// it writes the repository's metadata, so never the read-only lane. Holds
+    /// every hook those programs may run.
+    syncs: Option<Vec<&'static str>>,
 }
 
 /// Judge a command line's programs. `None` unless every one only reads (or is
@@ -564,6 +564,11 @@ fn same_program(written: &str, declared: &str) -> bool {
 /// classifier meets them.
 pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     const UNREADABLE: &str = "ahma cannot read it as a plain command line";
+    // The classifier judges a line with a quoted heredoc by the line alone
+    // (R2.7.4), so the reason it waits is in that line, not in the heredoc.
+    if let Some(line) = without_quoted_heredoc(command) {
+        return why_exclusive(&line, site);
+    }
     if command.contains("<<") {
         return "it has a heredoc (`<<`), which ahma cannot read".to_string();
     }
@@ -623,6 +628,23 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     }
     if let Some(target) = line.writes.first().or(reading.tee_files.first()) {
         return format!("it writes `{target}`");
+    }
+    // A git command that writes only repository metadata waits only for a hook
+    // it may run, or a repository whose hooks ahma cannot see.
+    if let Some(hooks) = reading.syncs.as_deref().filter(|h| !h.is_empty())
+        && runs_any_hook(site.cwd, hooks)
+    {
+        return format!(
+            "`git` may run a hook here ({}), which runs any code; ahma could not rule that \
+             out (no repository it can inspect, a `core.hooksPath` setting, or the hook \
+             is installed)",
+            hooks.join(", ")
+        );
+    }
+    if reading.changes_dir && reading.syncs.is_some() {
+        return "it runs `git` after changing directory, so ahma cannot tell which \
+                repository's hooks apply"
+            .to_string();
     }
     if !site.read_only_enforced {
         return "ahma runs inside another sandbox here, so read-only commands cannot be held \
@@ -707,12 +729,12 @@ pub fn classify_shell_command_at(command: &str, site: &RunSite<'_>) -> Lane {
         return Lane::Exclusive;
     };
     let mut targets = line.writes.iter().chain(&reading.tee_files).peekable();
-    // `git fetch` / `git push` write only the repository's metadata, which no
-    // build touches, so they never wait behind one; a push that may run a
-    // pre-push hook, a line that also writes a file, or one that changes
-    // directory first still takes its turn.
-    if let Some(push) = reading.syncs {
-        return classify_sync_command(&reading, site.cwd, push, targets.peek().is_some());
+    // `git fetch` / `push` / `add` / `commit` write only the repository's
+    // metadata, which no build touches, so they never wait behind one; one
+    // that may run a hook, a line that also writes a file, or one that
+    // changes directory first still takes its turn.
+    if let Some(hooks) = &reading.syncs {
+        return classify_sync_command(&reading, site.cwd, hooks, targets.peek().is_some());
     }
     if targets.peek().is_none() {
         return classify_targetless_reader(&reading, site.read_only_enforced);
@@ -730,8 +752,8 @@ pub fn classify_shell_command_at(command: &str, site: &RunSite<'_>) -> Lane {
     }
 }
 
-fn classify_sync_command(reading: &Reading, cwd: &Path, push: bool, has_targets: bool) -> Lane {
-    let hook = push && push_runs_hook(cwd);
+fn classify_sync_command(reading: &Reading, cwd: &Path, hooks: &[&str], has_targets: bool) -> Lane {
+    let hook = runs_any_hook(cwd, hooks);
     if !has_targets && !reading.writes_through_args && !reading.changes_dir && !hook {
         Lane::Service
     } else {
@@ -1080,8 +1102,11 @@ fn read_one_segment(seg: &Segment, reading: &mut Reading) -> Option<()> {
         reading.tee_files.extend(tee_files(args)?);
         return Some(());
     }
-    if let Some(push) = git_sync(program, args) {
-        reading.syncs = Some(reading.syncs.unwrap_or(false) || push);
+    if let Some(hooks) = git_sync(program, args) {
+        reading
+            .syncs
+            .get_or_insert_with(Vec::new)
+            .extend_from_slice(hooks);
         return Some(());
     }
     if !program_is_read_only(program, args) {
@@ -1565,11 +1590,39 @@ fn git_subcommand(args: &[String]) -> Option<(&str, &[String])> {
     None
 }
 
-/// `git fetch` or `git push`: commands that write only the repository's own
-/// metadata (objects and refs, which git locks itself) and never a file a
-/// build reads or writes. `None` for anything else, `Some(true)` for a push,
-/// which may run a pre-push hook.
-fn git_sync(program: &str, args: &[String]) -> Option<bool> {
+/// The commit hooks `git commit` may run; `--no-verify` skips `pre-commit`
+/// and `commit-msg` only.
+const COMMIT_HOOKS: &[&str] = &[
+    "pre-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+];
+const COMMIT_HOOKS_NO_VERIFY: &[&str] = &["prepare-commit-msg", "post-commit"];
+
+/// Whether a `git commit`'s arguments give it a message, so it opens no
+/// editor: `-m`/`-F`/`-C` (alone or ending a short cluster such as `-qm`),
+/// their long forms, or `--no-edit`.
+fn commit_has_message(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "--no-edit"
+            || ["--message", "--file", "--reuse-message"]
+                .iter()
+                .any(|long| a == long || a.starts_with(&format!("{long}=")))
+            || a.strip_prefix('-').is_some_and(|short| {
+                !short.starts_with('-')
+                    && short.chars().all(|c| c.is_ascii_alphabetic())
+                    && short.chars().any(|c| matches!(c, 'm' | 'F' | 'C'))
+            })
+    })
+}
+
+/// `git fetch`, `git push`, `git add` or `git commit`: commands that write only
+/// the repository's own metadata (index, objects and refs, which git locks
+/// itself) and never a file a build reads or writes. `None` for anything
+/// else; otherwise the hooks the command may run, each of which runs
+/// arbitrary code (empty for fetch and add).
+fn git_sync(program: &str, args: &[String]) -> Option<&'static [&'static str]> {
     if program != "git" {
         return None;
     }
@@ -1589,23 +1642,39 @@ fn git_sync(program: &str, args: &[String]) -> Option<bool> {
             || a.starts_with("--receive-pack")
             || a.starts_with("--exec")
     };
+    let no_verify = |a: &String| a == "--no-verify" || (sub == "commit" && a == "-n");
     match sub {
-        "fetch" if !rest.iter().any(bad) => Some(false),
-        "push" if !rest.iter().any(bad) => Some(rest.iter().all(|a| a != "--no-verify")),
+        "fetch" if !rest.iter().any(bad) => Some(&[]),
+        "push" if !rest.iter().any(bad) => Some(if rest.iter().any(no_verify) {
+            &[]
+        } else {
+            &["pre-push"]
+        }),
+        "add" if !rest.iter().any(bad) => Some(&[]),
+        "commit" if !rest.iter().any(bad) && commit_has_message(rest) => {
+            Some(if rest.iter().any(no_verify) {
+                COMMIT_HOOKS_NO_VERIFY
+            } else {
+                COMMIT_HOOKS
+            })
+        }
         _ => None,
     }
 }
 
-/// Whether a push from `cwd` runs a pre-push hook: the repository has one,
-/// or a `core.hooksPath` setting may point at one. Anything that cannot be
-/// told (a `.git` file of a linked worktree, no repository found) counts as
-/// a hook.
-fn push_runs_hook(cwd: &Path) -> bool {
+/// Whether a git command from `cwd` may run one of `hooks`: the repository
+/// has one, or a `core.hooksPath` setting may point at one. Anything that
+/// cannot be told (a `.git` file of a linked worktree, no repository found)
+/// counts as a hook.
+fn runs_any_hook(cwd: &Path, hooks: &[&str]) -> bool {
+    if hooks.is_empty() {
+        return false;
+    }
     let Some(repo) = cwd.ancestors().find(|a| a.join(".git").exists()) else {
         return true;
     };
     let git = repo.join(".git");
-    if !git.is_dir() || git.join("hooks").join("pre-push").exists() {
+    if !git.is_dir() || hooks.iter().any(|h| git.join("hooks").join(h).exists()) {
         return true;
     }
     let mentions_hooks_path = |file: PathBuf| {
@@ -2225,6 +2294,60 @@ mod watch_and_redirect_tests {
         assert_eq!(site_at("git fetch"), Lane::Service, "fetch runs no hook");
     }
 
+    /// `git add` and `git commit` also write only the repository's metadata
+    /// (the index, objects, refs), which git locks itself: a commit waited five
+    /// minutes behind a test run for nothing. `git add` runs no hook. A commit
+    /// may run `pre-commit`, `prepare-commit-msg`, `commit-msg` and
+    /// `post-commit` (`--no-verify` skips the first and third), any of which
+    /// runs arbitrary code, so with one installed it still takes its turn. A
+    /// commit without its own message opens an editor, so it does too.
+    #[test]
+    fn add_and_a_hookless_commit_never_wait_behind_a_build() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = td.path().join("repo");
+        let hooks = repo.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let site_at = |cmd: &str| {
+            let inside = |p: &Path| p.starts_with(&repo);
+            classify_shell_command_at(
+                cmd,
+                &RunSite {
+                    cwd: &repo,
+                    read_only_enforced: true,
+                    writes_workspace: &inside,
+                },
+            )
+        };
+        for cmd in [
+            "git add Cargo.lock",
+            "git add -A",
+            "git commit -m 'fix: it'",
+            "git commit -qm wip",
+            "git add Cargo.lock && git commit -q -F - <<'EOF'\nfix: it's done\nEOF",
+            "git commit --amend --no-edit",
+        ] {
+            assert_eq!(site_at(cmd), Lane::Service, "{cmd}");
+        }
+        for cmd in ["git commit", "git commit -a", "git add x > log"] {
+            assert_eq!(site_at(cmd), Lane::Exclusive, "{cmd}");
+        }
+
+        std::fs::write(hooks.join("commit-msg"), "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            site_at("git commit -m x"),
+            Lane::Exclusive,
+            "a hook runs code"
+        );
+        assert_eq!(site_at("git commit --no-verify -m x"), Lane::Service);
+        assert_eq!(site_at("git add x"), Lane::Service, "add runs no hook");
+        std::fs::write(hooks.join("post-commit"), "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            site_at("git commit --no-verify -m x"),
+            Lane::Exclusive,
+            "--no-verify does not skip post-commit"
+        );
+    }
+
     #[test]
     fn gh_commands_that_only_read_remote_state_are_read_only() {
         for cmd in [
@@ -2583,6 +2706,22 @@ mod queue_reason_tests {
                 writes_workspace: &inside,
             },
         )
+    }
+
+    /// A quoted heredoc is inert stdin (R2.7.4), so the classifier judges the
+    /// line without it; the reason must too. `git add … && git commit -F -
+    /// <<'EOF'` waited five minutes behind a build "because it has a heredoc",
+    /// when what made it wait was git, a writer. An unquoted heredoc can run
+    /// `$(…)` in its body, so for that one the heredoc is the reason.
+    #[test]
+    fn a_quoted_heredoc_line_is_blamed_on_its_program_not_the_heredoc() {
+        let commit = "git add Cargo.lock && git commit -q -F - <<'EOF'\nfix: it's done\nEOF";
+        let reason = why(commit, false);
+        assert!(!reason.contains("heredoc"), "{reason}");
+        assert!(reason.contains("git"), "{reason}");
+
+        let unquoted = why("cat <<EOF\n$(rm -rf x)\nEOF", false);
+        assert!(unquoted.contains("heredoc"), "{unquoted}");
     }
 
     /// `${n}` is the same plain variable as `$n`; only a bare name counts.

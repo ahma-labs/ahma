@@ -69,6 +69,13 @@ status()                                     → ── Finished since your last
   lane. A push that may run a pre-push hook (the repository has `hooks/pre-push`, or a git
   config sets `core.hooksPath`) takes its turn like any writer, unless it passes
   `--no-verify`.
+- **`git add` and `git commit` don't either, unless a hook may run.** They also write only
+  git's metadata. `git add` runs no hook. A commit waits only if the repository has a
+  `pre-commit`, `prepare-commit-msg`, `commit-msg` or `post-commit` hook (or a git config
+  sets `core.hooksPath`), since a hook runs any code; `--no-verify` skips `pre-commit` and
+  `commit-msg`, not the other two. A commit without its own message (`-m`, `-F`, `-C` or
+  `--no-edit`) opens an editor, so it waits too. When a commit does wait, the notice names
+  git and the hook, not a heredoc carrying its message.
 - **Output sent outside every workspace is not a workspace write.** A reader whose
   redirections (`>`, `>>`, `2>`, `&>`, `| tee`) write only files outside the workspace and
   every other repository the session can write — `gh pr checks 87 --watch > /tmp/ci.log`,
