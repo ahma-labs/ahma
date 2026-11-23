@@ -1161,6 +1161,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: ws.clone(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         let args = HooksExecArgs {
             platform: HookPlatform::Claude,
@@ -1286,6 +1287,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: ws.clone(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         let args = HooksExecArgs {
             platform: HookPlatform::Claude,
@@ -1453,6 +1455,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: ws.clone(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         let args = HooksExecArgs {
             platform: HookPlatform::Claude,
@@ -1725,6 +1728,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: tmp.path().to_path_buf(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         for command in [
             "ahma hooks run-shell --approve-grant t --wrapped-by ahma-hooks-wrapper-v1 --command x",
@@ -1953,6 +1957,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: ws.clone(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         let args = HooksExecArgs {
             platform: HookPlatform::Claude,
@@ -2028,6 +2033,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: ws.clone(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         let cmd = "sudo log collect --device-udid X --last 2m --output /tmp/x.logarchive";
         let input = serde_json::json!({
@@ -2101,6 +2107,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: ws.clone(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         let args = HooksExecArgs {
             platform: HookPlatform::Claude,
@@ -2158,6 +2165,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: ws.clone(),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
         let args = HooksExecArgs {
             platform: HookPlatform::Claude,
