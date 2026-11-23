@@ -386,6 +386,15 @@ drops work — and it is built so that no crash, kill or power loss can leave it
     A line that also writes a file, changes directory, or uses an option that checks out
     files or runs a program of the caller's choosing (`--update-head-ok`, `--upload-pack`,
     `--receive-pack`, `--exec`) is exclusive. They are never read-only: they write.
+  - *`git add` and `git commit`* are service on the same grounds: they write only the
+    index, objects and refs. `git add` runs no hook. A commit may run `pre-commit`,
+    `prepare-commit-msg`, `commit-msg` and `post-commit` (`--no-verify`/`-n` skips the
+    first and third), so with one installed, a `core.hooksPath` setting, or a repository
+    that cannot be told it is exclusive; a commit without its own message (`-m`, `-F`,
+    `-C`, their long forms or `--no-edit`) opens an editor and is exclusive too. Field
+    case (2026-11-23): `git add … && git commit -F - <<'EOF'` waited five minutes behind a
+    test run. The reason a line waits (R2.7.3) is judged like its lane: a quoted heredoc is
+    left out, so that commit is never blamed on its heredoc.
   - *MTDF tools* take their lane from `concurrency` (`exclusive` | `read_only` |
     `service`), the nearest declaration winning (subcommand over parent subcommand over
     tool), resolved once when the definition is parsed. The bundled tools **must** declare
