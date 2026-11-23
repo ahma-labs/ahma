@@ -571,8 +571,8 @@ Corollaries:
   feature branch. A worktree per agent only buys a redundant cold build and its own
   contaminated `target/`.
 - **If parallel builds are ever truly unavoidable, lean on sccache — never a shared
-  `CARGO_TARGET_DIR`.** sccache (which ahma now supports inside the sandbox; set
-  `sandbox.trust_build_caches = true`) shares *compiled artifacts* content-addressably and
+  `CARGO_TARGET_DIR`.** sccache (which ahma supports inside the sandbox through its `sccache`
+  profile, on by default) shares *compiled artifacts* content-addressably and
   concurrency-safely, so a second build of `ring` is a cache hit instead of a recompile. A
   shared target dir is the wrong tool: concurrent writers to one `target/` reintroduce the very
   provenance contamination above.

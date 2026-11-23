@@ -65,6 +65,12 @@ const SHARED_ROOTS: &[&[&str]] = &[
     &["Documents"],
     &["Downloads"],
     &["Desktop"],
+    // Toolchain homes: cargo, cargo-deny, cargo-audit and cargo-binstall each
+    // keep their own folder here, beside files the rust profile says must
+    // never be writable (`bin/`, `config.toml`, `credentials.toml`). A refusal
+    // of cargo-deny's advisory-DB lock once offered all of `~/.cargo`.
+    &[".cargo"],
+    &[".rustup"],
 ];
 
 /// One path a hooked command was refused.
@@ -2811,6 +2817,39 @@ mod tests {
         );
         assert!(is_volume_root(Path::new("/Volumes/T7")));
         assert!(!is_volume_root(Path::new("/Volumes/T7/caches")));
+    }
+
+    /// SPEC R-PERM.10.1, R-PERM.5: `~/.cargo` holds several tools' folders
+    /// and the files the rust profile says must never be writable (`bin/`,
+    /// `config.toml`, `credentials.toml`). A refusal of cargo-deny's advisory
+    /// DB lock offered all of `~/.cargo` read-write; it must offer the tool's
+    /// own folder, and never `~/.cargo` or `~/.rustup` themselves.
+    #[test]
+    fn a_refusal_under_the_cargo_home_offers_the_tools_folder_not_cargo_home() {
+        let home = Path::new("/Users/me");
+        let root = |p: &str| tool_root(Path::new(p), Some(home), &[]);
+        assert_eq!(
+            root("/Users/me/.cargo/advisory-dbs"),
+            Path::new("/Users/me/.cargo/advisory-dbs")
+        );
+        assert_eq!(
+            root("/Users/me/.cargo/advisory-dbs/advisory-db-3157b0e258782691"),
+            Path::new("/Users/me/.cargo/advisory-dbs")
+        );
+        assert_eq!(
+            root("/Users/me/.rustup/downloads"),
+            Path::new("/Users/me/.rustup/downloads")
+        );
+        assert!(!widening_is_safe(
+            Path::new("/Users/me/.cargo"),
+            Some(home),
+            &[]
+        ));
+        assert!(!widening_is_safe(
+            Path::new("/Users/me/.rustup"),
+            Some(home),
+            &[]
+        ));
     }
 
     /// SPEC R-PERM.10.1: under a per-user shared folder the tool's folder is
