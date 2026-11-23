@@ -240,7 +240,11 @@ In HTTP mode, each MCP session gets its own sandbox scope derived from the `root
 
 Cursor runs all `stdio` MCP servers in a **shared process** context when the IDE window has no workspace folder open (e.g. after a fresh install or when opening a single file rather than a folder). In this case, Cursor's MCP client responds to `roots/list` with an empty array `{"roots":[]}`.
 
-Ahma treats an empty `roots/list` response as "client has no workspace roots yet" and keeps the sandbox in a deferred state. Any `tools/call` request before a real workspace root is provided returns HTTP 409 / JSON-RPC error `-32001` ("Sandbox initializing...") instead of silently scoping every command to an empty or wrong directory. The built-ins that change nothing (`status`, `ahma_help`, `await`, …) still answer, so `ahma_help topic=roots` can explain the wait.
+An empty `roots/list` answer is not a usable scope (SPEC R5.2.7). With `[sandbox] container_root` configured, ahma falls back to it (narrowed to the first project a tool call touches, R5.2.6). Without one, it fails the session at once rather than silently scoping every command to an empty or wrong directory: `tools/call` returns HTTP 403 with the remediation below. While roots have not arrived yet, `tools/call` returns HTTP 409 / JSON-RPC error `-32001` ("Sandbox initializing..."). The built-ins that change nothing (`status`, `ahma_help`, `await`, …) still answer, so `ahma_help topic=roots` can explain the wait.
+
+### Claude Code and the 2026-07-28 protocol
+
+Claude Code first probes with the 2026-07-28 `server/discover` handshake. That protocol forbids a server sending requests such as `roots/list` and approval prompts down stdio; they must come back as `InputRequiredResult` replies, which ahma does not produce yet. Until it does, ahma declines the probe, and Claude Code falls back to the `initialize` handshake, where roots and approval prompts work (SPEC R-HUB.4.2).
 
 **Resolutions (pick one):**
 

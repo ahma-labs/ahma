@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// the `source:` attribution so the user knows *why* the scope is what it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeSource {
-    /// `--sandbox-scope` / `--working-directories` / user settings / task vault.
+    /// `--sandbox-scope` / `--working-dir` / user settings / task vault.
     Explicit,
     /// Workspace roots reported by the MCP client via `roots/list`.
     RootsList,

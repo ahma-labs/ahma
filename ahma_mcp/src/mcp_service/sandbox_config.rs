@@ -457,7 +457,7 @@ impl AhmaMcpService {
             return;
         }
 
-        // SPEC R5.2.2: an explicit scope (`--sandbox-scope`, `--working-directories`,
+        // SPEC R5.2.2: an explicit scope (`--sandbox-scope`, `--working-dir`,
         // task vault) is locked and never widened or replaced — the server must not
         // request or apply `roots/list` for it. This guard lives here, at the single
         // door every roots-driven configuration passes through, rather than only in
@@ -509,7 +509,7 @@ impl AhmaMcpService {
     }
 
     /// SPEC R5.2.2 explicit-scope fast path: if the sandbox was given an
-    /// explicit scope (`--sandbox-scope`, `--working-directories`, task
+    /// explicit scope (`--sandbox-scope`, `--working-dir`, task
     /// vault), commit it without querying `roots/list` at all — that scope
     /// must never be widened or replaced by a client's answer. Returns
     /// `true` when this path applied and the caller must return immediately

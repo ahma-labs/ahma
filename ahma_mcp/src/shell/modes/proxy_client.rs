@@ -42,6 +42,21 @@ const MAX_CONSECUTIVE_FORWARD_FAILURES: u32 = 3;
 /// reconnected by hand, although the next hub was one respawn away.
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
+/// Whether the proxy answers a 2026-07-28 `server/discover` probe (SPEC
+/// R-HUB.4.1, suspended). That era forbids a server writing requests to stdout
+/// (`roots/list` and `elicitation/create` must come back as an
+/// `InputRequiredResult`), and ahma does not do that yet: Claude Code sessions
+/// never settled a sandbox scope and never showed an approval prompt. Declined,
+/// a dual-era client falls back to `initialize`, where both work. Set to `true`
+/// once roots and elicitation travel as `InputRequiredResult`.
+const ANSWER_MODERN_DISCOVER: bool = false;
+
+/// The error a declined `server/discover` gets. Any error but a recognised
+/// modern one makes a dual-era client fall back to `initialize` (2026-07-28
+/// stdio "Backward Compatibility").
+const DISCOVER_DECLINED_MESSAGE: &str = "Method not found: server/discover. This ahma speaks \
+     the initialize handshake; fall back to initialize.";
+
 /// What a request is answered with while the bridge cannot be reached.
 const BRIDGE_UNREACHABLE_MESSAGE: &str = "ahma is restarting or unreachable. This connection \
      stays open and reconnects automatically on your next request, so retry shortly. \
@@ -1069,6 +1084,26 @@ where
                 };
                 let val = serde_json::to_value(&msg).unwrap();
                 let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
+                if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD)
+                    && !ANSWER_MODERN_DISCOVER
+                {
+                    tracing::info!(
+                        transport,
+                        "Declining server/discover (SPEC R-HUB.4.1 suspended) so the client falls back to initialize"
+                    );
+                    if let Some(id) = request_id {
+                        relay_forward_failure_to_client(
+                            &mut stdio,
+                            id,
+                            Some(serde_json::json!({
+                                "code": ahma_common::mcp_methods::RpcErrorCode::MethodNotFound,
+                                "message": DISCOVER_DECLINED_MESSAGE,
+                            })),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
                 if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD) {
                     tracing::info!(
                         transport,
@@ -3085,59 +3120,45 @@ mod tests {
         );
     }
 
+    /// SPEC R-HUB.4.1 (suspended): over the 2026-07-28 protocol a server may
+    /// not write requests to stdout, yet ahma's `roots/list` and
+    /// `elicitation/create` still travel that way, so a Claude Code session's
+    /// scope never settled and no approval prompt ever reached the human.
+    /// Until both travel as `InputRequiredResult`, the probe is declined with
+    /// an error the 2026-07-28 stdio "Backward Compatibility" rules read as
+    /// "legacy server": a dual-era client then falls back to `initialize`,
+    /// where roots and prompts already work. The bridge never sees the probe.
     #[tokio::test]
-    async fn server_discover_probe_returns_discover_result_and_establishes_session() {
+    async fn server_discover_is_declined_so_a_dual_era_client_falls_back_to_initialize() {
         let state = TestState::new();
-        // Send server/discover first, then subscriptions/listen, then client_request(3)
         let stdio = state.stdio(VecDeque::from(vec![
             client_discover_request(1),
-            serde_json::from_value(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "subscriptions/listen",
-                "params": {"notifications": {"toolsListChanged": true}}
-            }))
-            .unwrap(),
+            client_initialize(2),
             client_request(3),
         ]));
         let mut client = state.client(0);
-        client.inbound = VecDeque::from(vec![bridge_initialize_response(0), bridge_response(3)]);
+        client.inbound = VecDeque::from(vec![bridge_initialize_response(2), bridge_response(3)]);
         let mut reconnect = no_reconnect;
 
         let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(result.is_ok());
 
-        // Inspect what was sent to stdio
-        let sent = state.sent.lock();
-        assert!(
-            sent.len() >= 2,
-            "expected discover response and subscriptions/listen response"
-        );
-        let first_sent = serde_json::to_value(&sent[0]).expect("json");
-        assert_eq!(first_sent["id"], 1);
-        assert_eq!(
-            first_sent["result"]["supportedVersions"],
-            serde_json::json!(["2026-07-28", "2025-11-25"]),
-            "first_sent was: {first_sent:#?}"
-        );
-        assert_eq!(
-            first_sent["result"]["capabilities"]["tools"]["listChanged"],
-            true
-        );
-        assert_eq!(first_sent["result"]["serverInfo"]["name"], "ahma");
-
-        let second_sent = serde_json::to_value(&sent[1]).expect("json");
-        assert_eq!(second_sent["id"], 2);
-        assert_eq!(second_sent["result"], serde_json::json!({}));
-
-        // The bridge should have received:
-        // 1. Synthesized initialize (id 0)
-        // 2. Synthesized notifications/initialized
-        // 3. client_request(3)
+        let sent: Vec<serde_json::Value> = state
+            .sent
+            .lock()
+            .iter()
+            .map(|m| serde_json::to_value(m).expect("json"))
+            .collect();
+        let probe_reply = sent
+            .iter()
+            .find(|m| m["id"] == 1)
+            .unwrap_or_else(|| panic!("the probe is answered: {sent:#?}"));
+        assert_eq!(probe_reply["error"]["code"], -32601, "{probe_reply:#?}");
+        assert!(probe_reply.get("result").is_none(), "{probe_reply:#?}");
         assert_eq!(
             state.attempts.load(Ordering::SeqCst),
-            3,
-            "bridge received synthesized initialize, initialized notification, and client_request"
+            2,
+            "the bridge gets the client's own initialize and tools/call, never a synthesized one"
         );
     }
 

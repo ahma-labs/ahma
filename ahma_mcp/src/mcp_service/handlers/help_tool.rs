@@ -448,7 +448,7 @@ fn roots() -> String {
      \n\
      If it never settles, or you see 'no sandbox scope', the client is not providing roots. \
      That is a setup step only the user can do: start ahma with `--sandbox-scope <dir>` (or \
-     `--working-directories <dir>`), for example in the `args` of the MCP server entry. Tell \
+     `--working-dir <dir>`), for example in the `args` of the MCP server entry. Tell \
      them that exact flag; do not try to run the command another way.\n"
         .to_string()
 }
