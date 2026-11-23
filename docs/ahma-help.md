@@ -72,10 +72,21 @@ workspace.
 
 ## When a human is needed
 
-The last step of `blocked` is the only one that involves you: the agent asks for
-the narrowest directory with `ahma sandbox grant <dir>`. Paths no grant can unlock
-(credentials, ahma's own settings) keep their refusal text; `ahma_help` does not
-suggest a way around them.
+The last step of `blocked` is the only one that involves you. The agent asks for
+the narrowest directory, and how depends on where its command ran:
+
+- **A hooked shell in Claude Code:** the agent runs the refused command once more,
+  unchanged. ahma then asks you in Claude Code's own dialog. Only a command that
+  *failed* arms that question, so the agent is told not to pipe it through `| tail`
+  or `| grep`, which would hide the failure. The hook's first-command scope
+  disclosure says the same, so the agent knows before its first refusal.
+- **ahma's MCP tools:** the agent calls `sandbox_grant` with `confirm: true`, which
+  raises your prompt and reports your answer.
+- **Anywhere else:** the agent asks you to run `ahma sandbox grant <dir>`.
+
+If no grant comes, the agent reports the blocked step instead of quietly dropping
+it. Paths no grant can unlock (credentials, ahma's own settings) keep their refusal
+text; `ahma_help` does not suggest a way around them.
 
 ## See also
 

@@ -352,7 +352,7 @@ fn blocked(facts: &HelpFacts) -> String {
     format!(
         "Blocked: 'Operation not permitted', or a write was denied.\n\
          \n\
-         Do not retry the same command, and do not copy caches or toolchains into the \
+         Do not retry it hoping it passes, and do not copy caches or toolchains into the \
          workspace: it bloats the project and goes stale. Work down this list, and keep working \
          at step 1 and 2 until a human has answered step 3.\n\
          \n\
@@ -364,9 +364,17 @@ fn blocked(facts: &HelpFacts) -> String {
          {step2}\
          3. Only when the tool cannot be redirected, or it really needs the real location \
          (installing a global binary, a credential store), ask the human, once, for the \
-         narrowest directory: `ahma sandbox grant <dir>` (add --read-only when only a read was \
-         refused). Say what you need it for. A grant applies from the next command; nothing to \
-         restart.\n\
+         narrowest directory. How depends on where the command ran:\n\
+         \x20  - A hooked shell in Claude Code: run the refused command once more, unchanged and \
+         without a pipe such as `| tail` or `| grep` that hides its failure (only a command \
+         that fails arms the question). ahma then asks the human in Claude Code's own dialog. \
+         Never pass `--approve-grant` yourself.\n\
+         \x20  - ahma's MCP tools: call `sandbox_grant` with `confirm: true` and a one-sentence \
+         reason; it raises the human's prompt and tells you the answer.\n\
+         \x20  - Anywhere else: ask the human to run `ahma sandbox grant <dir>` (add --read-only \
+         when only a read was refused). Say what you need it for.\n\
+         A grant applies from the next command; nothing to restart. If no grant comes, report \
+         the blocked step to the human; do not drop it silently.\n\
          \n\
          Some things no grant can unlock (credentials, ahma's own settings). The refusal says \
          so; do not look for a way around it.\n\
@@ -654,6 +662,27 @@ mod tests {
         let help = text.find("--help").unwrap();
         let grant = text.find("ahma sandbox grant").unwrap();
         assert!(help < grant, "ask a human last: {text}");
+    }
+
+    /// SPEC R-HELP.3, R-PERM.10: in Claude Code, running the refused command
+    /// again IS how the human gets asked. A ladder that said "do not retry the
+    /// same command" left an agent believing it could not ask at all; and a pipe
+    /// such as `| tail` hides the failure that arms the dialog.
+    #[test]
+    fn blocked_says_how_each_channel_asks_the_human() {
+        let text = render(Some("blocked"), &open_facts());
+        assert!(!text.contains("Do not retry the same command"), "{text}");
+        assert!(text.contains("Claude Code"), "{text}");
+        assert!(text.contains("once more, unchanged"), "{text}");
+        assert!(text.contains("| tail"), "{text}");
+        assert!(
+            text.contains("`sandbox_grant` with `confirm: true`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("do not drop it silently"),
+            "a blocked check is reported, not skipped: {text}"
+        );
     }
 
     #[test]
