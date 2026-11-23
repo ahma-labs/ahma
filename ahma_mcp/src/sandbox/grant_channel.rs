@@ -587,7 +587,33 @@ pub fn hook_denial_text(
 /// a block. `None` when the output shows no refusal outside the scope.
 pub fn hook_side_refusal_note(output: &str, who: &HookRequester) -> Option<String> {
     let (path, access) = hook_side_refusal(output, who)?;
-    Some(refusal_note(&path, access, &who.scopes))
+    let piped = who.command.as_deref().is_some_and(ends_in_filter_pipe);
+    Some(refusal_note(&path, access, &who.scopes, piped))
+}
+
+/// Whether a command line's last stage is an output filter (`… | tail -3`,
+/// `… | grep x`). Its exit status, not the refused tool's, is then the
+/// command's, so a refusal that broke the tool still "succeeded" and the
+/// harness dialog (R-PERM.10) was never armed. Text only: `segment_texts`
+/// splits at every operator, so the line must also contain a `|`.
+fn ends_in_filter_pipe(command: &str) -> bool {
+    const FILTERS: &[&str] = &[
+        "tail", "head", "grep", "egrep", "fgrep", "rg", "sed", "awk", "cut", "sort", "uniq", "wc",
+        "tee", "tr", "less", "more", "cat", "column", "jq",
+    ];
+    if !command.contains('|') {
+        return false;
+    }
+    let segments = ahma_common::shell_words::segment_texts(command);
+    if segments.len() < 2 {
+        return false;
+    }
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    ahma_common::shell_words::program_index(last)
+        .and_then(|i| Path::new(&last[i]).file_name()?.to_str())
+        .is_some_and(|program| FILTERS.contains(&program))
 }
 
 /// The out-of-scope path and access a hooked command that **succeeded** was
@@ -634,9 +660,7 @@ pub fn hook_side_refusal(
         let lower = l.to_ascii_lowercase();
         l.contains(&shown)
             && !is_listed_text(l)
-            && (lower.contains("operation not permitted")
-                || lower.contains("permission denied")
-                || lower.contains("read-only file system"))
+            && super::denial_scan::refusal_access(&lower).is_some()
             && !lower.contains("(publickey)")
     });
     if !refused_here {
@@ -683,6 +707,7 @@ pub fn refusal_note(
     path: &Path,
     access: ahma_common::config::ScopeAccess,
     scopes: &[PathBuf],
+    piped: bool,
 ) -> String {
     let target = offered_dir_for(path, scopes);
     let (verb, ro) = if access.is_write() {
@@ -690,11 +715,16 @@ pub fn refusal_note(
     } else {
         ("read", " --read-only")
     };
+    let dialog = if piped {
+        "in Claude Code, the pipe hid the failure: if the tool failed for it, re-run it without \
+         the pipe and ahma asks in its dialog."
+    } else {
+        "in Claude Code, ahma asks in its dialog only if a command fails for it."
+    };
     format!(
         "ahma: the sandbox refused a {verb} outside the workspace ({}) and the command went on \
          without it; if it needs that, a human can run `ahma sandbox grant {}{ro}` (add \
-         `--session` for this terminal session only); in Claude Code, ahma asks in its \
-         dialog only if a command fails for it.",
+         `--session` for this terminal session only); {dialog}",
         path.display(),
         target.display()
     )
@@ -1271,6 +1301,53 @@ mod grant_dir_gate_tests {
 #[cfg(test)]
 mod context_tests {
     use super::*;
+
+    /// The success path must know every refusal wording the failure path knows
+    /// (`denial_scan::refusal_access`). cargo-deny's lock message says
+    /// "read-only path" and nothing else; piped through `| tail` its command
+    /// "succeeded", and the agent got neither a dialog nor this note.
+    #[test]
+    fn a_tool_worded_read_only_lock_in_a_piped_command_gets_a_note_and_a_pipe_hint() {
+        let ws = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let dbs = cache.path().join("advisory-dbs");
+        std::fs::create_dir_all(&dbs).unwrap();
+        let lock = dbs.join("db.lock");
+        let out = format!(
+            "[ERROR] failed to acquire advisory database lock: file lock error: failed to \
+             obtain lock file '{}': attempted to take an exclusive lock on a read-only path",
+            lock.display()
+        );
+        let who = |command: &str| HookRequester {
+            harness: None,
+            session_id: None,
+            scopes: vec![ws.path().to_path_buf()],
+            command: Some(command.to_string()),
+        };
+        let piped = hook_side_refusal_note(&out, &who("cargo deny check 2>&1 | tail -3"))
+            .expect("a read-only-path refusal is a refusal on the success path too");
+        assert!(piped.contains(&lock.display().to_string()), "{piped}");
+        assert!(piped.contains("the pipe hid the failure"), "{piped}");
+        let plain = hook_side_refusal_note(&out, &who("cargo deny check")).expect("a note");
+        assert!(!plain.contains("pipe"), "{plain}");
+    }
+
+    #[test]
+    fn only_a_trailing_filter_stage_counts_as_a_hiding_pipe() {
+        assert!(ends_in_filter_pipe("cargo deny check 2>&1 | tail -3"));
+        assert!(ends_in_filter_pipe(
+            "make 2>&1 | /usr/bin/grep -E 'error|warn'"
+        ));
+        assert!(!ends_in_filter_pipe("cargo deny check"));
+        assert!(
+            !ends_in_filter_pipe("grep -E 'a|b' notes.txt"),
+            "a quoted `|` is not a pipe"
+        );
+        assert!(
+            !ends_in_filter_pipe("cat log | cargo deny check"),
+            "the refused tool is the last stage, so its status is the command's"
+        );
+    }
 
     /// A command that succeeded although the sandbox refused one of its writes
     /// gets one line naming the path and the grant, not the blocking panel

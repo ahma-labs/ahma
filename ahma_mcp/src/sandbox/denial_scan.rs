@@ -174,18 +174,28 @@ fn denial_keyword_access(line: &str) -> Option<ScopeAccess> {
     if is_seatbelt && line.contains("file-read") {
         return Some(ScopeAccess::Ro);
     }
-    // Kept in step with `scan_line`: a tool that reports the errno in its own words
-    // ("...on a read-only path") may equally split the path and the reason across
-    // lines, so the multi-line shape must recognise the same wording.
-    let lower = line.to_ascii_lowercase();
+    // The same wordings as `scan_line`: a tool that reports the errno in its own
+    // words ("...on a read-only path") may equally split the path and the reason
+    // across lines, so the multi-line shape must recognise them too.
+    refusal_access(&line.to_ascii_lowercase())
+}
+
+/// The refusal wordings every scanner recognises, given an already-lowercased
+/// line: `Rw` for those that reveal a write, `Ro` for the ambiguous ones.
+///
+/// One list on purpose. The failure scan, its multi-line shape and the
+/// success-path note (`grant_channel::hook_side_refusal`) each kept their own
+/// copy, and the note's lacked "read-only path": cargo-deny's advisory-DB lock
+/// refusal, piped through `| tail`, then produced no note and no dialog at all.
+pub(crate) fn refusal_access(lower: &str) -> Option<ScopeAccess> {
     if lower.contains("read-only file system")
         || lower.contains("read-only path")
         || lower.contains("operation not permitted")
-        || says_not_writable(&lower)
+        || says_not_writable(lower)
     {
         return Some(ScopeAccess::Rw);
     }
-    if line.contains("Access is denied") || line.contains("Permission denied") {
+    if lower.contains("access is denied") || lower.contains("permission denied") {
         return Some(ScopeAccess::Ro);
     }
     None
@@ -228,10 +238,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     // academic — it is the exact denial that sent an agent off to re-run the
     // command outside the sandbox instead of asking for a grant.
     let lower = line.to_ascii_lowercase();
-    if (lower.contains("read-only file system")
-        || lower.contains("read-only path")
-        || lower.contains("operation not permitted")
-        || says_not_writable(&lower))
+    if refusal_access(&lower) == Some(ScopeAccess::Rw)
         && let Some(path) = extract_path(line)
     {
         return Some(DenialHit {
