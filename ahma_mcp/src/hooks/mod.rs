@@ -302,6 +302,11 @@ pub struct HooksRunShellArgs {
     /// The harness's own time limit for this call, in milliseconds.
     #[arg(long = "harness-timeout-ms", hide = true)]
     pub harness_timeout_ms: Option<u64>,
+
+    /// The shell the harness itself would run this command with (SPEC
+    /// R-HOOK-SHELL). Taken only when it is a bash or zsh that exists.
+    #[arg(long = "harness-shell", hide = true)]
+    pub harness_shell: Option<PathBuf>,
 }
 
 impl HooksRunShellArgs {
@@ -358,6 +363,7 @@ impl HooksRunShellArgs {
                 background: self.background,
                 timeout_ms: self.harness_timeout_ms,
             },
+            harness_shell: self.harness_shell,
         })
     }
 }
@@ -506,6 +512,12 @@ struct HookEnvironment {
     home_dir: PathBuf,
     project_root: PathBuf,
     current_exe: PathBuf,
+    /// The shell the harness itself would run the command with, when ahma can
+    /// tell (SPEC R-HOOK-SHELL); `run-shell` runs it under that shell rather
+    /// than the platform default. `None` keeps [`platform_shell_program`].
+    ///
+    /// [`platform_shell_program`]: crate::shell_pool::platform_shell_program
+    harness_shell: Option<PathBuf>,
 }
 
 impl HookEnvironment {
@@ -520,6 +532,7 @@ impl HookEnvironment {
             home_dir,
             project_root,
             current_exe,
+            harness_shell: None,
         })
     }
 
@@ -533,6 +546,43 @@ impl HookEnvironment {
     fn config_path(&self, platform: HookPlatform, scope: HookScope) -> PathBuf {
         platform.config_path(self.scope_root(scope), scope)
     }
+}
+
+/// Whether `path` is an existing file named `bash` or `zsh`: the only shells
+/// Claude Code runs Bash-tool commands with, and the only ones `run-shell`
+/// takes from its command line.
+fn is_bash_or_zsh(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("bash" | "zsh")
+    ) && path.is_file()
+}
+
+/// The shell Claude Code runs a Bash-tool command with, by its documented
+/// order (SPEC R-HOOK-SHELL): `CLAUDE_CODE_SHELL` when it names a working
+/// bash or zsh, else `$SHELL` when that does. `None` past that (Claude Code
+/// would then search `PATH` for zsh, then bash; ahma keeps its platform
+/// default instead of guessing). Pure: the caller reads the environment.
+fn claude_code_shell(
+    claude_code_shell: Option<std::ffi::OsString>,
+    shell: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    [claude_code_shell, shell]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .find(|p| is_bash_or_zsh(p))
+}
+
+/// The program `run-shell` runs a command line with: the harness's shell it
+/// was handed (`--harness-shell`) when that is a bash or zsh that exists, else
+/// the platform shell. Re-checked here because the flag is on a command line
+/// anyone can write.
+fn run_shell_program(harness_shell: Option<&Path>) -> String {
+    harness_shell
+        .filter(|p| is_bash_or_zsh(p))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| crate::shell_pool::platform_shell_program().to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -577,6 +627,10 @@ pub struct WrappedShellPayload {
     /// What the harness declared about how it runs this call.
     #[serde(default)]
     pub intent: HarnessIntent,
+    /// The shell the harness would run it with (SPEC R-HOOK-SHELL); checked
+    /// again by `run-shell` before use (only an existing bash or zsh is taken).
+    #[serde(default)]
+    pub harness_shell: Option<PathBuf>,
 }
 
 /// What a harness declared about how it runs one shell call, read from the
@@ -1355,7 +1409,7 @@ async fn run_exec(args: HooksExecArgs, cfg: &AppConfig) -> Result<()> {
     // Detect the runtime environment. On failure we FAIL OPEN: the command runs
     // unsandboxed via the default terminal, accompanied by a loud warning. We
     // must never block the user's terminal just because ahma broke.
-    let env = match HookEnvironment::detect() {
+    let mut env = match HookEnvironment::detect() {
         Ok(e) => e,
         Err(e) => {
             let decision = if is_ahma_hooks_active() {
@@ -1370,6 +1424,15 @@ async fn run_exec(args: HooksExecArgs, cfg: &AppConfig) -> Result<()> {
 
     if args.platform == HookPlatform::Antigravity && args.scope == HookScope::User {
         let _ = ensure_antigravity_global_permission_grants(&env);
+    }
+    // SPEC R-HOOK-SHELL: run the command under the shell Claude Code itself
+    // would have used, not the platform default. The hook inherits Claude
+    // Code's environment. PowerShell elsewhere is not a choice to make here.
+    if args.platform == HookPlatform::Claude && cfg!(unix) {
+        env.harness_shell = claude_code_shell(
+            std::env::var_os("CLAUDE_CODE_SHELL"),
+            std::env::var_os("SHELL"),
+        );
     }
 
     let decision = compute_exec_decision(&stdin, args.scope, &env, args.platform);
@@ -1909,8 +1972,15 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         link_this_run,
     )?;
 
-    let result =
-        execute_with_signal_forwarding(&adapter, &payload.cwd, &payload.command, limit_secs).await;
+    let shell = run_shell_program(payload.harness_shell.as_deref());
+    let result = execute_with_signal_forwarding(
+        &adapter,
+        &shell,
+        &payload.cwd,
+        &payload.command,
+        limit_secs,
+    )
+    .await;
 
     // The command is done; give its terminal event a brief moment to reach the
     // hub before this process exits. Bounded and short (SPEC R-HUB.8): a
@@ -2071,6 +2141,7 @@ fn build_hook_adapter(
 
 async fn execute_with_signal_forwarding(
     adapter: &crate::adapter::Adapter,
+    shell: &str,
     cwd: &str,
     command: &str,
     limit_secs: u64,
@@ -2091,7 +2162,7 @@ async fn execute_with_signal_forwarding(
     // (SPEC R2.1): the harness owns the call's lifetime (R-SETUP.2.1).
     let exec = adapter.run_to_completion(
         None,
-        crate::shell_pool::platform_shell_program(),
+        shell,
         Some(adapter_args),
         cwd,
         timeout,
@@ -3176,6 +3247,10 @@ fn build_wrapped_shell_command(
     if let Some(ref sid) = session_id {
         args.push("--session-id".to_string());
         args.push(sid.clone());
+    }
+    if let Some(shell) = &env.harness_shell {
+        args.push("--harness-shell".to_string());
+        args.push(shell.display().to_string());
     }
     args.extend(intent.args());
     // The ask form (SPEC R-PERM.10.2): Claude Code's dialog shows this text,
@@ -4317,6 +4392,85 @@ mod tests {
         );
     }
 
+    /// SPEC R-HOOK-SHELL: Claude Code runs a Bash-tool command with
+    /// `CLAUDE_CODE_SHELL` when that is a working bash or zsh, else with
+    /// `$SHELL` when that is one. The hook re-runs the command inside the
+    /// sandbox, and on macOS always used `/bin/bash` 3.2, which mis-parses
+    /// `$(cat <<'EOF' … it's … EOF)` that the user's zsh parses: an agent's
+    /// command broke only because ahma was in the way.
+    #[test]
+    fn the_harness_shell_follows_claude_codes_own_order() {
+        let bin = tempdir().unwrap();
+        let make = |name: &str| {
+            let p = bin.path().join(name);
+            fs::write(&p, "").unwrap();
+            p.into_os_string()
+        };
+        let (zsh, bash, fish) = (make("zsh"), make("bash"), make("fish"));
+        let missing = bin.path().join("nowhere").join("zsh").into_os_string();
+        let pick = |code: Option<&std::ffi::OsString>, shell: Option<&std::ffi::OsString>| {
+            claude_code_shell(code.cloned(), shell.cloned())
+        };
+        assert_eq!(pick(Some(&bash), Some(&zsh)), Some(PathBuf::from(&bash)));
+        assert_eq!(pick(None, Some(&zsh)), Some(PathBuf::from(&zsh)));
+        assert_eq!(pick(Some(&fish), Some(&zsh)), Some(PathBuf::from(&zsh)));
+        assert_eq!(
+            pick(Some(&missing), Some(&bash)),
+            Some(PathBuf::from(&bash))
+        );
+        assert_eq!(
+            pick(None, Some(&fish)),
+            None,
+            "fish is not a shell Claude Code uses"
+        );
+        assert_eq!(pick(None, None), None);
+    }
+
+    #[test]
+    fn the_wrapped_command_carries_the_harness_shell_and_run_shell_rechecks_it() {
+        let bin = tempdir().unwrap();
+        let zsh = bin.path().join("zsh");
+        fs::write(&zsh, "").unwrap();
+        let mut env = test_env();
+        env.harness_shell = Some(zsh.clone());
+        let wrapped = build_wrapped_shell_command(
+            HookScope::User,
+            &env,
+            "/w",
+            "echo hi",
+            None,
+            None,
+            HarnessIntent::default(),
+        )
+        .unwrap();
+        assert!(wrapped.contains("--harness-shell"), "{wrapped}");
+        assert!(wrapped.contains(&zsh.display().to_string()), "{wrapped}");
+        let plain = build_wrapped_shell_command(
+            HookScope::User,
+            &test_env(),
+            "/w",
+            "echo hi",
+            None,
+            None,
+            HarnessIntent::default(),
+        )
+        .unwrap();
+        assert!(!plain.contains("--harness-shell"), "{plain}");
+
+        assert_eq!(run_shell_program(Some(&zsh)), zsh.display().to_string());
+        let fish = bin.path().join("fish");
+        fs::write(&fish, "").unwrap();
+        assert_eq!(
+            run_shell_program(Some(&fish)),
+            crate::shell_pool::platform_shell_program(),
+            "only bash or zsh is taken from the command line"
+        );
+        assert_eq!(
+            run_shell_program(None),
+            crate::shell_pool::platform_shell_program()
+        );
+    }
+
     fn test_env() -> HookEnvironment {
         let temp = tempdir().expect("tempdir");
         let root = temp.keep();
@@ -4328,6 +4482,7 @@ mod tests {
             } else {
                 "ahma"
             }),
+            harness_shell: None,
         }
     }
 
@@ -4889,6 +5044,7 @@ mod tests {
                 background: true,
                 timeout_ms: Some(5000),
             },
+            harness_shell: Some(PathBuf::from("/bin/zsh")),
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         let decoded = decode_wrapped_shell_payload(&encoded).unwrap();
@@ -5821,6 +5977,7 @@ mod tests {
             home_dir: tmp.path().join("home"),
             project_root: tmp.path().join("repo"),
             current_exe: stub,
+            harness_shell: None,
         };
         let command = "S=\"$HOME/x\" && echo 'it'\\''s' \\$S `date` && cat > $S/r.sh <<'EOF'\n\
                        CH=\"/Applications/Google Chrome.app\"\nEOF\nAHMA_CMD\n";
@@ -5853,6 +6010,7 @@ mod tests {
             approve_grant: None,
             background: false,
             harness_timeout_ms: None,
+            harness_shell: None,
         };
         let payload = args
             .resolve_payload_from(&mut read_back.as_bytes())
@@ -5889,6 +6047,7 @@ mod tests {
             approve_grant: None,
             background: false,
             harness_timeout_ms: None,
+            harness_shell: None,
             raw_command: Vec::new(),
         };
         let payload = args.resolve_payload().unwrap();
@@ -5909,6 +6068,7 @@ mod tests {
             approve_grant: None,
             background: false,
             harness_timeout_ms: None,
+            harness_shell: None,
             raw_command: vec![
                 "cargo".to_string(),
                 "check".to_string(),
@@ -5928,6 +6088,7 @@ mod tests {
             command: "echo old".to_string(),
             session_id: None,
             intent: HarnessIntent::default(),
+            harness_shell: None,
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&original).unwrap());
         let args = HooksRunShellArgs {
@@ -5940,6 +6101,7 @@ mod tests {
             approve_grant: None,
             background: false,
             harness_timeout_ms: None,
+            harness_shell: None,
             raw_command: Vec::new(),
         };
         let payload = args.resolve_payload().unwrap();
@@ -6942,6 +7104,7 @@ mod tests {
             home_dir: home.clone(),
             project_root: tmp.path().join("proj"),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         };
 
         ensure_antigravity_global_permission_grants(&env).unwrap();

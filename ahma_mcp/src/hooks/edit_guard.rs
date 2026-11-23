@@ -975,6 +975,7 @@ mod tests {
             home_dir: td.path().join("home"),
             project_root: td.path().join("proj"),
             current_exe: PathBuf::from("/usr/local/bin/ahma"),
+            harness_shell: None,
         }
     }
 

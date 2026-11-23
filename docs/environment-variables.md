@@ -206,6 +206,7 @@ These are standard ecosystem variables that Ahma reads but does not define:
 | `XDG_RUNTIME_DIR` | Linux: per-user runtime directory for hub socket |
 | `CARGO_HOME` | Cargo home override; affects package cache scope |
 | `PATH` | Executable search path |
+| `CLAUDE_CODE_SHELL` / `SHELL` | Claude Code's terminal hook runs each command in the shell Claude Code itself uses: `CLAUDE_CODE_SHELL` when it names a bash or zsh, else `SHELL` when that does, else ahma's platform shell (SPEC R-HOOK-SHELL) |
 | `NO_COLOR` | Any non-empty value suppresses colour in the TUI (https://no-color.org). Styles keep bold/dim emphasis; only hues are dropped. Glyph choice is separate — it follows `TERM` |
 | `TERM` | `dumb` selects ASCII fallbacks for box-drawing and status glyphs |
 | `OTEL_*` / `TRACEPARENT` | OpenTelemetry distributed tracing. Requires a binary built with the `otel` cargo feature (off by default; release binaries ship it — see `ahma_common/Cargo.toml`'s `otel` feature comment). Without it these variables, and `--opentelemetry <url>`, are accepted but produce no export |

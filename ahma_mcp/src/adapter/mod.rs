@@ -3595,6 +3595,39 @@ mod tests {
         assert!(text.contains("before-the-limit"), "{text}");
     }
 
+    /// SPEC R-HOOK-SHELL: a hooked Claude Code command runs under the shell
+    /// Claude Code itself would use, which on macOS is usually zsh. The line
+    /// below is the one macOS's `/bin/bash` 3.2 refused ("unexpected EOF while
+    /// looking for matching `''"): an apostrophe in a quoted heredoc inside
+    /// `$(…)`. Through the adapter, wrapper and sandbox it must run as zsh.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_heredoc_with_an_apostrophe_inside_a_substitution_runs_under_zsh() {
+        let zsh = Path::new("/bin/zsh");
+        if !zsh.is_file() {
+            eprintln!("skipping: no /bin/zsh on this machine (a platform prerequisite)");
+            return;
+        }
+        let (adapter, td) = adapter_with_mode(crate::sandbox::SandboxMode::Test);
+        let line = "x=$(cat <<'EOF'\nit's done\nEOF\n); echo \"got: $x\"";
+        let config = crate::AhmaMcpService::build_shell_subcommand_config(
+            Some(30),
+            &ExecutionMode::Synchronous,
+        );
+        let out = adapter
+            .run_to_completion(
+                None,
+                &zsh.display().to_string(),
+                Some(shell_args(line)),
+                &td.path().to_string_lossy(),
+                Some(30),
+                Some(&config),
+            )
+            .await
+            .expect("zsh parses it");
+        assert!(out.contains("got: it's done"), "{out}");
+    }
+
     /// SPEC R2.7.10: a command the human declared long-running takes no
     /// lease and gets its own timeout; anything chained to it is judged as
     /// usual.
