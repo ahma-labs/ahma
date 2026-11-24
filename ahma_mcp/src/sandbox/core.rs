@@ -368,7 +368,7 @@ pub struct Sandbox {
     /// `roots ∪ {sandbox_dir}` rather than discarding the secondary scope.
     pub(super) scratch_dir: Option<PathBuf>,
     /// When true, the scopes were explicitly provided by the user (via
-    /// `--sandbox-scope`, `--working-directories`, or a task vault) and MUST NOT
+    /// `--sandbox-scope`, `--working-dir`, or a task vault) and MUST NOT
     /// be widened or replaced via the MCP `roots/list` protocol (SPEC R5.5).
     ///
     /// When false, the scopes were implicitly derived (e.g. from the current
@@ -691,7 +691,7 @@ impl Sandbox {
         let canonicalized = scopes::canonicalize_scopes(
             scopes,
             mode,
-            "Specify explicit directories with --sandbox-scope or --working-directories. \
+            "Specify explicit directories with --sandbox-scope or --working-dir. \
              Example: --sandbox-scope /home/user/project",
         )?;
 
@@ -796,7 +796,7 @@ impl Sandbox {
 
     /// Mark whether the initial scopes were explicitly provided by the user.
     ///
-    /// Explicit scopes (`--sandbox-scope`, `--working-directories`, task vault)
+    /// Explicit scopes (`--sandbox-scope`, `--working-dir`, task vault)
     /// must not be widened or replaced via `roots/list` (SPEC R5.5). Implicit
     /// scopes (CWD fallback, `--tmp`) are provisional and yield to client roots.
     #[must_use]

@@ -680,7 +680,7 @@ Confining writes is necessary but not sufficient: a legitimate write *inside* th
 #### Scope source (no spoofable inference)
 
 - **R5.2**: **Scope source precedence**: The locked scope **must** be derived from exactly one of the following, in order; the chosen source **must** be recorded for display (R5.4):
-  1. **Explicit** `--sandbox-scope` / `--working-directories` (CLI, user settings file, or task vault) — locked immediately; `roots/list` is **not** requested (R5.2.2).
+  1. **Explicit** `--sandbox-scope` / `--working-dir` (CLI, user settings file, or task vault) — locked immediately; `roots/list` is **not** requested (R5.2.2).
   2. **Client `roots/list`** — the workspace roots reported by the MCP client. An **empty** roots array is **not** a usable answer (R5.2.7); it falls through to the next source.
   3. **Container root, auto-narrowed** — the user-configured container directory, with the writable set narrowed to the one project subtree actually in use (R5.2.3, R5.2.6).
 
@@ -1857,6 +1857,19 @@ lifetime.
     namespaced keys (wire capture, 2026-11-06). Reading the plain key alone classified every
     Claude Code session behind the hub as Antigravity, so it was offered the harness file tools
     R26 withholds, and its parallel subagents each raised a permission prompt for them.
+  - **R-HUB.4.2 — No modern session until server requests travel the modern way.** The
+    2026-07-28 protocol forbids a server writing JSON-RPC requests to stdout: `roots/list` and
+    `elicitation/create` **must** reach a modern client as an `InputRequiredResult` reply to its
+    own `tools/call`, and `subscriptions/listen` **must** be acknowledged and held open. Until
+    the frontend does both, it **must** decline `server/discover` with a JSON-RPC error
+    (`-32601`), which the 2026-07-28 stdio "Backward Compatibility" rules read as a legacy server,
+    so a dual-era client falls back to `initialize`, where roots and elicitation work; the bridge
+    never sees the probe (`proxy_client::ANSWER_MODERN_DISCOVER`). Field case (2026-11-23): a
+    Claude Code session negotiated 2026-07-28, the proxy wrote the hub's `roots/list` to stdout
+    and answered `subscriptions/listen` with `{}`, so the scope never settled
+    (`run_terminal_command` answered "Sandbox initializing from client roots" for the whole
+    session) and every `sandbox_grant`, network and link prompt silently waited out its budget.
+    R-HUB.4.1's `_meta` reading stays for when the probe is answered again.
 
 - **R-HUB.5 — Upgrade by draining.** A **strictly newer** build asks the hub to **drain**: hand
   over to the new build without ending anyone's work. It never tears down sessions that belong

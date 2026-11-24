@@ -681,7 +681,7 @@ impl AhmaMcpService {
 
     fn should_skip_client_roots_sandbox_setup(&self) -> bool {
         // SPEC R5.5: only EXPLICIT user-provided scopes (--sandbox-scope,
-        // --working-directories, task vault) suppress the roots/list request.
+        // --working-dir, task vault) suppress the roots/list request.
         // Implicitly-derived scopes (the CWD fallback) are
         // provisional: we still ask the client for its workspace roots and prefer
         // them. This is what lets shared-process clients like Cursor — whose

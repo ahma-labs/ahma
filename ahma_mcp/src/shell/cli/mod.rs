@@ -602,7 +602,7 @@ fn resolve_deferred_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
         "Sandbox initialization deferred with ZERO scopes — tool calls will return \
          HTTP 409 until the client sends roots/list or roots/list_changed. \
          If your client does not send roots (e.g. Antigravity), add \
-         --sandbox-scope <path> or --working-directories <path> to prevent this."
+         --sandbox-scope <path> or --working-dir <path> to prevent this."
     );
     Ok(Some(Vec::new()))
 }
@@ -798,7 +798,7 @@ fn create_sandbox_instance(
     };
 
     // SPEC R5.5: scopes are "explicit" when the user named them directly via
-    // --sandbox-scope, --working-directories, or a task vault. Those must never
+    // --sandbox-scope, --working-dir, or a task vault. Those must never
     // be widened/replaced via roots/list. Scopes derived implicitly (CWD
     // fallback) are provisional and yield to client-provided roots.
     let explicit_scopes =
@@ -4476,7 +4476,7 @@ mod tests {
     }
 
     /// Regression: a deferred sandbox with an explicit `--sandbox-scope` but no
-    /// `--working-directories` must seed that scope as a provisional fallback,
+    /// `--working-dir` must seed that scope as a provisional fallback,
     /// NOT return an empty scope set. The HTTP bridge forwards its `default_scope`
     /// to the subprocess as `--sandbox-scope <path> --defer-sandbox`; if defer
     /// resolution drops that scope, a client that doesn't support `roots/list`
@@ -4504,7 +4504,7 @@ mod tests {
         assert_eq!(dunce::canonicalize(tmp.path()).unwrap(), scopes[0]);
     }
 
-    /// `--working-directories` still wins over `--sandbox-scope` in defer mode.
+    /// `--working-dir` still wins over `--sandbox-scope` in defer mode.
     #[test]
     fn test_resolve_deferred_scopes_working_dirs_win_over_sandbox_scope() {
         init_test();
