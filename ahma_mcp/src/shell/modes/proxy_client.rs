@@ -53,18 +53,9 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// once elicitation does too and `subscriptions/listen` is held open.
 const ANSWER_MODERN_DISCOVER: bool = false;
 
-#[cfg(test)]
-thread_local! {
-    /// Lets a test drive the modern path while [`ANSWER_MODERN_DISCOVER`] is
-    /// off in production. Thread-local because `#[tokio::test]` runs the proxy
-    /// on the test's own thread.
-    static ANSWER_MODERN_DISCOVER_IN_TEST: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
 fn answer_modern_discover() -> bool {
     #[cfg(test)]
-    if ANSWER_MODERN_DISCOVER_IN_TEST.with(std::cell::Cell::get) {
+    if tests::ANSWER_MODERN_DISCOVER_IN_TEST.with(std::cell::Cell::get) {
         return true;
     }
     ANSWER_MODERN_DISCOVER
@@ -3513,6 +3504,14 @@ mod tests {
             );
         })
         .await;
+    }
+
+    thread_local! {
+        /// Lets a test drive the modern path while [`ANSWER_MODERN_DISCOVER`]
+        /// is off in production. Thread-local because `#[tokio::test]` runs
+        /// the proxy on the test's own thread.
+        pub(super) static ANSWER_MODERN_DISCOVER_IN_TEST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
     }
 
     type Reaction = dyn Fn(&serde_json::Value) -> Vec<Option<serde_json::Value>> + Send + Sync;
