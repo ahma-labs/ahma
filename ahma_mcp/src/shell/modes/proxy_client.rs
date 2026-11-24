@@ -4,11 +4,12 @@
 //! this module acts as a transparent proxy that forwards all stdio
 //! JSON-RPC traffic to the running server.
 
+use super::modern_input::{self, CallStep, Flush, ModernSession};
 use crate::transport_patch::PatchedStdioTransport;
 use ahma_common::mcp_methods::ROOTS_LIST_METHOD;
 use ahma_common::mcp_methods::{
     INITIALIZE_METHOD, INITIALIZED_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
-    SUBSCRIPTIONS_LISTEN_METHOD,
+    SUBSCRIPTIONS_LISTEN_METHOD, TOOLS_CALL_METHOD,
 };
 use ahma_common::mcp_protocol::{ADVERTISED_PROTOCOL_VERSIONS, MCP_PROTOCOL_VERSION_2025_11_25};
 use anyhow::{Context, Result, anyhow};
@@ -47,9 +48,18 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// (`roots/list` and `elicitation/create` must come back as an
 /// `InputRequiredResult`), and ahma does not do that yet: Claude Code sessions
 /// never settled a sandbox scope and never showed an approval prompt. Declined,
-/// a dual-era client falls back to `initialize`, where both work. Set to `true`
-/// once roots and elicitation travel as `InputRequiredResult`.
+/// a dual-era client falls back to `initialize`, where both work. Roots now
+/// travel as `InputRequiredResult` (R-HUB.4.3, `modern_input`); set to `true`
+/// once elicitation does too and `subscriptions/listen` is held open.
 const ANSWER_MODERN_DISCOVER: bool = false;
+
+fn answer_modern_discover() -> bool {
+    #[cfg(test)]
+    if tests::ANSWER_MODERN_DISCOVER_IN_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
+    ANSWER_MODERN_DISCOVER
+}
 
 /// The error a declined `server/discover` gets. Any error but a recognised
 /// modern one makes a dual-era client fall back to `initialize` (2026-07-28
@@ -176,6 +186,19 @@ where
     }
 
     if let Some(roots_response) = &handshake.roots_response {
+        // A deferred-roots session (SPEC R-HUB.4.3) is not asked for roots at
+        // handshake time; tell it they changed, as the first call did.
+        if modern_input::defers_roots(init_request) {
+            let changed: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": ahma_common::mcp_methods::ROOTS_LIST_CHANGED_METHOD,
+            }))
+            .context("reconnect: roots/list_changed does not deserialize")?;
+            client
+                .send(changed)
+                .await
+                .map_err(|e| anyhow!("reconnect: failed to send roots/list_changed: {e:?}"))?;
+        }
         tokio::time::timeout(
             Duration::from_secs(15),
             wait_and_answer_roots_list(client, roots_response),
@@ -984,7 +1007,7 @@ fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
             })
         });
 
-    serde_json::json!({
+    let mut initialize = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 0,
         "method": INITIALIZE_METHOD,
@@ -993,7 +1016,69 @@ fn synthesize_initialize_request(val: &serde_json::Value) -> serde_json::Value {
             "capabilities": client_capabilities,
             "clientInfo": client_info
         }
-    })
+    });
+    // SPEC R-HUB.4.3: this client can return roots only with its first tool
+    // call, so the bridge must not ask for them at handshake time.
+    modern_input::mark_defers_roots(&mut initialize);
+    initialize
+}
+
+/// Answer a client request on stdio with a result built here, not by the
+/// bridge (`server/discover`, an `InputRequiredResult`).
+async fn answer_on_stdio<S>(stdio: &mut S, id: serde_json::Value, result: serde_json::Value) -> bool
+where
+    S: Transport<RoleServer>,
+    S::Error: std::fmt::Debug,
+{
+    let req_id: RequestId = serde_json::from_value(id).unwrap_or(RequestId::Number(1));
+    let message = TxJsonRpcMessage::<RoleServer>::response(
+        ServerResult::CustomResult(CustomResult(result)),
+        req_id,
+    );
+    match stdio.send(message).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(error = ?e, "Failed to answer a client request on stdio");
+            false
+        }
+    }
+}
+
+/// Send what a [`Flush`] holds to the bridge: answers and notifications, then
+/// the calls they gated. A call that fails to forward is answered on stdio
+/// with the bridge's own error when there is one (SPEC R-HUB.4.3).
+async fn deliver_modern_flush<S, C>(
+    flush: Flush,
+    conn: &mut BridgeConnection<C>,
+    stdio: &mut S,
+    transport: &str,
+) where
+    S: Transport<RoleServer>,
+    C: Transport<RoleClient>,
+    S::Error: std::fmt::Debug,
+    C::Error: std::fmt::Debug + std::fmt::Display,
+{
+    let messages = flush.to_bridge.into_iter().map(|m| (m, false));
+    let calls = flush.calls.into_iter().map(|m| (m, true));
+    for (message, is_call) in messages.chain(calls) {
+        let id = message.get("id").cloned();
+        let typed: TxJsonRpcMessage<RoleClient> = match serde_json::from_value(message) {
+            Ok(typed) => typed,
+            Err(e) => {
+                tracing::error!(transport, error = %e, "A message for the bridge does not deserialize");
+                continue;
+            }
+        };
+        if let Err(e) = conn.client.send(typed).await {
+            tracing::warn!(transport, error = %e, "Failed to forward a modern-session message to the bridge");
+            if is_call && let Some(id) = id {
+                let recovered = recover_bridge_jsonrpc_error(&format!("{e}"));
+                relay_forward_failure_to_client(stdio, id, recovered).await;
+            }
+            continue;
+        }
+        conn.forwarded_any = true;
+    }
 }
 
 /// Proxy stdio to the MCP endpoint on `socket_path` — an `AF_UNIX` socket on
@@ -1051,6 +1136,9 @@ where
     // The bridge transport and the session state that describes it. A
     // reconnect swaps the transport only through `BridgeConnection::adopt`.
     let mut conn = BridgeConnection::new(client);
+    // Set once a 2026-07-28 client opened with `server/discover` (SPEC
+    // R-HUB.4.2, R-HUB.4.3).
+    let mut modern: Option<ModernSession> = None;
 
     // Handshake deadline: if the client never sends its first message (the
     // `initialize` handshake) within this window, the connection was spawned
@@ -1062,6 +1150,10 @@ where
     tokio::pin!(handshake_timer);
 
     loop {
+        let held_deadline = modern
+            .as_ref()
+            .and_then(ModernSession::held_deadline)
+            .map(tokio::time::Instant::from_std);
         tokio::select! {
             biased;
             _ = &mut handshake_timer, if !conn.forwarded_any => {
@@ -1085,7 +1177,7 @@ where
                 let val = serde_json::to_value(&msg).unwrap();
                 let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
                 if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD)
-                    && !ANSWER_MODERN_DISCOVER
+                    && !answer_modern_discover()
                 {
                     tracing::info!(
                         transport,
@@ -1112,6 +1204,9 @@ where
                     let discover_id = request_id.clone().unwrap_or_else(|| serde_json::json!(1));
 
                     let synth_init = synthesize_initialize_request(&val);
+                    modern = Some(ModernSession::new(
+                        synth_init["params"]["capabilities"].clone(),
+                    ));
 
                     handshake.observe_client_to_bridge(&synth_init);
 
@@ -1205,6 +1300,37 @@ where
                     }
                     continue;
                 }
+                let (msg, val) = match modern.as_mut() {
+                    Some(session)
+                        if val.get("method").and_then(|m| m.as_str())
+                            == Some(TOOLS_CALL_METHOD) =>
+                    {
+                        match session.on_tools_call(val, std::time::Instant::now()) {
+                            CallStep::AskClient(result) => {
+                                if let Some(id) = request_id {
+                                    answer_on_stdio(&mut stdio, id, result).await;
+                                }
+                                continue;
+                            }
+                            CallStep::Held => {
+                                let flush = session.flush();
+                                deliver_modern_flush(flush, &mut conn, &mut stdio, transport).await;
+                                if handshake.roots_response.is_none() {
+                                    handshake.roots_response = session.roots_response();
+                                }
+                                continue;
+                            }
+                            CallStep::Forward(call) => match serde_json::from_value(call.clone()) {
+                                Ok(typed) => (typed, call),
+                                Err(e) => {
+                                    tracing::error!(transport, error = %e, "A stripped tools/call does not deserialize");
+                                    continue;
+                                }
+                            },
+                        }
+                    }
+                    _ => (msg, val),
+                };
                 handshake.observe_client_to_bridge(&val);
                 if conn.disconnected {
                     match reconnect_with_retries(
@@ -1439,6 +1565,21 @@ where
                     break;
                 };
                 let mut val = serde_json::to_value(&msg).unwrap();
+                // SPEC R-HUB.4.2: a 2026-07-28 client's stdout carries no
+                // server request. Each is answered here; a `roots/list` waits
+                // for the roots the client's first tool call brings.
+                if let Some(session) = modern.as_mut()
+                    && modern_input::is_server_request(&val)
+                {
+                    let answer = session.on_server_request(&val);
+                    let mut flush = session.flush();
+                    flush.to_bridge.splice(0..0, answer);
+                    deliver_modern_flush(flush, &mut conn, &mut stdio, transport).await;
+                    if handshake.roots_response.is_none() {
+                        handshake.roots_response = session.roots_response();
+                    }
+                    continue;
+                }
                 handshake.observe_bridge_to_client(&val);
                 // The server cannot know its transport was rebuilt; the proxy
                 // owns the heartbeat's `reconnects` field (#485). Only a
@@ -1460,6 +1601,19 @@ where
                     break;
                 }
                 conn.bridge_responded = true;
+            }
+            _ = tokio::time::sleep_until(held_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if held_deadline.is_some() =>
+            {
+                // The bridge never asked for the roots it was told about: its
+                // scope did not come from the client. It decides what the
+                // held calls get.
+                if let Some(session) = modern.as_mut() {
+                    tracing::info!(transport, "Bridge did not ask for roots; releasing held tool calls");
+                    let calls = session.release_held();
+                    let flush = Flush { to_bridge: Vec::new(), calls };
+                    deliver_modern_flush(flush, &mut conn, &mut stdio, transport).await;
+                }
             }
         }
     }
@@ -3116,7 +3270,11 @@ mod tests {
         assert_eq!(init["params"]["clientInfo"]["name"], "cursor-vscode");
         assert_eq!(
             init["params"]["capabilities"],
-            serde_json::json!({"roots": {}})
+            serde_json::json!({
+                "roots": {},
+                // SPEC R-HUB.4.3: added for the bridge, not from the client.
+                "experimental": {ahma_common::mcp_methods::ROOTS_ON_FIRST_CALL_CAPABILITY: {}}
+            })
         );
     }
 
@@ -3346,5 +3504,362 @@ mod tests {
             );
         })
         .await;
+    }
+
+    thread_local! {
+        /// Lets a test drive the modern path while [`ANSWER_MODERN_DISCOVER`]
+        /// is off in production. Thread-local because `#[tokio::test]` runs
+        /// the proxy on the test's own thread.
+        pub(super) static ANSWER_MODERN_DISCOVER_IN_TEST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    type Reaction = dyn Fn(&serde_json::Value) -> Vec<Option<serde_json::Value>> + Send + Sync;
+
+    /// A peer that answers what it is sent: every message the proxy sends it
+    /// is recorded and handed to `react`, whose replies `receive` then yields
+    /// in order. A `None` reply ends the stream (EOF). Stands in for either
+    /// side, so a whole exchange can be scripted without timing tricks.
+    struct Scripted {
+        sent: Arc<Mutex<Vec<serde_json::Value>>>,
+        tx: tokio::sync::mpsc::UnboundedSender<Option<serde_json::Value>>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<Option<serde_json::Value>>,
+        react: Arc<Reaction>,
+    }
+    impl Scripted {
+        fn new(
+            initial: Vec<serde_json::Value>,
+            react: impl Fn(&serde_json::Value) -> Vec<Option<serde_json::Value>> + Send + Sync + 'static,
+        ) -> Self {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for message in initial {
+                tx.send(Some(message)).expect("open channel");
+            }
+            Self {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                tx,
+                rx,
+                react: Arc::new(react),
+            }
+        }
+        fn record(&self, item: serde_json::Value) {
+            for reply in (self.react)(&item) {
+                self.tx.send(reply).expect("open channel");
+            }
+            self.sent.lock().push(item);
+        }
+        async fn next<T: serde::de::DeserializeOwned>(&mut self) -> Option<T> {
+            let value = self.rx.recv().await.flatten()?;
+            Some(serde_json::from_value(value).expect("a scripted message deserializes"))
+        }
+    }
+    impl Transport<RoleServer> for Scripted {
+        type Error = std::io::Error;
+        fn send(
+            &mut self,
+            item: TxJsonRpcMessage<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+            self.record(serde_json::to_value(item).unwrap());
+            std::future::ready(Ok(()))
+        }
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+            self.next().await
+        }
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    impl Transport<RoleClient> for Scripted {
+        type Error = std::io::Error;
+        fn send(
+            &mut self,
+            item: TxJsonRpcMessage<RoleClient>,
+        ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+            self.record(serde_json::to_value(item).unwrap());
+            std::future::ready(Ok(()))
+        }
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+            self.next().await
+        }
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// A 2026-07-28 `tools/call`: capabilities travel per request in `_meta`.
+    fn modern_tools_call(id: i64, name: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": {"command": "true"},
+                "_meta": {"io.modelcontextprotocol/clientCapabilities": {"roots": {}}}
+            }
+        });
+        if let serde_json::Value::Object(extra) = extra {
+            call["params"].as_object_mut().unwrap().extend(extra);
+        }
+        call
+    }
+
+    const MODERN_ROOTS: &str = "file:///workspace";
+
+    /// The bridge as a deferred-roots session sees it: answers `initialize`,
+    /// asks for roots only when told they changed, and answers tool calls.
+    fn deferred_bridge() -> Scripted {
+        Scripted::new(Vec::new(), |m| {
+            let id = m.get("id").cloned();
+            match m.get("method").and_then(|m| m.as_str()) {
+                Some(INITIALIZE_METHOD) => vec![Some(serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {"listChanged": true}},
+                        "serverInfo": {"name": "ahma", "version": "0.1.0"}
+                    }
+                }))],
+                Some(ahma_common::mcp_methods::ROOTS_LIST_CHANGED_METHOD) => {
+                    vec![Some(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 50, "method": ROOTS_LIST_METHOD
+                    }))]
+                }
+                Some("tools/call") => vec![Some(serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": "ok"}]}
+                }))],
+                _ => Vec::new(),
+            }
+        })
+    }
+
+    async fn run_scripted(stdio: Scripted, bridge: Scripted) {
+        ANSWER_MODERN_DISCOVER_IN_TEST.with(|c| c.set(true));
+        let mut reconnect = || -> Result<Scripted> { panic!("no reconnect in this test") };
+        let run = run_transport_proxy(stdio, bridge, "test", None, &mut reconnect, None);
+        let outcome = tokio::time::timeout(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            run,
+        )
+        .await
+        .expect("the scripted exchange finishes");
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// Any message with both a `method` and an `id` — a server request, which a
+    /// 2026-07-28 server may not write to stdout (SPEC R-HUB.4.2).
+    fn server_requests(sent: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        sent.iter()
+            .filter(|m| m.get("method").is_some() && m.get("id").is_some())
+            .collect()
+    }
+
+    /// SPEC R-HUB.4.3: over 2026-07-28 the scope comes from roots the client
+    /// returns in reply to an `InputRequiredResult` on its first tool call. The
+    /// call that carried the answer is the one that runs; the bridge never
+    /// sees the unanswered first attempt, and nothing reaches stdout but
+    /// results.
+    #[tokio::test]
+    async fn modern_client_roots_arrive_via_input_required_and_never_as_stdio_request() {
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            |m| match m["id"].as_i64() {
+                Some(1) => vec![Some(modern_tools_call(
+                    2,
+                    "run_terminal_command",
+                    serde_json::json!({}),
+                ))],
+                Some(2) => {
+                    let result = &m["result"];
+                    assert_eq!(result["resultType"], "input_required", "{m:#?}");
+                    assert_eq!(
+                        result["inputRequests"]["ahma.roots"]["method"],
+                        ROOTS_LIST_METHOD
+                    );
+                    vec![Some(modern_tools_call(
+                        3,
+                        "run_terminal_command",
+                        serde_json::json!({
+                            "inputResponses": {"ahma.roots": {"roots": [{"uri": MODERN_ROOTS}]}},
+                            "requestState": result["requestState"].clone(),
+                        }),
+                    ))]
+                }
+                Some(3) => vec![None],
+                _ => Vec::new(),
+            },
+        );
+        let stdio_sent = stdio.sent.clone();
+        let bridge = deferred_bridge();
+        let bridge_sent = bridge.sent.clone();
+
+        run_scripted(stdio, bridge).await;
+
+        let stdio_sent = stdio_sent.lock();
+        assert!(
+            server_requests(&stdio_sent).is_empty(),
+            "no server request on a modern client's stdout: {stdio_sent:#?}"
+        );
+        let answer = stdio_sent
+            .iter()
+            .find(|m| m["id"] == 3)
+            .unwrap_or_else(|| panic!("the retried call is answered: {stdio_sent:#?}"));
+        assert_eq!(answer["result"]["content"][0]["text"], "ok");
+
+        let bridge_sent = bridge_sent.lock();
+        let init = &bridge_sent[0];
+        assert_eq!(init["method"], INITIALIZE_METHOD);
+        assert!(
+            init["params"]["capabilities"]["experimental"]
+                [ahma_common::mcp_methods::ROOTS_ON_FIRST_CALL_CAPABILITY]
+                .is_object(),
+            "the bridge is told roots come with the first call: {init:#?}"
+        );
+        let roots_answer = bridge_sent
+            .iter()
+            .find(|m| m["id"] == 50)
+            .unwrap_or_else(|| panic!("the bridge's roots/list is answered: {bridge_sent:#?}"));
+        assert_eq!(roots_answer["result"]["roots"][0]["uri"], MODERN_ROOTS);
+        let calls: Vec<&serde_json::Value> = bridge_sent
+            .iter()
+            .filter(|m| m["method"] == "tools/call")
+            .collect();
+        assert_eq!(calls.len(), 1, "only the answered retry runs: {calls:#?}");
+        assert_eq!(calls[0]["id"], 3);
+        assert!(calls[0]["params"].get("inputResponses").is_none());
+        assert!(calls[0]["params"].get("requestState").is_none());
+        let roots_answer_at = bridge_sent.iter().position(|m| m["id"] == 50).unwrap();
+        let call_at = bridge_sent
+            .iter()
+            .position(|m| m["method"] == "tools/call")
+            .unwrap();
+        assert!(
+            roots_answer_at < call_at,
+            "the scope is settled before the call it gates"
+        );
+    }
+
+    /// SPEC R-HUB.4.2: what the bridge asks a modern client is answered for
+    /// it, never written to its stdout. A prompt is dismissed at once so the
+    /// permission ladder moves on instead of waiting out its budget.
+    #[tokio::test]
+    async fn modern_client_stdout_never_carries_a_server_request() {
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            |m| match m["id"].as_i64() {
+                Some(1) => vec![Some(modern_tools_call(
+                    2,
+                    "ahma_help",
+                    serde_json::json!({}),
+                ))],
+                Some(2) => vec![None],
+                _ => Vec::new(),
+            },
+        );
+        let stdio_sent = stdio.sent.clone();
+        let bridge = Scripted::new(Vec::new(), |m| {
+            let id = m.get("id").cloned();
+            match m.get("method").and_then(|m| m.as_str()) {
+                Some(INITIALIZE_METHOD) => vec![Some(
+                    serde_json::to_value(bridge_initialize_response(0)).unwrap(),
+                )],
+                // A bridge that asks the legacy way, before any tool call.
+                Some(INITIALIZED_METHOD) => vec![
+                    Some(serde_json::json!({"jsonrpc": "2.0", "id": 60, "method": "ping"})),
+                    Some(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 61, "method": "elicitation/create",
+                        "params": {"message": "Allow?", "requestedSchema": {"type": "object", "properties": {}}}
+                    })),
+                    Some(
+                        serde_json::json!({"jsonrpc": "2.0", "id": 62, "method": ROOTS_LIST_METHOD}),
+                    ),
+                ],
+                Some("tools/call") => vec![Some(serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {"content": []}
+                }))],
+                _ => Vec::new(),
+            }
+        });
+        let bridge_sent = bridge.sent.clone();
+
+        run_scripted(stdio, bridge).await;
+
+        let stdio_sent = stdio_sent.lock();
+        assert!(
+            server_requests(&stdio_sent).is_empty(),
+            "no server request on a modern client's stdout: {stdio_sent:#?}"
+        );
+        let bridge_sent = bridge_sent.lock();
+        let answer = |id: i64| {
+            bridge_sent
+                .iter()
+                .find(|m| m["id"] == id && m.get("method").is_none())
+        };
+        assert_eq!(
+            answer(60).expect("ping answered")["result"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            answer(61).expect("prompt answered")["result"]["action"],
+            "cancel"
+        );
+        assert!(
+            answer(62).is_none(),
+            "roots/list waits for roots the client has not sent yet: {bridge_sent:#?}"
+        );
+        assert!(
+            bridge_sent
+                .iter()
+                .any(|m| m["id"] == 2 && m["method"] == "tools/call"),
+            "a scope-exempt tool runs without roots"
+        );
+    }
+
+    /// SPEC R-HUB.4.3: a reconnected deferred-roots session is not asked for
+    /// roots at handshake time either, so the replay tells it they changed
+    /// and answers the `roots/list` that follows from the cache.
+    #[tokio::test]
+    async fn replay_announces_cached_roots_to_a_deferred_roots_session() {
+        let mut init = synthesize_initialize_request(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": {"io.modelcontextprotocol/clientCapabilities": {"roots": {}}}}
+        }));
+        init["id"] = serde_json::json!(0);
+        let handshake = CachedHandshake {
+            init_request: Some(init),
+            notif_initialized: Some(
+                serde_json::to_value(client_notifications_initialized()).unwrap(),
+            ),
+            roots_response: Some(serde_json::to_value(client_roots_list_response(0)).unwrap()),
+            ..Default::default()
+        };
+        let mut bridge = deferred_bridge();
+        let sent = bridge.sent.clone();
+
+        tokio::time::timeout(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            replay_handshake(&mut bridge, &handshake),
+        )
+        .await
+        .expect("the replay does not wait for a roots/list that never comes")
+        .expect("replay succeeds");
+
+        let sent = sent.lock();
+        let methods: Vec<&str> = sent
+            .iter()
+            .map(|m| m["method"].as_str().unwrap_or("(response)"))
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                INITIALIZE_METHOD,
+                INITIALIZED_METHOD,
+                ahma_common::mcp_methods::ROOTS_LIST_CHANGED_METHOD,
+                "(response)"
+            ]
+        );
+        assert_eq!(sent[3]["id"], 50);
+        assert_eq!(sent[3]["result"]["roots"][0]["uri"], "file:///workspace");
     }
 }

@@ -803,6 +803,93 @@ async fn test_multi_root_workspace_scoping() {
 }
 
 // =============================================================================
+// Test: Deferred roots (SPEC R-HUB.4.3)
+// =============================================================================
+
+/// A 2026-07-28 client behind the stdio proxy can hand over roots only with
+/// its first tool call, so its session must not be asked at handshake time,
+/// and the call that runs right behind the roots must not meet a sandbox
+/// still configuring them. Ordinary sessions poll (`wait_for_tool_ready`)
+/// past that window; this one must not have to.
+#[tokio::test]
+async fn test_deferred_roots_session_is_asked_only_when_told_and_runs_the_next_call() {
+    let root = TempDir::new().expect("Failed to create root dir");
+    let tools_temp = TempDir::new().expect("Failed to create tools temp dir");
+    let tools_dir = tools_temp.path().join("tools");
+    write_pwd_tool_config(&tools_dir);
+
+    let server = spawn_server_guard_strict_roots(&tools_dir)
+        .await
+        .expect("Failed to start strict-roots server");
+    let base_url = server_base_url(&server);
+    let client = common::make_h2_client();
+    let init_request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {
+                "roots": {},
+                "experimental": {ahma_common::mcp_methods::ROOTS_ON_FIRST_CALL_CAPABILITY: {}}
+            },
+            "clientInfo": {"name": "claude-code", "version": "2.1.319"}
+        }
+    });
+    let (_, session_id) = send_mcp_request(&client, &base_url, &init_request, None)
+        .await
+        .expect("initialize");
+    let session_id = session_id.expect("session id");
+
+    let sse = open_roots_sse_stream(&client, &base_url, &session_id)
+        .await
+        .expect("SSE stream");
+    sleep(TestTimeouts::short_delay()).await;
+    send_initialized_notification(&client, &base_url, &session_id)
+        .await
+        .expect("initialized");
+
+    // The handshake is complete and no roots were asked for: a call is told
+    // to wait (409), not failed for a handshake timeout.
+    let early = send_mcp_request(
+        &client,
+        &base_url,
+        &pwd_tool_call(2, Some(root.path())),
+        Some(&session_id),
+    )
+    .await;
+    let early_error = early.expect_err("no scope yet");
+    assert!(early_error.contains("409"), "got: {early_error}");
+
+    // The proxy announces the roots its first call brought; only now does
+    // the worker ask, and the answer comes back over SSE as usual.
+    let root_uris = vec![encode_file_uri(root.path())];
+    let exchange = {
+        let (client, base_url, session_id) = (client.clone(), base_url.clone(), session_id.clone());
+        tokio::spawn(async move {
+            process_roots_exchange_stream(sse, &client, &base_url, &session_id, &root_uris).await
+        })
+    };
+    let changed = json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"});
+    let _ = send_mcp_request(&client, &base_url, &changed, Some(&session_id)).await;
+    exchange
+        .await
+        .expect("SSE task panicked")
+        .expect("roots/list asked and answered");
+
+    // Straight after the roots: no polling, the call waits out configuration.
+    let (response, _) = send_mcp_request(
+        &client,
+        &base_url,
+        &pwd_tool_call(3, Some(root.path())),
+        Some(&session_id),
+    )
+    .await
+    .expect("the call right behind the roots succeeds");
+    assert!(response.get("error").is_none(), "{response:?}");
+}
+
+// =============================================================================
 // Test: URL-Encoded Paths
 // =============================================================================
 

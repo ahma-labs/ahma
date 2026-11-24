@@ -1,0 +1,475 @@
+//! The stdio proxy's side of a 2026-07-28 session (SPEC R-HUB.4.2, R-HUB.4.3).
+//!
+//! That protocol forbids a server writing requests to a stdio client. A server
+//! that needs something from the client answers one of the client's own
+//! requests with an `InputRequiredResult`, and the client retries that request
+//! with the answers attached. ahma's worker still asks the legacy way, on the
+//! server→client channel, so the proxy translates:
+//!
+//! * no server request ever reaches stdout ([`ModernSession::on_server_request`]);
+//! * the client's roots are fetched by answering its first scoped `tools/call`
+//!   with `input_required` ([`ModernSession::on_tools_call`]), and the retry
+//!   that carries them is the call that runs;
+//! * the worker's `roots/list` is answered from those roots, and the call is
+//!   held until it has been ([`ModernSession::flush`]), so it never meets a
+//!   sandbox that is still waiting for them.
+//!
+//! The bridge is told not to ask at handshake time by
+//! [`ROOTS_ON_FIRST_CALL_CAPABILITY`] on the synthesized `initialize`.
+//!
+//! Everything here is a pure function of the messages; the proxy loop does the
+//! I/O.
+
+use ahma_common::mcp_methods::{
+    ROOTS_LIST_CHANGED_METHOD, ROOTS_LIST_METHOD, ROOTS_ON_FIRST_CALL_CAPABILITY, RpcErrorCode,
+    is_scope_exempt_tool,
+};
+use serde_json::{Value, json};
+use std::time::{Duration, Instant};
+
+/// The key of ahma's one input request. Server-assigned and opaque to the
+/// client, which returns its answer under the same key.
+pub(crate) const ROOTS_INPUT_KEY: &str = "ahma.roots";
+
+/// How many times a call is answered with `input_required` before the proxy
+/// stops asking and settles on empty roots, so a client that never answers
+/// still gets the bridge's own remediation (container root, or a refusal that
+/// says how to set a scope) instead of an endless loop.
+pub(crate) const MAX_ROOTS_ASKS: u32 = 2;
+
+/// How long a call waits for the bridge to ask for the roots it was just told
+/// about. A bridge whose scope was set without the client (`--sandbox-scope`,
+/// a default scope) never asks, and its calls must not wait forever.
+pub(crate) const HELD_CALL_GRACE: Duration = Duration::from_secs(10);
+
+const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// What the proxy does with a client `tools/call`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CallStep {
+    /// Forward this call (with any input fields stripped) to the bridge now.
+    Forward(Value),
+    /// Answer the client with this `InputRequiredResult`; the bridge never
+    /// sees the call.
+    AskClient(Value),
+    /// The call is held; [`ModernSession::flush`] releases it.
+    Held,
+}
+
+/// Messages the proxy must send the bridge, in order: answers and
+/// notifications first, then the calls they were gating.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Flush {
+    pub(crate) to_bridge: Vec<Value>,
+    pub(crate) calls: Vec<Value>,
+}
+
+/// One modern client's roots exchange.
+#[derive(Debug, Default)]
+pub(crate) struct ModernSession {
+    /// Capabilities the client declared on `server/discover`, used when a
+    /// request carries none of its own.
+    discover_capabilities: Value,
+    /// The client's `roots/list` result, once its retry brought it (or the
+    /// proxy gave up asking and settled on none).
+    roots: Option<Value>,
+    asks: u32,
+    request_state: Option<String>,
+    /// Ids of bridge `roots/list` requests not answered yet.
+    parked_roots_requests: Vec<Value>,
+    /// The bridge has been given the roots.
+    roots_delivered: bool,
+    list_changed_sent: bool,
+    held_calls: Vec<Value>,
+    held_since: Option<Instant>,
+}
+
+impl ModernSession {
+    /// `discover_capabilities`: what the client declared on `server/discover`
+    /// (the synthesized `initialize` carries them).
+    pub(crate) fn new(discover_capabilities: Value) -> Self {
+        Self {
+            discover_capabilities,
+            ..Self::default()
+        }
+    }
+
+    /// Decide what happens to a client `tools/call`.
+    pub(crate) fn on_tools_call(&mut self, call: Value, now: Instant) -> CallStep {
+        if self.roots_delivered || is_exempt(&call) {
+            return CallStep::Forward(strip_input_fields(call));
+        }
+        if self.roots.is_none() {
+            match self.answered_roots(&call) {
+                Some(roots) => self.roots = Some(roots),
+                None if self.may_ask(&call) => return CallStep::AskClient(self.ask()),
+                None => self.roots = Some(json!({ "roots": [] })),
+            }
+        }
+        self.held_calls.push(strip_input_fields(call));
+        self.held_since.get_or_insert(now);
+        CallStep::Held
+    }
+
+    /// Answer a request the bridge addressed to the client. `None` means it
+    /// is a `roots/list`, parked until [`Self::flush`] can answer it.
+    pub(crate) fn on_server_request(&mut self, request: &Value) -> Option<Value> {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        match request.get("method").and_then(Value::as_str) {
+            Some(ROOTS_LIST_METHOD) => {
+                self.parked_roots_requests.push(id);
+                None
+            }
+            // SPEC R-HUB.4.2: until prompts travel as `input_required`, a
+            // question the client cannot be asked is dismissed at once, so the
+            // permission ladder moves on instead of waiting out its budget.
+            Some("elicitation/create") => Some(response(id, json!({ "action": "cancel" }))),
+            // The bridge's liveness probe. This proxy is the client's end of
+            // the pipe; stdio EOF, not a ping, is what ends the session.
+            Some("ping") => Some(response(id, json!({}))),
+            Some(method) => Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": RpcErrorCode::MethodNotFound,
+                    "message": format!(
+                        "{method} cannot reach a 2026-07-28 stdio client: servers may not \
+                         write requests to its stdout"
+                    ),
+                },
+            })),
+            None => None,
+        }
+    }
+
+    /// What to send the bridge now. With the roots known it answers every
+    /// parked `roots/list`, or, if the bridge has not asked, tells it the roots
+    /// changed so it does; held calls follow once the bridge has them.
+    pub(crate) fn flush(&mut self) -> Flush {
+        let Some(roots) = &self.roots else {
+            return Flush::default();
+        };
+        let mut to_bridge: Vec<Value> = self
+            .parked_roots_requests
+            .drain(..)
+            .map(|id| response(id, roots.clone()))
+            .collect();
+        if !to_bridge.is_empty() {
+            self.roots_delivered = true;
+        } else if !self.roots_delivered && !self.list_changed_sent {
+            self.list_changed_sent = true;
+            to_bridge.push(json!({ "jsonrpc": "2.0", "method": ROOTS_LIST_CHANGED_METHOD }));
+        }
+        let calls = if self.roots_delivered {
+            self.take_held()
+        } else {
+            Vec::new()
+        };
+        Flush { to_bridge, calls }
+    }
+
+    /// When held calls stop waiting for a bridge that never asks.
+    pub(crate) fn held_deadline(&self) -> Option<Instant> {
+        self.held_since.map(|since| since + HELD_CALL_GRACE)
+    }
+
+    /// Release held calls unanswered by a `roots/list`: the bridge's scope
+    /// did not come from the client, and the bridge decides what they get.
+    pub(crate) fn release_held(&mut self) -> Vec<Value> {
+        self.roots_delivered = true;
+        self.take_held()
+    }
+
+    /// The roots as a cached `roots/list` answer, for the reconnect replay.
+    pub(crate) fn roots_response(&self) -> Option<Value> {
+        let roots = self.roots.as_ref().filter(|_| self.roots_delivered)?;
+        Some(response(json!(0), roots.clone()))
+    }
+
+    fn take_held(&mut self) -> Vec<Value> {
+        self.held_since = None;
+        std::mem::take(&mut self.held_calls)
+    }
+
+    fn answered_roots(&self, call: &Value) -> Option<Value> {
+        let params = call.get("params")?;
+        let state = params.get("requestState").and_then(Value::as_str)?;
+        if self.request_state.as_deref() != Some(state) {
+            return None;
+        }
+        let answer = params.get("inputResponses")?.get(ROOTS_INPUT_KEY)?;
+        answer.get("roots")?.as_array()?;
+        Some(answer.clone())
+    }
+
+    /// The client may be sent an input request only for a capability it
+    /// declared: on this request, or failing that on `server/discover`.
+    fn may_ask(&self, call: &Value) -> bool {
+        let capabilities = call
+            .pointer("/params/_meta")
+            .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
+            .unwrap_or(&self.discover_capabilities);
+        self.asks < MAX_ROOTS_ASKS && capabilities.get("roots").is_some_and(Value::is_object)
+    }
+
+    fn ask(&mut self) -> Value {
+        self.asks += 1;
+        let state = format!("ahma-roots-{}", self.asks);
+        self.request_state = Some(state.clone());
+        json!({
+            "resultType": "input_required",
+            "inputRequests": { ROOTS_INPUT_KEY: { "method": ROOTS_LIST_METHOD } },
+            "requestState": state,
+        })
+    }
+}
+
+/// Whether a synthesized `initialize` tells the bridge roots come later.
+pub(crate) fn defers_roots(initialize: &Value) -> bool {
+    initialize
+        .pointer("/params/capabilities/experimental")
+        .and_then(|experimental| experimental.get(ROOTS_ON_FIRST_CALL_CAPABILITY))
+        .is_some()
+}
+
+/// Mark a synthesized `initialize` as deferring roots to the first call.
+pub(crate) fn mark_defers_roots(initialize: &mut Value) {
+    let Some(capabilities) = initialize
+        .pointer_mut("/params/capabilities")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let experimental = capabilities
+        .entry("experimental")
+        .or_insert_with(|| json!({}));
+    if let Some(experimental) = experimental.as_object_mut() {
+        experimental.insert(ROOTS_ON_FIRST_CALL_CAPABILITY.to_string(), json!({}));
+    }
+}
+
+/// Whether a message from the bridge is a request addressed to the client.
+pub(crate) fn is_server_request(message: &Value) -> bool {
+    message.get("method").is_some() && message.get("id").is_some_and(|id| !id.is_null())
+}
+
+fn is_exempt(call: &Value) -> bool {
+    call.pointer("/params/name")
+        .and_then(Value::as_str)
+        .is_some_and(is_scope_exempt_tool)
+}
+
+/// The bridge and worker speak the legacy protocol: the retry's MRTR fields
+/// mean nothing to them.
+fn strip_input_fields(mut call: Value) -> Value {
+    if let Some(params) = call.get_mut("params").and_then(Value::as_object_mut) {
+        params.remove("inputResponses");
+        params.remove("requestState");
+    }
+    call
+}
+
+fn response(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn discover_with_roots() -> Value {
+        json!({"roots": {}})
+    }
+
+    fn call(id: i64, name: &str, extra: Value) -> Value {
+        let mut call = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": name, "arguments": {}}
+        });
+        if let Value::Object(extra) = extra {
+            call["params"].as_object_mut().unwrap().extend(extra);
+        }
+        call
+    }
+
+    fn answer(state: &Value) -> Value {
+        json!({
+            "inputResponses": {ROOTS_INPUT_KEY: {"roots": [{"uri": "file:///w"}]}},
+            "requestState": state,
+        })
+    }
+
+    fn asked(step: CallStep) -> Value {
+        match step {
+            CallStep::AskClient(result) => result,
+            other => panic!("expected an input request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_scoped_call_is_answered_with_an_input_request_for_roots() {
+        let mut session = ModernSession::new(discover_with_roots());
+        let result = asked(
+            session.on_tools_call(call(2, "run_terminal_command", json!({})), Instant::now()),
+        );
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(
+            result["inputRequests"][ROOTS_INPUT_KEY]["method"],
+            ROOTS_LIST_METHOD
+        );
+        assert!(result["requestState"].is_string());
+        assert_eq!(
+            session.flush(),
+            Flush::default(),
+            "nothing reaches the bridge"
+        );
+    }
+
+    #[test]
+    fn the_answered_retry_is_held_until_the_bridge_has_the_roots() {
+        let mut session = ModernSession::new(discover_with_roots());
+        let now = Instant::now();
+        let state =
+            asked(session.on_tools_call(call(2, "x", json!({})), now))["requestState"].clone();
+        assert_eq!(
+            session.on_tools_call(call(3, "x", answer(&state)), now),
+            CallStep::Held
+        );
+
+        let flush = session.flush();
+        assert_eq!(flush.to_bridge.len(), 1);
+        assert_eq!(flush.to_bridge[0]["method"], ROOTS_LIST_CHANGED_METHOD);
+        assert!(flush.calls.is_empty(), "held until the bridge asks");
+
+        assert_eq!(
+            session.on_server_request(&json!({"jsonrpc": "2.0", "id": 9, "method": "roots/list"})),
+            None
+        );
+        let flush = session.flush();
+        assert_eq!(flush.to_bridge[0]["id"], 9);
+        assert_eq!(flush.to_bridge[0]["result"]["roots"][0]["uri"], "file:///w");
+        assert_eq!(flush.calls.len(), 1);
+        assert_eq!(flush.calls[0]["id"], 3);
+        assert!(flush.calls[0]["params"].get("inputResponses").is_none());
+        assert!(flush.calls[0]["params"].get("requestState").is_none());
+
+        assert!(matches!(
+            session.on_tools_call(call(4, "x", json!({})), now),
+            CallStep::Forward(_)
+        ));
+        assert!(session.roots_response().is_some());
+    }
+
+    #[test]
+    fn a_roots_list_the_bridge_sent_first_is_answered_without_a_list_changed() {
+        let mut session = ModernSession::new(discover_with_roots());
+        let now = Instant::now();
+        session.on_server_request(&json!({"jsonrpc": "2.0", "id": 9, "method": "roots/list"}));
+        let state =
+            asked(session.on_tools_call(call(2, "x", json!({})), now))["requestState"].clone();
+        session.on_tools_call(call(3, "x", answer(&state)), now);
+        let flush = session.flush();
+        assert_eq!(flush.to_bridge.len(), 1);
+        assert_eq!(flush.to_bridge[0]["id"], 9);
+        assert_eq!(flush.calls.len(), 1);
+    }
+
+    #[test]
+    fn a_client_that_never_answers_is_asked_twice_then_gets_empty_roots() {
+        let mut session = ModernSession::new(discover_with_roots());
+        let now = Instant::now();
+        for id in 2..2 + i64::from(MAX_ROOTS_ASKS) {
+            asked(session.on_tools_call(call(id, "x", json!({})), now));
+        }
+        assert_eq!(
+            session.on_tools_call(call(9, "x", json!({})), now),
+            CallStep::Held
+        );
+        session.on_server_request(&json!({"jsonrpc": "2.0", "id": 5, "method": "roots/list"}));
+        let flush = session.flush();
+        assert_eq!(flush.to_bridge[0]["result"], json!({"roots": []}));
+        assert_eq!(flush.calls[0]["id"], 9);
+    }
+
+    #[test]
+    fn a_stale_request_state_is_not_an_answer() {
+        let mut session = ModernSession::new(discover_with_roots());
+        let now = Instant::now();
+        asked(session.on_tools_call(call(2, "x", json!({})), now));
+        let step = session.on_tools_call(call(3, "x", answer(&json!("forged"))), now);
+        assert!(matches!(step, CallStep::AskClient(_)), "{step:?}");
+    }
+
+    #[test]
+    fn a_client_without_roots_is_never_asked() {
+        let mut session = ModernSession::new(json!({}));
+        assert_eq!(
+            session.on_tools_call(call(2, "x", json!({})), Instant::now()),
+            CallStep::Held
+        );
+        let flush = session.flush();
+        assert_eq!(flush.to_bridge[0]["method"], ROOTS_LIST_CHANGED_METHOD);
+    }
+
+    #[test]
+    fn a_per_request_capability_overrides_discover() {
+        let mut session = ModernSession::new(json!({}));
+        let with_roots = json!({"_meta": {CLIENT_CAPABILITIES_META: {"roots": {}}}});
+        assert!(matches!(
+            session.on_tools_call(call(2, "x", with_roots), Instant::now()),
+            CallStep::AskClient(_)
+        ));
+    }
+
+    #[test]
+    fn scope_exempt_tools_are_never_held() {
+        let mut session = ModernSession::new(discover_with_roots());
+        assert!(matches!(
+            session.on_tools_call(call(2, "ahma_help", json!({})), Instant::now()),
+            CallStep::Forward(_)
+        ));
+    }
+
+    #[test]
+    fn held_calls_are_released_when_the_bridge_never_asks() {
+        let mut session = ModernSession::new(json!({}));
+        let now = Instant::now();
+        session.on_tools_call(call(2, "x", json!({})), now);
+        session.flush();
+        assert_eq!(session.held_deadline(), Some(now + HELD_CALL_GRACE));
+        assert_eq!(session.release_held().len(), 1);
+        assert_eq!(session.held_deadline(), None);
+        assert!(matches!(
+            session.on_tools_call(call(3, "x", json!({})), now),
+            CallStep::Forward(_)
+        ));
+    }
+
+    #[test]
+    fn server_requests_other_than_roots_are_answered_for_the_client() {
+        let mut session = ModernSession::default();
+        let cancel = session
+            .on_server_request(&json!({"jsonrpc": "2.0", "id": 1, "method": "elicitation/create"}))
+            .unwrap();
+        assert_eq!(cancel["result"]["action"], "cancel");
+        let pong = session
+            .on_server_request(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+            .unwrap();
+        assert_eq!(pong["result"], json!({}));
+        let refused = session
+            .on_server_request(
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "sampling/createMessage"}),
+            )
+            .unwrap();
+        assert_eq!(refused["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn the_defer_marker_round_trips() {
+        let mut init = json!({"params": {"capabilities": {"roots": {}}}});
+        assert!(!defers_roots(&init));
+        mark_defers_roots(&mut init);
+        assert!(defers_roots(&init));
+        assert!(init["params"]["capabilities"]["roots"].is_object());
+    }
+}

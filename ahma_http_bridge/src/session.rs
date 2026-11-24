@@ -235,6 +235,10 @@ pub struct Session {
     pub client_info: Mutex<Option<Value>>,
     /// Client capabilities sent in initialize request
     pub capabilities: Mutex<Option<Value>>,
+    /// The client returns roots only with its first tool call (SPEC
+    /// R-HUB.4.3): it declared
+    /// [`ahma_common::mcp_methods::ROOTS_ON_FIRST_CALL_CAPABILITY`].
+    defers_roots: AtomicBool,
     /// Map of pending routed request IDs to response channels
     pub routed_requests: Arc<DashMap<RpcId, oneshot::Sender<Value>>>,
     /// Map of pending server-to-client request IDs to their method name (e.g. roots/list)
@@ -271,8 +275,37 @@ pub struct Session {
 impl Session {
     /// Set the client info and capabilities for this session.
     pub async fn set_client_info(&self, client_info: Value, capabilities: Value) {
+        let defers = capabilities
+            .pointer("/experimental")
+            .and_then(|e| e.get(ahma_common::mcp_methods::ROOTS_ON_FIRST_CALL_CAPABILITY))
+            .is_some();
+        self.defers_roots.store(defers, Ordering::SeqCst);
         *self.client_info.lock().await = Some(client_info);
         *self.capabilities.lock().await = Some(capabilities);
+    }
+
+    /// Whether roots arrive with the client's first tool call rather than in
+    /// answer to a handshake-time `roots/list` (SPEC R-HUB.4.3). Such a
+    /// session is not asked at handshake time, is not timed out for lacking
+    /// roots, and a tool call that meets it mid-configuration waits.
+    pub fn defers_roots(&self) -> bool {
+        self.defers_roots.load(Ordering::SeqCst)
+    }
+
+    /// For a deferred-roots session whose sandbox is `Configuring`, wait up
+    /// to `budget` for it to become `Active` (SPEC R-HUB.4.3): its proxy sends
+    /// the tool call right behind the roots, so the worker is still applying
+    /// them. Returns at once for every other session or state.
+    pub async fn wait_out_deferred_configuration(&self, budget: Duration) {
+        if !self.defers_roots()
+            || !matches!(
+                self.current_sandbox_state(),
+                ahma_common::sandbox_state::SandboxState::Configuring { .. }
+            )
+        {
+            return;
+        }
+        let _ = tokio::time::timeout(budget, self.wait_for_sandbox_active()).await;
     }
 
     /// Check if the session is terminated
@@ -341,6 +374,11 @@ impl Session {
 
     /// Check if the handshake has timed out
     pub fn is_handshake_timed_out(&self) -> Option<u64> {
+        // A deferred-roots client cannot send roots before its first tool
+        // call, which may come long after the handshake (SPEC R-HUB.4.3).
+        if self.defers_roots() {
+            return None;
+        }
         // If the sandbox is Active or Configuring, the handshake is done or in
         // progress — don't sweep the session.
         match self.sandbox_state_machine.current() {
@@ -558,8 +596,15 @@ impl Session {
         }
     }
 
-    /// Send roots/list_changed notification to subprocess.
+    /// Send roots/list_changed notification to subprocess — unless the client
+    /// defers roots to its first call (SPEC R-HUB.4.3): the worker's
+    /// `roots/list` would then wait for an answer that cannot come yet. Its
+    /// proxy sends `roots/list_changed` itself once it has them.
     async fn send_roots_list_changed(&self) -> Result<()> {
+        if self.defers_roots() {
+            info!(session_id = %self.id, "Handshake complete; roots deferred to the client's first tool call");
+            return Ok(());
+        }
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": ahma_common::mcp_methods::ROOTS_LIST_CHANGED_METHOD
@@ -1766,6 +1811,7 @@ impl SessionManager {
             event_history: parking_lot::Mutex::new(VecDeque::new()),
             client_info: Mutex::new(None),
             capabilities: Mutex::new(None),
+            defers_roots: AtomicBool::new(false),
             routed_requests: Arc::new(DashMap::new()),
             pending_client_requests: Arc::new(DashMap::new()),
             sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
@@ -2447,6 +2493,7 @@ mod session_logic_tests {
             event_history: parking_lot::Mutex::new(VecDeque::new()),
             client_info: Mutex::new(None),
             capabilities: Mutex::new(None),
+            defers_roots: AtomicBool::new(false),
             routed_requests: Arc::new(DashMap::new()),
             pending_client_requests: Arc::new(DashMap::new()),
             sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
@@ -2685,6 +2732,96 @@ mod session_logic_tests {
             .transition_to_active_with_scopes(vec![std::env::temp_dir().join("p")])
             .unwrap();
         assert!(session.is_handshake_timed_out().is_none());
+    }
+
+    // ── Deferred roots (SPEC R-HUB.4.3) ──────────────────────────────────────
+
+    async fn deferring(session: &Session) {
+        session
+            .set_client_info(
+                serde_json::json!({"name": "claude-code"}),
+                serde_json::json!({
+                    "roots": {},
+                    "experimental": {ahma_common::mcp_methods::ROOTS_ON_FIRST_CALL_CAPABILITY: {}}
+                }),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_deferring_client_is_not_asked_for_roots_at_handshake_time() {
+        let (session, mut rx) = make_test_session();
+        deferring(&session).await;
+        assert!(session.defers_roots());
+        session.mark_sse_connected().await.unwrap();
+        session.mark_mcp_initialized().await.unwrap();
+        assert_eq!(session.handshake_state(), HandshakeState::RootsRequested);
+        assert!(
+            rx.try_recv().is_err(),
+            "the worker's roots/list would wait for an answer that cannot come yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferring_client_is_never_timed_out_for_lacking_roots() {
+        let (session, _rx) = make_test_session_with_timeout(Duration::ZERO);
+        deferring(&session).await;
+        assert!(session.is_handshake_timed_out().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_client_still_defers_nothing() {
+        let (session, _rx) = make_test_session();
+        session
+            .set_client_info(
+                serde_json::json!({"name": "c"}),
+                serde_json::json!({"roots": {}}),
+            )
+            .await;
+        assert!(!session.defers_roots());
+    }
+
+    #[tokio::test]
+    async fn a_deferring_clients_call_waits_out_configuration() {
+        let (session, _rx) = make_test_session();
+        deferring(&session).await;
+        let scope = std::env::temp_dir().join("p");
+        session
+            .sandbox_state_machine
+            .transition_to_configuring(vec![scope.clone()])
+            .unwrap();
+        let activator = session.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            activator
+                .sandbox_state_machine
+                .transition_to_active_with_scopes(vec![scope])
+                .unwrap();
+        });
+        session
+            .wait_out_deferred_configuration(TestTimeouts::get(TimeoutCategory::Quick))
+            .await;
+        assert!(session.is_sandbox_locked(), "the call goes on once Active");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_clients_call_does_not_wait_out_configuration() {
+        let (session, _rx) = make_test_session();
+        session
+            .sandbox_state_machine
+            .transition_to_configuring(vec![std::env::temp_dir().join("p")])
+            .unwrap();
+        // A budget far longer than the check: finishing within it proves no wait.
+        let waited = tokio::time::timeout(
+            TestTimeouts::get(TimeoutCategory::Quick),
+            session.wait_out_deferred_configuration(TestTimeouts::get(TimeoutCategory::SseStream)),
+        )
+        .await;
+        assert!(
+            waited.is_ok(),
+            "an ordinary session keeps the immediate 409"
+        );
+        assert!(!session.is_sandbox_locked());
     }
 
     // ── is_sse_connected / is_mcp_initialized state matrix ───────────────────
