@@ -7,7 +7,6 @@ use ahma_common::mcp_methods::{
     RpcErrorCode, SAMPLING_CREATE_MESSAGE_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
     SUBSCRIPTIONS_LISTEN_METHOD, TOOLS_CALL_METHOD,
 };
-use ahma_common::mcp_protocol::ADVERTISED_PROTOCOL_VERSIONS;
 use ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS;
 use axum::{
     body::Body,
@@ -539,19 +538,11 @@ async fn handle_post_request(
             "name": "ahma",
             "version": env!("CARGO_PKG_VERSION"),
         });
-        let result = serde_json::json!({
-            "supportedVersions": ADVERTISED_PROTOCOL_VERSIONS,
-            "capabilities": {
-                "tools": {
-                    "listChanged": true,
-                }
-            },
-            "instructions": SERVER_INSTRUCTIONS,
-            "serverInfo": server_info.clone(),
-            "_meta": {
-                "io.modelcontextprotocol/serverInfo": server_info,
-            }
-        });
+        let result = ahma_common::mcp_protocol::discover_result(
+            serde_json::json!({ "tools": { "listChanged": true } }),
+            SERVER_INSTRUCTIONS,
+            server_info,
+        );
         return json_response(serde_json::json!({
             "jsonrpc": "2.0",
             "id": inbound.reply_id(),
@@ -2288,6 +2279,10 @@ mod tests {
         );
         assert_eq!(body["result"]["capabilities"]["tools"]["listChanged"], true);
         assert_eq!(body["result"]["serverInfo"]["name"], "ahma");
+        // SPEC R-HUB.4.4: the same builder as the stdio proxy.
+        assert_eq!(body["result"]["resultType"], "complete");
+        assert_eq!(body["result"]["cacheScope"], "private");
+        assert!(body["result"]["ttlMs"].is_u64());
     }
 
     #[tokio::test]

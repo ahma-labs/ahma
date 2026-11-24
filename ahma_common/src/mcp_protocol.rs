@@ -61,8 +61,49 @@ pub fn negotiated_protocol_version(init_response: &Value) -> String {
         .to_string()
 }
 
+/// How long a client may cache a `DiscoverResult`, in milliseconds: none.
+/// The hub behind a session can be replaced by a newer build at any time
+/// (R-HUB.5), and with it the capabilities and instructions.
+pub const DISCOVER_TTL_MS: u64 = 0;
+
+/// The 2026-07-28 `DiscoverResult` (SPEC R-HUB.4.4), built in one place for
+/// every surface that answers `server/discover`, so none of them drifts from
+/// the required fields (`resultType`, `ttlMs`, `cacheScope`). `private`: the
+/// instructions and tool set are this user's.
+pub fn discover_result(capabilities: Value, instructions: &str, server_info: Value) -> Value {
+    serde_json::json!({
+        "resultType": "complete",
+        "supportedVersions": ADVERTISED_PROTOCOL_VERSIONS,
+        "capabilities": capabilities,
+        "instructions": instructions,
+        "ttlMs": DISCOVER_TTL_MS,
+        "cacheScope": "private",
+        "serverInfo": server_info.clone(),
+        "_meta": { "io.modelcontextprotocol/serverInfo": server_info },
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_discover_result_carries_every_required_field() {
+        let result = discover_result(json!({"tools": {}}), "i", json!({"name": "ahma"}));
+        for field in [
+            "resultType",
+            "supportedVersions",
+            "capabilities",
+            "ttlMs",
+            "cacheScope",
+        ] {
+            assert!(result.get(field).is_some(), "{field}: {result:#?}");
+        }
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "ahma"
+        );
+    }
 
     #[test]
     fn every_advertised_revision_is_accepted() {

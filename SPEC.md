@@ -1874,8 +1874,8 @@ lifetime.
     (`modern_input`) — `roots/list` from the client's roots (R-HUB.4.3), `ping` with `{}` (stdio
     EOF, not a ping, ends the session), `elicitation/create` with `cancel` until prompts travel
     as an `InputRequiredResult` (so the permission ladder moves on rather than waiting out its
-    budget), anything else with `-32601`. Status: roots done (R-HUB.4.3); elicitation and
-    `subscriptions/listen` still pending, so the probe is still declined.
+    budget), anything else with `-32601`. Status: roots (R-HUB.4.3) and `subscriptions/listen`
+    (R-HUB.4.4) done; elicitation still pending, so the probe is still declined.
   - **R-HUB.4.3 — Roots arrive with the first tool call.** A modern client can hand over roots
     only in reply to an `InputRequiredResult` on a request it sent. The frontend **must** answer
     the client's first `tools/call` that needs a scope (not `SCOPE_EXEMPT_TOOLS`) with
@@ -1897,6 +1897,27 @@ lifetime.
     cached roots the same way. The trust model is R5.2's: roots still come from the client
     application, never from the launch directory (R5.2.1). Roots are deprecated in 2026-07-28
     but not removed; revisit when a spec version removes them.
+  - **R-HUB.4.4 — A modern client's stdout carries only what it asked for.** Over 2026-07-28
+    stdio a server writes results, notifications about a request in flight, and notifications
+    on a `subscriptions/listen` stream the client opened for them. The frontend owns those
+    streams; the bridge never sees one. It **must** answer a listen with
+    `notifications/subscriptions/acknowledged` (`_meta["io.modelcontextprotocol/subscriptionId"]`
+    = the listen's request id, `notifications` = the subset ahma honours: `toolsListChanged`)
+    before anything else on it, hold the request open, and answer it
+    `{"resultType": "complete", "_meta": {subscriptionId}}` when the client sends
+    `notifications/cancelled` for it. Every write to stdout **must** pass one filter
+    (`modern_input::ModernStdio`, so the proxy's own messages cannot skip it): a result gains
+    `resultType: "complete"` unless it says otherwise; `notifications/tools/list_changed` goes
+    once to each stream that asked for it, tagged with that stream's id, and nowhere else;
+    progress and acknowledgements pass; everything else is dropped. That includes
+    `notifications/message` and ahma's own `notifications/ahma/*` (session events and their
+    `notifications/message` mirror), so a modern client is not told of a transparent reconnect
+    except through the `tools/list_changed` that follows a version change. `server/discover`
+    is answered with `ahma_common::mcp_protocol::discover_result`, the one builder every
+    surface uses, which carries `resultType`, `ttlMs` (0: the hub may be replaced at any time,
+    R-HUB.5) and `cacheScope: "private"`. A repeated probe on the same connection is answered
+    from that result, never with a second `initialize`. The HTTP bridge answers a
+    `subscriptions/listen` POST with `{}`; holding it open as an SSE stream is not done.
 
 - **R-HUB.5 — Upgrade by draining.** A **strictly newer** build asks the hub to **drain**: hand
   over to the new build without ending anyone's work. It never tears down sessions that belong
