@@ -4,7 +4,7 @@
 //! this module acts as a transparent proxy that forwards all stdio
 //! JSON-RPC traffic to the running server.
 
-use super::modern_input::{self, CallStep, Flush, ModernSession};
+use super::modern_input::{self, CallRoute, CallStep, Flush, ModernSession};
 use crate::transport_patch::PatchedStdioTransport;
 use ahma_common::mcp_methods::ROOTS_LIST_METHOD;
 use ahma_common::mcp_methods::{
@@ -46,11 +46,12 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// Whether the proxy answers a 2026-07-28 `server/discover` probe (SPEC
 /// R-HUB.4.1, suspended). That era forbids a server writing requests to stdout
 /// (`roots/list` and `elicitation/create` must come back as an
-/// `InputRequiredResult`), and ahma does not do that yet: Claude Code sessions
-/// never settled a sandbox scope and never showed an approval prompt. Declined,
-/// a dual-era client falls back to `initialize`, where both work. Roots now
-/// travel as `InputRequiredResult` (R-HUB.4.3) and listen streams are held open
-/// (R-HUB.4.4); set to `true` once elicitation travels that way too.
+/// `InputRequiredResult`). Before ahma did that, Claude Code sessions never
+/// settled a sandbox scope and never showed an approval prompt. Declined,
+/// a dual-era client falls back to `initialize`, where both work. Roots
+/// (R-HUB.4.3) and prompts (R-HUB.4.5) now travel as `InputRequiredResult` and
+/// listen streams are held open (R-HUB.4.4); set to `true` once a live check with
+/// Claude Code passes.
 const ANSWER_MODERN_DISCOVER: bool = false;
 
 fn answer_modern_discover() -> bool {
@@ -1075,10 +1076,9 @@ async fn deliver_modern_flush<S, C>(
     S::Error: std::fmt::Debug,
     C::Error: std::fmt::Debug + std::fmt::Display,
 {
-    let messages = flush.to_bridge.into_iter().map(|m| (m, false));
-    let calls = flush.calls.into_iter().map(|m| (m, true));
-    for (message, is_call) in messages.chain(calls) {
+    for message in flush.to_bridge.into_iter().chain(flush.calls) {
         let id = message.get("id").cloned();
+        let is_call = message.get("method").and_then(|m| m.as_str()) == Some(TOOLS_CALL_METHOD);
         let typed: TxJsonRpcMessage<RoleClient> = match serde_json::from_value(message) {
             Ok(typed) => typed,
             Err(e) => {
@@ -1351,13 +1351,36 @@ where
                                 }
                                 continue;
                             }
-                            CallStep::Forward(call) => match serde_json::from_value(call.clone()) {
-                                Ok(typed) => (typed, call),
-                                Err(e) => {
-                                    tracing::error!(transport, error = %e, "A stripped tools/call does not deserialize");
+                            CallStep::Forward(call) => match session.prompts.on_call(call) {
+                                CallRoute::Forward(call) => match serde_json::from_value(call.clone()) {
+                                    Ok(typed) => (typed, call),
+                                    Err(e) => {
+                                        tracing::error!(transport, error = %e, "A stripped tools/call does not deserialize");
+                                        continue;
+                                    }
+                                },
+                                // SPEC R-HUB.4.5: an answered prompt, or a
+                                // prompt riding this call.
+                                CallRoute::Answer { to_bridge, to_client } => {
+                                    let flush = Flush { to_bridge, calls: Vec::new() };
+                                    deliver_modern_flush(flush, &mut conn, &mut stdio, transport).await;
+                                    for message in to_client {
+                                        send_value_on_stdio(&mut stdio, message).await;
+                                    }
                                     continue;
                                 }
                             },
+                        }
+                    }
+                    // A cancel for a call the bridge knows by its original id.
+                    Some(session)
+                        if val.get("method").and_then(|m| m.as_str())
+                            == Some("notifications/cancelled") =>
+                    {
+                        let val = session.prompts.rewrite_client_cancel(val);
+                        match serde_json::from_value(val.clone()) {
+                            Ok(typed) => (typed, val),
+                            Err(_) => continue,
                         }
                     }
                     _ => (msg, val),
@@ -1599,6 +1622,34 @@ where
                 // SPEC R-HUB.4.2: a 2026-07-28 client's stdout carries no
                 // server request. Each is answered here; a `roots/list` waits
                 // for the roots the client's first tool call brings.
+                // SPEC R-HUB.4.5: a prompt becomes a running call's
+                // `input_required`, or waits for the next call.
+                if let Some(session) = modern.as_mut()
+                    && modern_input::is_server_request(&val)
+                    && val.get("method").and_then(|m| m.as_str()) == Some("elicitation/create")
+                {
+                    for message in session.prompts.on_elicitation(&val) {
+                        send_value_on_stdio(&mut stdio, message).await;
+                    }
+                    conn.bridge_responded = true;
+                    continue;
+                }
+                // A call's result goes to the id the client now awaits.
+                if let Some(session) = modern.as_mut()
+                    && val.get("method").is_none()
+                    && val.get("id").is_some()
+                {
+                    for message in session.prompts.on_bridge_response(val) {
+                        send_value_on_stdio(&mut stdio, message).await;
+                    }
+                    conn.bridge_responded = true;
+                    continue;
+                }
+                if let Some(session) = modern.as_mut()
+                    && val.get("method").and_then(|m| m.as_str()) == Some("notifications/cancelled")
+                {
+                    session.prompts.on_bridge_cancelled(&val);
+                }
                 if let Some(session) = modern.as_mut()
                     && modern_input::is_server_request(&val)
                 {
@@ -3772,8 +3823,7 @@ mod tests {
     }
 
     /// SPEC R-HUB.4.2: what the bridge asks a modern client is answered for
-    /// it, never written to its stdout. A prompt is dismissed at once so the
-    /// permission ladder moves on instead of waiting out its budget.
+    /// it, never written to its stdout. (Prompts: R-HUB.4.5, tested below.)
     #[tokio::test]
     async fn modern_client_stdout_never_carries_a_server_request() {
         let stdio = Scripted::new(
@@ -3798,10 +3848,6 @@ mod tests {
                 // A bridge that asks the legacy way, before any tool call.
                 Some(INITIALIZED_METHOD) => vec![
                     Some(serde_json::json!({"jsonrpc": "2.0", "id": 60, "method": "ping"})),
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0", "id": 61, "method": "elicitation/create",
-                        "params": {"message": "Allow?", "requestedSchema": {"type": "object", "properties": {}}}
-                    })),
                     Some(
                         serde_json::json!({"jsonrpc": "2.0", "id": 62, "method": ROOTS_LIST_METHOD}),
                     ),
@@ -3830,10 +3876,6 @@ mod tests {
         assert_eq!(
             answer(60).expect("ping answered")["result"],
             serde_json::json!({})
-        );
-        assert_eq!(
-            answer(61).expect("prompt answered")["result"]["action"],
-            "cancel"
         );
         assert!(
             answer(62).is_none(),
@@ -4046,5 +4088,199 @@ mod tests {
             .filter(|m| m["method"] == INITIALIZE_METHOD)
             .count();
         assert_eq!(initializes, 1);
+    }
+
+    const PROMPT_MESSAGE: &str = "Allow writes to /x?";
+
+    fn bridge_elicitation(id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "elicitation/create",
+            "params": {
+                "message": PROMPT_MESSAGE,
+                "requestedSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+            }
+        })
+    }
+
+    /// The one input request in an `input_required` result, as (key, request).
+    fn only_input_request(result: &serde_json::Value) -> (String, serde_json::Value) {
+        assert_eq!(result["resultType"], "input_required", "{result:#?}");
+        let requests = result["inputRequests"].as_object().expect("inputRequests");
+        assert_eq!(requests.len(), 1, "{result:#?}");
+        let (key, request) = requests.iter().next().unwrap();
+        (key.clone(), request.clone())
+    }
+
+    fn retry_with(
+        id: i64,
+        name: &str,
+        key: &str,
+        answer: serde_json::Value,
+        state: &serde_json::Value,
+    ) -> serde_json::Value {
+        modern_tools_call(
+            id,
+            name,
+            serde_json::json!({"inputResponses": {key: answer}, "requestState": state}),
+        )
+    }
+
+    /// SPEC R-HUB.4.5: a prompt raised while a call runs is that call's
+    /// `input_required`. The retry carries the human's answer; the bridge,
+    /// still running the original, gets the answer, and its result comes back
+    /// as the retry's. The tool runs once.
+    #[tokio::test]
+    async fn an_approval_prompt_during_a_call_reaches_the_client_as_input_required() {
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            |m| match m["id"].as_i64() {
+                Some(1) => vec![Some(modern_tools_call(
+                    2,
+                    "sandbox_grant",
+                    serde_json::json!({}),
+                ))],
+                Some(2) => {
+                    let (key, request) = only_input_request(&m["result"]);
+                    assert_eq!(request["method"], "elicitation/create");
+                    assert_eq!(request["params"]["message"], PROMPT_MESSAGE);
+                    vec![Some(retry_with(
+                        3,
+                        "sandbox_grant",
+                        &key,
+                        serde_json::json!({"action": "accept", "content": {"ok": true}}),
+                        &m["result"]["requestState"],
+                    ))]
+                }
+                Some(3) => vec![None],
+                _ => Vec::new(),
+            },
+        );
+        let stdio_sent = stdio.sent.clone();
+        let bridge = Scripted::new(Vec::new(), |m| {
+            if m["id"] == 70 {
+                let action = m["result"]["action"].as_str().unwrap_or("none").to_string();
+                return vec![Some(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2,
+                    "result": {"content": [{"type": "text", "text": action}]}
+                }))];
+            }
+            match m.get("method").and_then(|m| m.as_str()) {
+                Some(INITIALIZE_METHOD) => vec![Some(
+                    serde_json::to_value(bridge_initialize_response(0)).unwrap(),
+                )],
+                Some("tools/call") => vec![Some(bridge_elicitation(70))],
+                _ => Vec::new(),
+            }
+        });
+        let bridge_sent = bridge.sent.clone();
+
+        run_scripted(stdio, bridge).await;
+
+        let sent = stdio_sent.lock();
+        assert!(server_requests(&sent).is_empty(), "{sent:#?}");
+        let answer = sent
+            .iter()
+            .find(|m| m["id"] == 3)
+            .unwrap_or_else(|| panic!("the retry gets the original's result: {sent:#?}"));
+        assert_eq!(answer["result"]["content"][0]["text"], "accept");
+        assert_eq!(answer["result"]["resultType"], "complete");
+
+        let bridge_sent = bridge_sent.lock();
+        let calls = bridge_sent
+            .iter()
+            .filter(|m| m["method"] == "tools/call")
+            .count();
+        assert_eq!(calls, 1, "the tool runs once: {bridge_sent:#?}");
+        let reply = bridge_sent
+            .iter()
+            .find(|m| m["id"] == 70)
+            .expect("the prompt is answered");
+        assert_eq!(reply["result"]["action"], "accept");
+        assert_eq!(reply["result"]["content"]["ok"], true);
+    }
+
+    /// SPEC R-HUB.4.5: a prompt raised while no call runs (an async command
+    /// asking for network access) rides the client's next call. Its retry,
+    /// which the bridge never saw, is the call that runs.
+    #[tokio::test]
+    async fn an_approval_prompt_with_no_call_in_flight_rides_the_next_call() {
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            |m| {
+                if m["method"] == "notifications/progress" {
+                    return vec![Some(modern_tools_call(3, "await", serde_json::json!({})))];
+                }
+                match m["id"].as_i64() {
+                    Some(1) => vec![Some(modern_tools_call(
+                        2,
+                        "ahma_help",
+                        serde_json::json!({}),
+                    ))],
+                    Some(3) => {
+                        let (key, _) = only_input_request(&m["result"]);
+                        vec![Some(retry_with(
+                            4,
+                            "await",
+                            &key,
+                            serde_json::json!({"action": "decline"}),
+                            &m["result"]["requestState"],
+                        ))]
+                    }
+                    Some(4) => vec![None],
+                    _ => Vec::new(),
+                }
+            },
+        );
+        let stdio_sent = stdio.sent.clone();
+        let bridge = Scripted::new(Vec::new(), |m| {
+            let id = m.get("id").cloned();
+            match m.get("method").and_then(|m| m.as_str()) {
+                Some(INITIALIZE_METHOD) => vec![Some(
+                    serde_json::to_value(bridge_initialize_response(0)).unwrap(),
+                )],
+                Some("tools/call") if id == Some(serde_json::json!(2)) => vec![
+                    Some(serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}})),
+                    Some(bridge_elicitation(71)),
+                    // What the client reacts to, so its next call comes after the prompt.
+                    Some(serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/progress",
+                        "params": {"progressToken": "t", "progress": 1}
+                    })),
+                ],
+                Some("tools/call") => vec![Some(serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": "done"}]}
+                }))],
+                _ => Vec::new(),
+            }
+        });
+        let bridge_sent = bridge.sent.clone();
+
+        run_scripted(stdio, bridge).await;
+
+        let sent = stdio_sent.lock();
+        assert!(server_requests(&sent).is_empty(), "{sent:#?}");
+        assert_eq!(
+            sent.iter().find(|m| m["id"] == 4).expect("retry answered")["result"]["content"][0]["text"],
+            "done"
+        );
+        let bridge_sent = bridge_sent.lock();
+        let reply = bridge_sent
+            .iter()
+            .find(|m| m["id"] == 71)
+            .unwrap_or_else(|| panic!("the prompt is answered: {bridge_sent:#?}"));
+        assert_eq!(reply["result"]["action"], "decline");
+        let calls: Vec<&serde_json::Value> = bridge_sent
+            .iter()
+            .filter(|m| m["method"] == "tools/call")
+            .collect();
+        assert_eq!(
+            calls.iter().map(|c| c["id"].clone()).collect::<Vec<_>>(),
+            vec![serde_json::json!(2), serde_json::json!(4)],
+            "the asked-on call never runs; its retry does"
+        );
+        assert!(calls[1]["params"].get("inputResponses").is_none());
+        let reply_at = bridge_sent.iter().position(|m| m["id"] == 71).unwrap();
+        let retry_at = bridge_sent.iter().position(|m| m["id"] == 4).unwrap();
+        assert!(reply_at < retry_at, "answered before the call goes on");
     }
 }
