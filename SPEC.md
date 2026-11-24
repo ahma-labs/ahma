@@ -1874,8 +1874,9 @@ lifetime.
     (`modern_input`) — `roots/list` from the client's roots (R-HUB.4.3), `ping` with `{}` (stdio
     EOF, not a ping, ends the session), `elicitation/create` with `cancel` until prompts travel
     as an `InputRequiredResult` (so the permission ladder moves on rather than waiting out its
-    budget), anything else with `-32601`. Status: roots (R-HUB.4.3) and `subscriptions/listen`
-    (R-HUB.4.4) done; elicitation still pending, so the probe is still declined.
+    budget), anything else with `-32601`. Status: roots (R-HUB.4.3), `subscriptions/listen`
+    (R-HUB.4.4) and prompts (R-HUB.4.5) done; the probe stays declined until a live check with
+    Claude Code passes.
   - **R-HUB.4.3 — Roots arrive with the first tool call.** A modern client can hand over roots
     only in reply to an `InputRequiredResult` on a request it sent. The frontend **must** answer
     the client's first `tools/call` that needs a scope (not `SCOPE_EXEMPT_TOOLS`) with
@@ -1918,6 +1919,19 @@ lifetime.
     R-HUB.5) and `cacheScope: "private"`. A repeated probe on the same connection is answered
     from that result, never with a second `initialize`. The HTTP bridge answers a
     `subscriptions/listen` POST with `{}`; holding it open as an SSE stream is not done.
+  - **R-HUB.4.5 — Prompts ride tool calls.** The worker's `elicitation/create` (a
+    `sandbox_grant`, network, link or web approval) **must** reach a modern client as an
+    `InputRequiredResult` (`inputRequests["ahma.elicit.<id>"] = {"method": "elicitation/create",
+    "params": …}`), never on stdout as a request. A prompt raised while a call runs becomes the
+    oldest running call's `input_required`; the client's retry carries the answer, which the
+    frontend gives the bridge, and the bridge's result for the original call is delivered under
+    the retry's id (held if it comes first), so the tool runs once. A prompt raised while no call
+    runs (an async command asking for network access) **must** ride the client's next call; that
+    call's retry, which the bridge never saw, is the one that runs. A prompt the retry leaves
+    unanswered is answered `cancel` (the human did not decide); one the worker withdraws
+    (`notifications/cancelled`) is never asked. A client cancel of a call the bridge knows by
+    its original id is rewritten to that id. Every tool call is tracked, scope-exempt or not:
+    `sandbox_grant` and `network_grant` are exempt and prompt.
 
 - **R-HUB.5 — Upgrade by draining.** A **strictly newer** build asks the hub to **drain**: hand
   over to the new build without ending anyone's work. It never tears down sessions that belong

@@ -82,6 +82,8 @@ pub(crate) struct ModernSession {
     list_changed_sent: bool,
     held_calls: Vec<Value>,
     held_since: Option<Instant>,
+    /// Approval prompts and the calls they ride (SPEC R-HUB.4.5).
+    pub(crate) prompts: Prompts,
 }
 
 impl ModernSession {
@@ -94,10 +96,11 @@ impl ModernSession {
         }
     }
 
-    /// Decide what happens to a client `tools/call`.
+    /// Decide what happens to a client `tools/call`. A forwarded call keeps
+    /// its input fields: [`Prompts::on_call`] reads and strips them next.
     pub(crate) fn on_tools_call(&mut self, call: Value, now: Instant) -> CallStep {
         if self.roots_delivered || is_exempt(&call) {
-            return CallStep::Forward(strip_input_fields(call));
+            return CallStep::Forward(call);
         }
         if self.roots.is_none() {
             match self.answered_roots(&call) {
@@ -120,10 +123,10 @@ impl ModernSession {
                 self.parked_roots_requests.push(id);
                 None
             }
-            // SPEC R-HUB.4.2: until prompts travel as `input_required`, a
-            // question the client cannot be asked is dismissed at once, so the
-            // permission ladder moves on instead of waiting out its budget.
-            Some("elicitation/create") => Some(response(id, json!({ "action": "cancel" }))),
+            // Prompts go to [`Prompts::on_elicitation`]; one that reaches
+            // here anyway is dismissed, so the permission ladder moves on
+            // instead of waiting out its budget.
+            Some(ELICITATION_METHOD) => Some(response(id, json!({ "action": "cancel" }))),
             // The bridge's liveness probe. This proxy is the client's end of
             // the pipe; stdio EOF, not a ping, is what ends the session.
             Some("ping") => Some(response(id, json!({}))),
@@ -165,6 +168,9 @@ impl ModernSession {
         } else {
             Vec::new()
         };
+        for call in &calls {
+            self.prompts.track(call);
+        }
         Flush { to_bridge, calls }
     }
 
@@ -177,7 +183,11 @@ impl ModernSession {
     /// did not come from the client, and the bridge decides what they get.
     pub(crate) fn release_held(&mut self) -> Vec<Value> {
         self.roots_delivered = true;
-        self.take_held()
+        let calls = self.take_held();
+        for call in &calls {
+            self.prompts.track(call);
+        }
+        calls
     }
 
     /// The roots as a cached `roots/list` answer, for the reconnect replay.
@@ -222,6 +232,224 @@ impl ModernSession {
             "requestState": state,
         })
     }
+}
+
+// ── Approval prompts as input_required (SPEC R-HUB.4.5) ────────────────────
+
+const ELICITATION_METHOD: &str = "elicitation/create";
+const ELICIT_KEY_PREFIX: &str = "ahma.elicit.";
+
+/// What the proxy does with a client `tools/call` once roots are settled.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CallRoute {
+    /// Forward this call, input fields stripped, through the normal path.
+    Forward(Value),
+    /// Handled here: write these to the bridge, then these to the client.
+    Answer {
+        to_bridge: Vec<Value>,
+        to_client: Vec<Value>,
+    },
+}
+
+/// An `input_required` the client has been sent and not yet answered.
+#[derive(Debug)]
+struct Asked {
+    state: String,
+    /// The bridge's `elicitation/create` request ids it carries.
+    prompts: Vec<Value>,
+    /// The call the bridge is still running for it, whose result the retry
+    /// receives; `None` when the asked-on call never reached the bridge, so
+    /// the retry is what runs.
+    bridge_call: Option<Value>,
+}
+
+/// Approval prompts for a client that may only be asked through results.
+///
+/// A prompt the worker raises while a call runs becomes that call's
+/// `input_required`: the client's retry carries the answer, the bridge (still
+/// running the original) gets it, and the original's result comes back under
+/// the retry's id, so the tool runs once. A prompt raised while no call runs —
+/// an async command asking for network access — rides the client's next call,
+/// and that call's retry is what the bridge runs.
+#[derive(Debug, Default)]
+pub(crate) struct Prompts {
+    asks: u64,
+    /// Prompts no call has carried to the client yet: (request id, params).
+    parked: Vec<(Value, Value)>,
+    asked: Vec<Asked>,
+    /// Calls the bridge is running: (id the client awaits, id the bridge knows).
+    in_flight: Vec<(Value, Value)>,
+    /// Results for calls whose retry has not arrived yet, by bridge id.
+    early: Vec<(Value, Value)>,
+}
+
+impl Prompts {
+    /// Record a call that went to the bridge some other way (released from
+    /// the roots hold), so a prompt it raises can find it.
+    pub(crate) fn track(&mut self, call: &Value) {
+        if let Some(id) = call.get("id").filter(|id| !id.is_null()) {
+            self.in_flight.push((id.clone(), id.clone()));
+        }
+    }
+
+    /// The worker raised a prompt. Returns what to write to the client: the
+    /// oldest running call's `input_required`, or nothing if no call is
+    /// running (it then rides the next one).
+    pub(crate) fn on_elicitation(&mut self, request: &Value) -> Vec<Value> {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+        if self.in_flight.is_empty() {
+            self.parked.push((id, params));
+            return Vec::new();
+        }
+        let (client_id, bridge_id) = self.in_flight.remove(0);
+        let result = self.ask(vec![(id, params)], Some(bridge_id));
+        vec![response(client_id, result)]
+    }
+
+    /// Route a client `tools/call`.
+    pub(crate) fn on_call(&mut self, call: Value) -> CallRoute {
+        let client_id = call.get("id").cloned().unwrap_or(Value::Null);
+        let state = call
+            .pointer("/params/requestState")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(at) = state
+            .as_deref()
+            .and_then(|state| self.asked.iter().position(|a| a.state == state))
+        {
+            let asked = self.asked.remove(at);
+            let mut to_bridge = answers(&asked.prompts, &call);
+            let mut to_client = Vec::new();
+            match asked.bridge_call {
+                Some(bridge_id) => {
+                    if let Some(at) = self.early.iter().position(|(b, _)| *b == bridge_id) {
+                        let (_, mut result) = self.early.remove(at);
+                        result["id"] = client_id;
+                        to_client.push(result);
+                    } else {
+                        self.in_flight.push((client_id, bridge_id));
+                    }
+                }
+                None => {
+                    self.in_flight.push((client_id.clone(), client_id));
+                    to_bridge.push(strip_input_fields(call));
+                }
+            }
+            return CallRoute::Answer {
+                to_bridge,
+                to_client,
+            };
+        }
+        if !self.parked.is_empty() {
+            let prompts = std::mem::take(&mut self.parked);
+            let result = self.ask(prompts, None);
+            return CallRoute::Answer {
+                to_bridge: Vec::new(),
+                to_client: vec![response(client_id, result)],
+            };
+        }
+        let call = strip_input_fields(call);
+        self.track(&call);
+        CallRoute::Forward(call)
+    }
+
+    /// A response from the bridge. Returns what to write to the client: a
+    /// call's result under the id the client now awaits, held back when that
+    /// retry has not come yet; any other response as it is.
+    pub(crate) fn on_bridge_response(&mut self, response: Value) -> Vec<Value> {
+        let Some(id) = response.get("id").cloned() else {
+            return vec![response];
+        };
+        if let Some(at) = self.in_flight.iter().position(|(_, b)| *b == id) {
+            let (client_id, _) = self.in_flight.remove(at);
+            let mut response = response;
+            response["id"] = client_id;
+            return vec![response];
+        }
+        if self
+            .asked
+            .iter()
+            .any(|a| a.bridge_call.as_ref() == Some(&id))
+        {
+            self.early.push((id, response));
+            return Vec::new();
+        }
+        vec![response]
+    }
+
+    /// The worker withdrew a prompt (`notifications/cancelled` from the
+    /// bridge): never ask it, and ignore an answer to it.
+    pub(crate) fn on_bridge_cancelled(&mut self, notification: &Value) {
+        let Some(id) = notification.pointer("/params/requestId") else {
+            return;
+        };
+        self.parked.retain(|(parked, _)| parked != id);
+        for asked in &mut self.asked {
+            asked.prompts.retain(|prompt| prompt != id);
+        }
+    }
+
+    /// A client cancel names the id the client knows; the bridge may know
+    /// that call by its original id.
+    pub(crate) fn rewrite_client_cancel(&self, mut notification: Value) -> Value {
+        let bridge_id = notification
+            .pointer("/params/requestId")
+            .and_then(|id| self.in_flight.iter().find(|(c, _)| c == id))
+            .map(|(_, b)| b.clone());
+        if let Some(bridge_id) = bridge_id {
+            notification["params"]["requestId"] = bridge_id;
+        }
+        notification
+    }
+
+    fn ask(&mut self, prompts: Vec<(Value, Value)>, bridge_call: Option<Value>) -> Value {
+        self.asks += 1;
+        let state = format!("ahma-elicit-{}", self.asks);
+        let requests: serde_json::Map<String, Value> = prompts
+            .iter()
+            .map(|(id, params)| {
+                (
+                    elicit_key(id),
+                    json!({ "method": ELICITATION_METHOD, "params": params }),
+                )
+            })
+            .collect();
+        self.asked.push(Asked {
+            state: state.clone(),
+            prompts: prompts.into_iter().map(|(id, _)| id).collect(),
+            bridge_call,
+        });
+        json!({
+            "resultType": "input_required",
+            "inputRequests": requests,
+            "requestState": state,
+        })
+    }
+}
+
+/// The input-request key for a bridge prompt id.
+fn elicit_key(id: &Value) -> String {
+    match id {
+        Value::String(s) => format!("{ELICIT_KEY_PREFIX}{s}"),
+        other => format!("{ELICIT_KEY_PREFIX}{other}"),
+    }
+}
+
+/// The bridge's answers to `prompts`, from a retry's `inputResponses`. A
+/// prompt the retry left unanswered is cancelled: the human did not decide.
+fn answers(prompts: &[Value], call: &Value) -> Vec<Value> {
+    let responses = call.pointer("/params/inputResponses");
+    prompts
+        .iter()
+        .map(|id| {
+            let answer = responses
+                .and_then(|r| r.get(elicit_key(id)))
+                .cloned()
+                .unwrap_or_else(|| json!({ "action": "cancel" }));
+            response(id.clone(), answer)
+        })
+        .collect()
 }
 
 /// Whether a synthesized `initialize` tells the bridge roots come later.
@@ -754,5 +982,103 @@ mod tests {
         ] {
             assert!(listens.outgoing(dropped.clone()).is_empty(), "{dropped}");
         }
+    }
+
+    fn prompt(id: i64) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": ELICITATION_METHOD, "params": {"message": "m"}})
+    }
+
+    fn forwarded(route: CallRoute) -> Value {
+        match route {
+            CallRoute::Forward(call) => call,
+            other => panic!("expected a forward, got {other:?}"),
+        }
+    }
+
+    fn answered(route: CallRoute) -> (Vec<Value>, Vec<Value>) {
+        match route {
+            CallRoute::Answer {
+                to_bridge,
+                to_client,
+            } => (to_bridge, to_client),
+            other => panic!("expected an answer, got {other:?}"),
+        }
+    }
+
+    fn retry(id: i64, asked: &Value, answer: Option<Value>) -> Value {
+        let state = asked["result"]["requestState"].clone();
+        let key = asked["result"]["inputRequests"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let responses = answer
+            .map(|a| json!({ key: a }))
+            .unwrap_or_else(|| json!({}));
+        call(
+            id,
+            "x",
+            json!({"inputResponses": responses, "requestState": state}),
+        )
+    }
+
+    #[test]
+    fn a_result_that_beats_the_retry_waits_for_it() {
+        let mut prompts = Prompts::default();
+        forwarded(prompts.on_call(call(2, "x", json!({}))));
+        let asked = prompts.on_elicitation(&prompt(70)).remove(0);
+        assert_eq!(asked["id"], 2);
+        let early = json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}});
+        assert!(
+            prompts.on_bridge_response(early).is_empty(),
+            "held for the retry"
+        );
+        let (to_bridge, to_client) =
+            answered(prompts.on_call(retry(3, &asked, Some(json!({"action": "accept"})))));
+        assert_eq!(to_bridge[0]["id"], 70);
+        assert_eq!(to_client.len(), 1);
+        assert_eq!(to_client[0]["id"], 3, "delivered under the retry's id");
+    }
+
+    #[test]
+    fn a_prompt_the_retry_leaves_unanswered_is_cancelled() {
+        let mut prompts = Prompts::default();
+        forwarded(prompts.on_call(call(2, "x", json!({}))));
+        let asked = prompts.on_elicitation(&prompt(70)).remove(0);
+        let (to_bridge, _) = answered(prompts.on_call(retry(3, &asked, None)));
+        assert_eq!(to_bridge[0]["result"]["action"], "cancel");
+    }
+
+    #[test]
+    fn a_withdrawn_prompt_is_never_asked() {
+        let mut prompts = Prompts::default();
+        prompts.on_elicitation(&prompt(71));
+        prompts.on_bridge_cancelled(&json!({
+            "jsonrpc": "2.0", "method": CANCELLED_METHOD, "params": {"requestId": 71}
+        }));
+        let call = forwarded(prompts.on_call(call(2, "x", json!({}))));
+        assert_eq!(call["id"], 2, "nothing left to ask, so the call just runs");
+    }
+
+    #[test]
+    fn a_client_cancel_reaches_the_call_the_bridge_knows() {
+        let mut prompts = Prompts::default();
+        forwarded(prompts.on_call(call(2, "x", json!({}))));
+        let asked = prompts.on_elicitation(&prompt(70)).remove(0);
+        answered(prompts.on_call(retry(3, &asked, Some(json!({"action": "accept"})))));
+        let cancel =
+            json!({"jsonrpc": "2.0", "method": CANCELLED_METHOD, "params": {"requestId": 3}});
+        assert_eq!(
+            prompts.rewrite_client_cancel(cancel)["params"]["requestId"],
+            2
+        );
+        let other =
+            json!({"jsonrpc": "2.0", "method": CANCELLED_METHOD, "params": {"requestId": 9}});
+        assert_eq!(
+            prompts.rewrite_client_cancel(other)["params"]["requestId"],
+            9
+        );
     }
 }
