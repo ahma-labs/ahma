@@ -1925,6 +1925,16 @@ lifetime.
     (`notifications/cancelled`) is never asked. A client cancel of a call the bridge knows by
     its original id is rewritten to that id. Every tool call is tracked, scope-exempt or not:
     `sandbox_grant` and `network_grant` are exempt and prompt.
+  - **R-HUB.4.6 — The bridge sees the legacy session only.** Every message a modern client sends
+    the bridge **must** reach it without the 2026-07-28 request envelope in `params._meta`
+    (`io.modelcontextprotocol/protocolVersion`, `…/clientInfo`, `…/clientCapabilities`) and
+    without the MRTR fields (`inputResponses`, `requestState`); the rest of `_meta`
+    (`progressToken`) is kept. The bridge and worker run the 2025-11-25 session the synthesized
+    `initialize` opened, and rmcp refuses every server request a worker sends while handling a
+    request that names 2026-07-28 (`-32600`, "return InputRequiredResult instead"). Live with
+    Claude Code 2.1.331 that refusal demoted the approval prompt for the session before the
+    frontend could carry it (R-HUB.4.5), and failed `await`'s liveness ping, so every `await`
+    gave up after 20 s. The frontend, not the worker, is where the modern protocol ends.
 
 - **R-HUB.5 — Upgrade by draining.** A **strictly newer** build asks the hub to **drain**: hand
   over to the new build without ending anyone's work. It never tears down sessions that belong
