@@ -11,7 +11,7 @@ use ahma_common::mcp_methods::{
     INITIALIZE_METHOD, INITIALIZED_METHOD, SERVER_DISCOVER_METHOD, SERVER_INSTRUCTIONS,
     SUBSCRIPTIONS_LISTEN_METHOD, TOOLS_CALL_METHOD,
 };
-use ahma_common::mcp_protocol::{ADVERTISED_PROTOCOL_VERSIONS, MCP_PROTOCOL_VERSION_2025_11_25};
+use ahma_common::mcp_protocol::MCP_PROTOCOL_VERSION_2025_11_25;
 use anyhow::{Context, Result, anyhow};
 use rmcp::model::{CustomResult, RequestId, ServerResult};
 use rmcp::service::RoleClient;
@@ -49,8 +49,8 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// `InputRequiredResult`), and ahma does not do that yet: Claude Code sessions
 /// never settled a sandbox scope and never showed an approval prompt. Declined,
 /// a dual-era client falls back to `initialize`, where both work. Roots now
-/// travel as `InputRequiredResult` (R-HUB.4.3, `modern_input`); set to `true`
-/// once elicitation does too and `subscriptions/listen` is held open.
+/// travel as `InputRequiredResult` (R-HUB.4.3) and listen streams are held open
+/// (R-HUB.4.4); set to `true` once elicitation travels that way too.
 const ANSWER_MODERN_DISCOVER: bool = false;
 
 fn answer_modern_discover() -> bool {
@@ -1044,6 +1044,23 @@ where
     }
 }
 
+/// Write a message built here (a listen acknowledgement or completion) to
+/// stdio. Best-effort: a client that went away is noticed at its EOF.
+async fn send_value_on_stdio<S>(stdio: &mut S, message: serde_json::Value)
+where
+    S: Transport<RoleServer>,
+    S::Error: std::fmt::Debug,
+{
+    match serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(message) {
+        Ok(message) => {
+            if let Err(e) = stdio.send(message).await {
+                tracing::debug!(error = ?e, "Writing to stdio failed (non-fatal)");
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "A message for stdio does not deserialize"),
+    }
+}
+
 /// Send what a [`Flush`] holds to the bridge: answers and notifications, then
 /// the calls they gated. A call that fails to forward is answered on stdio
 /// with the bridge's own error when there is one (SPEC R-HUB.4.3).
@@ -1115,7 +1132,7 @@ async fn run_proxy_client_socket(
 }
 
 async fn run_transport_proxy<S, C>(
-    mut stdio: S,
+    stdio: S,
     client: C,
     transport: &str,
     handshake_deadline: Option<Duration>,
@@ -1132,6 +1149,11 @@ where
     // `recover_bridge_jsonrpc_error`.
     C::Error: std::fmt::Debug + std::fmt::Display + Send,
 {
+    // Every write to stdout goes through the R-HUB.4.4 filter, which stays a
+    // pass-through unless the client opens with `server/discover`.
+    let mut stdio = modern_input::ModernStdio::new(stdio);
+    // The `DiscoverResult` this connection was given, for a repeated probe.
+    let mut discover_answer: Option<serde_json::Value> = None;
     let mut handshake = CachedHandshake::default();
     // The bridge transport and the session state that describes it. A
     // reconnect swaps the transport only through `BridgeConnection::adopt`.
@@ -1202,6 +1224,12 @@ where
                         "Received server/discover probe from modern MCP client (2026-07-28); establishing first-class modern stateless session"
                     );
                     let discover_id = request_id.clone().unwrap_or_else(|| serde_json::json!(1));
+                    // The session this connection opened already exists; a
+                    // second `initialize` would replace it.
+                    if let Some(cached) = &discover_answer {
+                        answer_on_stdio(&mut stdio, discover_id, cached.clone()).await;
+                        continue;
+                    }
 
                     let synth_init = synthesize_initialize_request(&val);
                     modern = Some(ModernSession::new(
@@ -1251,25 +1279,16 @@ where
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| SERVER_INSTRUCTIONS.to_string());
 
-                    let discover_result = serde_json::json!({
-                        "supportedVersions": ADVERTISED_PROTOCOL_VERSIONS,
-                        "capabilities": bridge_capabilities,
-                        "instructions": bridge_instructions,
-                        "serverInfo": bridge_server_info.clone(),
-                        "_meta": {
-                            "io.modelcontextprotocol/serverInfo": bridge_server_info
-                        }
-                    });
-
-                    let req_id: RequestId =
-                        serde_json::from_value(discover_id).unwrap_or(RequestId::Number(1));
-                    let tx_msg = TxJsonRpcMessage::<RoleServer>::response(
-                        ServerResult::CustomResult(CustomResult(discover_result)),
-                        req_id,
+                    let discover_result = ahma_common::mcp_protocol::discover_result(
+                        bridge_capabilities,
+                        &bridge_instructions,
+                        bridge_server_info,
                     );
+                    discover_answer = Some(discover_result.clone());
+                    // SPEC R-HUB.4.4: from here on, what reaches stdout is filtered.
+                    stdio.go_modern();
 
-                    if let Err(e) = stdio.send(tx_msg).await {
-                        tracing::error!(transport, error = ?e, "Failed to send server/discover response to stdio");
+                    if !answer_on_stdio(&mut stdio, discover_id, discover_result).await {
                         break;
                     }
 
@@ -1289,15 +1308,27 @@ where
                     continue;
                 }
 
+                // SPEC R-HUB.4.4: a listen stream is the proxy's to keep. It is
+                // acknowledged, held open, and completed when the client
+                // cancels it; the bridge never sees it.
                 if val.get("method").and_then(|m| m.as_str()) == Some(SUBSCRIPTIONS_LISTEN_METHOD) {
-                    tracing::debug!(transport, "Handling modern subscriptions/listen request");
-                    if let Some(id) = request_id {
-                        let req_id: RequestId =
-                            serde_json::from_value(id).unwrap_or(RequestId::Number(1));
-                        let ok_msg =
-                            TxJsonRpcMessage::<RoleServer>::response(ServerResult::empty(()), req_id);
-                        let _ = stdio.send(ok_msg).await;
+                    tracing::debug!(transport, "Opening a subscriptions/listen stream");
+                    match stdio.listens() {
+                        Some(listens) => {
+                            let ack = listens.open(&val);
+                            send_value_on_stdio(&mut stdio, ack).await;
+                        }
+                        // A legacy client has no such method; answer as before.
+                        None => {
+                            if let Some(id) = request_id {
+                                answer_on_stdio(&mut stdio, id, serde_json::json!({})).await;
+                            }
+                        }
                     }
+                    continue;
+                }
+                if let Some(done) = stdio.listens().and_then(|listens| listens.close(&val)) {
+                    send_value_on_stdio(&mut stdio, done).await;
                     continue;
                 }
                 let (msg, val) = match modern.as_mut() {
@@ -3861,5 +3892,159 @@ mod tests {
         );
         assert_eq!(sent[3]["id"], 50);
         assert_eq!(sent[3]["result"]["roots"][0]["uri"], "file:///workspace");
+    }
+
+    const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+
+    /// SPEC R-HUB.4.4: `subscriptions/listen` is acknowledged before anything
+    /// is sent on it, stays open, and ends with a `complete` result when the
+    /// client cancels it. `tools/list_changed` reaches the client only on that
+    /// stream, tagged with its id; notifications the client never asked for
+    /// do not reach it at all, and every result says what kind it is.
+    #[tokio::test]
+    async fn subscriptions_listen_is_acknowledged_and_held_open() {
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            |m| {
+                if m["method"] == "notifications/subscriptions/acknowledged" {
+                    return vec![Some(modern_tools_call(
+                        3,
+                        "ahma_help",
+                        serde_json::json!({}),
+                    ))];
+                }
+                match m["id"].as_i64() {
+                    Some(1) => vec![Some(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2, "method": SUBSCRIPTIONS_LISTEN_METHOD,
+                        "params": {
+                            "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"},
+                            "notifications": {"toolsListChanged": true, "resourcesListChanged": true}
+                        }
+                    }))],
+                    Some(3) => vec![Some(serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": 2}
+                    }))],
+                    Some(2) => vec![None],
+                    _ => Vec::new(),
+                }
+            },
+        );
+        let stdio_sent = stdio.sent.clone();
+        let bridge = Scripted::new(Vec::new(), |m| {
+            let id = m.get("id").cloned();
+            match m.get("method").and_then(|m| m.as_str()) {
+                Some(INITIALIZE_METHOD) => vec![Some(
+                    serde_json::to_value(bridge_initialize_response(0)).unwrap(),
+                )],
+                Some("tools/call") => vec![
+                    Some(
+                        serde_json::json!({"jsonrpc": "2.0", "method": TOOLS_LIST_CHANGED_METHOD}),
+                    ),
+                    Some(serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/message",
+                        "params": {"level": "info", "data": "unasked"}
+                    })),
+                    Some(serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/progress",
+                        "params": {"progressToken": "t", "progress": 1}
+                    })),
+                    Some(
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": []}}),
+                    ),
+                ],
+                _ => Vec::new(),
+            }
+        });
+        let bridge_sent = bridge.sent.clone();
+
+        run_scripted(stdio, bridge).await;
+
+        let sent = stdio_sent.lock();
+        let discover = sent
+            .iter()
+            .find(|m| m["id"] == 1)
+            .expect("discover answered");
+        assert_eq!(discover["result"]["resultType"], "complete");
+        assert!(discover["result"]["ttlMs"].is_u64(), "{discover:#?}");
+        assert!(
+            ["public", "private"]
+                .contains(&discover["result"]["cacheScope"].as_str().unwrap_or("")),
+            "{discover:#?}"
+        );
+
+        let position = |pred: &dyn Fn(&serde_json::Value) -> bool| sent.iter().position(pred);
+        let ack_at = position(&|m| m["method"] == "notifications/subscriptions/acknowledged")
+            .unwrap_or_else(|| panic!("listen acknowledged: {sent:#?}"));
+        let ack = &sent[ack_at];
+        assert_eq!(ack["params"]["_meta"][SUBSCRIPTION_ID], 2);
+        assert_eq!(
+            ack["params"]["notifications"],
+            serde_json::json!({"toolsListChanged": true}),
+            "only what ahma honours is acknowledged"
+        );
+
+        let changed: Vec<&serde_json::Value> = sent
+            .iter()
+            .filter(|m| m["method"] == TOOLS_LIST_CHANGED_METHOD)
+            .collect();
+        assert_eq!(changed.len(), 1, "{sent:#?}");
+        assert_eq!(changed[0]["params"]["_meta"][SUBSCRIPTION_ID], 2);
+        assert!(
+            sent.iter().all(|m| m["method"] != "notifications/message"),
+            "nothing the client did not ask for: {sent:#?}"
+        );
+        assert!(sent.iter().any(|m| m["method"] == "notifications/progress"));
+
+        let call = sent.iter().find(|m| m["id"] == 3).expect("call answered");
+        assert_eq!(call["result"]["resultType"], "complete");
+        let listen_done_at = position(&|m| m["id"] == 2).expect("listen completed");
+        let call_at = position(&|m| m["id"] == 3).unwrap();
+        assert!(call_at < listen_done_at, "held open until cancelled");
+        assert_eq!(sent[listen_done_at]["result"]["resultType"], "complete");
+        assert_eq!(sent[listen_done_at]["result"]["_meta"][SUBSCRIPTION_ID], 2);
+
+        let bridge_sent = bridge_sent.lock();
+        assert!(
+            bridge_sent
+                .iter()
+                .all(|m| m["id"] != 2 && m["method"] != "notifications/cancelled"),
+            "the stream is the proxy's; the bridge never sees it: {bridge_sent:#?}"
+        );
+    }
+
+    /// A 2026-07-28 client may fetch `server/discover` again. The session it
+    /// opened already exists: a second `initialize` would replace it.
+    #[tokio::test]
+    async fn a_repeated_discover_is_answered_without_a_second_initialize() {
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            |m| match m["id"].as_i64() {
+                Some(1) => vec![Some(
+                    serde_json::to_value(client_discover_request(2)).unwrap(),
+                )],
+                Some(2) => vec![None],
+                _ => Vec::new(),
+            },
+        );
+        let stdio_sent = stdio.sent.clone();
+        let bridge = deferred_bridge();
+        let bridge_sent = bridge.sent.clone();
+
+        run_scripted(stdio, bridge).await;
+
+        let sent = stdio_sent.lock();
+        let first = sent.iter().find(|m| m["id"] == 1).unwrap();
+        let second = sent
+            .iter()
+            .find(|m| m["id"] == 2)
+            .unwrap_or_else(|| panic!("the repeat is answered: {sent:#?}"));
+        assert_eq!(first["result"], second["result"]);
+        let initializes = bridge_sent
+            .lock()
+            .iter()
+            .filter(|m| m["method"] == INITIALIZE_METHOD)
+            .count();
+        assert_eq!(initializes, 1);
     }
 }

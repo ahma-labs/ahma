@@ -273,6 +273,197 @@ fn response(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+// ── subscriptions/listen and what reaches stdout (SPEC R-HUB.4.4) ───────────
+
+const SUBSCRIPTION_ID_META: &str = "io.modelcontextprotocol/subscriptionId";
+const ACKNOWLEDGED_METHOD: &str = "notifications/subscriptions/acknowledged";
+const CANCELLED_METHOD: &str = "notifications/cancelled";
+const PROGRESS_METHOD: &str = "notifications/progress";
+const TOOLS_LIST_CHANGED_METHOD: &str = "notifications/tools/list_changed";
+
+/// A modern client's open `subscriptions/listen` streams. Each is named by
+/// the id of the request that opened it, which stays unanswered until the
+/// client cancels it.
+#[derive(Debug, Default)]
+pub(crate) struct Listens {
+    /// (listen request id, wants `tools/list_changed`)
+    streams: Vec<(Value, bool)>,
+}
+
+impl Listens {
+    /// Open a stream and return its acknowledgement, which must precede
+    /// anything sent on it. The filter it echoes is what ahma honours: tool
+    /// list changes. ahma has no prompts and pushes no resource updates.
+    pub(crate) fn open(&mut self, request: &Value) -> Value {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let tools = request
+            .pointer("/params/notifications/toolsListChanged")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.streams.push((id.clone(), tools));
+        let accepted = if tools {
+            json!({ "toolsListChanged": true })
+        } else {
+            json!({})
+        };
+        json!({
+            "jsonrpc": "2.0",
+            "method": ACKNOWLEDGED_METHOD,
+            "params": { "_meta": { SUBSCRIPTION_ID_META: id }, "notifications": accepted },
+        })
+    }
+
+    /// Close the stream a client `notifications/cancelled` names, returning
+    /// the `complete` result that ends it; `None` when it names no stream.
+    pub(crate) fn close(&mut self, cancelled: &Value) -> Option<Value> {
+        if cancelled.get("method").and_then(Value::as_str) != Some(CANCELLED_METHOD) {
+            return None;
+        }
+        let id = cancelled.pointer("/params/requestId")?;
+        let at = self.streams.iter().position(|(open, _)| open == id)?;
+        let (id, _) = self.streams.remove(at);
+        Some(response(
+            id.clone(),
+            json!({ "resultType": "complete", "_meta": { SUBSCRIPTION_ID_META: id } }),
+        ))
+    }
+
+    /// What a message bound for a modern client's stdout becomes. A server
+    /// may write only results, notifications about a request in flight, and
+    /// notifications on a stream the client opened for them. So:
+    ///
+    /// * a result is passed, marked `complete` if it does not say otherwise;
+    /// * `tools/list_changed` goes once to each stream that asked for it,
+    ///   tagged with that stream's id, and nowhere else;
+    /// * progress and stream acknowledgements pass;
+    /// * everything else — log messages, ahma's own notifications, and any
+    ///   server request that got this far (R-HUB.4.2) — is dropped.
+    pub(crate) fn outgoing(&self, message: Value) -> Vec<Value> {
+        let method = message.get("method").and_then(Value::as_str);
+        match method {
+            None => vec![with_result_type(message)],
+            Some(_) if is_server_request(&message) => {
+                tracing::warn!(
+                    ?method,
+                    "Dropping a server request bound for a 2026-07-28 client's stdout"
+                );
+                Vec::new()
+            }
+            Some(TOOLS_LIST_CHANGED_METHOD) => self
+                .streams
+                .iter()
+                .filter(|(_, tools)| *tools)
+                .map(|(id, _)| tagged(&message, id))
+                .collect(),
+            Some(PROGRESS_METHOD | ACKNOWLEDGED_METHOD) => vec![message],
+            Some(_) => Vec::new(),
+        }
+    }
+}
+
+/// Results of this protocol version must say what they are.
+fn with_result_type(mut message: Value) -> Value {
+    if let Some(result) = message.get_mut("result").and_then(Value::as_object_mut) {
+        result
+            .entry("resultType")
+            .or_insert_with(|| json!("complete"));
+    }
+    message
+}
+
+fn tagged(notification: &Value, subscription: &Value) -> Value {
+    let mut notification = notification.clone();
+    let params = notification
+        .as_object_mut()
+        .map(|n| n.entry("params").or_insert_with(|| json!({})));
+    if let Some(params) = params.and_then(Value::as_object_mut) {
+        let meta = params.entry("_meta").or_insert_with(|| json!({}));
+        if let Some(meta) = meta.as_object_mut() {
+            meta.insert(SUBSCRIPTION_ID_META.to_string(), subscription.clone());
+        }
+    }
+    notification
+}
+
+/// The proxy's stdio, with the R-HUB.4.4 filter applied to everything it
+/// writes once the client turned out to be a 2026-07-28 one. Every write goes
+/// through here — the bridge's messages and the proxy's own (session events,
+/// the post-reconnect `tools/list_changed`) — so no path can skip the rule.
+pub(crate) struct ModernStdio<S> {
+    inner: S,
+    /// `None` until `server/discover`: a legacy client gets every message.
+    listens: Option<Listens>,
+}
+
+impl<S> ModernStdio<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            listens: None,
+        }
+    }
+
+    pub(crate) fn go_modern(&mut self) {
+        self.listens.get_or_insert_with(Listens::default);
+    }
+
+    /// The client's listen streams; `None` for a legacy client.
+    pub(crate) fn listens(&mut self) -> Option<&mut Listens> {
+        self.listens.as_mut()
+    }
+}
+
+impl<S> rmcp::transport::Transport<rmcp::service::RoleServer> for ModernStdio<S>
+where
+    S: rmcp::transport::Transport<rmcp::service::RoleServer>,
+{
+    type Error = S::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let messages = match &self.listens {
+            None => vec![item],
+            Some(listens) => match serde_json::to_value(&item) {
+                Ok(value) => listens
+                    .outgoing(value)
+                    .into_iter()
+                    .filter_map(|m| serde_json::from_value(m).ok())
+                    .collect(),
+                Err(_) => vec![item],
+            },
+        };
+        // Each send's future is `'static` by the trait's contract, but its
+        // type still names `&mut self`; boxing erases that, so several can be
+        // started in order and awaited together.
+        type PendingSend<E> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), E>> + Send>>;
+        let mut sends: Vec<PendingSend<S::Error>> = Vec::with_capacity(messages.len());
+        for message in messages {
+            sends.push(Box::pin(self.inner.send(message)));
+        }
+        async move {
+            for send in sends {
+                send.await?;
+            }
+            Ok(())
+        }
+    }
+
+    fn receive(
+        &mut self,
+    ) -> impl std::future::Future<
+        Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::service::RoleServer>>,
+    > + Send {
+        self.inner.receive()
+    }
+
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +662,97 @@ mod tests {
         mark_defers_roots(&mut init);
         assert!(defers_roots(&init));
         assert!(init["params"]["capabilities"]["roots"].is_object());
+    }
+
+    fn listen(id: i64, notifications: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "subscriptions/listen",
+            "params": {"_meta": {}, "notifications": notifications}
+        })
+    }
+
+    #[test]
+    fn a_listen_is_acknowledged_with_only_what_ahma_honours() {
+        let mut listens = Listens::default();
+        let ack = listens.open(&listen(
+            7,
+            json!({"toolsListChanged": true, "promptsListChanged": true, "resourceSubscriptions": ["file:///x"]}),
+        ));
+        assert_eq!(ack["method"], ACKNOWLEDGED_METHOD);
+        assert_eq!(ack["params"]["_meta"][SUBSCRIPTION_ID_META], 7);
+        assert_eq!(
+            ack["params"]["notifications"],
+            json!({"toolsListChanged": true})
+        );
+        assert_eq!(
+            listens.outgoing(ack.clone()),
+            vec![ack],
+            "the ack itself passes"
+        );
+    }
+
+    #[test]
+    fn tools_list_changed_goes_to_each_stream_that_asked_tagged() {
+        let mut listens = Listens::default();
+        let changed = json!({"jsonrpc": "2.0", "method": TOOLS_LIST_CHANGED_METHOD});
+        assert!(
+            listens.outgoing(changed.clone()).is_empty(),
+            "no stream, no notification"
+        );
+        listens.open(&listen(1, json!({"toolsListChanged": true})));
+        listens.open(&listen(2, json!({})));
+        listens.open(&listen(3, json!({"toolsListChanged": true})));
+        let out = listens.outgoing(changed);
+        let ids: Vec<&Value> = out
+            .iter()
+            .map(|m| &m["params"]["_meta"][SUBSCRIPTION_ID_META])
+            .collect();
+        assert_eq!(ids, vec![&json!(1), &json!(3)]);
+    }
+
+    #[test]
+    fn a_cancel_completes_its_stream_and_nothing_else() {
+        let mut listens = Listens::default();
+        listens.open(&listen(4, json!({"toolsListChanged": true})));
+        let cancel = |id: i64| json!({"jsonrpc": "2.0", "method": CANCELLED_METHOD, "params": {"requestId": id}});
+        assert_eq!(
+            listens.close(&cancel(9)),
+            None,
+            "another request's cancel is not ours"
+        );
+        let done = listens.close(&cancel(4)).expect("completes");
+        assert_eq!(done["id"], 4);
+        assert_eq!(done["result"]["resultType"], "complete");
+        assert_eq!(done["result"]["_meta"][SUBSCRIPTION_ID_META], 4);
+        let changed = json!({"jsonrpc": "2.0", "method": TOOLS_LIST_CHANGED_METHOD});
+        assert!(
+            listens.outgoing(changed).is_empty(),
+            "a closed stream gets nothing"
+        );
+    }
+
+    #[test]
+    fn outgoing_marks_results_and_drops_what_was_not_asked_for() {
+        let listens = Listens::default();
+        let result = listens.outgoing(json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+        assert_eq!(result[0]["result"]["resultType"], "complete");
+        let asked = listens.outgoing(json!({
+            "jsonrpc": "2.0", "id": 2, "result": {"resultType": "input_required"}
+        }));
+        assert_eq!(
+            asked[0]["result"]["resultType"], "input_required",
+            "kept as is"
+        );
+        let error = json!({"jsonrpc": "2.0", "id": 3, "error": {"code": 1, "message": "m"}});
+        assert_eq!(listens.outgoing(error.clone()), vec![error]);
+        let progress = json!({"jsonrpc": "2.0", "method": PROGRESS_METHOD, "params": {}});
+        assert_eq!(listens.outgoing(progress.clone()), vec![progress]);
+        for dropped in [
+            json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/ahma/session_event", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "roots/list"}),
+        ] {
+            assert!(listens.outgoing(dropped.clone()).is_empty(), "{dropped}");
+        }
     }
 }
