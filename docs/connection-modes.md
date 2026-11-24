@@ -244,7 +244,7 @@ An empty `roots/list` answer is not a usable scope (SPEC R5.2.7). With `[sandbox
 
 ### Claude Code and the 2026-07-28 protocol
 
-Claude Code first probes with the 2026-07-28 `server/discover` handshake. That protocol forbids a server sending requests such as `roots/list` and approval prompts down stdio; they must come back as `InputRequiredResult` replies. ahma can already fetch roots that way: it answers the first tool call that needs a scope with a request for the client's roots, and runs the retry that brings them (SPEC R-HUB.4.3). It also keeps `subscriptions/listen` streams open and sends tool-list changes only on them (SPEC R-HUB.4.4). Approval prompts ride tool calls the same way (SPEC R-HUB.4.5). Until a live check with Claude Code confirms all three, ahma still declines the probe, and Claude Code falls back to the `initialize` handshake, where roots and approval prompts work (SPEC R-HUB.4.2).
+Claude Code first probes with the 2026-07-28 `server/discover` handshake. That protocol forbids a server sending requests such as `roots/list` and approval prompts down stdio; they must come back as `InputRequiredResult` replies. ahma fetches roots that way: it answers the first tool call that needs a scope with a request for the client's roots, and runs the retry that brings them (SPEC R-HUB.4.3). It also keeps `subscriptions/listen` streams open and sends tool-list changes only on them (SPEC R-HUB.4.4). Approval prompts ride tool calls the same way (SPEC R-HUB.4.5). So ahma answers the probe, and Claude Code sessions run on the 2026-07-28 protocol. No server request is ever written to stdout (SPEC R-HUB.4.2).
 
 **Resolutions (pick one):**
 

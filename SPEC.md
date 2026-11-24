@@ -1857,26 +1857,19 @@ lifetime.
     namespaced keys (wire capture, 2026-11-06). Reading the plain key alone classified every
     Claude Code session behind the hub as Antigravity, so it was offered the harness file tools
     R26 withholds, and its parallel subagents each raised a permission prompt for them.
-  - **R-HUB.4.2 — No modern session until server requests travel the modern way.** The
-    2026-07-28 protocol forbids a server writing JSON-RPC requests to stdout: `roots/list` and
-    `elicitation/create` **must** reach a modern client as an `InputRequiredResult` reply to its
-    own `tools/call`, and `subscriptions/listen` **must** be acknowledged and held open. Until
-    the frontend does both, it **must** decline `server/discover` with a JSON-RPC error
-    (`-32601`), which the 2026-07-28 stdio "Backward Compatibility" rules read as a legacy server,
-    so a dual-era client falls back to `initialize`, where roots and elicitation work; the bridge
-    never sees the probe (`proxy_client::ANSWER_MODERN_DISCOVER`). Field case (2026-11-23): a
-    Claude Code session negotiated 2026-07-28, the proxy wrote the hub's `roots/list` to stdout
-    and answered `subscriptions/listen` with `{}`, so the scope never settled
-    (`run_terminal_command` answered "Sandbox initializing from client roots" for the whole
-    session) and every `sandbox_grant`, network and link prompt silently waited out its budget.
-    R-HUB.4.1's `_meta` reading stays for when the probe is answered again. In a modern session
-    the frontend **must not** write any server request to stdout: it answers each itself
-    (`modern_input`) — `roots/list` from the client's roots (R-HUB.4.3), `ping` with `{}` (stdio
-    EOF, not a ping, ends the session), `elicitation/create` with `cancel` until prompts travel
-    as an `InputRequiredResult` (so the permission ladder moves on rather than waiting out its
-    budget), anything else with `-32601`. Status: roots (R-HUB.4.3), `subscriptions/listen`
-    (R-HUB.4.4) and prompts (R-HUB.4.5) done; the probe stays declined until a live check with
-    Claude Code passes.
+  - **R-HUB.4.2 — No server request on a modern client's stdout.** The 2026-07-28 protocol
+    forbids a server writing JSON-RPC requests to stdout. In a modern session the frontend
+    **must not** write one; it answers each itself (`modern_input`): `roots/list` from the
+    client's roots (R-HUB.4.3), `elicitation/create` through the client's tool calls
+    (R-HUB.4.5), `ping` with `{}` (stdio EOF, not a ping, ends the session), anything else with
+    `-32601`. Field case (2026-11-23): a Claude Code session negotiated 2026-07-28, the proxy
+    wrote the hub's `roots/list` to stdout and answered `subscriptions/listen` with `{}`, so the
+    scope never settled (`run_terminal_command` answered "Sandbox initializing from client
+    roots" for the whole session) and every `sandbox_grant`, network and link prompt silently
+    waited out its budget. From then until R-HUB.4.3–4.5 were in place, the frontend declined
+    `server/discover` with `-32601`, which the 2026-07-28 stdio "Backward Compatibility" rules
+    read as a legacy server, so Claude Code fell back to `initialize`. A regression here is
+    worse than the decline was; reverting to it is the safe fallback.
   - **R-HUB.4.3 — Roots arrive with the first tool call.** A modern client can hand over roots
     only in reply to an `InputRequiredResult` on a request it sent. The frontend **must** answer
     the client's first `tools/call` that needs a scope (not `SCOPE_EXEMPT_TOOLS`) with
