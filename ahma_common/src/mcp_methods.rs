@@ -44,6 +44,14 @@ pub const SERVER_DISCOVER_METHOD: &str = "server/discover";
 /// Modern MCP (2026-07-28 / SEP-2575) subscriptions listen method.
 pub const SUBSCRIPTIONS_LISTEN_METHOD: &str = "subscriptions/listen";
 
+/// Experimental client capability the stdio proxy puts on the `initialize` it
+/// synthesizes for a 2026-07-28 client (SPEC R-HUB.4.3). That client can
+/// return roots only in reply to an `InputRequiredResult` on a request it sent,
+/// so the bridge must not ask for them at handshake time, nor time the session
+/// out for not having them yet: the proxy announces them with
+/// `notifications/roots/list_changed` once the first tool call brings them.
+pub const ROOTS_ON_FIRST_CALL_CAPABILITY: &str = "io.github.ahma/rootsOnFirstCall";
+
 // The server instructions are one text with a mode-specific middle; the
 // shared parts are macros so both variants are compile-time constants that
 // cannot drift apart.

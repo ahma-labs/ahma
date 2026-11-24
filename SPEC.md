@@ -1869,7 +1869,34 @@ lifetime.
     and answered `subscriptions/listen` with `{}`, so the scope never settled
     (`run_terminal_command` answered "Sandbox initializing from client roots" for the whole
     session) and every `sandbox_grant`, network and link prompt silently waited out its budget.
-    R-HUB.4.1's `_meta` reading stays for when the probe is answered again.
+    R-HUB.4.1's `_meta` reading stays for when the probe is answered again. In a modern session
+    the frontend **must not** write any server request to stdout: it answers each itself
+    (`modern_input`) — `roots/list` from the client's roots (R-HUB.4.3), `ping` with `{}` (stdio
+    EOF, not a ping, ends the session), `elicitation/create` with `cancel` until prompts travel
+    as an `InputRequiredResult` (so the permission ladder moves on rather than waiting out its
+    budget), anything else with `-32601`. Status: roots done (R-HUB.4.3); elicitation and
+    `subscriptions/listen` still pending, so the probe is still declined.
+  - **R-HUB.4.3 — Roots arrive with the first tool call.** A modern client can hand over roots
+    only in reply to an `InputRequiredResult` on a request it sent. The frontend **must** answer
+    the client's first `tools/call` that needs a scope (not `SCOPE_EXEMPT_TOOLS`) with
+    `{"resultType": "input_required", "inputRequests": {"ahma.roots": {"method": "roots/list"}},
+    "requestState": …}`, and only when the client declared `roots` (on that request's `_meta`,
+    or on `server/discover`). The retry that carries the matching `requestState` and
+    `inputResponses["ahma.roots"]` is the call that runs, with those two fields stripped; the
+    unanswered first attempt never reaches the bridge. The frontend **must** hold that call
+    until it has answered the worker's `roots/list` (prompting one with
+    `notifications/roots/list_changed` when the bridge has not asked), so the call never meets a
+    sandbox still waiting for roots; a bridge whose scope did not come from the client never
+    asks, so held calls are released after `HELD_CALL_GRACE`. After two unanswered asks it
+    settles on empty roots, which R5.2.7 already handles (the container root, or a refusal with
+    remediation). The synthesized `initialize` carries the experimental capability
+    `io.github.ahma/rootsOnFirstCall`; for such a session the bridge **must not** send the
+    handshake-time `roots/list_changed`, **must not** time it out for lacking roots, and a
+    tool call that meets its sandbox `Configuring` **must** wait for `Active` (within the
+    request timeout) instead of taking the immediate 409. The reconnect replay announces the
+    cached roots the same way. The trust model is R5.2's: roots still come from the client
+    application, never from the launch directory (R5.2.1). Roots are deprecated in 2026-07-28
+    but not removed; revisit when a spec version removes them.
 
 - **R-HUB.5 — Upgrade by draining.** A **strictly newer** build asks the hub to **drain**: hand
   over to the new build without ending anyone's work. It never tears down sessions that belong

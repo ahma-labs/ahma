@@ -977,6 +977,18 @@ fn get_conflict_message(requires_client_roots: bool) -> &'static str {
 /// it goes through, so `status` and `ahma_help` can explain the wait they are
 /// stuck in (SPEC R-HELP.1). The subprocess applies its own gate to every
 /// other tool. A failed or terminated session refuses everything.
+/// SPEC R-HUB.4.3: a deferred-roots client's proxy sends a tool call straight
+/// after the roots it carried, so the call meets a sandbox that is still
+/// `Configuring`. It waits for the worker to finish, within the request
+/// timeout, instead of being refused for a race the client cannot see. Every
+/// other session keeps the immediate 409.
+async fn wait_out_deferred_configuration(session_manager: &SessionManager, session_id: &str) {
+    if let Some(session) = session_manager.get_session(session_id) {
+        let budget = Duration::from_secs(session_manager.request_timeout_secs());
+        session.wait_out_deferred_configuration(budget).await;
+    }
+}
+
 fn check_sandbox_lock(
     session_manager: &SessionManager,
     session_id: &str,
@@ -1885,6 +1897,9 @@ async fn gate_session_request(
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
         .is_some_and(ahma_common::mcp_methods::is_scope_exempt_tool);
+    if method == Some(TOOLS_CALL_METHOD) && !exempt {
+        wait_out_deferred_configuration(session_manager, session_id).await;
+    }
     if method == Some(TOOLS_CALL_METHOD)
         && let Some(response) =
             check_sandbox_lock(session_manager, session_id, request_id.clone(), exempt)

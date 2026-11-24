@@ -8,6 +8,7 @@ pub mod http_bridge;
 pub mod hub;
 pub mod hub_client;
 pub mod list_tools;
+mod modern_input;
 pub mod proxy_client;
 pub mod server;
 pub mod session_options;
