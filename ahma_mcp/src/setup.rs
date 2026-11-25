@@ -172,6 +172,13 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         return crate::setup_plan::run_plan_command(args.path, args.apply);
     }
     let interactive = is_interactive_session(&args);
+    if let Some(notice) = no_terminal_notice(
+        args.auto,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    ) {
+        eprintln!("{notice}");
+    }
 
     if interactive {
         print_wizard_banner();
@@ -216,6 +223,17 @@ fn select_transport_for(actions: &[SetupAction], interactive: bool) -> &'static 
     } else {
         "stdio"
     }
+}
+
+/// The line saying setup could not ask, when it was not told `--auto` and has
+/// no terminal to ask on (an agent's `!` line, a pipe). Without it, a user who
+/// asked for the wizard saw the defaults run with no question and no reason.
+fn no_terminal_notice(auto: bool, stdin_tty: bool, stdout_tty: bool) -> Option<&'static str> {
+    let can_ask = stdin_tty && stdout_tty;
+    (!auto && !can_ask).then_some(
+        "ahma setup: no terminal to ask on, so it applied the defaults below without asking. \
+         Run it in a terminal to choose, or pass --auto when this is what you want.",
+    )
 }
 
 /// Whether the wizard should ask questions interactively: not `--auto`, and
@@ -286,11 +304,10 @@ fn print_setup_action_guidance() {
     println!("                     (Claude Code, Cursor, VS Code, etc.).");
     println!("  Terminal hooks   - also reroutes commands your AI tool runs directly in a");
     println!("                     terminal through ahma's sandbox, not just its MCP tool");
-    println!("                     calls. NOT selected by default: this is an experimental");
-    println!("                     project and sandbox-exception handling isn't fully");
-    println!("                     hardened yet, so an automatic hook could interfere with");
-    println!("                     your work. Include \"3\" below (or pass --hooks) once");
-    println!("                     you want to opt in.");
+    println!("                     calls. Selected by default for the clients where a");
+    println!("                     refused command reaches a question you can answer");
+    println!("                     (Claude Code, Cursor); left out, with the reason, for the");
+    println!("                     rest. Pass --hooks to include them anyway.");
     println!("  TLS certificates - generates a local TLS certificate for the HTTP bridge.");
     println!();
 }
@@ -1091,6 +1108,29 @@ async fn prompt_yes_no_setup(prompt: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Run with no terminal (an agent's `!` line, a pipe), `ahma setup` cannot
+    /// ask, and used to run its defaults without a word, so a user who asked
+    /// for the wizard saw it never appear. It must say so; `--auto` asked for
+    /// exactly that, so it stays quiet.
+    #[test]
+    fn setup_says_when_it_cannot_ask() {
+        assert!(super::no_terminal_notice(false, false, true).is_some());
+        assert!(super::no_terminal_notice(false, true, false).is_some());
+        assert!(
+            super::no_terminal_notice(true, false, false).is_none(),
+            "--auto asked for it"
+        );
+        assert!(
+            super::no_terminal_notice(false, true, true).is_none(),
+            "a terminal can ask"
+        );
+        let line = super::no_terminal_notice(false, false, false).unwrap();
+        assert!(
+            line.contains("terminal") && line.contains("--auto"),
+            "{line}"
+        );
+    }
     use super::*;
     use tempfile::tempdir;
 

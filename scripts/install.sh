@@ -5,7 +5,6 @@
 # Supported platforms:
 #   - Linux x86_64 (glibc and musl)
 #   - Linux ARM64/aarch64 (glibc and musl)
-#   - Linux ARMv7 (Raspberry Pi 2/3)
 #   - macOS ARM64 (Apple Silicon)
 #
 # Environment variables:
