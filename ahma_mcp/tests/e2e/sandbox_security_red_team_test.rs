@@ -1037,15 +1037,29 @@ async fn red_team_truncate_outside_scope_blocked() {
         return;
     }
 
-    let temp_dir = TempDir::new().unwrap();
-    let outside_dir = TempDir::new().unwrap();
+    // Both directories outside temp, so `--disable-temp-files` (which keeps the
+    // outside file's directory out of the scope) cannot also refuse the scope
+    // itself. Siblings in the test's working directory; each removed on drop.
+    let base = std::env::current_dir().expect("current directory");
+    let scope_dir = tempfile::Builder::new()
+        .prefix("ahma-redteam-truncate-scope-")
+        .tempdir_in(&base)
+        .unwrap();
+    let outside_dir = tempfile::Builder::new()
+        .prefix("ahma-redteam-truncate-outside-")
+        .tempdir_in(&base)
+        .unwrap();
+    // The control: a file in the scope the same command must truncate, which
+    // proves the command ran under the sandbox rather than not at all.
+    let inside_file = scope_dir.path().join("mine.txt");
     let outside_file = outside_dir.path().join("precious.txt");
+    fs::write(&inside_file, "mine to truncate\n").unwrap();
     fs::write(&outside_file, "do not lose me\n").unwrap();
 
     let tools_dir = get_workspace_tools_dir();
     let client = ClientBuilder::new()
         .tools_dir(&tools_dir)
-        .working_dir(temp_dir.path())
+        .working_dir(scope_dir.path())
         .no_sandbox(false)
         .arg("--disable-temp-files")
         .build()
@@ -1055,15 +1069,22 @@ async fn red_team_truncate_outside_scope_blocked() {
     let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": format!(
-                "perl -e 'truncate($ARGV[0], 0) or die \"truncate: $!\\n\"' '{}'",
+                "perl -e 'truncate($ARGV[0], 0) or die \"inside: $!\\n\"; truncate($ARGV[1], 0) or die \"outside: $!\\n\"' '{}' '{}'",
+                inside_file.display(),
                 outside_file.display()
             ),
             "execution_mode": "Synchronous"
         }))
         .unwrap(),
     );
-    let _ = client.call_tool(params).await;
+    let result = client.call_tool(params).await;
 
+    assert_eq!(
+        fs::metadata(&inside_file).unwrap().len(),
+        0,
+        "the control failed: the command did not truncate the file inside its scope, so it \
+         never ran and this test proves nothing. Result: {result:?}"
+    );
     assert_eq!(
         fs::read_to_string(&outside_file).unwrap(),
         "do not lose me\n",
