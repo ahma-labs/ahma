@@ -101,7 +101,9 @@ ahma serve stdio
 
 ahma does not read `.env` files. The variable must be in the environment ahma runs in: export
 it before your editor starts, or set it in the `env` block of the ahma entry in your MCP
-client config.
+client config. The hub keeps a secret-looking variable only when a provider here names it
+with `${VAR}`, or `[sandbox] env_allow` lists it, so a key that only a project's own
+`livelog` tool reads must be in `env_allow` ([security-sandbox.md](security-sandbox.md)).
 
 ## LM Studio (`[lmstudio]` in `~/.ahma/settings.toml`)
 
