@@ -69,7 +69,7 @@ Use ahma inside WSL2 for a Landlock boundary. Details:
   - macOS denies them.
   - Linux detects them after the fact (`TRUST-HANDOFF WRITE`), unless you set `linux_deny_tier = "namespace"`.
   - The shared package cache is a cross-project channel (`--no-package-cache-write`).
-- **On macOS, other processes' environments are readable.** A sandboxed command can read the arguments and environment of your other processes, so API keys in an editor's or agent's environment are exposed (fix planned, SPEC R-HARDEN.2).
+- **On macOS, other processes' environments are readable.** A sandboxed command can read the arguments and environment of your other processes, and no macOS sandbox rule can stop it. ahma keeps secrets out of its own long-lived processes, but an API key in your editor's or agent's environment is exposed. Keep keys in the keychain, and use `--restrict-network` (SPEC R-HARDEN.2).
 - **No CPU, memory or process limits.**
 - **Commands that bypass ahma.** A native terminal without hooks is not sandboxed. Check with `ahma hooks status`.
 

@@ -221,6 +221,15 @@ pub(crate) fn hub_command(
     for key in ahma_common::process_guard::NOT_INHERITED_BY_HUB {
         cmd.env_remove(key);
     }
+    // Secrets never ride along (SPEC R-HARDEN.2): on macOS a sandboxed command
+    // can read the environment of any of the user's processes, and no Seatbelt
+    // rule stops it, so the hub, which outlives whoever started it and every
+    // worker it spawns, must not hold them. Kept: what an LLM provider in
+    // `~/.ahma/config.toml` names with `${VAR}`, and `[sandbox] env_allow`.
+    let keep = hub_env_keep();
+    for key in hub_env_removals(std::env::vars().map(|(k, _)| k), &keep) {
+        cmd.env_remove(key);
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -233,6 +242,59 @@ pub(crate) fn hub_command(
         cmd.creation_flags(crate::shell_pool::CREATE_NO_WINDOW);
     }
     cmd
+}
+
+/// The secret-looking variables to remove from the hub's environment: every
+/// `names` entry that looks like a credential, except those in `keep`
+/// (case-insensitive). Pure, for testing.
+pub(crate) fn hub_env_removals<I>(names: I, keep: &[String]) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let keep: Vec<String> = keep.iter().map(|k| k.to_ascii_uppercase()).collect();
+    names
+        .into_iter()
+        .filter(|n| {
+            crate::sandbox::is_secret_env_name(n) && !keep.contains(&n.to_ascii_uppercase())
+        })
+        .collect()
+}
+
+/// The variables the hub keeps although they look like secrets: those a
+/// configured LLM provider reads (`${VAR}` in its key, URL or model), and the
+/// operator's `[sandbox] env_allow`.
+fn hub_env_keep() -> Vec<String> {
+    let config = ahma_common::config::AhmaConfig::load();
+    let fields = config.providers.iter().flat_map(|p| {
+        [
+            Some(p.base_url.as_str()),
+            Some(p.default_model.as_str()),
+            p.api_key.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    });
+    let mut keep = env_references(fields);
+    keep.extend(ahma_common::config::AhmaSettings::load().sandbox.env_allow);
+    keep
+}
+
+/// Every `NAME` in `${NAME}` or `${NAME:-default}` in `fields`, in order.
+pub(crate) fn env_references<'a>(fields: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut names = Vec::new();
+    for field in fields {
+        let mut rest = field;
+        while let Some(start) = rest.find("${") {
+            rest = &rest[start + 2..];
+            let Some(end) = rest.find('}') else { break };
+            let name = rest[..end].split(":-").next().unwrap_or_default();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+    names
 }
 
 /// May this process start a hub from `exe`?
@@ -362,6 +424,38 @@ mod hub_spawn_rule_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// SPEC R-HARDEN.2: on macOS any same-user process's environment is
+    /// readable by a sandboxed command, and no Seatbelt rule stops it, so the
+    /// hub (which outlives whoever started it) must not carry secrets. It keeps
+    /// what a configured LLM provider names with `${VAR}`, and the operator's
+    /// `[sandbox] env_allow`, so the advisor and log monitoring still work.
+    #[test]
+    fn the_hub_drops_secrets_but_keeps_what_providers_need() {
+        let names = [
+            "PATH",
+            "HOME",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+        ]
+        .map(String::from);
+        let keep = vec!["openai_api_key".to_string()];
+        let mut removed = super::hub_env_removals(names, &keep);
+        removed.sort();
+        assert_eq!(removed, ["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]);
+    }
+
+    #[test]
+    fn provider_references_are_read_from_every_field() {
+        let refs = super::env_references([
+            "${OPENAI_API_KEY}",
+            "https://${HOST_VAR:-localhost}/v1",
+            "plain-model",
+            "${A}${B}",
+        ]);
+        assert_eq!(refs, ["OPENAI_API_KEY", "HOST_VAR", "A", "B"]);
+    }
 
     /// SPEC R2.7.7: the hub outlives whoever started it, so it inherits
     /// neither that tree's worker marker nor its workspace lease.
