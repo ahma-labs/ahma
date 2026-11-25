@@ -194,7 +194,7 @@ may change. `planned`: agreed and specified, not started.
 | Release signing (R-SIGN) | in-progress | Developer-ID signing wired, awaiting the Apple secrets (R-SIGN.1); Windows is a stated assumption (R-SIGN.3) |
 | OpenTelemetry export | tests-pass | `otel` cargo feature, off by default |
 | Code complexity analysis (`ahma simplify`) | tests-pass | `ahma_simplify/SPEC.md` |
-| Hardening roadmap (R-HARDEN) | planned | Landlock ABI, same-user isolation, seccomp, network restricted by default, macOS home reads, credentials at the boundary (R-HARDEN.1–8) |
+| Hardening roadmap (R-HARDEN) | in-progress | R-HARDEN.1 (Landlock ABI 3, truncate) done; planned: same-user isolation, seccomp, network restricted by default, macOS home reads, credentials at the boundary (R-HARDEN.1–8) |
 | One policy decision point (R-POLICY.1–2) | planned | One `decide`, one precedence for every userspace permission |
 | Team policy in Cedar (R-POLICY.3–6) | planned | Forbid-only Cedar files that narrow; `ahma policy validate`, `explain`, `export`, `verify` |
 
@@ -1166,7 +1166,7 @@ needs no pairing, as below.
 
 ### R-HARDEN: Hardening roadmap
 
-**Status: planned** (open: §11). A sandbox on the shared host kernel has limits a microVM does
+**Status: in-progress.** R-HARDEN.1 is tests-pass; the rest are planned (open: §11). A sandbox on the shared host kernel has limits a microVM does
 not ([docs/how-ahma-compares.md](docs/how-ahma-compares.md)). These requirements close the ones
 ahma can close without a VM. They keep invariant 1, and they keep the stance: default
 policies, a human decides, a model only advises. Each one lands as its own change, starting
@@ -1176,7 +1176,7 @@ with a red-team test that fails.
   - Ahma **must** handle, best effort, every filesystem access right of the newest Landlock ABI it supports, so an access that an older ABI cannot express is never left open silently.
   - In particular, `truncate(2)` (ABI 3, Linux 6.2) **must** be denied outside the write scope.
   - On a kernel too old to deny it, the gap **must** be disclosed (invariant 2).
-  - Today ahma handles ABI 2.
+  - **tests-pass** for ABI 3: the ruleset handles `Truncate`, granted only where writes are, and the partial-enforcement warning names the right that is missing (`red_team_truncate_outside_scope_blocked`).
 - **R-HARDEN.2 — Same-user processes stay out of reach.** A sandboxed command **must not** read another process's environment, memory or arguments, or signal or connect to an abstract Unix socket of a process outside its own sandbox.
   - On Linux the reads are refused by Landlock's ptrace scoping (tested). Signals and abstract sockets **must** be scoped with Landlock ABI 6 where the kernel has it.
   - On macOS, another process's arguments and environment (`KERN_PROCARGS2`) **must** be refused, as signals already are (R6.2.6), while `pgrep`, `lsof` and `ahma ps` keep working (R6.2.8). Open today (§11).
@@ -2512,7 +2512,7 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **Container daemon sockets on Linux** (R-HANDOFF.6): Landlock at the ABI ahma uses does not mediate `connect(2)` to a pathname unix socket, and ahma has no other rule there, so a command whose user may reach a daemon socket (the `docker` group for `/var/run/docker.sock`, rootless Docker or podman under `$XDG_RUNTIME_DIR`) can use it. Masking the sockets in the opt-in mount-namespace tier (R6.1.7) is the likely route.
 - **The hub's token protects least where there is no filesystem boundary** (R-HUB.13): on Windows a command can read `hub.token` and connect; on Linux a command can reach the socket and the token is the only barrier (the runtime directory is in no Landlock ruleset and the token is never in an argument or environment variable; that a command cannot read a holder's memory or `/proc/<pid>/environ` rests on Landlock's ptrace scoping, pinned by `red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder`); under macOS deferral to an outer sandbox (R7.6) that sandbox, not ahma's, decides whether a command can connect or read the token. A hub socket the operator places in a directory a sandbox can read puts its token there too.
 - **Hardening roadmap and one decision point** (R-HARDEN.1–8, R-POLICY.1–6): planned, none implemented yet.
-- **Suspected, under test: `truncate(2)` outside the scope on Linux** (R-HARDEN.1): ahma's Landlock ruleset handles ABI 2, and truncation is a separate access right only from ABI 3. A sandboxed command may be able to truncate a file it cannot open for writing.
+- **`truncate(2)` outside the scope on Linux before 6.2** (R-HARDEN.1): Landlock has no truncation right before ABI 3, so on those kernels a sandboxed command can still truncate a file it cannot open for writing; ahma says so in its partial-enforcement warning.
 - **Another process's environment is readable on macOS** (R-HARDEN.2): the Seatbelt profile allows `process-info*` and `sysctl-read` for every process (`sandbox/seatbelt.rs`), so `sysctl(KERN_PROCARGS2)` returns the arguments and the whole environment of any process of the same user that is outside the sandbox. Measured 2026-11-25: a command under ahma's profile read all 60 environment entries of the running ahma hub. An API key in an editor's, agent's or hub's environment is therefore readable by a sandboxed command. Linux refuses the same read (`/proc/<pid>/environ`) through Landlock's ptrace scoping, pinned by `red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder`.
 - **The crates.io token is readable** (R-PERM.5, R6.2.3): the shipped `rust` profile grants `~/.cargo` read+execute, so `~/.cargo/credentials.toml` is readable by a sandboxed command on macOS and Linux; it is on no read denylist. Cargo needs it only to publish. Denying it on macOS is one Seatbelt rule; Linux needs the ruleset to grant `~/.cargo` piecewise.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

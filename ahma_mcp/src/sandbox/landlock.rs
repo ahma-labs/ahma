@@ -16,16 +16,27 @@ fn build_landlock_ruleset(policy: &super::KernelPolicy) -> Result<landlock::Rule
         RulesetCreatedAttr,
     };
 
-    // V2: V1's core access flags plus `Refer`. Without `Refer`, Landlock refuses
-    // every rename or link that changes a file's directory with EXDEV, even
-    // inside the writable scope: `mv` hides it with a copy fallback, but any
-    // program calling rename(2) across directories failed (ahma's own trash
-    // tests did, run through ahma on Linux). `Refer` is granted only where
-    // writes are (`access_all`), so it moves files within writable areas and
-    // reaches nothing new. Best effort: on kernels before 5.19 it is dropped
-    // and V1 behaviour remains. Not V5: its `IoctlDev` is unused and would
-    // report `PartiallyEnforced` on every kernel before 6.10.
-    let abi = ABI::V2;
+    // V3: V1's core access flags, plus `Refer` (V2) and `Truncate` (V3).
+    //
+    // Without `Refer`, Landlock refuses every rename or link that changes a
+    // file's directory with EXDEV, even inside the writable scope: `mv` hides
+    // it with a copy fallback, but any program calling rename(2) across
+    // directories failed (ahma's own trash tests did, run through ahma on
+    // Linux).
+    //
+    // Without `Truncate` handled, truncate(2) is not a Landlock access at all,
+    // so a sandboxed command could zero any file the user can write outside
+    // the scope, without ever opening it (SPEC R-HARDEN.1). Handling it also
+    // gates ftruncate(2) and open(O_TRUNC), which is why every rule that grants
+    // writing carries it too (`access_all`, the `/dev` sinks).
+    //
+    // Both are granted only where writes are (`access_all`), so they reach
+    // nothing new. Best effort: on a kernel without them (Refer: before 5.19,
+    // Truncate: before 6.2) they are dropped, the ruleset reports
+    // `PartiallyEnforced`, and the older behaviour remains. Not V5: its
+    // `IoctlDev` is unused and would report `PartiallyEnforced` on every kernel
+    // before 6.10.
+    let abi = ABI::V3;
     let access_all = AccessFs::from_all(abi);
     let access_read = AccessFs::from_read(abi);
 
@@ -180,13 +191,16 @@ pub fn enforce_landlock_sandbox(policy: &super::KernelPolicy) -> Result<()> {
             ));
         }
         landlock::RulesetStatus::PartiallyEnforced => {
-            // This is unexpected with ABI::V1 — all V1 access flags should be
-            // supported by any kernel that passes check_sandbox_prerequisites().
-            // Log prominently so CI failures are diagnosable.
+            // The kernel lacks an access right the ruleset handles: `Refer`
+            // before 5.19, `Truncate` before 6.2, TCP connect before 6.7. Say
+            // which guarantee is gone rather than that something is (SPEC
+            // R-HARDEN.1, invariant 2).
             tracing::warn!(
                 "Landlock sandbox is PARTIALLY enforced for scopes: {:?} (status: {:?}). \
-                 Some access flags were downgraded — the kernel may not fully support ABI V1. \
-                 Consider verifying kernel version and Landlock LSM configuration.",
+                 This kernel's Landlock lacks a right ahma asks for: before Linux 6.2 a \
+                 sandboxed command can still truncate(2) a file outside the scope, before \
+                 5.19 cross-directory renames fail, and before 6.7 TCP connect is not \
+                 confined to the egress proxy.",
                 scopes,
                 status
             );
@@ -258,11 +272,13 @@ fn add_landlock_system_rules(
     // already allows on macOS. `/dev` itself is read-only above, which made
     // every `git` command die at startup (`could not open '/dev/null' for
     // reading and writing`: git opens it O_RDWR to sanitize its std fds).
+    // `Truncate` too: `> /dev/null` opens with O_TRUNC, which Landlock gates as
+    // truncation once the ruleset handles ABI 3.
     for sink in ["/dev/null", "/dev/zero"] {
         if let Ok(fd) = PathFd::new(sink) {
             let _ = ruleset.add_rule(PathBeneath::new(
                 fd,
-                AccessFs::ReadFile | AccessFs::WriteFile,
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
             ));
         }
     }
@@ -333,7 +349,7 @@ fn add_landlock_profile_rules(
             RuleKind::Folder => continue,
             // Directory rights on a file make the rule invalid: keep the
             // ones a file can carry.
-            RuleKind::File if rule.path.is_file() => access & AccessFs::from_file(ABI::V2),
+            RuleKind::File if rule.path.is_file() => access & AccessFs::from_file(ABI::V3),
             _ => access,
         };
         if let Ok(fd) = PathFd::new(&rule.path) {
