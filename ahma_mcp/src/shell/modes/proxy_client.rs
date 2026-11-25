@@ -43,31 +43,6 @@ const MAX_CONSECUTIVE_FORWARD_FAILURES: u32 = 3;
 /// reconnected by hand, although the next hub was one respawn away.
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
-/// Whether the proxy answers a 2026-07-28 `server/discover` probe (SPEC
-/// R-HUB.4.1, suspended). That era forbids a server writing requests to stdout
-/// (`roots/list` and `elicitation/create` must come back as an
-/// `InputRequiredResult`). Before ahma did that, Claude Code sessions never
-/// settled a sandbox scope and never showed an approval prompt. Declined,
-/// a dual-era client falls back to `initialize`, where both work. Roots
-/// (R-HUB.4.3) and prompts (R-HUB.4.5) now travel as `InputRequiredResult` and
-/// listen streams are held open (R-HUB.4.4); set to `true` once a live check with
-/// Claude Code passes.
-const ANSWER_MODERN_DISCOVER: bool = false;
-
-fn answer_modern_discover() -> bool {
-    #[cfg(test)]
-    if tests::ANSWER_MODERN_DISCOVER_IN_TEST.with(std::cell::Cell::get) {
-        return true;
-    }
-    ANSWER_MODERN_DISCOVER
-}
-
-/// The error a declined `server/discover` gets. Any error but a recognised
-/// modern one makes a dual-era client fall back to `initialize` (2026-07-28
-/// stdio "Backward Compatibility").
-const DISCOVER_DECLINED_MESSAGE: &str = "Method not found: server/discover. This ahma speaks \
-     the initialize handshake; fall back to initialize.";
-
 /// What a request is answered with while the bridge cannot be reached.
 const BRIDGE_UNREACHABLE_MESSAGE: &str = "ahma is restarting or unreachable. This connection \
      stays open and reconnects automatically on your next request, so retry shortly. \
@@ -1198,26 +1173,6 @@ where
                 };
                 let val = serde_json::to_value(&msg).unwrap();
                 let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
-                if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD)
-                    && !answer_modern_discover()
-                {
-                    tracing::info!(
-                        transport,
-                        "Declining server/discover (SPEC R-HUB.4.1 suspended) so the client falls back to initialize"
-                    );
-                    if let Some(id) = request_id {
-                        relay_forward_failure_to_client(
-                            &mut stdio,
-                            id,
-                            Some(serde_json::json!({
-                                "code": ahma_common::mcp_methods::RpcErrorCode::MethodNotFound,
-                                "message": DISCOVER_DECLINED_MESSAGE,
-                            })),
-                        )
-                        .await;
-                    }
-                    continue;
-                }
                 if val.get("method").and_then(|m| m.as_str()) == Some(SERVER_DISCOVER_METHOD) {
                     tracing::info!(
                         transport,
@@ -1377,13 +1332,27 @@ where
                         if val.get("method").and_then(|m| m.as_str())
                             == Some("notifications/cancelled") =>
                     {
-                        let val = session.prompts.rewrite_client_cancel(val);
+                        let val = modern_input::legacy_request(
+                            session.prompts.rewrite_client_cancel(val),
+                        );
                         match serde_json::from_value(val.clone()) {
                             Ok(typed) => (typed, val),
                             Err(_) => continue,
                         }
                     }
-                    _ => (msg, val),
+                    // SPEC R-HUB.4.6: everything else a modern client sends
+                    // reaches the bridge without its 2026-07-28 envelope.
+                    Some(_) => {
+                        let val = modern_input::legacy_request(val);
+                        match serde_json::from_value(val.clone()) {
+                            Ok(typed) => (typed, val),
+                            Err(e) => {
+                                tracing::error!(transport, error = %e, "A modern request does not deserialize without its envelope");
+                                continue;
+                            }
+                        }
+                    }
+                    None => (msg, val),
                 };
                 handshake.observe_client_to_bridge(&val);
                 if conn.disconnected {
@@ -3338,6 +3307,35 @@ mod tests {
         );
     }
 
+    /// The live loop reads the probe back out of rmcp's parsed message, not the
+    /// raw line, so the capabilities must survive that round trip too.
+    #[test]
+    fn discover_capabilities_survive_the_rmcp_round_trip() {
+        let raw = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "server-discover-probe-1",
+            "method": "server/discover",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2.1.331"},
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "roots": {"listChanged": true},
+                    "elicitation": {"form": {}, "url": {}}
+                }
+            }}
+        });
+        let parsed: RxJsonRpcMessage<RoleServer> = serde_json::from_value(raw).unwrap();
+        let val = serde_json::to_value(&parsed).unwrap();
+
+        let init = synthesize_initialize_request(&val);
+
+        assert_eq!(
+            init["params"]["capabilities"]["elicitation"],
+            serde_json::json!({"form": {}, "url": {}}),
+            "{val:#}\n{init:#}"
+        );
+    }
+
     /// The un-namespaced spellings the proxy already understood keep working.
     #[test]
     fn synthesized_initialize_keeps_plain_client_info_from_discover() {
@@ -3360,46 +3358,48 @@ mod tests {
         );
     }
 
-    /// SPEC R-HUB.4.1 (suspended): over the 2026-07-28 protocol a server may
-    /// not write requests to stdout, yet ahma's `roots/list` and
-    /// `elicitation/create` still travel that way, so a Claude Code session's
-    /// scope never settled and no approval prompt ever reached the human.
-    /// Until both travel as `InputRequiredResult`, the probe is declined with
-    /// an error the 2026-07-28 stdio "Backward Compatibility" rules read as
-    /// "legacy server": a dual-era client then falls back to `initialize`,
-    /// where roots and prompts already work. The bridge never sees the probe.
+    /// SPEC R-HUB.4.1: a 2026-07-28 probe is answered, and opens a modern
+    /// session on the bridge: roots, prompts and listen streams now travel
+    /// the way that protocol allows (R-HUB.4.3–4.5). It was declined while
+    /// they did not (R-HUB.4.2). No test seam: this is the shipped default.
     #[tokio::test]
-    async fn server_discover_is_declined_so_a_dual_era_client_falls_back_to_initialize() {
-        let state = TestState::new();
-        let stdio = state.stdio(VecDeque::from(vec![
-            client_discover_request(1),
-            client_initialize(2),
-            client_request(3),
-        ]));
-        let mut client = state.client(0);
-        client.inbound = VecDeque::from(vec![bridge_initialize_response(2), bridge_response(3)]);
-        let mut reconnect = no_reconnect;
+    async fn server_discover_is_answered_and_opens_a_modern_session() {
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            |m| match m["id"].as_i64() {
+                Some(1) => vec![None],
+                _ => Vec::new(),
+            },
+        );
+        let stdio_sent = stdio.sent.clone();
+        let bridge = deferred_bridge();
+        let bridge_sent = bridge.sent.clone();
+        let mut reconnect = || -> Result<Scripted> { panic!("no reconnect in this test") };
 
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
-        assert!(result.is_ok());
+        let result = tokio::time::timeout(
+            ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick),
+            run_transport_proxy(stdio, bridge, "test", None, &mut reconnect, None),
+        )
+        .await
+        .expect("finishes");
+        assert!(result.is_ok(), "{result:?}");
 
-        let sent: Vec<serde_json::Value> = state
-            .sent
-            .lock()
-            .iter()
-            .map(|m| serde_json::to_value(m).expect("json"))
-            .collect();
-        let probe_reply = sent
+        let sent = stdio_sent.lock();
+        let reply = sent
             .iter()
             .find(|m| m["id"] == 1)
             .unwrap_or_else(|| panic!("the probe is answered: {sent:#?}"));
-        assert_eq!(probe_reply["error"]["code"], -32601, "{probe_reply:#?}");
-        assert!(probe_reply.get("result").is_none(), "{probe_reply:#?}");
-        assert_eq!(
-            state.attempts.load(Ordering::SeqCst),
-            2,
-            "the bridge gets the client's own initialize and tools/call, never a synthesized one"
+        assert!(reply.get("error").is_none(), "{reply:#?}");
+        assert_eq!(reply["result"]["resultType"], "complete");
+        assert!(
+            reply["result"]["supportedVersions"]
+                .as_array()
+                .is_some_and(|v| v.contains(&serde_json::json!("2026-07-28"))),
+            "{reply:#?}"
         );
+        let bridge_sent = bridge_sent.lock();
+        assert_eq!(bridge_sent[0]["method"], INITIALIZE_METHOD);
+        assert!(modern_input::defers_roots(&bridge_sent[0]));
     }
 
     #[tokio::test]
@@ -3588,14 +3588,6 @@ mod tests {
         .await;
     }
 
-    thread_local! {
-        /// Lets a test drive the modern path while [`ANSWER_MODERN_DISCOVER`]
-        /// is off in production. Thread-local because `#[tokio::test]` runs
-        /// the proxy on the test's own thread.
-        pub(super) static ANSWER_MODERN_DISCOVER_IN_TEST: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
-    }
-
     type Reaction = dyn Fn(&serde_json::Value) -> Vec<Option<serde_json::Value>> + Send + Sync;
 
     /// A peer that answers what it is sent: every message the proxy sends it
@@ -3717,7 +3709,6 @@ mod tests {
     }
 
     async fn run_scripted(stdio: Scripted, bridge: Scripted) {
-        ANSWER_MODERN_DISCOVER_IN_TEST.with(|c| c.set(true));
         let mut reconnect = || -> Result<Scripted> { panic!("no reconnect in this test") };
         let run = run_transport_proxy(stdio, bridge, "test", None, &mut reconnect, None);
         let outcome = tokio::time::timeout(
@@ -4088,6 +4079,82 @@ mod tests {
             .filter(|m| m["method"] == INITIALIZE_METHOD)
             .count();
         assert_eq!(initializes, 1);
+    }
+
+    /// SPEC R-HUB.4.6: the bridge and worker run the 2025-11-25 session the
+    /// synthesized `initialize` opened. A request that still names 2026-07-28
+    /// in its `_meta` makes rmcp refuse every server request the worker sends
+    /// while handling it — the `sandbox_grant` prompt and `await`'s liveness
+    /// ping, as Claude Code 2.1.331 showed live — so the proxy drops that
+    /// envelope and keeps the rest of `_meta`.
+    #[tokio::test]
+    async fn a_modern_request_envelope_never_reaches_the_bridge() {
+        let envelope = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2.1.331"},
+            "io.modelcontextprotocol/clientCapabilities": {
+                "roots": {}, "elicitation": {"form": {}}
+            },
+            "progressToken": 7
+        });
+        let list = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": {"_meta": envelope.clone()}
+        });
+        let call = serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "sandbox_grant", "arguments": {}, "_meta": envelope}
+        });
+        let stdio = Scripted::new(
+            vec![serde_json::to_value(client_discover_request(1)).unwrap()],
+            move |m| match m["id"].as_i64() {
+                Some(1) => vec![Some(list.clone())],
+                Some(2) => vec![Some(call.clone())],
+                Some(3) => vec![None],
+                _ => Vec::new(),
+            },
+        );
+        let bridge = Scripted::new(Vec::new(), |m| {
+            match m.get("method").and_then(|m| m.as_str()) {
+                Some(INITIALIZE_METHOD) => vec![Some(
+                    serde_json::to_value(bridge_initialize_response(0)).unwrap(),
+                )],
+                Some("tools/list") => vec![Some(serde_json::json!({
+                    "jsonrpc": "2.0", "id": m["id"], "result": {"tools": []}
+                }))],
+                Some("tools/call") => vec![Some(serde_json::json!({
+                    "jsonrpc": "2.0", "id": m["id"],
+                    "result": {"content": [{"type": "text", "text": "ok"}]}
+                }))],
+                _ => Vec::new(),
+            }
+        });
+        let bridge_sent = bridge.sent.clone();
+
+        run_scripted(stdio, bridge).await;
+
+        let bridge_sent = bridge_sent.lock();
+        for method in ["tools/list", "tools/call"] {
+            let request = bridge_sent
+                .iter()
+                .find(|m| m["method"] == method)
+                .unwrap_or_else(|| panic!("{method} reaches the bridge: {bridge_sent:#?}"));
+            let meta = &request["params"]["_meta"];
+            for key in [
+                "io.modelcontextprotocol/protocolVersion",
+                "io.modelcontextprotocol/clientInfo",
+                "io.modelcontextprotocol/clientCapabilities",
+            ] {
+                assert!(
+                    meta.get(key).is_none(),
+                    "{method} still carries {key}: {request:#}"
+                );
+            }
+            assert_eq!(
+                meta["progressToken"], 7,
+                "{method} keeps the rest: {request:#}"
+            );
+        }
     }
 
     const PROMPT_MESSAGE: &str = "Allow writes to /x?";

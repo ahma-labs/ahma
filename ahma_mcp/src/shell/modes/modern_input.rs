@@ -109,7 +109,7 @@ impl ModernSession {
                 None => self.roots = Some(json!({ "roots": [] })),
             }
         }
-        self.held_calls.push(strip_input_fields(call));
+        self.held_calls.push(legacy_request(call));
         self.held_since.get_or_insert(now);
         CallStep::Held
     }
@@ -333,7 +333,7 @@ impl Prompts {
                 }
                 None => {
                     self.in_flight.push((client_id.clone(), client_id));
-                    to_bridge.push(strip_input_fields(call));
+                    to_bridge.push(legacy_request(call));
                 }
             }
             return CallRoute::Answer {
@@ -349,7 +349,7 @@ impl Prompts {
                 to_client: vec![response(client_id, result)],
             };
         }
-        let call = strip_input_fields(call);
+        let call = legacy_request(call);
         self.track(&call);
         CallRoute::Forward(call)
     }
@@ -487,14 +487,33 @@ fn is_exempt(call: &Value) -> bool {
         .is_some_and(is_scope_exempt_tool)
 }
 
-/// The bridge and worker speak the legacy protocol: the retry's MRTR fields
-/// mean nothing to them.
-fn strip_input_fields(mut call: Value) -> Value {
-    if let Some(params) = call.get_mut("params").and_then(Value::as_object_mut) {
+/// The per-request envelope a 2026-07-28 client puts in `params._meta`.
+const REQUEST_ENVELOPE_META: [&str; 3] = [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientInfo",
+    CLIENT_CAPABILITIES_META,
+];
+
+/// A modern client's message as the bridge must see it (SPEC R-HUB.4.6). The
+/// bridge and worker run the 2025-11-25 session the synthesized `initialize`
+/// opened, so the retry's MRTR fields mean nothing to them, and the request
+/// envelope is harmful: rmcp refuses every server request a worker sends while
+/// handling a request that names 2026-07-28, which silenced approval prompts
+/// and `await`'s liveness ping. The rest of `_meta` (`progressToken`) stays.
+pub(crate) fn legacy_request(mut message: Value) -> Value {
+    if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
         params.remove("inputResponses");
         params.remove("requestState");
+        if let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) {
+            for key in REQUEST_ENVELOPE_META {
+                meta.remove(key);
+            }
+            if meta.is_empty() {
+                params.remove("_meta");
+            }
+        }
     }
-    call
+    message
 }
 
 fn response(id: Value, result: Value) -> Value {
