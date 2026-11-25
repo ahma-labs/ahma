@@ -3515,9 +3515,10 @@ mod policy_overlay_tests {
     impl PolicyOverlay for ForbidWritesUnder {
         fn forbids(&self, request: &Request<'_>) -> Option<String> {
             match (request.action, request.resource) {
-                (Action::Write, Resource::Path(p)) if p.starts_with(&self.0) => {
-                    Some(format!("team policy forbids writing under {}", self.0.display()))
-                }
+                (Action::Write, Resource::Path(p)) if p.starts_with(&self.0) => Some(format!(
+                    "team policy forbids writing under {}",
+                    self.0.display()
+                )),
                 _ => None,
             }
         }
@@ -3541,7 +3542,10 @@ mod policy_overlay_tests {
             other => panic!("expected the overlay to refuse the grant, got {other:?}"),
         }
         assert!(
-            !matches!(classify_grant_risk(&other, None, &[]), GrantRisk::Refused(_)),
+            !matches!(
+                classify_grant_risk(&other, None, &[]),
+                GrantRisk::Refused(_)
+            ),
             "the overlay must narrow only what it names"
         );
     }
