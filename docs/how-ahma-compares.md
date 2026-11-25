@@ -44,6 +44,12 @@ argues that an *agent* needs a stronger boundary than a container
 
 ### Other kernel sandboxes
 
+The agent vendors themselves have settled on in-place kernel sandboxing for their own
+agents. Anthropic uses it for Claude Code, OpenAI for Codex, and Cursor for its agent.
+Cursor reports that sandboxed agents stop 40% less often
+([Cursor](https://cursor.com/blog/agent-sandboxing)). Ahma uses the same mechanisms; what
+differs is the scope: one boundary and one permission ledger across all of them.
+
 - **[Anthropic sandbox-runtime](https://github.com/anthropics/sandbox-runtime) and [Claude Code's sandboxed Bash](https://code.claude.com/docs/en/sandboxing)**: Seatbelt on macOS, bubblewrap on Linux, a proxy with domain allowlists; reads allowed everywhere by default. It covers Claude Code's Bash tool, not MCP servers, and is off unless you turn it on.
 - **[OpenAI Codex CLI](https://developers.openai.com/codex/agent-approvals-security)**: Seatbelt on macOS, bubblewrap on Linux, a native Windows sandbox; network off in `workspace-write` by default.
 - **[Cursor](https://cursor.com/blog/agent-sandboxing)**: Seatbelt on macOS; Landlock and seccomp on Linux; WSL2 on Windows.

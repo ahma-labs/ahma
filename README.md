@@ -75,6 +75,14 @@ Use ahma inside WSL2 for a Landlock boundary. Details:
 
 ## How it compares
 
+Ahma isn't alone in this approach. Anthropic sandboxes Claude Code's own shell with the same
+operating-system mechanisms (Seatbelt on macOS, bubblewrap on Linux); in its auto-allow mode a
+command that runs inside the sandbox needs no prompt at all
+([Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing),
+[how Anthropic contains Claude](https://www.anthropic.com/engineering/how-we-contain-claude)).
+OpenAI Codex and Cursor do the same. Ahma brings that boundary to every agent you use, under
+one set of permissions.
+
 | Approach | What bounds the agent |
 |---|---|
 | Nothing / "YOLO" | Your whole user account; the model decides |
