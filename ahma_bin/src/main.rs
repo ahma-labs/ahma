@@ -167,7 +167,27 @@ async fn run() -> Result<()> {
     match ahma_policy::install_from_default_dirs() {
         ahma_policy::Installed::None => {}
         ahma_policy::Installed::Rules(n) => {
-            tracing::info!("team policy: {n} forbid rule(s) loaded (`ahma policy list`)")
+            tracing::info!("team policy: {n} forbid rule(s) loaded (`ahma policy list`)");
+            // SPEC R-POLICY.4: say where each path rule is held, so a rule
+            // nobody's kernel enforces is never mistaken for one that is.
+            let k = ahma_common::policy::installed_kernel_denies();
+            let paths = k.read.len() + k.write.len();
+            if paths > 0 {
+                let held = if cfg!(target_os = "macos") {
+                    "by the kernel (Seatbelt) and by ahma's file tools"
+                } else {
+                    "by ahma's file tools and grant decisions only: the kernel does not \
+                     deny a path inside the workspace here yet"
+                };
+                tracing::info!("team policy: {paths} path rule(s) held {held}");
+            }
+            if k.userspace_only > 0 {
+                tracing::info!(
+                    "team policy: {} conditional path rule(s) held by ahma's own decisions \
+                     only, never by the kernel",
+                    k.userspace_only
+                );
+            }
         }
         ahma_policy::Installed::Broken(e) => tracing::error!(
             "team policy could not be loaded, so ahma refuses every tool call and permission \

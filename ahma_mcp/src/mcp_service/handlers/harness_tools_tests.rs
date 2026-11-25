@@ -575,6 +575,51 @@ async fn write_file_success() {
     assert_eq!(text, "File written");
 }
 
+/// SPEC R-POLICY.4: ahma's own file tools hold team policy wherever it runs
+/// (on Linux they are the only holder inside the workspace). A forbidden write
+/// is refused before anything touches the file, naming the rule's reason; a
+/// read of the same path, forbidden only for writing, still works.
+#[tokio::test]
+async fn a_team_policy_forbid_refuses_ahmas_own_file_write() {
+    struct ForbidWritesUnder(std::path::PathBuf);
+    impl ahma_common::policy::PolicyOverlay for ForbidWritesUnder {
+        fn forbids(&self, request: &ahma_common::policy::Request<'_>) -> Option<String> {
+            use ahma_common::policy::{Action, Resource};
+            match (request.action, request.resource) {
+                (Action::Write, Resource::Path(p)) if p.starts_with(&self.0) => {
+                    Some("team policy: no writes here".to_string())
+                }
+                _ => None,
+            }
+        }
+    }
+    // Canonical, as a policy must name it (`/private/var/…` on macOS).
+    let dir = tempfile::tempdir().unwrap();
+    let forbidden = dunce::canonicalize(dir.path()).unwrap().join("forbidden");
+    std::fs::create_dir_all(&forbidden).unwrap();
+    let _ = ahma_common::policy::install_overlay(Arc::new(ForbidWritesUnder(forbidden.clone())));
+    let svc = make_service_with(
+        Arc::new(MockFileOpsProvider::default()),
+        Arc::new(MockWebPageFetcher::default()),
+    )
+    .await;
+    let target = forbidden.join("x.txt");
+    let err = svc
+        .handle_write_file(make_args(&[
+            ("path", json!(target.to_string_lossy())),
+            ("content", json!("hello")),
+        ]))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("no writes here"), "{}", err.message);
+    assert!(
+        svc.handle_read_file(make_args(&[("path", json!(target.to_string_lossy()))]))
+            .await
+            .is_ok(),
+        "only writing is forbidden"
+    );
+}
+
 /// `write_file` creates or overwrites. Overwriting needs to have seen what is
 /// there: an existing file it never read is refused (it used to be replaced
 /// blind), and one read in this session is overwritten.

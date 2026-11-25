@@ -113,6 +113,10 @@ impl Sandbox {
         // reaches neither its socket nor the directory that holds the token.
         let hub_denies = hub_rendezvous_denies();
         let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(&git_resolution_roots);
+        // SPEC R-POLICY.4: team policy's literal path forbids, last in the
+        // profile (last match wins), so no allow above reopens one, inside
+        // the workspace or out.
+        let policy_deny_rules = policy_deny_rules(&ahma_common::policy::installed_kernel_denies());
 
         // SPEC R6.2.6: signals stay inside this command's own sandbox unless
         // the user opted out — see `super::signals`.
@@ -141,11 +145,12 @@ impl Sandbox {
 (allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]*") (extension "com.apple.sandbox.pty")))
 {exec_config_deny_rules}{network_rules}{socket_connect_denies}{agent_connect_denies}{hub_denies}(allow mach-lookup)
 {run_rule}{pasteboard_denies}(allow ipc-posix-shm*)
-{broker_rules}"#,
+{broker_rules}{policy_deny_rules}"#,
             working_dir = wd_str,
             working_dir_write = working_dir_write,
             signal_rules = signal_rules,
             gpu_rules = gpu_rules,
+            policy_deny_rules = policy_deny_rules,
             system_rules = system_rules,
             credential_deny_rules = credential_deny_rules,
             keychain_rules = keychain_rules,
@@ -747,6 +752,27 @@ fn pasteboard_denies() -> String {
         .collect()
 }
 
+/// Seatbelt rules for team policy's kernel denies (SPEC R-POLICY.4): one
+/// `deny` per path, canonical where it exists (macOS checks the resolved path,
+/// `/private/var` for `/var`), quoted for SBPL.
+pub(crate) fn policy_deny_rules(denies: &ahma_common::policy::KernelDenies) -> String {
+    let quote = |p: &std::path::Path| {
+        let p = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        p.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    };
+    let mut rules = String::new();
+    for p in &denies.read {
+        rules.push_str(&format!("(deny file-read* (subpath \"{}\"))\n", quote(p)));
+    }
+    for p in &denies.write {
+        rules.push_str(&format!("(deny file-write* (subpath \"{}\"))\n", quote(p)));
+    }
+    rules
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::core::Sandbox;
@@ -1026,6 +1052,60 @@ mod tests {
             !profile.contains("Keychains"),
             "no keychain allow rule when disabled, got:\n{profile}"
         );
+    }
+
+    /// SPEC R-POLICY.4: a team-policy forbid on a literal path becomes a
+    /// Seatbelt deny, emitted after the workspace allow so it holds inside the
+    /// workspace too, where no grant is ever asked. The path is quoted for
+    /// SBPL, so a `"` in it cannot end the string.
+    #[test]
+    fn policy_denies_render_and_come_after_the_workspace_allow() {
+        let rules = super::policy_deny_rules(&ahma_common::policy::KernelDenies {
+            read: vec![std::path::PathBuf::from("/r")],
+            write: vec![std::path::PathBuf::from("/w/a\"b")],
+            userspace_only: 0,
+        });
+        assert!(
+            rules.contains("(deny file-read* (subpath \"/r\"))"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("(deny file-write* (subpath \"/w/a\\\"b\"))"),
+            "{rules}"
+        );
+
+        struct ForbidWrite(std::path::PathBuf);
+        impl ahma_common::policy::PolicyOverlay for ForbidWrite {
+            fn forbids(&self, _: &ahma_common::policy::Request<'_>) -> Option<String> {
+                None
+            }
+            fn kernel_denies(&self) -> ahma_common::policy::KernelDenies {
+                ahma_common::policy::KernelDenies {
+                    write: vec![self.0.clone()],
+                    ..Default::default()
+                }
+            }
+        }
+        let dir = tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let secrets = root.join("secrets");
+        let _ =
+            ahma_common::policy::install_overlay(std::sync::Arc::new(ForbidWrite(secrets.clone())));
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, Default::default()).unwrap();
+        let profile = sb.generate_seatbelt_profile_test(&root);
+        let allow = profile
+            .find(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                root.display()
+            ))
+            .expect("workspace allow");
+        let deny = profile
+            .find(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                secrets.display()
+            ))
+            .unwrap_or_else(|| panic!("policy deny missing:\n{profile}"));
+        assert!(deny > allow, "the deny must be the last word:\n{profile}");
     }
 
     /// The exec-config denies are worthless unless they are the *last* word:

@@ -68,6 +68,30 @@ impl AhmaMcpService {
     /// Refuse an edit while a command that may read or write the same
     /// workspace is running (SPEC R2.7.8): the edit would land partway
     /// through that command, and its result would describe neither version.
+    /// Refuse a file access team policy forbids (SPEC R-POLICY.4). ahma's own
+    /// file tools hold it on every platform; on Linux, inside the workspace,
+    /// they are the only holder, since Landlock cannot deny a path below one it
+    /// allows.
+    fn ensure_policy_allows(
+        &self,
+        action: ahma_common::policy::Action,
+        path: &Path,
+    ) -> Result<(), McpError> {
+        use ahma_common::policy::{self, DefaultAnswer, Facts, Resource};
+        let resolved = self
+            .adapter
+            .sandbox()
+            .validate_path(path)
+            .unwrap_or_else(|_| path.to_path_buf());
+        match policy::decide(
+            &policy::Request::new(action, Resource::Path(&resolved)),
+            &Facts::new(DefaultAnswer::Allow),
+        ) {
+            policy::Decision::Deny { reason, .. } => Err(mcp_invalid_params(reason)),
+            _ => Ok(()),
+        }
+    }
+
     fn ensure_workspace_not_busy(&self, path: &Path) -> Result<(), McpError> {
         let enabled = self
             .app_config
@@ -109,6 +133,7 @@ impl AhmaMcpService {
         let end_line = num("end_line")
             .or_else(|| num("limit").map(|limit| start_line.unwrap_or(1) + limit.max(1) - 1));
 
+        self.ensure_policy_allows(ahma_common::policy::Action::Read, Path::new(path))?;
         let scopes = self.adapter.sandbox().scopes().to_vec();
         let result = self
             .file_ops_provider
@@ -508,6 +533,7 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'content' is required"))?;
 
         let path_ref = Path::new(path);
+        self.ensure_policy_allows(ahma_common::policy::Action::Write, path_ref)?;
         self.ensure_workspace_not_busy(path_ref)?;
         // Creating is free; overwriting needs to have seen what is there.
         self.ensure_read_and_unchanged(path_ref).await?;
@@ -603,6 +629,7 @@ impl AhmaMcpService {
         edits: &[ahma_harness_tools::edit::Edit],
         tool: &str,
     ) -> Result<CallToolResult, McpError> {
+        self.ensure_policy_allows(ahma_common::policy::Action::Write, path)?;
         self.ensure_workspace_not_busy(path)?;
         self.ensure_read_and_unchanged(path).await?;
         let narrowing = self.narrow_container_for(path);
@@ -670,6 +697,7 @@ impl AhmaMcpService {
             }
             for p in op.paths() {
                 if let Ok(full) = ahma_harness_tools::resolve_patch_path(&scopes, &base_dir, p) {
+                    self.ensure_policy_allows(ahma_common::policy::Action::Write, &full)?;
                     self.ensure_workspace_not_busy(&full)?;
                     touched.push(full);
                 }

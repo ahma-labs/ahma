@@ -64,6 +64,7 @@ pub struct TeamPolicy {
     policies: PolicySet,
     schema: Schema,
     rules: Vec<Rule>,
+    kernel: ahma_common::policy::KernelDenies,
 }
 
 impl std::fmt::Debug for TeamPolicy {
@@ -180,6 +181,7 @@ impl TeamPolicy {
                 .collect();
             return Err(LoadError::Invalid(errors.join("; ")));
         }
+        let kernel = kernel_denies_of(&policies);
         let permit = Policy::parse(
             Some(PolicyId::new(PERMIT_ALL)),
             "permit(principal, action, resource);",
@@ -192,12 +194,18 @@ impl TeamPolicy {
             policies,
             schema,
             rules,
+            kernel,
         })
     }
 
     /// The loaded forbids.
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    /// The forbids the kernel can hold (SPEC R-POLICY.4).
+    pub fn kernel_denies(&self) -> ahma_common::policy::KernelDenies {
+        self.kernel.clone()
     }
 
     /// The forbid that denies `request`, if one does: its id and its reason.
@@ -260,6 +268,10 @@ struct Built {
 }
 
 impl PolicyOverlay for TeamPolicy {
+    fn kernel_denies(&self) -> ahma_common::policy::KernelDenies {
+        self.kernel.clone()
+    }
+
     fn forbids(&self, request: &Request<'_>) -> Option<String> {
         // A request the schema cannot express (an action applied to a resource
         // it does not take) is not something a forbid can name; it is allowed
@@ -283,6 +295,42 @@ impl PolicyOverlay for BrokenPolicy {
             self.error
         ))
     }
+}
+
+/// The forbids the kernel can hold: unconditional, for any principal, on a
+/// literal `Ahma::Path`, for `read` or `write` (or any action). Every other
+/// path rule is held only where ahma decides, and is counted.
+fn kernel_denies_of(policies: &PolicySet) -> ahma_common::policy::KernelDenies {
+    use cedar_policy::{ActionConstraint, PrincipalConstraint, ResourceConstraint};
+    let mut out = ahma_common::policy::KernelDenies::default();
+    for policy in policies.policies() {
+        let path = match policy.resource_constraint() {
+            ResourceConstraint::In(uid) | ResourceConstraint::Eq(uid)
+                if uid.type_name().to_string() == "Ahma::Path" =>
+            {
+                PathBuf::from(uid.id().unescaped())
+            }
+            _ => continue,
+        };
+        if policy.has_non_scope_constraint()
+            || !matches!(policy.principal_constraint(), PrincipalConstraint::Any)
+        {
+            out.userspace_only += 1;
+            continue;
+        }
+        let names: Vec<String> = match policy.action_constraint() {
+            ActionConstraint::Any => vec!["read".into(), "write".into()],
+            ActionConstraint::Eq(a) => vec![a.id().unescaped().to_string()],
+            ActionConstraint::In(v) => v.iter().map(|a| a.id().unescaped().to_string()).collect(),
+        };
+        if names.iter().any(|n| n == "read") {
+            out.read.push(path.clone());
+        }
+        if names.iter().any(|n| n == "write") {
+            out.write.push(path);
+        }
+    }
+    out
 }
 
 fn action_name(action: Action) -> &'static str {
