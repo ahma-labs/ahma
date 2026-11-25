@@ -252,3 +252,23 @@ mod export {
         }
     }
 }
+
+/// SPEC R-POLICY.4: an unconditional forbid on a literal path, for anyone,
+/// can be held by the kernel; anything conditional, principal-bound or not a
+/// path is held only where ahma decides, and is counted so it can be said.
+#[test]
+fn literal_path_forbids_become_kernel_denies() {
+    let p = policy(
+        r#"
+        forbid(principal, action == Ahma::Action::"write", resource in Ahma::Path::"/a");
+        forbid(principal, action in [Ahma::Action::"read", Ahma::Action::"write"], resource == Ahma::Path::"/b/f");
+        forbid(principal, action == Ahma::Action::"write", resource in Ahma::Path::"/d")
+          when { principal has workspace };
+        forbid(principal, action == Ahma::Action::"fetch", resource in Ahma::Host::"x.com");
+        "#,
+    );
+    let k = p.kernel_denies();
+    assert_eq!(k.write, [PathBuf::from("/a"), PathBuf::from("/b/f")]);
+    assert_eq!(k.read, [PathBuf::from("/b/f")]);
+    assert_eq!(k.userspace_only, 1, "the conditional path rule");
+}

@@ -156,6 +156,28 @@ pub enum Decision {
 pub trait PolicyOverlay: Send + Sync {
     /// `Some(reason)` when this request is forbidden.
     fn forbids(&self, request: &Request<'_>) -> Option<String>;
+
+    /// The forbids the kernel can hold (SPEC R-POLICY.4): unconditional, for
+    /// anyone, on a literal path. Kernel profiles deny these even inside the
+    /// workspace, where no grant decision is ever asked.
+    fn kernel_denies(&self) -> KernelDenies {
+        KernelDenies::default()
+    }
+}
+
+/// Paths a policy forbids that the kernel can be told to deny (R-POLICY.4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KernelDenies {
+    pub read: Vec<std::path::PathBuf>,
+    pub write: Vec<std::path::PathBuf>,
+    /// Path rules with a condition or a principal, held only where ahma
+    /// decides; counted so the gap can be disclosed.
+    pub userspace_only: usize,
+}
+
+/// The installed overlay's [`KernelDenies`], or none.
+pub fn installed_kernel_denies() -> KernelDenies {
+    overlay().map(|o| o.kernel_denies()).unwrap_or_default()
 }
 
 static OVERLAY: OnceLock<Arc<dyn PolicyOverlay>> = OnceLock::new();
