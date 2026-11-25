@@ -52,6 +52,14 @@ On Linux, Ahma uses [Landlock](https://docs.kernel.org/userspace-api/landlock.ht
 
 **Requirements**: Linux kernel 5.13 or newer (released June 2021). The server refuses to start on older kernels unless sandbox is explicitly disabled.
 
+Some rights need a newer kernel, and ahma asks for them best effort, logging which are missing:
+
+| Right | Kernel | Without it |
+|---|---|---|
+| Truncation (`truncate(2)`, `O_TRUNC`) | 6.2 | a command can truncate a file outside the scope |
+| Cross-directory rename (`Refer`) | 5.19 | renames between directories fail with `EXDEV` |
+| TCP connect only to the egress proxy | 6.7 | `--restrict-network` is advisory |
+
 ```bash
 uname -r   # 5.13 or newer
 ```
