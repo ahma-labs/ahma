@@ -396,7 +396,22 @@ impl LinkGrants {
     /// R-LINK.5): a grant naming it does; "any site" only when the host is
     /// neither `local` nor `outside_egress`.
     pub fn covers(&self, host: &str, local: bool, outside_egress: bool) -> bool {
-        self.always.iter().chain(&self.session).any(|p| match p {
+        self.covers_saved(host, local, outside_egress)
+            || self.covers_session(host, local, outside_egress)
+    }
+
+    /// Whether a saved grant (`[open_url]`) opens links to `host`.
+    pub fn covers_saved(&self, host: &str, local: bool, outside_egress: bool) -> bool {
+        Self::any_covers(&self.always, host, local, outside_egress)
+    }
+
+    /// Whether a grant made this session opens links to `host`.
+    pub fn covers_session(&self, host: &str, local: bool, outside_egress: bool) -> bool {
+        Self::any_covers(&self.session, host, local, outside_egress)
+    }
+
+    fn any_covers(patterns: &[HostPattern], host: &str, local: bool, outside_egress: bool) -> bool {
+        patterns.iter().any(|p| match p {
             HostPattern::Any => !local && !outside_egress,
             named => named.matches(host),
         })
@@ -660,11 +675,33 @@ pub fn decide(
         Egress::Open => false,
         Egress::Restricted(allows) => !local && !allows(host),
     };
-    if grants.covers(host, local, outside_egress) {
-        return LinkDecision::Open;
-    }
-    if grants.denied.iter().any(|d| d.eq_ignore_ascii_case(host)) {
-        return LinkDecision::Denied;
+    // One order for every permission (SPEC R-POLICY.2): a session answer, then
+    // a standing permit. A grant withdraws this session's deny: it is the later
+    // answer (a denied site is never asked again, so a grant can only come
+    // after), and the deny's refusal line names exactly that grant as the way
+    // through (R-LINK.6). So a deny is reported only while no grant covers the
+    // site.
+    use ahma_common::policy::{
+        self, Action, Decision, DefaultAnswer, Facts, Resource, SessionAnswer,
+    };
+    let saved = grants.covers_saved(host, local, outside_egress);
+    let mut facts = Facts::new(DefaultAnswer::Ask);
+    facts.session = if grants.covers_session(host, local, outside_egress) {
+        Some(SessionAnswer::Granted)
+    } else if !saved && grants.denied.iter().any(|d| d.eq_ignore_ascii_case(host)) {
+        Some(SessionAnswer::Denied)
+    } else {
+        None
+    };
+    facts.permitted = saved.then(|| "[open_url]".to_string());
+    let host_lc = host.to_ascii_lowercase();
+    match policy::decide(
+        &policy::Request::new(Action::OpenLink, Resource::Host(&host_lc)),
+        &facts,
+    ) {
+        Decision::Allow { .. } => return LinkDecision::Open,
+        Decision::Deny { .. } => return LinkDecision::Denied,
+        Decision::Ask => {}
     }
     LinkDecision::Ask(LinkQuestion {
         host: host.to_string(),

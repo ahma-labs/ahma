@@ -1288,8 +1288,22 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
     let home = home.map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
     let home = home.as_deref();
 
-    if let Some(reason) = check_grant_refusal(path, home, scopes) {
-        return GrantRisk::Refused(reason);
+    // One decision point (SPEC R-POLICY.1): the hard denylist is a forbid,
+    // and installed team policy (R-POLICY.3) may forbid more. A grant opens a
+    // path to reading, and perhaps writing, so it is refused when either is
+    // forbidden. Nothing else here can refuse: a grant reaching this point was
+    // asked for by a human, whose answer is the default.
+    {
+        use crate::policy::{self, Action, Decision, DefaultAnswer, Facts, Resource};
+        let mut facts = Facts::new(DefaultAnswer::Allow);
+        facts.forbidden = check_grant_refusal(path, home, scopes);
+        for action in [Action::Read, Action::Write] {
+            if let Decision::Deny { reason, .. } =
+                policy::decide(&policy::Request::new(action, Resource::Path(path)), &facts)
+            {
+                return GrantRisk::Refused(reason);
+            }
+        }
     }
 
     let warnings = collect_grant_warnings(path, home, scopes);
@@ -3487,5 +3501,52 @@ mod startup_flag_tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_overlay_tests {
+    use super::*;
+    use crate::policy::{self, Action, PolicyOverlay, Request, Resource};
+    use std::sync::Arc;
+
+    /// Forbids writing under one directory, as a team policy file would.
+    struct ForbidWritesUnder(PathBuf);
+    impl PolicyOverlay for ForbidWritesUnder {
+        fn forbids(&self, request: &Request<'_>) -> Option<String> {
+            match (request.action, request.resource) {
+                (Action::Write, Resource::Path(p)) if p.starts_with(&self.0) => Some(format!(
+                    "team policy forbids writing under {}",
+                    self.0.display()
+                )),
+                _ => None,
+            }
+        }
+    }
+
+    /// SPEC R-POLICY.2, R-POLICY.4: an installed overlay is a forbid, so a
+    /// grant of a path it covers is refused before anyone is asked, and a path
+    /// it does not cover is untouched. The directory is unique to this test, so
+    /// the process-wide overlay cannot change what any other test sees.
+    #[test]
+    fn an_installed_overlay_refuses_a_grant_it_forbids() {
+        let dir = tempfile::tempdir().unwrap();
+        let forbidden = dunce::canonicalize(dir.path()).unwrap().join("secrets");
+        std::fs::create_dir_all(&forbidden).unwrap();
+        let other = dunce::canonicalize(dir.path()).unwrap().join("fine");
+        std::fs::create_dir_all(&other).unwrap();
+        let _ = policy::install_overlay(Arc::new(ForbidWritesUnder(forbidden.clone())));
+
+        match classify_grant_risk(&forbidden, None, &[]) {
+            GrantRisk::Refused(why) => assert!(why.contains("team policy"), "{why}"),
+            other => panic!("expected the overlay to refuse the grant, got {other:?}"),
+        }
+        assert!(
+            !matches!(
+                classify_grant_risk(&other, None, &[]),
+                GrantRisk::Refused(_)
+            ),
+            "the overlay must narrow only what it names"
+        );
     }
 }

@@ -154,14 +154,37 @@ impl SignConsent for RecordedConsent {
             return Decision::Deny(refusal_line(request, false));
         };
         let now = ahma_common::session_grants::now_secs();
-        if ssh_sign::allowed(
-            &self.grants(now),
-            &request.key_fingerprint,
-            &destination,
-            &self.workspace,
-            now,
-        ) {
-            return Decision::Allow;
+        // One order for every permission (SPEC R-POLICY.2): a recorded grant
+        // is a standing permit, and the default is to refuse, since the broker
+        // never asks mid-handshake. A forbid from team policy wins over a grant
+        // and cannot be granted past, so it is not recorded for a later ask.
+        {
+            use ahma_common::policy::{self, Action, DefaultAnswer, Facts, Resource, Stage};
+            let mut facts = Facts::new(DefaultAnswer::Deny);
+            facts.permitted = ssh_sign::allowed(
+                &self.grants(now),
+                &request.key_fingerprint,
+                &destination,
+                &self.workspace,
+                now,
+            )
+            .then(|| "[[sandbox.ssh_sign]]".to_string());
+            let resource = match &request.destination {
+                Destination::Host { names, .. } => Resource::Host(names[0].as_str()),
+                Destination::Namespace(ns) => Resource::Namespace(ns.as_str()),
+                // `destination_key` returned `None` for anything else above.
+                _ => return Decision::Deny(refusal_line(request, false)),
+            };
+            let request_for =
+                policy::Request::new(Action::SshSign, resource).in_workspace(&self.workspace);
+            match policy::decide(&request_for, &facts) {
+                policy::Decision::Allow { .. } => return Decision::Allow,
+                policy::Decision::Deny {
+                    stage: Stage::Overlay | Stage::Forbid,
+                    reason,
+                } => return Decision::Deny(format!("ahma: signature refused: {reason}")),
+                _ => {}
+            }
         }
         // Left for the harness dialog, which asks before this command runs
         // again or before any command that can use the agent (R-PERM.10,
