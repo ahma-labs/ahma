@@ -213,6 +213,7 @@ setting_keys! {
         => SECURITY.switch("writing .ahma/ tool configs"),
     SandboxLinuxDenyTier = sandbox.linux_deny_tier => SECURITY,
     SandboxSyscallFilter = sandbox.syscall_filter => SECURITY,
+    SandboxHomeReads = sandbox.home_reads => SECURITY,
     LoggingTarget = logging.target => PREFERENCE,
     LoggingLogMonitor = logging.log_monitor => PREFERENCE,
     LoggingMonitorRateLimitSecs = logging.monitor_rate_limit_secs => PREFERENCE,

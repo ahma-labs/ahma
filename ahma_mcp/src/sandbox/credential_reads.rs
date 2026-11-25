@@ -270,6 +270,21 @@ pub fn keychain_access_allowed() -> bool {
     *KEYCHAIN_ACCESS_ALLOWED.read()
 }
 
+static HOME_READS_ALLOWLIST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Install `[sandbox] home_reads` (SPEC R-HARDEN.5): `true` for
+/// `"allowlist"`. macOS only; Linux reads nothing in home by default already.
+pub fn set_home_reads_allowlist(on: bool) {
+    HOME_READS_ALLOWLIST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether macOS profiles deny reading file contents under home except by
+/// allowlist.
+pub fn home_reads_allowlist() -> bool {
+    HOME_READS_ALLOWLIST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

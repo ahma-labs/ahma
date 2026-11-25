@@ -3693,6 +3693,16 @@ fn configure_linux_deny_tier(s: &ahma_common::config::AhmaSettings) {
     // SPEC R-HARDEN.3: the seccomp baseline, installed beside the deny tier
     // for the same reason (security tier, resolved once).
     sandbox::syscall_filter::set_syscall_filter(s.sandbox.syscall_filter);
+    // SPEC R-HARDEN.5: macOS home reads by allowlist, opt-in.
+    let allowlist = s.sandbox.home_reads == ahma_common::config::HomeReads::Allowlist;
+    sandbox::credential_reads::set_home_reads_allowlist(allowlist);
+    if allowlist && cfg!(target_os = "macos") {
+        tracing::info!(
+            "[sandbox] home_reads = \"allowlist\": commands cannot read file contents under \
+             your home except the workspace, enabled profiles, your grants and client \
+             configuration (SPEC R-HARDEN.5)"
+        );
+    }
 }
 
 /// Install `[sandbox] ssh_agent` (SPEC R-CRED.11) and, unless it is

@@ -1762,3 +1762,75 @@ fn a_folder_rule_makes_the_folder_writable_and_nothing_in_it() {
     assert!(!without.contains("DIR_WRITABLE"), "{without}");
     assert!(without.contains("LOCK_WRITTEN"), "{without}");
 }
+
+/// SPEC R-HARDEN.5: under `[sandbox] home_reads = "allowlist"` the kernel
+/// refuses the contents of a file in home that nothing allowed, while the
+/// workspace (inside home), `~/.gitconfig`, and a path's metadata stay
+/// readable. The control comes first: with the option off the same read
+/// works, so the refusal is the option's.
+#[test]
+fn home_reads_allowlist_is_kernel_enforced() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::credential_reads::set_home_reads_allowlist;
+
+    let home_dir = TempDir::new().expect("fake home");
+    let home = dunce::canonicalize(home_dir.path()).unwrap();
+    let secret = home.join("notes.txt");
+    std::fs::write(&secret, "home-secret").unwrap();
+    std::fs::write(home.join(".gitconfig"), "[user]\n\tname = probe\n").unwrap();
+    let ws = home.join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::write(ws.join("ok.txt"), "in-scope-content").unwrap();
+    // SAFETY: nextest runs each test in its own process; nothing else in it
+    // reads HOME concurrently.
+    unsafe { std::env::set_var("HOME", &home) };
+
+    let run = |profile: &str, program: &str, path: &std::path::Path| {
+        Command::new("sandbox-exec")
+            .args(["-p", profile, program, &path.to_string_lossy()])
+            .current_dir(&ws)
+            .output()
+            .expect("run sandbox-exec")
+    };
+
+    let sandbox = strict_sandbox(&ws, true);
+    let open = sandbox.generate_seatbelt_profile_test(&ws);
+    let out = run(&open, "/bin/cat", &secret);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("home-secret"),
+        "control: with the option off, home reads are open. stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    set_home_reads_allowlist(true);
+    let profile = sandbox.generate_seatbelt_profile_test(&ws);
+    set_home_reads_allowlist(false);
+
+    let out = run(&profile, "/bin/cat", &secret);
+    assert!(
+        !out.status.success() && !String::from_utf8_lossy(&out.stdout).contains("home-secret"),
+        "SECURITY: a file in home nothing allowed must be unreadable. stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    for (path, want) in [
+        (ws.join("ok.txt"), "in-scope-content"),
+        (home.join(".gitconfig"), "probe"),
+    ] {
+        let out = run(&profile, "/bin/cat", &path);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(want),
+            "{} must stay readable. stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "/bin/ls", "-d", &secret.to_string_lossy()])
+        .output()
+        .expect("run sandbox-exec");
+    assert!(
+        out.status.success(),
+        "metadata stays readable (ancestors of a workspace in home are stat-ed). stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

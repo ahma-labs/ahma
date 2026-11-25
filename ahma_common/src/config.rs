@@ -1332,6 +1332,35 @@ impl LinuxDenyTier {
     }
 }
 
+/// How macOS holds reads under the home directory (`[sandbox] home_reads`,
+/// SPEC R-HARDEN.5). Ignored elsewhere: Linux reads nothing in home that no
+/// rule grants, and Windows has no filesystem boundary.
+///
+/// An unknown value is a parse error, so — `[sandbox]` being a security table —
+/// it aborts startup rather than silently picking a mode (R-CFG6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HomeReads {
+    /// Default. Everything is readable apart from the credential denylist
+    /// (R6.2.3).
+    #[default]
+    Denylist,
+    /// File contents under home are unreadable apart from the workspace, the
+    /// enabled profiles' paths, your grants, and the configuration git, ssh
+    /// and the keychain need. Metadata stays readable.
+    Allowlist,
+}
+
+impl HomeReads {
+    /// The TOML token (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HomeReads::Denylist => "denylist",
+            HomeReads::Allowlist => "allowlist",
+        }
+    }
+}
+
 /// Which SSH agent a sandboxed command may use (`[sandbox] ssh_agent`, SPEC
 /// R-CRED.11).
 ///
@@ -1624,6 +1653,11 @@ pub struct SandboxSettings {
     /// R-HARDEN.3). Default: `true`
     #[serde(default = "default_true")]
     pub syscall_filter: bool,
+    /// macOS only. `"allowlist"` makes file contents under home unreadable
+    /// except the workspace, profiles, grants and client configuration (SPEC
+    /// R-HARDEN.5). See [`HomeReads`]. Default: `"denylist"`
+    #[serde(default)]
+    pub home_reads: HomeReads,
 }
 
 /// Every shipped profile, enabled — the opt-out default (R-PERM.5).
@@ -1744,6 +1778,7 @@ impl Default for SandboxSettings {
             allow_project_tool_config: false,
             linux_deny_tier: LinuxDenyTier::Detect,
             syscall_filter: true,
+            home_reads: HomeReads::Denylist,
         }
     }
 }
@@ -3036,6 +3071,12 @@ impl AhmaSettings {
             "syscall_filter",
             self.sandbox.syscall_filter.to_string(),
             d.sandbox.syscall_filter.to_string(),
+        );
+        w.setting(
+            "macOS: \"denylist\" lets commands read everything but credentials; \"allowlist\" makes file contents under your home unreadable except the workspace, enabled profiles, your grants, and what git, ssh and the keychain need (a denied read fails with Operation not permitted; grant it with ahma sandbox grant --read-only <path>).",
+            "home_reads",
+            toml_str(self.sandbox.home_reads.as_str()),
+            toml_str(d.sandbox.home_reads.as_str()),
         );
 
         // ── Logging ──────────────────────────────────────────────────────────
@@ -4692,6 +4733,7 @@ mod tests {
                 allow_project_tool_config: true,
                 linux_deny_tier: LinuxDenyTier::Namespace,
                 syscall_filter: false,
+                home_reads: HomeReads::Allowlist,
             },
             logging: LoggingSettings {
                 target: "stderr".into(),
@@ -6084,6 +6126,22 @@ persistent_scopes = [
         let s = AhmaSettings::load_from(tmp.path());
         assert!(s.sandbox.allow_project_tool_config);
         assert!(!s.sandbox.allow_git_hooks);
+    }
+
+    /// `[sandbox] home_reads` (SPEC R-HARDEN.5): `denylist` is the default,
+    /// and an unknown value aborts parsing rather than picking a mode.
+    #[test]
+    fn home_reads_defaults_to_denylist_and_rejects_an_unknown_value() {
+        assert_eq!(SandboxSettings::default().home_reads, HomeReads::Denylist);
+        for (token, want) in [
+            ("denylist", HomeReads::Denylist),
+            ("allowlist", HomeReads::Allowlist),
+        ] {
+            let parsed =
+                AhmaSettings::parse(&format!("[sandbox]\nhome_reads = \"{token}\"\n")).unwrap();
+            assert_eq!(parsed.sandbox.home_reads, want, "{token}");
+        }
+        assert!(AhmaSettings::parse("[sandbox]\nhome_reads = \"some\"\n").is_err());
     }
 
     /// `[sandbox] linux_deny_tier` (SPEC R6.1.7): `detect` is the default —
