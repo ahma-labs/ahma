@@ -14,11 +14,13 @@ commands ahma executes.*
 ## 2. Acceptance Criteria
 
 - `audit_bundle` scans every `*.json` tool definition in a directory and reports findings
-  by severity: embedded secrets, prompt-injection text in `description`/`hints`, path
-  arguments without `format: "path"`, and exfiltration-shaped command patterns.
-  `--strict` fails the audit on any finding.
+  by severity: embedded secrets, prompt-injection text and over-long text in the top-level
+  `description`, and a file that names a path-like key with no `format: "path"` anywhere.
+  `--strict` fails the audit on any finding. Still open: injection text in `hints` and
+  exfiltration-shaped command patterns are not checked.
 - `BundleChecksummer` writes a SHA-256 manifest of the bundle's files; `BundleVerifier`
-  re-hashes and compares. The checksum detects **corruption only**; it is not a signature:
+  re-hashes the files the manifest lists and compares; a `.json` file added after
+  checksumming is not detected (open). The checksum detects **corruption only**; it is not a signature:
   the manifest is unsigned and lives inside the bundle, so anyone who can edit a file can
   regenerate it. No surface — CLI output, docs, type names — may call the manifest a
   signature or imply it establishes trust.
