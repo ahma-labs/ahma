@@ -57,6 +57,8 @@ pub enum Resource<'a> {
     /// A host name, lower-cased by the caller.
     Host(&'a str),
     Tool(&'a str),
+    /// An `ssh-keygen -Y` signature namespace.
+    Namespace(&'a str),
 }
 
 /// Who asks: the agent working in a workspace, when the caller knows it.

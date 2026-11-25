@@ -747,11 +747,33 @@ async fn resolve_tool_approval(
     args_str: &str,
     gate: &dyn AgentApprovalGate,
 ) -> bool {
-    if !needs_approval(call_name, cfg.tool_approval, &cfg.non_mutating_tool_names) {
-        return true;
-    }
-    if crate::approvals::is_tool_allowed(&cfg.workspace_root, call_name).await {
-        return true;
+    // One order for every permission (SPEC R-POLICY.2): team policy may forbid
+    // a tool; a tool that changes nothing, or one already approved for this
+    // workspace, is a standing permit; anything else asks.
+    let no_approval_needed =
+        !needs_approval(call_name, cfg.tool_approval, &cfg.non_mutating_tool_names);
+    let decide = |approved_here: bool| {
+        use ahma_common::policy::{self, Action, DefaultAnswer, Facts, Resource};
+        let mut facts = Facts::new(DefaultAnswer::Ask);
+        facts.permitted = if no_approval_needed {
+            Some("changes nothing".to_string())
+        } else if approved_here {
+            Some("[permissions] tool_approvals".to_string())
+        } else {
+            None
+        };
+        policy::decide(
+            &policy::Request::new(Action::CallTool, Resource::Tool(call_name))
+                .in_workspace(&cfg.workspace_root),
+            &facts,
+        )
+    };
+    let approved_here = !no_approval_needed
+        && crate::approvals::is_tool_allowed(&cfg.workspace_root, call_name).await;
+    match decide(approved_here) {
+        ahma_common::policy::Decision::Allow { .. } => return true,
+        ahma_common::policy::Decision::Deny { .. } => return false,
+        ahma_common::policy::Decision::Ask => {}
     }
     // The model often asks for the same tool several times in one turn, and
     // those calls run concurrently. Hold one lock per (workspace, tool) across
@@ -761,7 +783,10 @@ async fn resolve_tool_approval(
     // already answered.
     let lock = approval_lock_for(&cfg.workspace_root, call_name);
     let _guard = lock.lock().await;
-    if crate::approvals::is_tool_allowed(&cfg.workspace_root, call_name).await {
+    if matches!(
+        decide(crate::approvals::is_tool_allowed(&cfg.workspace_root, call_name).await),
+        ahma_common::policy::Decision::Allow { .. }
+    ) {
         return true;
     }
     gate.request_approval(call_id, call_name, args_str).await
