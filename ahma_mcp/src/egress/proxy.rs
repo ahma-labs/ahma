@@ -303,14 +303,32 @@ async fn resolve_egress_approval(
     // timeout of its own; on a contended runner it occasionally exceeded even
     // `read_chunk`'s generous hang bound instead of failing fast on the
     // session-deny check that should have short-circuited it.
-    if net_approval.coordinator.is_session_granted(host) {
-        return true;
-    }
-    if net_approval.coordinator.is_session_denied(host) {
-        return false;
-    }
-    if allowlist.allows(host) {
-        return true;
+    //
+    // That is the one order every permission uses (SPEC R-POLICY.2), so the
+    // decision itself is `policy::decide`'s; only an `Ask` reaches the prompt.
+    {
+        use ahma_common::policy::{
+            self, Action, Decision, DefaultAnswer, Facts, Resource, SessionAnswer,
+        };
+        let mut facts = Facts::new(DefaultAnswer::Ask);
+        facts.session = if net_approval.coordinator.is_session_granted(host) {
+            Some(SessionAnswer::Granted)
+        } else if net_approval.coordinator.is_session_denied(host) {
+            Some(SessionAnswer::Denied)
+        } else {
+            None
+        };
+        facts.permitted = allowlist
+            .allows(host)
+            .then(|| "[network] allow".to_string());
+        match policy::decide(
+            &policy::Request::new(Action::Connect, Resource::Host(host)),
+            &facts,
+        ) {
+            Decision::Allow { .. } => return true,
+            Decision::Deny { .. } => return false,
+            Decision::Ask => {}
+        }
     }
 
     // Dedup: a decision for this domain already in flight (a concurrent

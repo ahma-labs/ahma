@@ -70,6 +70,7 @@ pub mod open_url;
 pub mod peer_factory;
 pub mod permissions;
 pub mod pid_alive;
+pub mod policy;
 pub mod process_guard;
 pub mod prompts;
 pub mod sandbox_state;
