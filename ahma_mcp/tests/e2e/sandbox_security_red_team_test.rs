@@ -1178,7 +1178,8 @@ async fn red_team_seccomp_refuses_kernel_attack_surface() {
         r#"perl -e '
             socket(my $u, 1, 1, 0) ? print "unix: opened\n" : print "unix: refused $!\n";
             socket(my $a, 38, 5, 0) ? print "alg: opened\n" : print "alg: refused $!\n";
-            my $r = syscall(425, 1, "\0" x 120); print $r < 0 ? "uring: refused $!\n" : "uring: opened\n";
+            my $params = "\0" x 120;
+            my $r = syscall(425, 1, $params); print $r < 0 ? "uring: refused $!\n" : "uring: opened\n";
             my $k = syscall({keyctl}, 0, -3, 0); print $k < 0 ? "keyctl: refused $!\n" : "keyctl: allowed\n";
         '"#
     );
@@ -1193,7 +1194,13 @@ async fn red_team_seccomp_refuses_kernel_attack_surface() {
         text.contains("unix: opened"),
         "the control must run: {text}"
     );
-    for refused in ["alg: refused", "uring: refused", "keyctl: refused"] {
+    // The exact errno is the filter's answer, so a refusal for some other
+    // reason (a kernel built without io_uring, say) cannot pass for it.
+    for refused in [
+        "alg: refused Address family not supported",
+        "uring: refused Function not implemented",
+        "keyctl: refused Function not implemented",
+    ] {
         assert!(
             text.contains(refused),
             "SECURITY: expected {refused}: {text}"

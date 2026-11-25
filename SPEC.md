@@ -1185,9 +1185,12 @@ with a red-team test that fails.
   - On Linux the reads are refused by Landlock's ptrace scoping (tested). Signals and abstract sockets **must** be scoped with Landlock ABI 6 where the kernel has it.
   - On macOS no Seatbelt rule can refuse another same-user process's arguments and environment (`KERN_PROCARGS2`): measured 2026-11-25, a profile of `deny default` with only file reads, exec, fork and mach lookups allowed still reads them, and so does one denying every sysctl. So ahma **must not** be where the secrets are: the hub and every worker it spawns start without secret-looking variables, keeping only those a configured LLM provider names with `${VAR}` and `[sandbox] env_allow` (`hub_client::hub_env_removals`). The processes that started ahma (an editor, an agent) are not ahma's, and stay readable (§11).
 - **R-HARDEN.3 — A Linux system-call baseline.** Every command **must** run under a seccomp filter that refuses what a build or test does not need and kernel exploits commonly reach:
-  - `AF_ALG` sockets, `io_uring`, `keyctl`/`add_key`, `bpf`, `perf_event_open`, `userfaultfd`, and `ptrace` of a process the command did not start.
-  - With `--restrict-network` on, also UDP and raw sockets, which Landlock cannot filter before ABI 10.
-  - A profile may lift one entry with a stated reason, shown at startup as profile hosts are (R-PERM.5).
+  - `io_uring`, `keyctl`/`add_key`/`request_key`, `bpf`, `perf_event_open` and `userfaultfd` **must** fail with `ENOSYS`, the answer a program treats as "not on this kernel" and falls back from; `AF_ALG` sockets with `EAFNOSUPPORT`.
+  - With `--restrict-network` on, also UDP and raw IP sockets, since Landlock's network rules cover TCP only.
+  - `ptrace` of a process the command did not start is Landlock's to refuse (R-HARDEN.2), not the filter's.
+  - A call from another ABI **must not** slip past the numbers: an x32 call (x86_64 with bit 30 set) fails with `ENOSYS`, and a process making a call for another architecture (i386, AArch32) is killed.
+  - The filter is applied in `pre_exec` after Landlock, on every spawn path (`sandbox::syscall_filter`). `[sandbox] syscall_filter = false` (security tier) turns it off, logged at startup. Planned: a profile lifting one entry with a stated reason, shown at startup as profile hosts are (R-PERM.5).
+  - **tests-pass**: `red_team_seccomp_refuses_kernel_attack_surface` (Linux CI), with a Unix socket as the control.
 - **R-HARDEN.4 — Network restricted by default.** Once shipped profiles cover the common toolchains (PyPI, RubyGems and container registries as well as today's), `[network] restrict` **must** default to `true`, so the exfiltration leg of the lethal trifecta is closed unless the human opens it. Until then the default stays off, because a default that breaks the first command is a default people turn off ([network-egress.md](docs/network-egress.md)).
   - Profile hosts keep toolchains working from the first command (R-PERM.5.3).
   - An unlisted host is asked (R-WEB.16), and the advisor may recommend (R-PERM.8).

@@ -450,16 +450,22 @@ impl Sandbox {
                 // task may not mount, which is also what stops the child from
                 // undoing it. Only alongside Landlock for that reason.
                 let mounts = self.spawn_deny_tier_mounts(working_dir);
+                let filter = self.spawn_syscall_filter();
                 // SAFETY: the closure only performs async-signal-safe syscalls
-                // (unshare, /proc writes, mount, prctl, landlock_restrict_self)
-                // on buffers built before fork; the OwnedFd moved into it stays
-                // open across fork so the raw fd remains valid in the child.
+                // (unshare, /proc writes, mount, prctl, landlock_restrict_self,
+                // seccomp) on buffers built before fork; the OwnedFd moved into
+                // it stays open across fork so the raw fd remains valid in the
+                // child.
                 unsafe {
                     cmd.pre_exec(move || {
                         if let Some(mounts) = &mounts {
                             mounts.enter_in_child()?;
                         }
-                        super::landlock::apply_landlock_ruleset_in_child(fd.as_raw_fd())
+                        super::landlock::apply_landlock_ruleset_in_child(fd.as_raw_fd())?;
+                        if let Some(filter) = &filter {
+                            super::syscall_filter::apply_in_child(filter)?;
+                        }
+                        Ok(())
                     });
                 }
             }
@@ -613,6 +619,16 @@ impl Sandbox {
             package_cache_write: writable && self.package_cache_write(),
             connect_tcp_port: self.egress_proxy_addr.read().map(|addr| addr.port()),
         }
+    }
+
+    /// The seccomp baseline for one command (SPEC R-HARDEN.3), built before
+    /// `fork`; with the egress proxy on it also refuses UDP and raw sockets.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_syscall_filter(&self) -> Option<Vec<seccompiler::BpfProgram>> {
+        if self.enforcement() != Enforcement::Kernel {
+            return None;
+        }
+        super::syscall_filter::spawn_filter(self.egress_proxy_addr.read().is_some())
     }
 
     /// Whether this sandbox can spawn a command the **kernel** forbids from

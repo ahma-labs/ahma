@@ -212,6 +212,7 @@ setting_keys! {
     SandboxAllowProjectToolConfig = sandbox.allow_project_tool_config
         => SECURITY.switch("writing .ahma/ tool configs"),
     SandboxLinuxDenyTier = sandbox.linux_deny_tier => SECURITY,
+    SandboxSyscallFilter = sandbox.syscall_filter => SECURITY,
     LoggingTarget = logging.target => PREFERENCE,
     LoggingLogMonitor = logging.log_monitor => PREFERENCE,
     LoggingMonitorRateLimitSecs = logging.monitor_rate_limit_secs => PREFERENCE,
