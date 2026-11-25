@@ -205,8 +205,15 @@ mod export {
         ];
         let text = export(&settings, Some(std::path::Path::new("/home/me")));
         validate_text(&text).unwrap_or_else(|e| panic!("export must validate: {e}\n{text}"));
+        // As the export spells it: joined by the platform, quoted with `\`
+        // escaped, so `/home/me\.aws` on Windows.
+        let aws = std::path::Path::new("/home/me")
+            .join(".aws")
+            .display()
+            .to_string()
+            .replace('\\', "\\\\");
         assert!(
-            text.contains(r#"resource in Ahma::Path::"/home/me/.aws""#),
+            text.contains(&format!(r#"resource in Ahma::Path::"{aws}""#)),
             "{text}"
         );
         assert!(
