@@ -1184,6 +1184,21 @@ fn check_grant_refusal(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> 
         }
     }
 
+    // 4c. The machine's team-policy directory (SPEC R-POLICY.3): neither it,
+    //     nor anything in it, nor anything that contains it, so an agent can
+    //     never write the rules that bind it. `~/.ahma/policy` is covered by
+    //     `~/.ahma` above.
+    let policy_dir = crate::policy::system_policy_dir();
+    let policy_dir = dunce::canonicalize(&policy_dir).unwrap_or(policy_dir);
+    if path.starts_with(&policy_dir) || policy_dir.starts_with(path) {
+        return Some(format!(
+            "'{}' is, or contains, the team-policy directory {}, which holds the rules that \
+             bind every agent on this machine and must never be writable by one",
+            path.display(),
+            policy_dir.display()
+        ));
+    }
+
     // 5. OS system directories.
     if is_system_dir(path) {
         return Some(format!(
@@ -3548,5 +3563,30 @@ mod policy_overlay_tests {
             ),
             "the overlay must narrow only what it names"
         );
+    }
+}
+
+#[cfg(test)]
+mod policy_dir_tests {
+    use super::*;
+
+    /// SPEC R-POLICY.3: no grant may open a team-policy directory, anything in
+    /// it, or anything that contains it, so an agent can never write the rules
+    /// that bind it. `~/.ahma/policy` is covered by `~/.ahma`; this is the
+    /// machine-wide one, which sits in no home.
+    #[test]
+    fn the_system_policy_directory_is_never_granted() {
+        let dir = crate::policy::system_policy_dir();
+        for path in [
+            dir.join("team.cedar"),
+            dir.clone(),
+            dir.parent().unwrap().to_path_buf(),
+        ] {
+            assert!(
+                matches!(classify_grant_risk(&path, None, &[]), GrantRisk::Refused(_)),
+                "{} must be refused",
+                path.display()
+            );
+        }
     }
 }

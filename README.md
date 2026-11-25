@@ -133,7 +133,7 @@ for hard isolation.
 | [SSH key broker](docs/ssh-agent-broker.md) | `git push` over SSH with no key in the sandbox: signs per host after consent (macOS, Linux; in progress) |
 | [Opening web links](docs/open-links.md) | `gh … --web` from the sandbox opens your browser, for sites you allowed (macOS, Linux; in progress) |
 | [Task vaults](docs/task-vault.md) | One directory per task as the whole scope; `rm` moves to the vault's trash |
-| [Team policy in Cedar](docs/cedar-policy.md) | Forbid-only Cedar rules that narrow what ahma allows on every surface; `ahma policy validate`, `list`, `explain` |
+| [Team policy in Cedar](docs/cedar-policy.md) | Forbid-only Cedar rules that narrow what ahma allows on every surface; `ahma policy validate`, `list`, `explain`, `export`, `verify` |
 | [Bundle audit](docs/bundle-audit.md) | Checks MTDF bundles for secrets, missing path validation and injection payloads |
 
 ## Getting an agent to use ahma

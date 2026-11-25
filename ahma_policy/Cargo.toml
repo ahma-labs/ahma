@@ -16,4 +16,5 @@ cedar-policy = { version = "4.15", default-features = false }
 thiserror.workspace = true
 
 [dev-dependencies]
+dunce.workspace = true
 tempfile.workspace = true

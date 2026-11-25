@@ -1134,6 +1134,8 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Policy(cmd) => match cmd {
             PolicyCommand::Validate { files } => policy_cmd::run_validate(&files),
             PolicyCommand::List => policy_cmd::run_list(),
+            PolicyCommand::Export => policy_cmd::run_export(),
+            PolicyCommand::Verify => policy_cmd::run_verify(),
             PolicyCommand::Explain {
                 action,
                 resource,
@@ -4057,6 +4059,10 @@ pub enum PolicyCommand {
     },
     /// List the loaded rules: their id, file, reason and text.
     List,
+    /// Print ahma's effective userspace policy as Cedar, for review: the built-in hard denylist and `[web] never_allow` as forbids, saved grants and allowlists as permits. It holds permits, so it can never be loaded back as team policy; session-only answers are not included.
+    Export,
+    /// Check that no grant, of any access, can open a credential directory, ahma's control files, a policy directory, the home directory or a filesystem root, through ahma's own decision code with any loaded team policy. Named cases, not a proof. Exits non-zero if one fails.
+    Verify,
     /// Say whether team policy forbids one request, and which rule does. ACTION is one of read, write, connect, fetch, open_link, ssh_sign, call_tool; RESOURCE is a path (read, write), a host or URL (connect, fetch, open_link, ssh_sign), or a tool name (call_tool).
     Explain {
         #[arg(value_name = "ACTION")]

@@ -41,6 +41,8 @@ EOF
 ahma policy validate                                # parse and check against ahma's schema
 ahma policy list                                    # what is loaded, from where
 ahma policy explain fetch https://pastebin.com/x    # which rule decides, and why
+ahma policy export                                  # ahma's effective policy as Cedar, for review
+ahma policy verify                                  # the grant invariants, checked; non-zero if one fails
 ```
 
 Policy is read once when each ahma process starts: a hooked command picks up a change at once, an MCP session when it next starts (quit the editor's ahma sessions, or the hub).
@@ -50,7 +52,7 @@ Policy is read once when each ahma process starts: a hooked command picks up a c
 | Directory | For |
 |---|---|
 | `~/.ahma/policy/*.cedar` | You. Inside `~/.ahma`, which no sandboxed command can write and no grant can open. |
-| `/etc/ahma/policy/` (Linux), `/Library/Application Support/ahma/policy/` (macOS), `%ProgramData%\ahma\policy\` (Windows) | An administrator or MDM, for every user of the machine. |
+| `/etc/ahma/policy/` (Linux), `/Library/Application Support/ahma/policy/` (macOS), `%ProgramData%\ahma\policy\` (Windows) | An administrator or MDM, for every user of the machine. Never grantable, nor anything in or above it. |
 
 A project's `.ahma/` is never read: an agent can write the repository it works in.
 
@@ -90,6 +92,21 @@ builds:
 
 A grant is refused when a rule forbids reading **or** writing its path, whatever access was
 asked for; finer handling is planned.
+
+## Export and verify
+
+`ahma policy export` prints what ahma enforces in userspace as Cedar: the built-in hard
+denylist and `[web] never_allow` as forbids, saved grants, `[network] allow` and
+`[web] always_allow` as permits. Review it in a pull request, or run Cedar's own tools on it.
+It holds permits, so it can never be loaded back as team policy. Host patterns are
+approximated where Cedar's hierarchy differs (a one-label `*.example.com` becomes everything
+under `example.com`, and a scheme or port is dropped), and each approximation is commented.
+
+`ahma policy verify` checks, through ahma's own decision code and with your team policy
+loaded, that no grant can open a credential directory, ahma's control files, a policy
+directory, the home directory or a filesystem root. It checks named cases; it does not prove
+the property over every request. A symbolic proof with Cedar's SMT compiler needs a cvc5
+solver and is not shipped.
 
 ## See also
 

@@ -168,3 +168,87 @@ fn chains_run_from_the_resource_to_the_root() {
         ["api.github.com", "github.com", "com"]
     );
 }
+
+mod export {
+    use ahma_common::config::{AhmaSettings, PersistentScope, ScopeAccess};
+    use ahma_policy::export::{export, validate_text, verify};
+    use std::path::PathBuf;
+
+    /// The export is valid Cedar against ahma's schema, permits included, so
+    /// a reviewer can run Cedar's own tooling on it (SPEC R-POLICY.6).
+    #[test]
+    fn the_export_is_valid_cedar_for_ahmas_schema() {
+        let mut settings = AhmaSettings::default();
+        settings.web.never_allow =
+            vec!["*.pastebin.com".into(), "https://evil.example:8443".into()];
+        settings.web.always_allow = vec!["api.github.com".into(), "*".into()];
+        settings.network.allow = vec!["index.crates.io".into()];
+        settings.sandbox.persistent_scopes = vec![
+            PersistentScope {
+                path: PathBuf::from("/opt/cache"),
+                access: ScopeAccess::Ro,
+                workspace: Some(PathBuf::from("/home/me/proj")),
+                granted_by: None,
+                granted_at: None,
+                note: None,
+                expires_at: None,
+            },
+            PersistentScope {
+                path: PathBuf::from("/srv/data"),
+                access: ScopeAccess::Rw,
+                workspace: None,
+                granted_by: None,
+                granted_at: None,
+                note: None,
+                expires_at: None,
+            },
+        ];
+        let text = export(&settings, Some(std::path::Path::new("/home/me")));
+        validate_text(&text).unwrap_or_else(|e| panic!("export must validate: {e}\n{text}"));
+        // As the export spells it: joined by the platform, quoted with `\`
+        // escaped, so `/home/me\.aws` on Windows.
+        let aws = std::path::Path::new("/home/me")
+            .join(".aws")
+            .display()
+            .to_string()
+            .replace('\\', "\\\\");
+        assert!(
+            text.contains(&format!(r#"resource in Ahma::Path::"{aws}""#)),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"principal.workspace == "/home/me/proj""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"resource in Ahma::Host::"pastebin.com""#),
+            "{text}"
+        );
+        assert!(text.contains("scheme and port are not modelled"), "{text}");
+    }
+
+    /// The export contains permits, so it can never be loaded as team policy.
+    #[test]
+    fn the_export_cannot_be_loaded_back_as_team_policy() {
+        let mut settings = AhmaSettings::default();
+        settings.network.allow = vec!["example.com".into()];
+        let text = export(&settings, None);
+        let err =
+            ahma_policy::TeamPolicy::from_sources(&[(PathBuf::from("x.cedar"), text)]).unwrap_err();
+        assert!(
+            matches!(err, ahma_policy::LoadError::Permit { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn verify_holds_for_a_fresh_home() {
+        let home = tempfile::tempdir().unwrap();
+        let home = dunce::canonicalize(home.path()).unwrap();
+        let checks = verify(Some(&home));
+        assert!(checks.len() >= 5, "{checks:?}");
+        for c in &checks {
+            assert!(c.held, "invariant failed: {}", c.claim);
+        }
+    }
+}

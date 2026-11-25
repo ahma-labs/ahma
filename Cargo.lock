@@ -336,6 +336,7 @@ version = "0.22.19"
 dependencies = [
  "ahma_common",
  "cedar-policy",
+ "dunce",
  "tempfile",
  "thiserror 2.0.21",
 ]

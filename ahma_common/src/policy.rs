@@ -227,6 +227,24 @@ pub fn decide_with(
     }
 }
 
+/// The machine-wide team-policy directory, for an administrator or MDM
+/// (SPEC R-POLICY.3). Here rather than in `ahma_policy` so grant admission can
+/// refuse it without depending on Cedar.
+pub fn system_policy_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Application Support/ahma/policy")
+    } else if cfg!(windows) {
+        std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("ahma")
+            .join("policy")
+    } else {
+        PathBuf::from("/etc/ahma/policy")
+    }
+}
+
 /// Why calling the tool `name` is forbidden, if it is: team policy may forbid
 /// a tool, and a policy file that failed to load forbids every one. The MCP
 /// server asks this for each `tools/call`, and terminal hooks for each hooked

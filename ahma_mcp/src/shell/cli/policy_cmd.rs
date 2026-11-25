@@ -62,6 +62,33 @@ pub(crate) fn run_list() -> Result<()> {
     Ok(())
 }
 
+/// `ahma policy export`: the effective userspace policy as Cedar.
+pub(crate) fn run_export() -> Result<()> {
+    let settings = ahma_common::config::AhmaSettings::load();
+    let home = ahma_common::config::ahma_home_dir();
+    print!(
+        "{}",
+        ahma_policy::export::export(&settings, home.as_deref())
+    );
+    Ok(())
+}
+
+/// `ahma policy verify`: the grant invariants, checked through ahma's own
+/// decision code.
+pub(crate) fn run_verify() -> Result<()> {
+    let home = ahma_common::config::ahma_home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
+    let checks = ahma_policy::export::verify(home.as_deref());
+    let failed = checks.iter().filter(|c| !c.held).count();
+    for c in &checks {
+        println!("{} {}", if c.held { "PASS" } else { "FAIL" }, c.claim);
+    }
+    if failed > 0 {
+        bail!("{failed} invariant(s) do not hold");
+    }
+    println!("All {} invariants hold.", checks.len());
+    Ok(())
+}
+
 /// `ahma policy explain ACTION RESOURCE [--workspace DIR]`: whether team
 /// policy forbids it, and which rule says so.
 pub(crate) fn run_explain(action: &str, resource: &str, workspace: Option<&Path>) -> Result<()> {
