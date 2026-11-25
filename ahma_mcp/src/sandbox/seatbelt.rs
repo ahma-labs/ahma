@@ -795,12 +795,22 @@ fn quote(p: &Path) -> String {
 /// blanket read allow, so every later allow (workspace, profiles, grants)
 /// re-opens its own part of home, and every later deny still holds.
 ///
-/// Only `file-read-data` is denied: metadata stays readable, because
-/// resolving a path inside a workspace in home stats each of its ancestors.
-/// A command can therefore still learn that a file exists, and its size, but
-/// not what it holds; a directory listing is denied with the rest.
+/// Metadata is let back in at once, because resolving a path inside a
+/// workspace in home stats each of its ancestors. A command can therefore
+/// still learn that a file exists, and its size, but not what it holds; a
+/// directory listing is denied with the rest.
+///
+/// The deny is `file-read*`, the same operation every later allow names. A
+/// `file-read-data` deny was measured on macOS CI (PR #396) to survive a
+/// later `(allow file-read* (subpath <workspace>))`: Seatbelt does not order
+/// a rule on one operation against a wildcard the way last-match-wins
+/// suggests. A wildcard deny reopened by wildcard allows is what the
+/// credential denylist already relies on.
 pub(crate) fn home_read_rules(home: &Path, keychain: bool) -> String {
-    let mut rules = format!("(deny file-read-data (subpath \"{}\"))\n", quote(home));
+    let mut rules = format!(
+        "(deny file-read* (subpath \"{0}\"))\n(allow file-read-metadata (subpath \"{0}\"))\n",
+        quote(home)
+    );
     let mut allow = |p: &Path| {
         let kind = if p.is_dir() { "subpath" } else { "literal" };
         rules.push_str(&format!("(allow file-read* ({kind} \"{}\"))\n", quote(p)));
@@ -1163,7 +1173,11 @@ mod tests {
         std::fs::create_dir_all(home.join("Library/Keychains")).unwrap();
 
         let rules = super::home_read_rules(&home, false);
-        let deny = format!("(deny file-read-data (subpath \"{}\"))", home.display());
+        let deny = format!("(deny file-read* (subpath \"{}\"))", home.display());
+        let metadata = format!(
+            "(allow file-read-metadata (subpath \"{}\"))",
+            home.display()
+        );
         let git = format!(
             "(allow file-read* (literal \"{}\"))",
             home.join(".gitconfig").display()
@@ -1173,8 +1187,9 @@ mod tests {
         assert!(git_at > deny_at, "{rules}");
         assert!(rules.contains(".CFUserTextEncoding"), "{rules}");
         assert!(!rules.contains("Keychains"), "keychain off: {rules}");
+        let metadata_at = rules.find(&metadata).unwrap_or_else(|| panic!("{rules}"));
         assert!(
-            !rules.contains("(deny file-read* "),
+            metadata_at > deny_at,
             "metadata must stay readable: {rules}"
         );
         assert!(
@@ -1192,7 +1207,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dunce::canonicalize(dir.path()).unwrap();
         let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, Default::default()).unwrap();
-        let deny = format!("(deny file-read-data (subpath \"{}\"))", home.display());
+        let deny = format!("(deny file-read* (subpath \"{}\"))", home.display());
 
         assert!(!sb.generate_seatbelt_profile_test(&root).contains(&deny));
 
