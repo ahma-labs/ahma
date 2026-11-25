@@ -1,0 +1,38 @@
+// The Cedar schema for ahma team policy (SPEC R-POLICY.3). Every team policy
+// file is validated against it, strictly, before ahma starts using it.
+//
+// Paths and hosts are hierarchies, so `resource in` matches a subtree or a
+// parent domain:
+//   Ahma::Path::"/home/me/.aws/credentials" in Ahma::Path::"/home/me/.aws"
+//   Ahma::Host::"api.github.com"           in Ahma::Host::"github.com"
+namespace Ahma {
+  // The agent asking, working in a workspace when ahma knows which.
+  entity Agent = {
+    workspace?: String,
+  };
+  // An absolute, canonical path; its parent is its parent directory.
+  entity Path in [Path];
+  // A lower-case host name; its parent is the name with one label fewer.
+  entity Host in [Host];
+  // A tool by its MCP name.
+  entity Tool;
+  // An `ssh-keygen -Y` signature namespace.
+  entity Namespace;
+
+  action read, write appliesTo {
+    principal: [Agent],
+    resource: [Path],
+  };
+  action connect, fetch, open_link appliesTo {
+    principal: [Agent],
+    resource: [Host],
+  };
+  action ssh_sign appliesTo {
+    principal: [Agent],
+    resource: [Host, Namespace],
+  };
+  action call_tool appliesTo {
+    principal: [Agent],
+    resource: [Tool],
+  };
+}

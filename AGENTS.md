@@ -235,6 +235,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Installation | [docs/installation.md](docs/installation.md) | — |
 | Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 (`ahma_http_bridge/SPEC.md`) |
 | Task vaults | [docs/task-vault.md](docs/task-vault.md) | `ahma_vault/SPEC.md` |
+| Team policy in Cedar (`ahma policy`, experimental) | [docs/cedar-policy.md](docs/cedar-policy.md) | R-POLICY, `ahma_policy/SPEC.md` |
 | TUI | [docs/tui.md](docs/tui.md) | R24, R25 (`ahma_tui/SPEC.md`) |
 | Browser surface (`ahma web`, experimental) | [docs/web.md](docs/web.md) | R-GUI, `ahma_gui/SPEC.md` |
 | Desktop window (`ahma desktop`, experimental) | [docs/desktop.md](docs/desktop.md) | R-DESK, `ahma_gui/SPEC.md` |
@@ -304,7 +305,7 @@ each former file is a `mod` inside one of them:
 | `ahma_mcp` | `unit` (pure logic + in-process MCP), `e2e` (spawns the `ahma` binary; OS-gated sandbox suites live here behind their `#![cfg]`), `latency_guard_test` (all `#[ignore]` benchmarks) |
 | `ahma_http_bridge` | `unit` (`SessionManager`/in-process), `e2e` (spawns a bridge server), `stress` (all `#[ignore]`) |
 | `ahma_tui` | `connection` |
-| `ahma_core`, `ahma_http_mcp_client`, `ahma_llm_monitor`, `ahma_simplify` | `integration` |
+| `ahma_core`, `ahma_http_mcp_client`, `ahma_llm_monitor`, `ahma_policy`, `ahma_simplify` | `integration` |
 
 Rules:
 * **Add a new integration test as `tests/<root>/<topic>.rs` plus a `mod <topic>;` line in the

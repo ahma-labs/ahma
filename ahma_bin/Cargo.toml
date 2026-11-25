@@ -86,6 +86,7 @@ ahma_simplify = { path = "../ahma_simplify", optional = true }
 ahma_tui = { path = "../ahma_tui" }
 ahma_gui = { path = "../ahma_gui" }
 ahma_common = { path = "../ahma_common" }
+ahma_policy = { path = "../ahma_policy" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 clap-markdown = "0.1"

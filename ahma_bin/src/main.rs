@@ -160,6 +160,21 @@ async fn run() -> Result<()> {
     let _telemetry_guard =
         init_logging_with_observability("info", !log_to_stderr, Some(cfg.observability.clone()))?;
 
+    // Team policy in Cedar (SPEC R-POLICY.3): read once, before anything in this
+    // process decides a permission. A broken file installs a policy that
+    // refuses everything, so ahma fails closed until it is fixed; `ahma policy`
+    // itself still runs, to say what is wrong.
+    match ahma_policy::install_from_default_dirs() {
+        ahma_policy::Installed::None => {}
+        ahma_policy::Installed::Rules(n) => {
+            tracing::info!("team policy: {n} forbid rule(s) loaded (`ahma policy list`)")
+        }
+        ahma_policy::Installed::Broken(e) => tracing::error!(
+            "team policy could not be loaded, so ahma refuses every tool call and permission \
+             until it is fixed: {e}. Run `ahma policy validate`."
+        ),
+    }
+
     // Register the global prompt runner from ahma_core
     ahma_mcp::register_global_prompt_runner(std::sync::Arc::new(
         ahma_core::agent::CorePromptRunner,

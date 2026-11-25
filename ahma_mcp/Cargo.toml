@@ -28,6 +28,7 @@ ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 ahma_log_monitor = { path = "../ahma_log_monitor" }
 ahma_update = { path = "../ahma_update" }
 ahma_vault = { path = "../ahma_vault" }
+ahma_policy = { path = "../ahma_policy" }
 anyhow.workspace = true
 async-trait.workspace = true
 # The SSH key broker signs and verifies with the crypto provider already in the

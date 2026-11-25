@@ -22,6 +22,7 @@
 //! See `docs/environment-variables.md` for the full reference.
 
 mod commands;
+mod policy_cmd;
 
 use super::{list_tools, modes, resolution};
 
@@ -1130,6 +1131,15 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Queue => commands::run_queue_command(),
         Subcommands::Ps { filter } => commands::run_ps_command(filter.as_deref()),
         Subcommands::Explain { topic } => commands::run_explain_command(topic.as_deref()),
+        Subcommands::Policy(cmd) => match cmd {
+            PolicyCommand::Validate { files } => policy_cmd::run_validate(&files),
+            PolicyCommand::List => policy_cmd::run_list(),
+            PolicyCommand::Explain {
+                action,
+                resource,
+                workspace,
+            } => policy_cmd::run_explain(&action, &resource, workspace.as_deref()),
+        },
         // `ahma`'s own `main` runs the helper before parsing (SPEC R-LINK.1);
         // this is the same helper for a binary that does not.
         Subcommands::OpenUrl { urls } => {
@@ -1591,6 +1601,9 @@ pub enum Subcommands {
         #[arg(value_name = "TOPIC")]
         topic: Option<String>,
     },
+    /// Team policy in Cedar (experimental, SPEC R-POLICY.3): forbid-only rules in ~/.ahma/policy/ or the machine's policy directory that narrow what ahma allows on every surface; a broken file makes ahma refuse everything until fixed. See docs/cedar-policy.md.
+    #[command(subcommand)]
+    Policy(PolicyCommand),
     /// Open a web link in the human's default browser from inside a command ahma runs (SPEC R-LINK). A sandboxed command cannot start a browser itself (SPEC R6.2.10), so this asks the ahma process outside the sandbox to open it: only http and https links, never files or apps, and only for a site the human allowed with `ahma permissions grant open-url <SITE>`; otherwise nothing opens and the line printed names that grant. Commands ahma runs also get this helper as `BROWSER` and `GH_BROWSER`, so `gh … --web` uses it without being asked. Outside a command ahma runs it opens nothing and says so. Exits 0 when every link opened, 1 otherwise.
     OpenUrl {
         /// The http or https addresses to open, in order; it stops at the first one not opened.
@@ -4031,6 +4044,29 @@ fn run_validation_mode(target: &str) -> Result<()> {
 
 async fn run_tool_info_mode(args: InfoArgs) -> Result<()> {
     commands::run_tool_info_mode(args).await
+}
+
+/// `ahma policy` subcommands (SPEC R-POLICY.3–5). All of them only read.
+#[derive(clap::Subcommand, Debug)]
+pub enum PolicyCommand {
+    /// Check that the given policy files, or every file ahma would load, parse, contain only forbid rules and match ahma's schema. Exits non-zero otherwise, since ahma refuses everything while a policy file is broken.
+    Validate {
+        /// Files to check; omit to check every file in the policy directories.
+        #[arg(value_name = "FILE")]
+        files: Vec<PathBuf>,
+    },
+    /// List the loaded rules: their id, file, reason and text.
+    List,
+    /// Say whether team policy forbids one request, and which rule does. ACTION is one of read, write, connect, fetch, open_link, ssh_sign, call_tool; RESOURCE is a path (read, write), a host or URL (connect, fetch, open_link, ssh_sign), or a tool name (call_tool).
+    Explain {
+        #[arg(value_name = "ACTION")]
+        action: String,
+        #[arg(value_name = "RESOURCE")]
+        resource: String,
+        /// The workspace the request would come from, for rules that test `principal.workspace`.
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+    },
 }
 
 #[cfg(test)]

@@ -2801,6 +2801,16 @@ fn compute_exec_decision(
     {
         return refusal;
     }
+    // Team policy (SPEC R-POLICY.3): a hooked command counts as
+    // `run_terminal_command`, so a rule forbidding that tool, or a policy file
+    // that failed to load, blocks it as the MCP server would.
+    if is_ahma_hooks_active()
+        && let Ok(Some(args)) = extract_tool_args(input)
+        && !is_wrapped_shell_command(&args.command)
+        && let Some(reason) = ahma_common::policy::forbidden_tool("run_terminal_command")
+    {
+        return HooksDecision::FailClosed { reason };
+    }
     let consented = HookConsentStore::current().is_consented();
     let mut decision =
         compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active(), consented);
