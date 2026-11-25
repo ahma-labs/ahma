@@ -195,7 +195,7 @@ may change. `planned`: agreed and specified, not started.
 | OpenTelemetry export | tests-pass | `otel` cargo feature, off by default |
 | Code complexity analysis (`ahma simplify`) | tests-pass | `ahma_simplify/SPEC.md` |
 | Hardening roadmap (R-HARDEN) | in-progress | R-HARDEN.1 (Landlock ABI 3, truncate) done; planned: same-user isolation, seccomp, network restricted by default, macOS home reads, credentials at the boundary (R-HARDEN.1–8) |
-| One policy decision point (R-POLICY.1–2) | planned | One `decide`, one precedence for every userspace permission |
+| One policy decision point (R-POLICY.1–2) | in-progress | `ahma_common::policy::decide`; web and egress migrated; links, SSH signatures, grants and tool approvals next |
 | Team policy in Cedar (R-POLICY.3–6) | planned | Forbid-only Cedar files that narrow; `ahma policy validate`, `explain`, `export`, `verify` |
 
 ---
@@ -1199,7 +1199,9 @@ with a red-team test that fails.
 
 ### R-POLICY: One policy decision point, and team policy in Cedar
 
-**Status: planned** (open: §11).
+**Status: in-progress.** `ahma_common::policy::decide` exists, with the R-POLICY.2 order and
+the overlay hook; `fetch_webpage` (R-WEB.2) and subprocess egress (R-WEB.16) decide through
+it. Links, SSH signatures, grant admission and tool approvals are still to move (open: §11).
 
 **Problem.** Ahma's userspace permission decisions are made in about ten places, and each orders the same inputs its own way:
 - `fetch_webpage` checks `always_allow` before a session deny (R-WEB.2).
@@ -1280,7 +1282,7 @@ This section governs **tool-level outbound HTTP made by the ahma process itself*
 - **R-WEB.2.1**: The default policy is `"allow"`: requests to domains in neither `always_allow` nor `never_allow` pass through without prompting.
 - **R-WEB.2.2**: `default_policy = "deny"` in `[web]` is **strict mode**: a domain not in the session grant list or `always_allow` holds the request and raises a prompt (R-WEB.6). The setup wizard and documentation **must** recommend `"deny"` for any workspace handling sensitive data, credentials or proprietary code.
 - **R-WEB.2.3**: Regardless of `default_policy`, `never_allow` entries **always block** and `block_private_ranges` (R-WEB.3) **always enforces**; neither can be overridden by session grants or `always_allow`.
-- **R-WEB.2.4**: Regardless of `default_policy`, `always_allow` entries **always permit** without a prompt.
+- **R-WEB.2.4**: Regardless of `default_policy`, `always_allow` entries permit without a prompt, unless the human denied that domain earlier this session: the session's answer comes before a standing permit (R-POLICY.2).
 
 ### R-WEB.3: Private-range blocking (always-on)
 
@@ -2511,7 +2513,7 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **A shared helper started outside the sandbox serves a sandboxed client** (R-PROC.5, R-HANDOFF.6): a tool that keeps one helper for the whole machine and finds it through a file or a loopback port (a Gradle or Kotlin daemon, an editor's language server) lets a sandboxed build hand its work to a helper the IDE started unconfined, which then runs it outside the sandbox with no message. R-PROC.5 ends the helpers a sandboxed command starts; nothing general stops a sandboxed client from reaching one it did not start, because the kernel rule would have to know each tool's rendezvous. Reasoned from the mechanics, not reproduced. The route is one helper per workspace, as data in the tool's profile (R-PERM.5.5), as `sccache` has; `--restrict-network` refuses loopback and so closes it for helpers reached by port.
 - **Container daemon sockets on Linux** (R-HANDOFF.6): Landlock at the ABI ahma uses does not mediate `connect(2)` to a pathname unix socket, and ahma has no other rule there, so a command whose user may reach a daemon socket (the `docker` group for `/var/run/docker.sock`, rootless Docker or podman under `$XDG_RUNTIME_DIR`) can use it. Masking the sockets in the opt-in mount-namespace tier (R6.1.7) is the likely route.
 - **The hub's token protects least where there is no filesystem boundary** (R-HUB.13): on Windows a command can read `hub.token` and connect; on Linux a command can reach the socket and the token is the only barrier (the runtime directory is in no Landlock ruleset and the token is never in an argument or environment variable; that a command cannot read a holder's memory or `/proc/<pid>/environ` rests on Landlock's ptrace scoping, pinned by `red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder`); under macOS deferral to an outer sandbox (R7.6) that sandbox, not ahma's, decides whether a command can connect or read the token. A hub socket the operator places in a directory a sandbox can read puts its token there too.
-- **Hardening roadmap and one decision point** (R-HARDEN.1–8, R-POLICY.1–6): planned, none implemented yet.
+- **Hardening roadmap and one decision point** (R-HARDEN.2–8, R-POLICY): R-HARDEN.2–8 planned. R-POLICY.1–2 cover the web and egress decisions; links, SSH signatures, grant admission and tool approvals still order their own inputs. R-POLICY.3–6 planned.
 - **`truncate(2)` outside the scope on Linux before 6.2** (R-HARDEN.1): Landlock has no truncation right before ABI 3, so on those kernels a sandboxed command can still truncate a file it cannot open for writing; ahma says so in its partial-enforcement warning.
 - **Another process's environment is readable on macOS** (R-HARDEN.2): the Seatbelt profile allows `process-info*` and `sysctl-read` for every process (`sandbox/seatbelt.rs`), so `sysctl(KERN_PROCARGS2)` returns the arguments and the whole environment of any process of the same user that is outside the sandbox. Measured 2026-11-25: a command under ahma's profile read all 60 environment entries of the running ahma hub. An API key in an editor's, agent's or hub's environment is therefore readable by a sandboxed command. Linux refuses the same read (`/proc/<pid>/environ`) through Landlock's ptrace scoping, pinned by `red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder`.
 - **The crates.io token is readable** (R-PERM.5, R6.2.3): the shipped `rust` profile grants `~/.cargo` read+execute, so `~/.cargo/credentials.toml` is readable by a sandboxed command on macOS and Linux; it is on no read denylist. Cargo needs it only to publish. Denying it on macOS is one Seatbelt rule; Linux needs the ruleset to grant `~/.cargo` piecewise.

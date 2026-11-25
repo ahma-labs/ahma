@@ -267,15 +267,16 @@ impl WebPolicy {
     }
 
     /// Decide what to do with `url`, given the domains already granted or denied
-    /// this session. Order (R-WEB.2): `never_allow` blocks first (cannot be
-    /// overridden), then `always_allow`, then session grant, then session deny,
-    /// then the default policy.
+    /// this session, in the one order every permission uses (SPEC R-POLICY.2,
+    /// R-WEB.2): `never_allow` is a forbid and cannot be overridden; then this
+    /// session's grant or deny; then `always_allow`; then the default policy.
     pub fn decide(
         &self,
         url: &str,
         session_grants: &[String],
         session_denies: &[String],
     ) -> WebDecision {
+        use crate::policy::{self, Action, DefaultAnswer, Facts, Resource, SessionAnswer};
         let Some((scheme, host, port)) = url_coordinates(url) else {
             return WebDecision::Deny {
                 reason: "unsupported or malformed URL (only http/https with a host)".into(),
@@ -285,46 +286,45 @@ impl WebPolicy {
         // checks below, instead of each `matches()` call and the session
         // checks each lowercasing `host` again.
         let host_lc = host.to_ascii_lowercase();
+        let find = |patterns: &[WebPattern]| {
+            patterns
+                .iter()
+                .find(|p| p.matches_lc(&scheme, &host_lc, port))
+                .map(|p| p.as_str().to_string())
+        };
 
-        if let Some(p) = self
-            .never_allow
-            .iter()
-            .find(|p| p.matches_lc(&scheme, &host_lc, port))
-        {
-            return WebDecision::Deny {
-                reason: format!("'{host}' matches never_allow pattern '{}'", p.as_str()),
-            };
-        }
-        if let Some(p) = self
-            .always_allow
-            .iter()
-            .find(|p| p.matches_lc(&scheme, &host_lc, port))
-        {
-            return WebDecision::Allow {
-                matched: p.as_str().to_string(),
-            };
-        }
-        if session_grants
+        let mut facts = Facts::new(match self.default_policy {
+            WebDefaultPolicy::Allow => DefaultAnswer::Allow,
+            WebDefaultPolicy::Deny => DefaultAnswer::Ask,
+        });
+        facts.forbidden =
+            find(&self.never_allow).map(|p| format!("'{host}' matches never_allow pattern '{p}'"));
+        facts.session = if session_grants
             .iter()
             .any(|g| g.eq_ignore_ascii_case(&host_lc))
         {
-            return WebDecision::Allow {
-                matched: "session".into(),
-            };
-        }
-        if session_denies
+            Some(SessionAnswer::Granted)
+        } else if session_denies
             .iter()
             .any(|d| d.eq_ignore_ascii_case(&host_lc))
         {
-            return WebDecision::Deny {
+            Some(SessionAnswer::Denied)
+        } else {
+            None
+        };
+        facts.permitted = find(&self.always_allow);
+
+        let request = policy::Request::new(Action::Fetch, Resource::Host(&host_lc));
+        match policy::decide(&request, &facts) {
+            policy::Decision::Allow { matched, .. } => WebDecision::Allow { matched },
+            policy::Decision::Deny {
+                stage: policy::Stage::Session,
+                ..
+            } => WebDecision::Deny {
                 reason: format!("'{host}' was denied earlier this session"),
-            };
-        }
-        match self.default_policy {
-            WebDefaultPolicy::Allow => WebDecision::Allow {
-                matched: "default-allow".into(),
             },
-            WebDefaultPolicy::Deny => WebDecision::Prompt { domain: host_lc },
+            policy::Decision::Deny { reason, .. } => WebDecision::Deny { reason },
+            policy::Decision::Ask => WebDecision::Prompt { domain: host_lc },
         }
     }
 }
@@ -454,6 +454,34 @@ mod tests {
         ));
         assert!(matches!(
             p.decide("https://no.example/x", &[], &["no.example".into()]),
+            WebDecision::Deny { .. }
+        ));
+    }
+
+    /// SPEC R-POLICY.2: this session's answer from a human comes before a
+    /// standing permit, so a domain the human just refused stays refused even
+    /// when `always_allow` covers it. (Before one precedence, `always_allow`
+    /// won here and the refusal was ignored.)
+    #[test]
+    fn a_session_deny_beats_always_allow() {
+        let p = policy(true, &["*.example.com"], &[]);
+        match p.decide(
+            "https://api.example.com/x",
+            &[],
+            &["api.example.com".into()],
+        ) {
+            WebDecision::Deny { reason } => assert!(reason.contains("denied earlier")),
+            other => panic!("a session deny must win over always_allow, got {other:?}"),
+        }
+    }
+
+    /// `never_allow` is a forbid: nothing permits what it covers, not even a
+    /// grant made this session (SPEC R-WEB.2, R-POLICY.2).
+    #[test]
+    fn never_allow_beats_a_session_grant() {
+        let p = policy(false, &[], &["evil.example"]);
+        assert!(matches!(
+            p.decide("https://evil.example/x", &["evil.example".into()], &[]),
             WebDecision::Deny { .. }
         ));
     }
