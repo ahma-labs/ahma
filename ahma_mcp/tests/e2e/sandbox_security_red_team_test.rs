@@ -1145,3 +1145,58 @@ fn scope_and_outside_dirs(what: &str) -> (TempDir, TempDir) {
     };
     (make("scope"), make("outside"))
 }
+
+// =============================================================================
+// RED TEAM: kernel attack surface behind a seccomp baseline (SPEC R-HARDEN.3)
+// =============================================================================
+
+/// A kernel privilege escalation escapes any Landlock sandbox, so commands run
+/// with the system calls a build or test never needs, and that 2026's kernel
+/// exploits reached, refused: `AF_ALG` sockets (CVE-2026-31431 "Copy Fail"),
+/// `io_uring`, `keyctl`. Each is refused with the error a program treats as
+/// "not available" (`EAFNOSUPPORT`, `ENOSYS`), so the ones that probe for
+/// them fall back instead of failing. A Unix socket, which builds use, still
+/// opens: the control that proves the command ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(target_os = "linux")]
+async fn red_team_seccomp_refuses_kernel_attack_surface() {
+    init_test_logging();
+    skip_if_landlock_unavailable!();
+    let (scope_dir, _outside) = scope_and_outside_dirs("seccomp");
+    let sandbox = Sandbox::new(
+        vec![scope_dir.path().to_path_buf()],
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions::default(),
+    )
+    .unwrap();
+    let keyctl = if std::env::consts::ARCH == "aarch64" {
+        219
+    } else {
+        250
+    };
+    let probe = format!(
+        r#"perl -e '
+            socket(my $u, 1, 1, 0) ? print "unix: opened\n" : print "unix: refused $!\n";
+            socket(my $a, 38, 5, 0) ? print "alg: opened\n" : print "alg: refused $!\n";
+            my $r = syscall(425, 1, "\0" x 120); print $r < 0 ? "uring: refused $!\n" : "uring: opened\n";
+            my $k = syscall({keyctl}, 0, -3, 0); print $k < 0 ? "keyctl: refused $!\n" : "keyctl: allowed\n";
+        '"#
+    );
+    let out = sandbox
+        .create_shell_command("bash", &probe, scope_dir.path())
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("unix: opened"),
+        "the control must run: {text}"
+    );
+    for refused in ["alg: refused", "uring: refused", "keyctl: refused"] {
+        assert!(
+            text.contains(refused),
+            "SECURITY: expected {refused}: {text}"
+        );
+    }
+}
