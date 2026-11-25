@@ -148,7 +148,8 @@ impl BundleVerifier {
         Self
     }
 
-    /// Re-hash every file the manifest names and compare.
+    /// Re-hash every file the manifest names and compare, and refuse a tool
+    /// file the manifest does not name (one added after checksumming).
     ///
     /// `Ok(true)` means every file matches the manifest beside it — i.e. nothing
     /// was corrupted in transit or by accident. It does **not** mean the bundle
@@ -166,6 +167,12 @@ impl BundleVerifier {
 
         for (filename, expected_hash) in &expected {
             if !verify_file_digest(bundle_dir, filename, expected_hash)? {
+                return Ok(false);
+            }
+        }
+        for (_, filename) in json_files_in_dir(bundle_dir)? {
+            if filename != MANIFEST_FILE_NAME && !expected.contains_key(&filename) {
+                warn!("Bundle file not in its manifest (added after checksumming): {filename}");
                 return Ok(false);
             }
         }
@@ -351,6 +358,21 @@ mod tests {
         let (tmp, json_path) = setup_checksummed_bundle();
 
         std::fs::write(&json_path, r#"{"name":"OTHER","command":"true"}"#).unwrap();
+        assert!(!BundleVerifier::new().verify(tmp.path()).unwrap());
+    }
+
+    /// A tool file added after checksumming is a change to the bundle too, and
+    /// the most likely one to be malicious: it adds a command. `verify` re-hashed
+    /// only the files the manifest named, so the new one passed unseen.
+    #[test]
+    fn verify_fails_when_a_tool_file_was_added() {
+        let (tmp, _json_path) = setup_checksummed_bundle();
+
+        std::fs::write(
+            tmp.path().join("added.json"),
+            r#"{"name":"NEW","command":"true"}"#,
+        )
+        .unwrap();
         assert!(!BundleVerifier::new().verify(tmp.path()).unwrap());
     }
 

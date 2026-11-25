@@ -58,11 +58,9 @@ a deprecated alias.
 
 ```bash
 ahma bundle verify /path/to/bundle-dir
-# PASS: every file the manifest lists is unchanged
-# FAIL: a listed file is missing or differs
+# PASS: every file the manifest lists is unchanged, and no other .json file is present
+# FAIL: a listed file is missing or differs, or a .json file was added after checksumming
 ```
-
-A `.json` file added after `checksum` is **not** detected.
 
 > **This is a corruption check, not a signature — and the distinction is not a
 > technicality.**

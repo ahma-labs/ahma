@@ -19,8 +19,8 @@ commands ahma executes.*
   `--strict` fails the audit on any finding. Still open: injection text in `hints` and
   exfiltration-shaped command patterns are not checked.
 - `BundleChecksummer` writes a SHA-256 manifest of the bundle's files; `BundleVerifier`
-  re-hashes the files the manifest lists and compares; a `.json` file added after
-  checksumming is not detected (open). The checksum detects **corruption only**; it is not a signature:
+  re-hashes the files the manifest lists and compares, and fails on a `.json` file the
+  manifest does not list (added after checksumming). The checksum detects **corruption only**; it is not a signature:
   the manifest is unsigned and lives inside the bundle, so anyone who can edit a file can
   regenerate it. No surface — CLI output, docs, type names — may call the manifest a
   signature or imply it establishes trust.
