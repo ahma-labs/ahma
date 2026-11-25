@@ -114,8 +114,8 @@ pub struct AppConfig {
     /// `--force-progress-notifications` CLI flag or
     /// `tools.force_progress_notifications` in settings.toml.
     pub force_progress_notifications: bool,
-    /// How tool calls return: wait for the result (`sync`, the default) or
-    /// return an operation id after a short window (`async`). CLI `--sync` /
+    /// How tool calls return: wait for the result (`sync`) or return an
+    /// operation id after a short window (`async`, the default). CLI `--sync` /
     /// `--async` > project/user `tools.execution_mode` > default.
     pub execution_mode: ahma_common::config::ExecutionPolicy,
     /// The mode given explicitly on the command line, if any. Only this is
@@ -1222,7 +1222,7 @@ pub struct Cli {
     #[arg(long = "tmp", global = true)]
     pub tmp: bool,
 
-    /// Add the scratch directory (default ~/sandbox) as a persistent secondary scope.
+    /// Add `[sandbox] scratch_directory` as a persistent secondary scope; does nothing unless that is set.
     /// The directory is created if it does not exist and survives roots/list updates,
     /// giving the AI a stable per-user scratch space regardless of which workspace is open.
     /// This does NOT toggle the (always-on) kernel sandbox — use --no-sandbox for that,
@@ -1317,8 +1317,8 @@ pub struct Cli {
     #[arg(long = "force-progress-notifications", global = true)]
     pub force_progress_notifications: bool,
 
-    /// Wait for each command to finish and return its result (the default;
-    /// overrides `tools.execution_mode = "async"`). The call still runs as a
+    /// Wait for each command to finish and return its result (overrides the
+    /// default, `tools.execution_mode = "async"`). The call still runs as a
     /// tracked operation, visible in status and the TUI and cancellable; a
     /// command that outlasts what the client can wait for returns its id and
     /// is collected with await.
@@ -1327,7 +1327,8 @@ pub struct Cli {
 
     /// Return an operation id after a short inline window instead of waiting
     /// for the result; collect it with the await tool. Lets a model start
-    /// several long commands in parallel. Overrides `tools.execution_mode`.
+    /// several long commands in parallel. The default; overrides
+    /// `tools.execution_mode`.
     #[arg(long = "async", global = true, overrides_with = "sync")]
     pub async_mode: bool,
 
@@ -1554,9 +1555,7 @@ pub enum Subcommands {
     /// agent skills, and optionally the ahma binary). Mirrors `ahma setup` with the same
     /// "what / which platforms" prompts when no flags are given.
     Uninstall(UninstallArgs),
-    /// Start the TUI hub for multi-instance aggregation. The hub collects
-    /// operation events from running ahma instances (including stdio processes spawned
-    /// by IDEs) and fans them to TUI subscribers. Starts automatically on first use.
+    /// Run the per-user hub: the one MCP endpoint editors connect to through `ahma serve stdio`, and the event stream `ahma tui`, `ahma web` and `ahma desktop` watch. Every session's commands run in a sandboxed worker it starts. It starts automatically on first use; run it yourself only to see why it will not start.
     Hub(HubArgs),
     /// Manage the settings file (`~/.ahma/settings.toml`). The primary place to
     /// configure Ahma behaviour, superseding environment variables and providing a
@@ -2524,7 +2523,7 @@ pub enum ServeTransport {
 /// Start a persistent HTTP-based MCP bridge.
 ///
 /// Binds a TCP listener and serves the MCP Streamable HTTP transport
-/// (2025-03-26 spec).  Each connecting client gets an isolated session
+/// (MCP Streamable HTTP).  Each connecting client gets an isolated session
 /// with its own sandbox scope.
 ///
 /// HTTP/3 over QUIC is enabled by default when the platform supports it
@@ -2859,8 +2858,8 @@ impl LegacyEgress {
   # Connect to a specific HTTP bridge
   ahma tui --connect http://localhost:8080
 
-  # Connect via a Unix domain socket
-  ahma tui --connect unix:///tmp/ahma.sock")]
+  # Connect to an `ahma serve unix` socket
+  ahma tui --connect unix:///run/ahma/mcp.sock")]
 pub struct TuiArgs {
     /// URL of the ahma server to monitor.
     ///
