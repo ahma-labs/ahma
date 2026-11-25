@@ -1007,3 +1007,86 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
 
     client.cancel().await.unwrap();
 }
+
+// =============================================================================
+// RED TEAM: truncate(2) outside the scope (SPEC R-HARDEN.1)
+// =============================================================================
+
+/// `truncate(2)` is a write that never opens the file. Landlock gates it only
+/// from ABI 3 (Linux 6.2), as its own access right, so a ruleset that handles
+/// ABI 2 leaves it open: a sandboxed command could zero any file the user can
+/// write, outside the scope. Seatbelt counts it as `file-write-data`. The
+/// command uses perl's `truncate`, a direct truncate(2) by path, because
+/// macOS has no `truncate` binary and a shell redirect opens the file (which
+/// ABI 1 already denies), so it would not test this at all.
+#[tokio::test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "AppContainer spawn isolation (SPEC R6.3.3) is switched off, so Windows has no \
+              path boundary to enforce this"
+)]
+async fn red_team_truncate_outside_scope_blocked() {
+    init_test_logging();
+    skip_if_os_sandbox_unenforced!();
+    #[cfg(target_os = "linux")]
+    if !landlock_abi_at_least(3) {
+        eprintln!(
+            "Skipping: this kernel's Landlock predates ABI 3 (Linux 6.2), which is the first \
+             that can deny truncate(2); ahma discloses the gap there (SPEC R-HARDEN.1)"
+        );
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let outside_dir = TempDir::new().unwrap();
+    let outside_file = outside_dir.path().join("precious.txt");
+    fs::write(&outside_file, "do not lose me\n").unwrap();
+
+    let tools_dir = get_workspace_tools_dir();
+    let client = ClientBuilder::new()
+        .tools_dir(&tools_dir)
+        .working_dir(temp_dir.path())
+        .no_sandbox(false)
+        .arg("--disable-temp-files")
+        .build()
+        .await
+        .unwrap();
+
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
+        serde_json::from_value(json!({
+            "command": format!(
+                "perl -e 'truncate($ARGV[0], 0) or die \"truncate: $!\\n\"' '{}'",
+                outside_file.display()
+            ),
+            "execution_mode": "Synchronous"
+        }))
+        .unwrap(),
+    );
+    let _ = client.call_tool(params).await;
+
+    assert_eq!(
+        fs::read_to_string(&outside_file).unwrap(),
+        "do not lose me\n",
+        "SECURITY: a sandboxed command truncated a file outside its scope: {}",
+        outside_file.display()
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The Landlock ABI this kernel offers, from `landlock_create_ruleset` with
+/// `LANDLOCK_CREATE_RULESET_VERSION`.
+#[cfg(target_os = "linux")]
+fn landlock_abi_at_least(min: i64) -> bool {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    // SAFETY: a version query passes no attributes and creates nothing.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    abi >= min
+}
