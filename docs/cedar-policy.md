@@ -86,7 +86,7 @@ builds:
 | Rule | Held by |
 |---|---|
 | Forbids a grant (`read`/`write` on a path outside the scope) | ahma refuses the grant; the path never enters the kernel scope |
-| Forbids a path *inside* the workspace, unconditionally | **macOS:** a Seatbelt deny, the last rule in every command's profile, so no shell command can read or write it. **Every platform:** ahma's own file tools refuse it. **Linux:** file tools only for now; a shell command can still reach it (the namespace deny tier is planned, SPEC R-POLICY.4) |
+| Forbids a path *inside* the workspace, unconditionally | **macOS:** a Seatbelt deny, the last rule in every command's profile, so no shell command can read or write it. **Every platform:** ahma's own file tools refuse it. **Linux:** a write rule is a read-only mount in each command's namespace when `[sandbox] linux_deny_tier = "namespace"` is on and the host allows it; otherwise, and for read rules always, file tools only, so a shell command can still reach the path |
 | A path rule with a condition (`when …`) or a principal | ahma's own decisions only (file tools, grants), never the kernel; startup says how many |
 | Forbids a host | the egress proxy (kernel-pinned to it on macOS and Linux 6.7+) and `fetch_webpage` |
 | Forbids a tool | the MCP server and terminal hooks refuse the call |

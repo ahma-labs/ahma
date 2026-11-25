@@ -584,7 +584,10 @@ impl Sandbox {
         if !roots.contains(&cwd) {
             roots.push(cwd.clone());
         }
-        let targets = super::deny_tier::mount_targets(&roots);
+        let targets = super::deny_tier::with_policy_write_denies(
+            super::deny_tier::mount_targets(&roots),
+            &ahma_common::policy::installed_kernel_denies().write,
+        );
         let mounts = super::deny_tier::DenyTierMounts::plan(&targets, Some(cwd.as_path()));
         if let Some(mounts) = &mounts {
             tracing::debug!(
