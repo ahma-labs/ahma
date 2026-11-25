@@ -118,7 +118,9 @@ async fn a_second_writer_is_queued_behind_the_first_and_says_so() -> Result<()> 
     let (mcp, temp) = server().await?;
     let wd = temp.path().join("ws");
 
-    let first = run(&mcp, &sleep_cmd(3), &wd).await?;
+    // A real writer: a bare `sleep` writes nothing and so waits on no one
+    // (SPEC R2.7.12).
+    let first = run(&mcp, &writer_cmd(3), &wd).await?;
     let first_id = op_id(&first);
 
     let second = run(&mcp, &echo_cmd("second-ran"), &wd).await?;
@@ -280,7 +282,9 @@ async fn a_file_changed_during_a_run_is_reported() -> Result<()> {
     let (mcp, temp) = server().await?;
     let wd = temp.path().join("ws");
 
-    let id = op_id(&run(&mcp, &sleep_cmd(3), &wd).await?);
+    // The drift report belongs to a run that holds the workspace; a bare
+    // `sleep` holds none (SPEC R2.7.12).
+    let id = op_id(&run(&mcp, &writer_cmd(3), &wd).await?);
     // Another writer — the harness's own editor, say — changes a source file.
     tokio::fs::write(wd.join("edited_meanwhile.rs"), "fn main() {}").await?;
 

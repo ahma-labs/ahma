@@ -147,7 +147,7 @@ Every call is a tracked operation (`status`, `ahma tui`, cancellable, full outpu
 - **`async` (default)** — a call returns inline if it finishes within a few seconds, otherwise
   an `operation_id`: keep working, then `await` it. Writers run one at a time in the order sent
   (the workspace queue): a result saying `NOT started — queued behind op X` will run by itself —
-  never resend it. Read-only commands (`git status`, `rg`, `ls`) answer at once. A result you
+  never resend it. Read-only commands (`git status`, `rg`, `ls`) and CI/cloud waits answer at once; for a script that only waits on CI, pass `read_only: true`. A result you
   never awaited arrives atop your next tool result; `changed_during_run` lists files another
   writer touched meanwhile; a `TRUST-HANDOFF WRITE` line means a git hook or `.ahma/` file changed — review it before your next git command. ([docs/workspace-queue.md](https://github.com/ahma-labs/ahma/blob/main/docs/workspace-queue.md))
 - **`sync`** (`--sync`) — a call returns the result when it finishes; past what your client can

@@ -389,6 +389,21 @@ impl Adapter {
                 {
                     Lane::Service
                 }
+                // Asked for by the caller (SPEC R2.7.12): the kernel holds the
+                // line to it, so the request needs no trust, only enforcement.
+                Some(_) if asks_read_only(args) => {
+                    if self.sandbox.can_enforce_read_only() {
+                        Lane::ReadOnly
+                    } else {
+                        reason = Some(
+                            "`read_only` was asked for, but the kernel cannot hold a command to \
+                             the read-only lane here (Windows, or ahma inside another sandbox), \
+                             so it takes its turn"
+                                .to_string(),
+                        );
+                        Lane::Exclusive
+                    }
+                }
                 Some(line) => {
                     // A redirection writes the workspace when its file lies in
                     // this workspace or in another repository the session can
@@ -1567,6 +1582,14 @@ fn watch_links(
 
 /// The shell command line of a `run_terminal_command`-style call (`command`
 /// plus `c_flag`), which is what the lane classifier and the mutex groups must
+/// Whether `run_terminal_command` was asked to run in the read-only lane
+/// (`read_only: true`, SPEC R2.7.12).
+fn asks_read_only(args: Option<&Map<String, serde_json::Value>>) -> bool {
+    args.and_then(|a| a.get("read_only"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// look at — the adapter's own `command` is then only the shell program.
 fn shell_command_line(args: Option<&Map<String, serde_json::Value>>) -> Option<&str> {
     let args = args?;
@@ -3461,6 +3484,34 @@ mod tests {
         args.insert("command".into(), json!(command));
         args.insert("c_flag".into(), json!(true));
         args
+    }
+
+    /// SPEC R2.7.12: `read_only: true` puts a line the classifier cannot read
+    /// (a project script that only waits on CI) in the read-only lane, where
+    /// the kernel refuses any workspace write, so it never waits and never
+    /// holds an edit back. Where the kernel cannot enforce the lane the request
+    /// is not honoured, and the reason says why.
+    #[test]
+    fn asking_for_read_only_runs_an_unreadable_line_in_the_read_only_lane() {
+        use workspace_queue::Lane;
+        let (strict, s) = adapter_with_mode(crate::sandbox::SandboxMode::Strict);
+        let mut args = shell_args("scripts/wait-for-ci.sh 387");
+        assert_eq!(
+            strict.resolve_lane(Some(&args), None, s.path()),
+            Lane::Exclusive,
+            "an unknown program takes its turn"
+        );
+        args.insert("read_only".into(), serde_json::Value::Bool(true));
+        let (lane, reason) = strict.resolve_lane_with_reason(Some(&args), None, s.path());
+        if strict.sandbox().can_enforce_read_only() {
+            assert_eq!(lane, Lane::ReadOnly);
+        } else {
+            assert_eq!(lane, Lane::Exclusive);
+            assert!(
+                reason.as_deref().is_some_and(|r| r.contains("read_only")),
+                "the refusal says why: {reason:?}"
+            );
+        }
     }
 
     /// SPEC R2.7.4: a reading command line is read-only only where the kernel
