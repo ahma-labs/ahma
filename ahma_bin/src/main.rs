@@ -175,9 +175,12 @@ async fn run() -> Result<()> {
             if paths > 0 {
                 let held = if cfg!(target_os = "macos") {
                     "by the kernel (Seatbelt) and by ahma's file tools"
+                } else if cfg!(target_os = "linux") {
+                    "by ahma's file tools; write rules also by the kernel when \
+                     `linux_deny_tier = \"namespace\"` is active (read-only mounts), \
+                     read rules never by the kernel"
                 } else {
-                    "by ahma's file tools and grant decisions only: the kernel does not \
-                     deny a path inside the workspace here yet"
+                    "by ahma's file tools only: there is no kernel path boundary here"
                 };
                 tracing::info!("team policy: {paths} path rule(s) held {held}");
             }

@@ -248,6 +248,23 @@ pub fn mount_targets(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+/// `targets` plus team policy's write denies (SPEC R-POLICY.4) that exist,
+/// canonical, sorted and de-duplicated. Landlock cannot deny a path below one
+/// it allows, so on Linux the read-only mount is what lets the kernel hold a
+/// write forbid inside the workspace. A read forbid has no mount equivalent and
+/// stays with ahma's own decisions.
+pub fn with_policy_write_denies(mut targets: Vec<PathBuf>, denies: &[PathBuf]) -> Vec<PathBuf> {
+    for p in denies {
+        if let Ok(c) = dunce::canonicalize(p)
+            && !targets.contains(&c)
+        {
+            targets.push(c);
+        }
+    }
+    targets.sort();
+    targets
+}
+
 /// The steps the child takes, in order. The discriminant travels from the
 /// probe child to the parent over a pipe; `0` means every step held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -683,6 +700,26 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+
+    /// SPEC R-POLICY.4 on Linux: team policy's write denies join the deny
+    /// tier's read-only mounts, canonical and de-duplicated, and only where the
+    /// path exists (a bind needs a mount point).
+    #[test]
+    fn team_policy_write_denies_join_the_read_only_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let hooks = root.join(".git").join("hooks");
+        let secrets = root.join("secrets");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        let merged = super::with_policy_write_denies(
+            vec![hooks.clone()],
+            &[secrets.clone(), hooks.clone(), root.join("absent")],
+        );
+        let mut want = vec![hooks, secrets];
+        want.sort();
+        assert_eq!(merged, want);
+    }
     use super::*;
 
     /// Restores `detect` however the test ends: the mode is process-global.
