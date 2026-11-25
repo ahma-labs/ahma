@@ -1,0 +1,19 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "ahma_policy"
+description = "Team policy in Cedar for ahma: forbid-only rules, loaded once from a trusted directory, consulted before every userspace permission decision (MIT OR Apache-2.0)."
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ahma_common = { path = "../ahma_common" }
+# Only the core language: ahma's schema uses no ipaddr, decimal or datetime
+# extension, and each is more code in every binary.
+cedar-policy = { version = "4.15", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

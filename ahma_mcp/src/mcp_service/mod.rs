@@ -1743,6 +1743,15 @@ impl ServerHandler for AhmaMcpService {
                 None
             };
 
+            // Team policy may forbid a tool, and a policy file that failed to
+            // load forbids every one, so ahma fails closed (SPEC R-POLICY.3).
+            // Before the scope gate: a refused call needs no scope.
+            if let Some(reason) = ahma_common::policy::forbidden_tool(tool_name.as_ref()) {
+                return Ok(
+                    CallToolResult::error(vec![rmcp::model::ContentBlock::text(reason)]).into(),
+                );
+            }
+
             let mut run_params = CallToolRequestParams::new(tool_name.clone());
             run_params.arguments = tool_args;
             run_params.meta = params.meta;

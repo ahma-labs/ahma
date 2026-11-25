@@ -284,7 +284,7 @@ ahma permissions list [--expiring 12h]         # every grant, or the leases to r
 ahma permissions list --kind net-host          # just network hosts
 ahma permissions revoke net-host <host> --yes  # revoke network grant
 ahma permissions revoke log-target <file> --yes  # revoke a log-symlink target approved with logs_approve
-
+ahma policy explain <action> <resource>        # a refusal citing "team policy" is a hard rule: relay it, never work around it
 ahma network allow <host>                      # allow subprocess egress to host
 ahma network list                              # view active allowlist
 ahma network revoke <host>                     # remove host from allowlist

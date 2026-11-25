@@ -289,6 +289,7 @@ ALLOWED_TEST_ROOTS=(
   ahma_core/tests/integration/main.rs
   ahma_http_mcp_client/tests/integration/main.rs
   ahma_llm_monitor/tests/integration/main.rs
+  ahma_policy/tests/integration/main.rs
 )
 LAYOUT_VIOLATIONS=""
 while IFS= read -r test_root; do

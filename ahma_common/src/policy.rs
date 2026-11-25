@@ -227,6 +227,20 @@ pub fn decide_with(
     }
 }
 
+/// Why calling the tool `name` is forbidden, if it is: team policy may forbid
+/// a tool, and a policy file that failed to load forbids every one. The MCP
+/// server asks this for each `tools/call`, and terminal hooks for each hooked
+/// command (as `run_terminal_command`), so both fail closed the same way.
+pub fn forbidden_tool(name: &str) -> Option<String> {
+    match decide(
+        &Request::new(Action::CallTool, Resource::Tool(name)),
+        &Facts::new(DefaultAnswer::Allow),
+    ) {
+        Decision::Deny { reason, .. } => Some(reason),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
