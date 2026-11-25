@@ -359,6 +359,15 @@ It is a `[sandbox]` key, so a repository's own `.ahma/settings.toml` cannot
 turn it off (R-CFG2.2). What it needs and what it does not cover:
 [security-sandbox.md](security-sandbox.md#prevented-where-the-host-allows-it-linux-opt-in).
 
+### Linux: the system-call baseline (`syscall_filter`)
+
+| Key | Values | Default | Effect |
+|---|---|---|---|
+| `syscall_filter` | `true`, `false` | `true` | Every command runs under a seccomp filter refusing `io_uring`, `bpf`, `perf_event_open`, `userfaultfd`, keyrings and `AF_ALG` sockets, and with `--restrict-network` UDP and raw sockets. `false` turns it off, for a tool that genuinely needs one (a profiler), and is logged at startup. Ignored off Linux. |
+
+What each refusal returns: [security-sandbox.md](security-sandbox.md#linux-landlock)
+(SPEC R-HARDEN.3).
+
 ## See also
 
 - [environment-variables.md](environment-variables.md) — remaining env vars reference

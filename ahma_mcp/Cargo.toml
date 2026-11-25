@@ -65,6 +65,9 @@ url.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
+# The seccomp baseline (SPEC R-HARDEN.3): a pure-Rust BPF builder whose
+# apply_filter is only prctl + seccomp(2), safe between fork and exec.
+seccompiler = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true

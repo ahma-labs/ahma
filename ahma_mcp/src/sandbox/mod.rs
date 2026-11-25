@@ -76,6 +76,7 @@ pub mod session_tier;
 pub mod setuid;
 pub mod signals;
 pub mod ssh_agent;
+pub mod syscall_filter;
 mod types;
 /// Windows backend. Compiled on **every** platform, unlike `landlock`/`seatbelt`,
 /// because its argv protocol, container-name derivation, launcher resolution and

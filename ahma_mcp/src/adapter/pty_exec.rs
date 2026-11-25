@@ -282,6 +282,7 @@ mod unix {
             // The read-only deny tier, as in `create_shell_command` (SPEC
             // R6.1.7): rebuilding the command dropped that pre_exec hook too.
             let mounts = sandbox.spawn_deny_tier_mounts(working_dir);
+            let filter = sandbox.spawn_syscall_filter();
             // SAFETY: the closure only performs async-signal-safe syscalls on
             // buffers built before fork; the OwnedFd moved into it stays open
             // across fork.
@@ -290,7 +291,11 @@ mod unix {
                     if let Some(mounts) = &mounts {
                         mounts.enter_in_child()?;
                     }
-                    crate::sandbox::apply_landlock_ruleset_in_child(fd.as_raw_fd())
+                    crate::sandbox::apply_landlock_ruleset_in_child(fd.as_raw_fd())?;
+                    if let Some(filter) = &filter {
+                        crate::sandbox::syscall_filter::apply_in_child(filter)?;
+                    }
+                    Ok(())
                 });
             }
         }

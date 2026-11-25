@@ -69,6 +69,16 @@ ahma probes Landlock itself at startup, because the `lsm` file can be wrong in c
 
 A Landlock rule is an allow-list of file descriptors, so the read-only set is expressed as explicitly as the writable one and anything unnamed is unreadable. This is the position the phrase "outside the scope is denied" actually describes, and it holds **only** here (SPEC R6.1.6).
 
+**System calls a build never needs are refused** (SPEC R-HARDEN.3). A kernel privilege escalation escapes any path sandbox, so every command also runs under a seccomp filter that keeps the kernel's least-needed, most-exploited surface out of reach:
+
+| Refused | Answer the program gets |
+|---|---|
+| `io_uring_*`, `bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `add_key`, `request_key` | `ENOSYS` ("Function not implemented"), so a program that probes for them, such as libuv for `io_uring`, falls back |
+| `AF_ALG` sockets (the kernel crypto API) | `EAFNOSUPPORT` |
+| UDP and raw IP sockets, only with `--restrict-network` | `EAFNOSUPPORT`; Landlock's network rules cover TCP only, so this keeps a datagram from leaving past the egress proxy |
+
+x32-ABI system calls are refused too, and a 32-bit x86 program is stopped (`SIGSYS`) at its first system call, since the filter's numbers do not apply to it. Tracing a process the command did not start is already refused by Landlock. A tool that genuinely needs one of these (a profiler using `perf_event_open`, say) needs `[sandbox] syscall_filter = false`, which turns the whole filter off and is logged at startup. It is a `[sandbox]` key, so a repository's own settings cannot set it.
+
 Moving or hard-linking a file into another directory works wherever writes do. On kernels before 5.19, Landlock refuses any rename that changes a file's directory with "Invalid cross-device link"; `mv` still works there (it copies), but programs that call `rename(2)` directly fail (SPEC R6.1.8).
 
 **Git hooks and `.ahma/` are watched, not protected — unless you opt in** (SPEC R6.1.7). Inside the workspace, Landlock cannot deny the trust-handoff paths — every resolved `<git dir>/hooks` and the project's `.ahma/` — so by default a command run through `run_terminal_command` can write `.git/hooks/pre-commit`, and your `git` will run it later outside any sandbox. ahma detects this instead: it inventories those paths before every command and compares afterwards, and a change leads the tool result with a `TRUST-HANDOFF WRITE` line. Nothing is reverted. See [Detected, not prevented](#detected-not-prevented-linux-and-windows). Where the host allows unprivileged user namespaces, `[sandbox] linux_deny_tier = "namespace"` makes the kernel refuse those writes: see [Prevented, where the host allows it](#prevented-where-the-host-allows-it-linux-opt-in).

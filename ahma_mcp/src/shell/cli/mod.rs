@@ -3690,6 +3690,9 @@ fn configure_handoff_allowances(cli: &Cli, s: &ahma_common::config::AhmaSettings
 /// `initialize_sandbox`, and only when the mode asks for it.
 fn configure_linux_deny_tier(s: &ahma_common::config::AhmaSettings) {
     sandbox::set_linux_deny_tier(s.sandbox.linux_deny_tier);
+    // SPEC R-HARDEN.3: the seccomp baseline, installed beside the deny tier
+    // for the same reason (security tier, resolved once).
+    sandbox::syscall_filter::set_syscall_filter(s.sandbox.syscall_filter);
 }
 
 /// Install `[sandbox] ssh_agent` (SPEC R-CRED.11) and, unless it is

@@ -1617,6 +1617,13 @@ pub struct SandboxSettings {
     /// Default: `"detect"`
     #[serde(default)]
     pub linux_deny_tier: LinuxDenyTier,
+    /// Linux only. Refuse, with a seccomp filter in every command, the system
+    /// calls a build or test never needs and kernel exploits commonly reach:
+    /// io_uring, bpf, perf_event_open, userfaultfd, keyrings and AF_ALG
+    /// sockets, and with `--restrict-network` UDP and raw sockets (SPEC
+    /// R-HARDEN.3). Default: `true`
+    #[serde(default = "default_true")]
+    pub syscall_filter: bool,
 }
 
 /// Every shipped profile, enabled — the opt-out default (R-PERM.5).
@@ -1736,6 +1743,7 @@ impl Default for SandboxSettings {
             allow_git_hooks: false,
             allow_project_tool_config: false,
             linux_deny_tier: LinuxDenyTier::Detect,
+            syscall_filter: true,
         }
     }
 }
@@ -3022,6 +3030,12 @@ impl AhmaSettings {
             "linux_deny_tier",
             toml_str(self.sandbox.linux_deny_tier.as_str()),
             toml_str(d.sandbox.linux_deny_tier.as_str()),
+        );
+        w.setting(
+            "Linux: refuse, in every command, the system calls builds never need and kernel exploits use (io_uring, bpf, keyrings, AF_ALG sockets; UDP and raw sockets with --restrict-network). Turn off only for a tool that genuinely needs one.",
+            "syscall_filter",
+            self.sandbox.syscall_filter.to_string(),
+            d.sandbox.syscall_filter.to_string(),
         );
 
         // ── Logging ──────────────────────────────────────────────────────────
@@ -4677,6 +4691,7 @@ mod tests {
                 allow_git_hooks: true,
                 allow_project_tool_config: true,
                 linux_deny_tier: LinuxDenyTier::Namespace,
+                syscall_filter: false,
             },
             logging: LoggingSettings {
                 target: "stderr".into(),
