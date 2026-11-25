@@ -201,8 +201,9 @@ the session that started it. An agent sees the same report in the `status` tool,
 |---|---|---|
 | `execution_mode` | `"async"` | `"sync"` makes every call wait for its result |
 | `workspace_queue` | `true` | `false` lets writers overlap again (the pre-R2.7 behaviour); only sensible with `execution_mode = "sync"` |
-| `edit_guard` | `true` | ahma's own file tools refuse edits while a command that may rewrite sources runs; also gates the edit guard installed by `ahma hooks install --edit-guard` |
+| `edit_guard` | `true` | ahma's own file tools refuse edits while a command that may rewrite sources runs; also gates the edit guard `ahma hooks install` adds |
 | `source_readers` | `[]` | This project's own wrappers that only read sources (`["scripts/heavy"]`): edits proceed while one runs |
+| `long_running` | `[]` | Shell commands that wait for a person or run for hours run without the lease and with their own timeout (user settings only; see Limits) |
 | `mutex_groups` | `cargo` | Extra per-workspace serialisation for tools that contend on a shared directory, matched on the command line you wrote, for piped, PTY and session commands alike |
 
 ## Limits

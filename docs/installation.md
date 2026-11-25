@@ -32,7 +32,15 @@ You need `ahma` on PATH before `ahma update` works.
 
 ### Linux / macOS
 
-**Latest (build from GitHub main via Cargo — requires [Rust](https://rustup.rs/)):**
+**Latest release (prebuilt binary):**
+
+```bash
+curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
+```
+
+It verifies the release attestation, installs to `~/.local/bin`, and runs `ahma setup --cli`.
+
+**Build from GitHub main via Cargo (requires [Rust](https://rustup.rs/)):**
 
 The workspace uses `reqwest` with the `http3` feature, so `cargo install --git` builds require
 `RUSTFLAGS='--cfg reqwest_unstable'` (config resolution for `cargo install` does not pick up the
@@ -131,16 +139,16 @@ Run the setup wizard to configure everything below in one step:
 ahma setup --cli    # interactive: asks which editors/features to configure
 ahma setup -y       # non-interactive: auto-detect and configure with defaults
 ahma setup          # in a terminal: the guided view of your settings and what is allowed
+ahma setup --plan   # show what this folder suggests changing; changes nothing (--apply asks item by item)
 ```
 
 A bare `ahma setup` in a terminal opens the guided view ([docs/setup.md](setup.md)); the
 installers and anything that wants the question-by-question wizard use `--cli`.
 
 `ahma setup` writes MCP server entries and agent skills for the editors it detects (Cursor, VS
-Code, Claude Code, Codex, …). [Terminal hooks](#terminal-hooks) are opt-in and excluded from the
-default selection — this is an experimental project and sandbox-exception handling isn't fully
-hardened yet, so an automatically installed hook could interfere with your work. Pass `--hooks`,
-or include hooks at the interactive prompt, to opt in. It is safe to re-run at any time — it only
+Code, Claude Code, Codex, …). [Terminal hooks](#terminal-hooks) are included by default for Cursor and Claude Code, where a
+denied command reaches a question and a grant takes effect on the next command. For Codex,
+Copilot CLI and Antigravity they are left out, and setup says why; pass `--hooks` to opt in. It is safe to re-run at any time — it only
 updates the pieces you ask it to (`--mcp`, `--hooks`, `--skills`, `--tls`). `ahma uninstall`
 reverses it with the same prompts. Restart your editor after it runs.
 
@@ -182,7 +190,7 @@ ahma hooks uninstall --platform cursor --scope project
 
 ## Platform notes
 
-Supported prebuilt release platforms: Linux x86_64/arm64, macOS Apple Silicon, Windows x86_64. Musl builds are available for Linux x86_64 and ARM64 (`ahma update --prefer-musl`; the `AHMA_PREFER_MUSL` env var is deprecated).
+Prebuilt release binaries: Linux x86_64 and arm64 (glibc, or musl with `ahma update --prefer-musl`), macOS Apple Silicon, Windows x86_64. There is no prebuilt binary for 32-bit ARM (Raspberry Pi 2/3) or Intel Macs: build from source. On Windows ahma has no OS path boundary yet; run it inside WSL2 for one ([security-sandbox.md](security-sandbox.md)).
 
 For sandbox behavior and day-to-day usage, see [README.md](../README.md) and [security-sandbox.md](security-sandbox.md).
 
@@ -209,10 +217,4 @@ Or use the `gh` CLI for out-of-band verification:
 gh attestation verify ahma-release-linux-x86_64.tar.gz --repo ahma-labs/ahma
 ```
 
-See [docs/release-signing.md](release-signing.md) for the full trust model.
-
-See **[docs/release-signing.md](release-signing.md)** for:
-
-- Keyless Sigstore trust model architecture and AGPL supply chain defense rationale
-- Step-by-step instructions for out-of-band manual verification of release signatures
-- Details on Sigstore OIDC issuing identities and transparency logging properties
+See [release-signing.md](release-signing.md) for the trust model and manual verification.

@@ -1,6 +1,6 @@
 # Opening web links from inside the sandbox
 
-**Status:** Experimental (v0.22.19). macOS and Linux, for commands run through the terminal
+**Status:** in progress (SPEC Quick Status; open items in SPEC §11). macOS and Linux, for commands run through the terminal
 hooks (Claude Code's Bash tool) and through MCP (`run_terminal_command`, with or without
 `pty`). On Windows commands open links as they would without ahma: there is no sandbox
 boundary there yet. SPEC:

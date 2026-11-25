@@ -1,6 +1,6 @@
 # SSH key broker — `git push` over SSH from inside the sandbox
 
-**Status:** Experimental (v0.22.3). macOS and Linux (on Windows ssh still uses only your own agent). Terminal hooks (Claude Code's Bash tool and other hooked
+**Status:** in progress (SPEC Quick Status; open items in SPEC §11). On by default. macOS and Linux (on Windows ssh still uses only your own agent). Terminal hooks (Claude Code's Bash tool and other hooked
 shells) and commands run through MCP `run_terminal_command`. An MCP command that is refused
 says so in an alert while it runs; there is no mid-command question yet, so a human grants
 with `ahma permissions grant ssh-sign`. SPEC: [R-CRED](../SPEC.md).
@@ -19,7 +19,7 @@ with any key the agent holds, silently.
 
 The broker replaces both. Each command gets an SSH agent of its own, served by ahma outside
 the sandbox. It signs only for a server the connection proves it is talking to, only with a
-human's yes for that key, that server and that workspace, and it records every signature.
+human's yes for that key, that server and that workspace, and it logs every signature and refusal in ahma's log.
 The key never enters the sandbox.
 
 ## What happens on `git push`

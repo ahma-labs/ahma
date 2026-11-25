@@ -1,23 +1,27 @@
 # Connection Modes
 
-`ahma` supports:
-1. **STDIO Mode** (default): your editor spawns `ahma` as a subprocess and communicates via standard I/O. Recommended for development.
-2. **HTTP Mode**: Start `ahma serve http` for HTTP/3 (QUIC) support.
+`ahma` has three transports:
 
-> **All of them go through one hub.** Whatever an editor spawns, the process
-> that actually serves MCP is the single per-user hub, and the tools run in a
-> kernel-sandboxed worker per session. See [docs/hub.md](hub.md).
+1. **STDIO** (default, recommended): your editor spawns `ahma serve stdio`, a pipe to the per-user hub.
+2. **HTTP** (`ahma serve http`): a Streamable HTTP server you start, on `127.0.0.1:3000` (HTTP/1.1 and HTTP/2; HTTP/3 when a certificate exists).
+3. **Unix socket** (`ahma serve unix`, also what a bare `ahma serve` starts): the same server on a Unix domain socket.
+
+`serve http` and `serve unix` require a bearer token by default.
+
+> **Editor sessions go through one hub.** The `ahma serve stdio` an editor spawns is a pipe
+> to the single per-user hub, and tools run in a kernel-sandboxed worker per session
+> ([hub.md](hub.md)). `ahma serve http` and `ahma serve unix` are separate servers you start
+> yourself; they too run one sandboxed worker per session.
 
 ## 1. STDIO Mode (Default)
 
 Your editor spawns `ahma` as a subprocess and communicates via standard I/O.
 That subprocess is a **pipe**: it ensures the per-user hub is running and
-forwards to it (SPEC R-HUB.1). This is the recommended mode for development
-because:
+forwards to it (SPEC R-HUB.1). This is the recommended mode because:
 
-- The sandbox scope comes from the workspace roots your editor reports via `roots/list` (VS Code and Cursor do this automatically). The subprocess's working directory is **never** trusted as a scope on its own (SPEC R5.2.1) — it is client-config-controlled and spoofable.
+- The sandbox scope comes from the workspace roots your editor reports (`roots/list`): VS Code and Cursor answer during the handshake, Claude Code with its first tool call ([below](#claude-code-and-the-2026-07-28-protocol)). The subprocess's working directory is **never** trusted as a scope on its own (SPEC R5.2.1): it is client-config-controlled and spoofable.
 - Each session gets its own kernel-sandboxed worker, locking its own scope. Three windows on three projects are three workers with three scopes.
-- Flags in *your* `mcp.json` — `--tools`, `--sandbox-scope`, a task vault — apply to *your* session and no one else's (SPEC R-HUB.4).
+- Flags in *your* `mcp.json` (`--tools`, `--sandbox-scope`, a task vault) apply to *your* session and no one else's (SPEC R-HUB.4).
 - No network exposure.
 
 ```bash
@@ -25,6 +29,8 @@ ahma serve stdio
 ```
 
 ### mcp.json examples
+
+`ahma setup` writes these for the editors it finds. By hand:
 
 **VS Code** (user profile `mcp.json` or `.vscode/mcp.json`):
 
@@ -41,19 +47,6 @@ ahma serve stdio
             "type": "stdio",
             "command": "ahma",
             "args": ["serve", "stdio", "--log-monitor"]
-        }
-    }
-}
-```
-
-Alternatively, in a terminal run `ahma serve http` for visibility of all actions, and use:
-
-```json
-{
-    "servers": {
-        "Ahma-http": {
-            "type": "http",
-            "url": "http://localhost:3000/mcp"
         }
     }
 }
@@ -87,13 +80,6 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 }
 ```
 
-> **Git worktrees.** Inside a linked worktree the repository's git storage sits outside the
-> workspace, so ahma grants `<main>/.git` and `<main>/.git/worktrees/<name>` read/write — but only
-> when the git dir names the worktree back through the `gitdir` back-reference git itself writes.
-> An unverifiable `gitdir:` pointer is refused and logged. Writes to `<git_dir>/hooks` remain
-> denied, kernel-enforced on macOS and application-layer only on Linux
-> ([security sandbox](security-sandbox.md)).
-
 **Antigravity / LM Studio** (same entry, minus the `"type"` field these clients do not accept):
 
 ```json
@@ -108,168 +94,180 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 ```
 
 > [!NOTE]
-> - **Antigravity answers `roots/list` — with an empty array.** It is roots-*empty*, not roots-*less* (an earlier revision of this document said otherwise; the correction is recorded in SPEC R5.4.2 with the wire evidence). An empty answer is not a workspace, so ahma falls through to the next scope source rather than treating it as one.
-> - **`ahma setup` writes no sandbox scope into this file.** It is client-owned — anyone configuring the client can edit it — so a scope written here is exactly the over-broad path that ahma is meant to distrust. Point ahma at the directory that holds your projects instead, in your own `~/.ahma/settings.toml`:
+> - **Antigravity answers `roots/list` with an empty array.** It is roots-*empty*, not roots-*less* (SPEC R5.4.2 has the wire evidence). An empty answer is not a workspace, so ahma falls through to the next scope source rather than treating it as one.
+> - **`ahma setup` writes no sandbox scope into this file.** It is client-owned (anyone configuring the client can edit it), so a scope written here is exactly the over-broad path ahma is meant to distrust. Point ahma at the directory that holds your projects instead, in your own `~/.ahma/settings.toml`:
 >   ```toml
 >   [sandbox]
 >   container_root = "~/github"
 >   ```
->   ahma narrows the writable scope from there to the one project you are actually working in, keeping the rest of the container readable but not writable.
-> - **You do not need a "sync" flag.** By default (`tools.execution_mode = "async"`) a command that finishes within a short window returns its output in the same response; a longer one returns an operation id to collect with `await`, while writers stay ordered by the workspace write queue ([workspace-queue.md](workspace-queue.md)). Set `sync` ([settings.md](settings.md#sync-or-async-toolsexecution_mode)) to make every call wait for its result, as long as your client tolerates on one open request (SPEC R2.6). Sending `"sync": true` to `run_terminal_command` does nothing; the result will say so.
+>   ahma narrows the writable scope from there to the one project you are working in, keeping the rest of the container readable but not writable.
+> - **You do not need a "sync" flag.** By default (`tools.execution_mode = "async"`) a command that finishes within a short window returns its output in the same response; a longer one returns an operation id to collect with `await`, while writers stay ordered by the workspace write queue ([workspace-queue.md](workspace-queue.md)). Set `sync` ([settings.md](settings.md#sync-or-async-toolsexecution_mode)) to make every call wait for its result, as long as your client tolerates one long-open request (SPEC R2.6). Sending `"sync": true` to `run_terminal_command` does nothing; the result will say so.
 
-## 2. HTTP Mode (EXPERIMENTAL)
+> **Git worktrees.** Inside a linked worktree the repository's git storage sits outside the
+> workspace, so ahma grants `<main>/.git` and `<main>/.git/worktrees/<name>` read/write, but only
+> when the git dir names the worktree back through the `gitdir` back-reference git itself writes.
+> An unverifiable `gitdir:` pointer is refused and logged. Writes to `<git_dir>/hooks` remain
+> denied, kernel-enforced on macOS and application-layer only on Linux
+> ([security sandbox](security-sandbox.md)).
 
-**IMPORTANT SECURITY NOTE**: HTTP mode is for local development only. Do not expose to untrusted networks. OAuth pass through is not yet fully implemented, so all tools are available to any client that can connect. Use firewall rules or `--host` to restrict access.
+### Claude Code and the 2026-07-28 protocol
 
-First start the server in a terminal with your preferred flags, defaulting to port 3000:
+Claude Code opens with the 2026-07-28 `server/discover` handshake. ahma's stdio frontend
+answers it, so the session runs on 2026-07-28. That protocol forbids a server writing requests
+to stdout, so for such a client (SPEC R-HUB.4.2–4.6):
+
+- **Roots arrive with the first tool call.** The first call that needs a scope is answered with a request for the client's roots, and the retry that carries them is the call that runs. `status` and `ahma_help` answer before then.
+- **Approval prompts ride tool calls.** A grant, network, link or web question is attached to the running call or, when none is running (an async command), to the client's next call. A question the retry leaves unanswered counts as cancelled.
+- **Only tool-list changes are pushed**, on the `subscriptions/listen` stream Claude Code opens. Log messages and ahma's session events are not sent ([session-health-notifications.md](session-health-notifications.md)).
+
+The hub behind the frontend still runs a 2025-11-25 session and never sees the newer
+protocol. `ahma serve http` answers `subscriptions/listen` with `{}` and does not hold it open.
+
+### Cursor shared-process and empty roots
+
+Cursor runs all `stdio` MCP servers in a **shared process** when the window has no workspace
+folder open (a fresh install, or a single file opened rather than a folder). Its MCP client
+then answers `roots/list` with `{"roots":[]}`.
+
+An empty answer is not a usable scope (SPEC R5.2.7). With `[sandbox] container_root`
+configured, ahma falls back to it (narrowed to the first project a tool call touches, R5.2.6).
+Without one, it fails the session at once rather than silently scoping every command to an
+empty or wrong directory: `tools/call` returns HTTP 403 with the remediation below. While roots
+have not arrived yet, `tools/call` returns HTTP 409 / JSON-RPC `-32001` ("Sandbox
+initializing..."). The built-ins that change nothing (`status`, `ahma_help`, `await`, …) still
+answer, so `ahma_help topic=roots` can explain the wait.
+
+**Resolutions (pick one):**
+
+1. **Open a workspace folder**: in Cursor, `File → Open Folder...`, so Cursor advertises it as a root.
+2. **Configure an explicit scope**: pass `--sandbox-scope /path/to/your/project` in your `mcp.json` `args`:
+   ```json
+   "args": ["serve", "stdio", "--log-monitor", "--sandbox-scope", "/path/to/project"]
+   ```
+3. **Set a container root**: `container_root = "~/github"` under `[sandbox]` in `~/.ahma/settings.toml`. ahma uses it only when the client reports no usable roots, and narrows the writable scope to the project in use.
+
+`--scratch` (deprecated alias `--sandbox`) is *not* a resolution: it adds an auxiliary scratch
+directory alongside the workspace scope, and does nothing unless you also set
+`[sandbox] scratch_directory`.
+
+## 2. HTTP Mode
+
+**Security.** `ahma serve http` binds `127.0.0.1` and requires a bearer token on every route
+but `/health` (see *Authentication* below). `--host 0.0.0.0` exposes it to that network; put a
+firewall or an authenticating reverse proxy in front.
 
 ```bash
-ahma serve http --scratch --log-monitor
+ahma serve http --log-monitor                                # port 3000, scope from roots/list
+ahma serve http --sandbox-scope /path/to/your/project        # for clients that send no roots
+ahma serve http --port 8080 --host 127.0.0.1
 ```
 
-The HTTP server accepts **HTTP/1.1 and HTTP/2** by default (pass `--disable-http1-1` to require HTTP/2+), and clients may upgrade to **HTTP/3** via Alt-Svc.
+Each session's scope comes from that client's `roots/list` answer. An explicit
+`--sandbox-scope` is locked and never replaced by client roots (SPEC R5.2.2). A client that
+declares no `roots` capability on a server with no `--sandbox-scope` gets an immediate,
+actionable error instead of a handshake timeout.
 
-- **HTTP/2** (h2c — cleartext, no TLS required): the preferred transport for all HTTP clients.
-- **HTTP/3** (QUIC): clients that advertise Alt-Svc support (including `ahma tui`) will automatically upgrade to QUIC when local TLS material is present at `~/.ahma/tls/`. Run `ahma tls init` to provision the certificate. See [TLS management](#tls-management-for-quic) below.
+The server accepts **HTTP/1.1 and HTTP/2** (`--disable-http1-1` requires HTTP/2+), and
+advertises **HTTP/3** when a certificate exists ([below](#http3-and-tls)).
 
-Default endpoint: `http://localhost:3000/mcp`
+> Over cleartext, HTTP/2 needs prior knowledge (`curl --http2-prior-knowledge`, reqwest
+> `http2_prior_knowledge()`). A plain HTTP/1.1 client works unless the server runs with
+> `--disable-http1-1`.
 
-- `POST /mcp` with `Accept: application/json`: JSON-RPC, preferred for speed and low overhead.
-- `POST /mcp` with `Accept: text/event-stream`: Streamable HTTP (SSE fallback for some networks).
-- `GET /mcp` with `Accept: text/event-stream`: SSE stream for server-to-client events.
+Endpoint: `http://localhost:3000/mcp`
+
+- `POST /mcp` with `Accept: application/json`: one JSON-RPC response; preferred.
+- `POST /mcp` with `Accept: text/event-stream`: the response as an SSE stream, with notifications first.
+- `GET /mcp` with `Accept: text/event-stream`: the server-to-client event stream.
 
 Protocol notes:
 
 - Notifications (id-less JSON-RPC messages) are answered `202 Accepted` with no body, on both POST transports.
-- An unknown or expired `Mcp-Session-Id` is answered `404 Not Found` — re-send `initialize` to start a fresh session.
+- An unknown or expired `Mcp-Session-Id` is answered `404 Not Found`: re-send `initialize` to start a fresh session.
 - JSON-RPC **batch arrays are rejected** with `400` (batching was removed from the MCP spec in 2025-06-18).
-- A request whose `id` is `null`, or an `initialize` sent without an `id`, is rejected with `400` and JSON-RPC `-32600`: MCP requires a string or number id on every request. Nothing is run and no session is started. The error message, and its `data.remediation`, say what to do — fix or update the client sending it; if it keeps happening, run [`ahma doctor`](doctor.md), or ask `/doctor <question>` in `ahma tui`.
-- Browser requests are accepted only from loopback origins; a non-loopback `Origin` header is rejected with `403` (DNS-rebinding guard). Non-browser clients send no `Origin` and are unaffected.
-- The **deprecated 2024-11-05 two-endpoint HTTP+SSE transport** (`/sse` + `/messages`) is **not** implemented; clients must speak Streamable HTTP on `/mcp`.
+- A request whose `id` is `null`, or an `initialize` sent without an `id`, is rejected with `400` and JSON-RPC `-32600`: MCP requires a string or number id. Nothing runs and no session starts. The error's `data.remediation` says what to do; if it keeps happening, run [`ahma doctor`](doctor.md).
+- Browser requests are accepted only from loopback origins; a non-loopback `Origin` is rejected with `403` (DNS-rebinding guard). Non-browser clients send no `Origin` and are unaffected.
+- The deprecated 2024-11-05 two-endpoint HTTP+SSE transport (`/sse` + `/messages`) is **not** implemented; speak Streamable HTTP on `/mcp`.
 
-> **Client configuration**: Configure your HTTP client with HTTP/2 prior-knowledge (`--http2-prior-knowledge` in curl, `http2_prior_knowledge()` in reqwest) because the server does not negotiate via ALPN (no TLS).
+### Authentication (on by default)
 
-Then configure your IDE to connect to for example `http://localhost:3000/mcp`:
+A command running inside ahma's sandbox can reach a loopback port, and a session locks the
+scope its client's `roots/list` names, so `ahma serve http` makes a token and requires it on
+every route but `/health` (SPEC R-HUB.14). The token is 64 hex characters in
+`serve-http-<port>.token` in your runtime directory (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`;
+`%LOCALAPPDATA%\ahma\run` on Windows), readable only by you and outside what a sandboxed
+command can read. ahma's own clients (`ahma tui --connect`, the proxies) find it themselves.
+Any other client must send it:
 
 ```json
 {
-    "servers": {
-        "Ahma-http": {
-            "type": "http",
-            "url": "http://localhost:3000/mcp"
-        }
+  "servers": {
+    "Ahma-http": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": { "Authorization": "Bearer ${input:ahma-token}" }
     }
+  },
+  "inputs": [{ "id": "ahma-token", "type": "promptString", "password": true,
+               "description": "Contents of the ahma serve http token file" }]
 }
 ```
 
-HTTP server that proxies MCP protocol to a stdio subprocess. Used for increased visibility, web clients, remote agents, debugging, or multi-client scenarios. HTTP mode derives each session's sandbox scope from that client's `roots/list` answer (VS Code and Cursor answer automatically). For clients that don't support roots, set a fixed sandbox scope (e.g. `--sandbox-scope /path/to/your/project`) — an explicit scope is locked and is never replaced by client roots (SPEC R5.2.2). A client that declares no `roots` capability on a bridge with no `--sandbox-scope` gets an immediate, actionable error instead of a handshake timeout.
+The generated token changes on every start. For a config that survives restarts, start the
+server with `--require-token-path <file>` (a file outside every sandbox scope) and use that
+token. `--allow-unauthenticated` runs with none; ahma says so on every start, because any local
+process, including a sandboxed command, can then use the server.
+
+### Streamable HTTP with curl
 
 ```bash
-# Start on default port 3000 (sandbox scope from roots/list)
-ahma serve http
+TOKEN=$(cat ~/.ahma/serve-http-3000.token)   # or $XDG_RUNTIME_DIR/ahma/…
 
-# Explicit sandbox scope (for clients that don't send roots/list)
-ahma serve http --sandbox-scope /path/to/your/project
-
-# Custom port and host
-ahma serve http --port 8080 --host 127.0.0.1
-```
-
-**Authentication (on by default).** A command running inside ahma's sandbox can reach a loopback port, and a session on this server locks the scope that client's `roots/list` names, so `ahma serve http` makes a token and requires it of every route but `/health` (SPEC R-HUB.14). The token is 64 hex characters in `serve-http-<port>.token` in your runtime directory, readable only by you and outside what a sandboxed command can read; ahma's own clients (`ahma tui --connect`, the proxies) find it themselves. Another client must be given it:
-
-```bash
-curl -H "Authorization: Bearer $(cat ~/.ahma/serve-http-3000.token)" http://127.0.0.1:3000/mcp ...
-```
-
-(`~/.ahma` is the runtime directory unless `XDG_RUNTIME_DIR` is set: then `$XDG_RUNTIME_DIR/ahma`.) To choose the token yourself use `--require-token-path <file>`. To run with none, `--allow-unauthenticated`: ahma says so on every start, because any local process, including a sandboxed command, can then use the server.
-
-| Feature | STDIO Mode | HTTP Mode |
-|---------|-----------|----------|
-| Sandbox scope | Client `roots/list` (or explicit flag) | Per session via `roots/list` (or explicit flag) |
-| Per-project isolation | Automatic | Automatic (per session) |
-| Configuration | `mcp.json` in IDE | CLI args or env vars |
-| Use case | Standard IDE integration | Debugging, advanced setups |
-
-## 3. HTTP Streaming (MCP Streamable HTTP)
-
-Ahma implements [MCP Streamable HTTP](https://spec.modelcontextprotocol.io/) for multiplexed, reconnection-resilient communication.
-
-**POST with JSON response:**
-
-```bash
+# JSON response
 curl -X POST http://localhost:3000/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
   -H "Mcp-Session-Id: <session-uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-```
 
-**POST with SSE streaming:**
-
-```bash
+# SSE response
 curl -X POST http://localhost:3000/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -H "Accept: text/event-stream" \
   -H "Mcp-Session-Id: <session-uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-```
 
-**Reconnect with event replay:**
-
-```bash
+# Reconnect and replay every event after id 42
 curl -X GET http://localhost:3000/mcp \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Accept: text/event-stream" \
-  -H "Mcp-Session-Id: <session-uuid>" \
-  -H "Last-Event-Id: 42"
-# Receives all events with ID > 42
+  -H "Mcp-Session-Id: <session-uuid>" -H "Last-Event-Id: 42"
 ```
 
-| Feature | SSE | HTTP Streaming |
-|---------|-----|----------------|
-| Content negotiation | GET only | POST with `Accept: text/event-stream` |
-| Event sequencing | None | SSE `id:` field for ordering and replay |
-| Reconnection | Client guesses missed events | `Last-Event-Id` enables precise replay |
-| Full-duplex | Separate streams | Single POST stream |
-| Multiplexing | Limited | Native per-session |
+| | STDIO | HTTP / Unix |
+|---|---|---|
+| Server | Per-user hub, started on demand | One you start and stop |
+| Sandbox scope | Per session from roots (or `--sandbox-scope`) | Same |
+| Authentication | Hub token, handled for you | Bearer token; third-party clients must send it |
+| Configuration | `mcp.json` args | CLI flags or `~/.ahma/settings.toml` |
 
-## Session Isolation
+Every session, in every mode, gets its own sandbox scope and worker
+([session-isolation.md](session-isolation.md)). A client that wants to show reconnects and
+pending sandbox grants can listen for ahma's
+[session-health notifications](session-health-notifications.md).
 
-In HTTP mode, each MCP session gets its own sandbox scope derived from the `roots/list` response. See [docs/session-isolation.md](session-isolation.md) for details. A client that wants to show reconnects and pending sandbox grants can listen for ahma's session-health notifications: [docs/session-health-notifications.md](session-health-notifications.md).
+## 3. Unix Socket Mode
 
-### Cursor shared-process and empty roots
+Serves MCP Streamable HTTP over a Unix domain socket instead of TCP: no port to collide on.
+File permissions keep other users out but not your own sandboxed commands, so it requires a
+token too (below).
 
-Cursor runs all `stdio` MCP servers in a **shared process** context when the IDE window has no workspace folder open (e.g. after a fresh install or when opening a single file rather than a folder). In this case, Cursor's MCP client responds to `roots/list` with an empty array `{"roots":[]}`.
-
-An empty `roots/list` answer is not a usable scope (SPEC R5.2.7). With `[sandbox] container_root` configured, ahma falls back to it (narrowed to the first project a tool call touches, R5.2.6). Without one, it fails the session at once rather than silently scoping every command to an empty or wrong directory: `tools/call` returns HTTP 403 with the remediation below. While roots have not arrived yet, `tools/call` returns HTTP 409 / JSON-RPC error `-32001` ("Sandbox initializing..."). The built-ins that change nothing (`status`, `ahma_help`, `await`, …) still answer, so `ahma_help topic=roots` can explain the wait.
-
-### Claude Code and the 2026-07-28 protocol
-
-Claude Code first probes with the 2026-07-28 `server/discover` handshake. That protocol forbids a server sending requests such as `roots/list` and approval prompts down stdio; they must come back as `InputRequiredResult` replies. ahma fetches roots that way: it answers the first tool call that needs a scope with a request for the client's roots, and runs the retry that brings them (SPEC R-HUB.4.3). It also keeps `subscriptions/listen` streams open and sends tool-list changes only on them (SPEC R-HUB.4.4). Approval prompts ride tool calls the same way (SPEC R-HUB.4.5). The modern protocol ends at ahma's stdio frontend: the hub behind it runs an ordinary 2025-11-25 session, and never sees a request that names 2026-07-28 (SPEC R-HUB.4.6). So ahma answers the probe, and Claude Code sessions run on the 2026-07-28 protocol. No server request is ever written to stdout (SPEC R-HUB.4.2).
-
-**Resolutions (pick one):**
-
-1. **Open a workspace folder** — in Cursor: `File → Open Folder...` — so that Cursor advertises the folder as a workspace root in its next `roots/list` response.
-2. **Configure an explicit scope** — pass `--sandbox-scope /path/to/your/project` in your `mcp.json` `args` list:
-   ```json
-   "args": ["serve", "stdio", "--log-monitor", "--sandbox-scope", "/path/to/project"]
-   ```
-3. **Set a container root** — put `container_root = "~/github"` under `[sandbox]` in `~/.ahma/settings.toml`, naming the directory that holds your projects. ahma uses it only when the client reports no usable roots, and narrows the writable scope to the single project subtree in use.
-
-`--scratch` (deprecated alias `--sandbox`) is *not* a resolution: it adds an auxiliary scratch directory alongside the real workspace scope, and does nothing unless you also set `[sandbox] scratch_directory`. It used to default to `~/sandbox` and double as the scope fallback, which is how sessions ended up silently locked to a directory nobody chose.
-
-## 4. Unix Socket Mode
-
-Serves MCP Streamable HTTP over a Unix domain socket instead of TCP. Lower latency than HTTP mode, no port conflicts, and access-controlled by filesystem permissions.
-
-This is the transport the per-user hub uses; running `ahma serve unix`
-yourself starts a **separate**, operator-owned server (SPEC R-HUB.1), which
-is what you want for a fixed scope or a custom path and not what you need for
-ordinary editor use.
+The per-user hub uses this transport; running `ahma serve unix` yourself starts a
+**separate**, operator-owned server (SPEC R-HUB.1), for a fixed scope or a custom path. You
+don't need it for ordinary editor use.
 
 ```bash
-# Start on the default socket: mcp.sock in your per-user runtime directory
-# ($XDG_RUNTIME_DIR/ahma, else ~/.ahma; %LOCALAPPDATA%\ahma\run on Windows),
-# beside the per-user hub's own hub.sock
+# Default socket: mcp.sock in your runtime directory, beside the hub's hub.sock
 ahma serve unix
 
 # Custom socket path
@@ -279,54 +277,48 @@ ahma serve unix --socket-path /run/ahma/mcp.sock
 ahma serve unix --socket-path @ahma
 ```
 
-**Authentication (on by default).** A command running inside ahma's sandbox can connect to a Unix socket, so `ahma serve unix` makes a token and requires it of every route but `/health` (SPEC R-HUB.14). It is written beside the socket (`mcp.sock` → `mcp.token`; for an abstract `@name` socket, `abstract-name.token` in the runtime directory), readable only by you, and removed when the server stops. ahma's own clients read it from there and need no configuration; a client that only dials the socket is refused with a 401 until it is given the token. `--require-token-path` chooses your own, and `--allow-unauthenticated` runs without one, disclosed on every start.
+**Authentication (on by default).** The token is written beside the socket (`mcp.sock` →
+`mcp.token`; for an abstract `@name` socket, `abstract-name.token` in the runtime directory),
+readable only by you, and removed when the server stops (SPEC R-HUB.14). ahma's own clients
+read it from there; any other client is refused with a 401 until it sends the token.
+`--require-token-path` chooses your own, and `--allow-unauthenticated` runs without one,
+disclosed on every start.
 
 ### mcp.json configuration (VS Code)
 
 ```json
 {
-    "servers": {
-        "ahma-unix": {
-            "type": "http",
-            "url": "unix:///run/user/1000/ahma/mcp.sock#/mcp"
-        }
+  "servers": {
+    "ahma-unix": {
+      "type": "http",
+      "url": "unix:///run/user/1000/ahma/mcp.sock#/mcp",
+      "headers": { "Authorization": "Bearer ${input:ahma-token}" }
     }
+  },
+  "inputs": [{ "id": "ahma-token", "type": "promptString", "password": true,
+               "description": "Contents of the ahma serve unix token file (mcp.token)" }]
 }
 ```
 
-**Why `#/mcp` in the URL?** VS Code uses the URL fragment (`#/subpath`) as the documented way to specify the HTTP endpoint path when connecting over a Unix socket. This is VS Code-specific syntax — the part before `#` is the socket path (`ahma setup` writes the resolved per-user path for you) and `/mcp` is the HTTP path to request on it. See the [VS Code MCP configuration reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) for details.
+VS Code takes the HTTP path from the URL fragment: the part before `#` is the socket path and
+`/mcp` the path requested on it ([VS Code MCP reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration)).
 
 > On Windows (10 1803 or later) this is the same `AF_UNIX` socket file, in
-> `%LOCALAPPDATA%\ahma\run`, and it is what `ahma serve` with no transport starts
-> there too. Abstract `@` sockets are Linux-only. Whether a given Windows MCP
-> client can dial a Unix socket is up to that client; `ahma serve http` works
-> with any of them.
+> `%LOCALAPPDATA%\ahma\run`. Abstract `@` sockets are Linux-only. Whether a Windows MCP client
+> can dial a Unix socket is up to that client; `ahma serve http` works with any of them.
 
-## HTTP/3 (QUIC)
+## HTTP/3 and TLS
 
-Ahma HTTP clients built on `reqwest` prefer HTTP/3 (QUIC) when the remote server advertises support via `Alt-Svc`, with transparent fallback to HTTP/2 and HTTP/1.1.
-
-For this local HTTP bridge endpoint, clients should expect HTTP/2 or HTTP/1.1.
-
-## TLS management for QUIC
-
-`ahma tui` upgrades to HTTP/3 (QUIC) when:
-1. The server returns an `Alt-Svc: h3=…` header, **and**
-2. Local TLS material exists at `~/.ahma/tls/` (or via `--tls-dir`).
-
-Manage the local TLS certificate with the `ahma tls` subcommands:
+`ahma serve http` advertises HTTP/3 with `Alt-Svc` when a certificate exists in `~/.ahma/tls/`
+and `--disable-quic` is not set. Clients that honour it (`ahma tui`, ahma's own clients)
+upgrade; others stay on HTTP/2 or HTTP/1.1. The `GET /mcp` push stream is not served over
+HTTP/3 (406), so clients keep it on HTTP/2 or 1.1 (ahma_http_bridge R8.7.3).
 
 ```bash
-# First-time provisioning (idempotent — safe to re-run)
-ahma tls init
-
-# Force certificate rotation (e.g. every 30 days or after key compromise)
-ahma tls rotate
-
-# Show certificate path, age, and whether rotation is recommended
-ahma tls status
+ahma tls init     # create the certificate (idempotent; `ahma setup` does this for you)
+ahma tls rotate   # replace it (e.g. every 30 days, or after a key compromise)
+ahma tls status   # path, age, and whether rotation is recommended
 ```
 
-The private key (`~/.ahma/tls/key.der`) is stored with mode `0600` (Unix). The certificate is self-signed and used only for local loopback QUIC sessions — it is not exposed to the network.
-
-Use `--disable-quic` flag to prevent the HTTP/3 upgrade.
+The private key (`~/.ahma/tls/key.der`) is mode `0600` on Unix. The certificate is self-signed
+and used only for local loopback QUIC sessions.

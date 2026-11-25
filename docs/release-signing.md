@@ -161,19 +161,10 @@ gh attestation verify ahma-release-linux-x86_64.tar.gz \
   --repo ahma-labs/ahma
 ```
 
-**Using `cosign`:**
-```bash
-cosign verify-blob \
-  --bundle ahma-release-linux-x86_64.tar.gz.sigstore.json \
-  --certificate-identity-regexp '^https://github\.com/ahma-labs/ahma/.+@refs/heads/main$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ahma-release-linux-x86_64.tar.gz
-```
-
 **Programmatically** (for CI/CD pipelines):
 ```bash
 # Download and check attestation metadata
-gh api repos/ahma-labs/ahma/attestations/sha256:$(sha256sum ahma | awk '{print $1}') \
+gh api repos/ahma-labs/ahma/attestations/sha256:$(shasum -a 256 ahma | awk '{print $1}') \
   | jq '.attestations[0].bundle.verificationMaterial.certificate.rawBytes' | base64 -d | openssl x509 -noout -text
 ```
 

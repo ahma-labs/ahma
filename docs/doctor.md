@@ -1,6 +1,6 @@
 # Doctor — `ahma doctor` and `/doctor`
 
-**Status:** Stable. SPEC: [R-DOCTOR](../SPEC.md).
+**Status:** tests-pass. SPEC: [R-DOCTOR](../SPEC.md).
 
 ## Why
 
@@ -48,19 +48,24 @@ Example report:
 |---|---|---|
 | Settings file parses | problem if not | none — the message names the line; ahma never overwrites a file it cannot read |
 | Granted folders (`[sandbox] persistent_scopes`) that no longer exist | warn | remove them |
+| Saved grants on the hard denylist, skipped at every start | warn | remove them |
+| Granted folders with no workspace (they apply to every project) | warn | none — revoke and re-grant from the project (SPEC R5.4.11) |
 | Tool approvals for folders that no longer exist | info | forget them |
 | A grant letting a workspace write **another repository** that a dialog's yes saved and no human confirmed (SPEC R-PERM.11) | warn | revoke it (keep it instead with the `ahma sandbox grant … --workspace …` the finding names) |
 | Grants into other repositories that you made yourself | info | none — a deliberate setup is listed, never questioned |
 | Hub running a different build than this binary | warn | none — quit ahma sessions and the next one starts the new build |
+| A harness allow-list auto-approves `sandbox_grant` or `network_grant` | warn | none |
+| A client's shell is hooked but its native edits are not guarded | warn | none — `ahma hooks install` (SPEC R5.5.6) |
+| Which clients' hooks apply ahma's sandbox | info | none |
+| An old `target/sccache` cache | info | none — the `rm -rf` it names |
 | Whether this folder is trusted, and what is always allowed here | info | none — `/settings trust` |
 | Log size, and the most repeated warnings in the newest log | info / warn | none |
 | Antigravity permission grants (`~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/config.json`) | warn / info | prune bloated one-off/malformed entries and install clean prefix token grants |
 | Git authentication from inside the sandbox: a key the [SSH key broker](ssh-agent-broker.md) signs with, or an agent holding any other key; HTTPS credential helper not blocked by a sandbox setting | warn / info | none — the finding names the exact `ssh-add` or `ssh-keygen` command, or settings key |
-| A build helper (sccache, a Gradle or Kotlin daemon) left running inside a sandbox, by shape: confined, orphaned, your own executable. New ones no longer arise: a sandboxed command's processes end with it ([security-sandbox.md](security-sandbox.md#helpers-left-running-inside-a-sandbox-sccache-gradle-and-kotlin-daemons), SPEC R-PROC.5) | warn | restart it (`--stop-server` / `--start-server`), refused if the doctor is itself sandboxed |
+| A build helper (sccache, a Gradle or Kotlin daemon) left running inside a sandbox, by shape: confined, orphaned, your own executable. New ones no longer arise: a sandboxed command's processes end with it ([security-sandbox.md](security-sandbox.md#helpers-left-running-inside-a-sandbox-sccache-gradle-and-kotlin-daemons), SPEC R-PROC.5) | warn | sccache: restart it (`--stop-server` / `--start-server`); Gradle/Kotlin: stop it. Refused if the doctor is itself sandboxed |
 | How grant prompts are being answered: median time-to-decision, share under three seconds, advisor followed | info / warn | none — a habit, not a file |
 | A session started in a subfolder of a git checkout whose root `.claude/settings.json` carries ahma's shell hook (Claude Code reads that file only from the folder a session starts in, so the hook never ran) | warn | none — start the session at the git root, or `ahma hooks install` for a user-level hook |
 | A session started in a folder that holds git checkouts (one or two folders below) whose own `.claude` settings declare hooks: Claude Code loads none of them there | info; warn when ahma's shell hook is among them and your own settings carry none | none — start the session in the checkout it works on, or `ahma hooks install` |
-| Sandbox profiles in effect and the GPU capability (`[sandbox] allow_gpu`) are shown on every scope surface | info | none |
 
 Every applied fix is written through the same strict read-modify-write the
 rest of ahma uses (it will not rewrite a file it cannot parse) and appended to

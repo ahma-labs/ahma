@@ -67,8 +67,7 @@ To undo: ahma settings set tools.long_running '[{ command = "make serve" }]'
 ### What `settings set` will and will not write
 
 - **`--project`** edits this repository's `.ahma/settings.toml`. Only preferences
-  go there; a security-tier key (anything in `[sandbox]`, `[network]`, `[web]`,
-  `[auth]`, `[permissions]`, plus `tools.long_running`) is refused with the command
+  go there; a security-tier key (everything in `[sandbox]`, `[network]`, `[web]`, `[auth]`, `[permissions]`, `[open_url]`, `[log_targets]`, plus `tools.long_running` and `http.unix_socket_path`) is refused with the command
   that sets it for you, because the file could not set it and ahma would only
   name it as ignored at every startup. The file gets its own header and does not
   list the security tables. With no `.ahma` directory it refuses; run it from
@@ -96,8 +95,7 @@ INFO  setting tools.timeout_secs = 600 (default 1800) from user (/home/me/.ahma/
 WARN  security-tier setting sandbox.disable_temp = true (default false) from user (/home/me/.ahma/settings.toml) (SPEC R-CFG5.2)
 ```
 
-Security-tier settings (everything in `[sandbox]`, `[auth]`, `[web]`, `[network]`,
-`[permissions]`, plus `http.unix_socket_path`) log at `warn`, so anything that
+Security-tier settings (everything in `[sandbox]`, `[network]`, `[web]`, `[auth]`, `[permissions]`, `[open_url]`, `[log_targets]`, plus `tools.long_running` and `http.unix_socket_path`) log at `warn`, so anything that
 shapes the sandbox is visible in the log without asking. A setting left at its
 default logs nothing. On Unix, a settings file that group or others can write
 also logs a `warn` with the fix (`chmod go-w <file>`): whoever can edit that
@@ -144,97 +142,12 @@ visible where ahma is launched: `--no-sandbox` and `--insecure-skip-verify` (SPE
 
 ---
 
-## Full schema
+## Every key
 
-All options are commented out by default.  
-Run `ahma settings init` to generate this file automatically.
-
-```toml
-# ~/.ahma/settings.toml — Ahma user settings
-#
-# All options are commented out.  Uncomment and edit any value to override
-# the compiled-in default.  CLI flags always take highest priority, followed
-# by this file, followed by deprecated AHMA_* environment variables.
-
-# ── LM Studio (local OpenAI-compatible server) ──────────────────────────────
-# Start the LM Studio Local Server (Developer tab), or headless: lms server start
-#
-# [lmstudio]
-# base_url = "http://localhost:1234/v1"  # default: 1234 (LM Studio local server)
-# model    = "openai/gpt-oss-20b"        # set to the model loaded in LM Studio
-
-# ── Tool execution ───────────────────────────────────────────────────────────
-# [tools]
-# timeout_secs = 1800     # longest one command may run (seconds; 30 minutes). A repo whose build gate
-#                         # runs near it can raise it in its own .ahma/settings.toml; an async
-#                         # operation is alerted at 80% (SPEC R2.6.6)
-# background_timeout_secs = 0 # limit for a hooked command the harness runs in the
-#                             # background (Claude Code `run_in_background`); 0 = none,
-#                             # the harness owns its lifetime (SPEC R-SETUP.2.1)
-# await_timeout_secs = 1800 # default `await` soft timeout (seconds); does not cancel the operation
-# idle_timeout_secs = 1800  # tool execution idle timeout (seconds without output); 0 disables
-# request_budget_override_secs = 0 # override the fallback single-request budget (SPEC R2.6.5); 0 = unset, use the built-in default
-# force_progress_notifications = false # send progress to Cursor despite its client-side logging quirk
-# execution_mode = "async" # "async": return an operation id after a short window,
-#                          # collect with `await`; "sync": wait for each command's
-#                          # result (within what the client can wait for). See below.
-# workspace_queue = true   # writers run one at a time per workspace, in arrival order
-# edit_guard = true        # refuse ahma's own file edits while a writer runs
-# source_readers = []      # this project's own commands that only read sources
-# long_running   = []      # commands that wait for a person or run for hours; no write-queue lease
-# skip_probes  = false    # skip availability probes at startup
-# minimize_tokens     = false # `ahma tui` chat: ask the model for terse answers
-# small_model_harness = false # `ahma tui` chat: tighter result/conversation budgets
-
-# ── Sandbox & filesystem security ────────────────────────────────────────────
-# [sandbox]
-# tmp_access   = true     # system temp dir in ahma's own scope (file tools, working_directory), after the workspace (R5.2.5)
-# allow_gpu    = false    # macOS: let sandboxed commands open the GPU (Metal); a capability, not a path (R6.2.7)
-# ssh_agent    = "broker" # SSH agent for commands: "broker" (asks first; macOS refuses a direct
-#                         # connect to your own agent), "passthrough" (your SSH_AUTH_SOCK, no
-#                         # broker), "off" (none). See ssh-agent-broker.md (R-CRED.11)
-# [permissions]
-# advisor              = true   # TUI: the selected model recommends an answer beside a grant prompt and each setup change (R-PERM.8, R-SETUP.4.9)
-# advisor_timeout_secs = 6      # how long to wait for it before showing the prompt without it
-# disable_temp = false    # the expert opt-out: close temp to commands, ahma's tools and native edits (overrides tmp_access)
-# defer        = false    # defer sandbox lock until client provides roots/list
-# allow_git_hooks = false           # let tools write <git dir>/hooks/** (default: denied)
-# allow_project_tool_config = false # let tools write this workspace's .ahma/ (default: denied)
-# linux_deny_tier = "detect"        # Linux: "namespace" also mounts git hooks and .ahma/ read-only
-#                                   # in each command's own namespace, so a write to them fails (R6.1.7)
-
-# ── Logging ──────────────────────────────────────────────────────────────────
-# [logging]
-# target                  = "file"   # "file" (rolling) or "stderr"
-# log_monitor             = false    # enable live log monitoring via LLM
-# monitor_rate_limit_secs = 60       # min seconds between log-monitor alerts
-# dir                     = ""       # log directory; "" resolves automatically
-
-# ── HTTP server (ahma serve http only) ───────────────────────────────────────
-# [http]
-# handshake_timeout_secs = 45      # MCP handshake timeout
-# disable_quic           = false   # disable HTTP/3 QUIC; fall back to HTTP/2 TCP
-# disable_http1_1        = false   # reject HTTP/1.1; require HTTP/2+
-
-# ── HTTP authentication & rate limiting ──────────────────────────────────────
-# [auth]
-# require_token_path = ""   # path to file containing required bearer token
-# rate_limit_rps     = 0    # max requests/second (0 = no limit)
-# rate_limit_burst   = 10   # burst allowance
-
-# ── Instance identity ────────────────────────────────────────────────────────
-# [instance]
-# label = "ahma"   # instance name shown in TUI and hub event stream
-
-# [hub]
-# idle_timeout_secs = 3600 # seconds with nothing attached — no MCP sessions and
-#                          # no TUI — before the per-user hub exits. 0 keeps
-#                          # it running. `[daemon]` (its old name) is still
-#                          # read. See docs/hub.md.
-# drain_timeout_secs = 3600 # longest a hub replaced by a newer install waits
-#                           # for running work before ending it and handing
-#                           # over. 0 waits as long as the work takes.
-```
+ahma keeps `~/.ahma/settings.toml` up to date on startup: every option is listed with its
+default, and only values you changed are uncommented. `AHMA_*` variables are ignored.
+`ahma settings init` resets the file. `ahma settings explain` lists every key by table, and
+`ahma settings explain <table>.<key>` gives its default and tier (SPEC R-CFG11).
 
 ---
 
@@ -337,8 +250,7 @@ exactly one file.
 **It may set preference-tier keys only.** This file travels with the repository,
 so anyone who can send you a clone can propose values for it — and a cloned
 repository must not be able to weaken the sandbox that is about to contain it.
-Everything in `[sandbox]`, `[auth]`, `[web]`, `[network]` and `[permissions]`,
-plus `http.unix_socket_path`, is refused there and reported by name at startup.
+Security-tier keys (everything in `[sandbox]`, `[network]`, `[web]`, `[auth]`, `[permissions]`, `[open_url]`, `[log_targets]`, plus `tools.long_running` and `http.unix_socket_path`) are refused there and reported by name at startup.
 Set those in `~/.ahma/settings.toml` or on the command line, where they are yours.
 
 `ahma settings show --origin` labels each key `cli`, `project (<path>)`,
@@ -350,7 +262,7 @@ did not get:
 #   refused (security-tier, R-CFG2.2): auth.require_token, sandbox.disable
 #   refused (unrecognised): tools.not_a_key
 tools.timeout_secs                            = 4242  # project (/path/to/repo/.ahma/settings.toml)
-sandbox.disable                               = false  # default
+sandbox.disable                               = false  # default (ignored; --no-sandbox is CLI-only)
 ```
 
 `--no-settings` ignores **both** files for the invocation.
@@ -358,7 +270,7 @@ sandbox.disable                               = false  # default
 Three `[sandbox]` keys are worth knowing:
 
 - **`profiles`** — the shipped toolchain carve-outs (`rust`, `node`, `go`,
-  `android`, `apple`, `common`). These used to be hard-coded in the sandbox backends, invisible and
+  `android`, `apple`, `common`, `gh`, `sccache`). These used to be hard-coded in the sandbox backends, invisible and
   un-refusable; they are now data you can inspect and disable. Set to `[]` to
   enable none of them.
 - **`package_cache_write`** (default `true`) — whether package-manager caches
@@ -385,11 +297,6 @@ See [permissions.md](permissions.md) for the full model.
 ---
 
 ## Trust-handoff escape hatches
-
-On macOS a sandboxed command may signal (`kill`) only the process tree it started
-itself; `signal_other_processes = true` lets it signal any of your processes, which is
-how one agent stopped another session's build — turn it on only for a workflow that
-genuinely has to stop a pre-existing server (SPEC R6.2.6).
 
 Some paths inside your workspace are writable by you but *executed by something
 outside ahma's sandbox*. ahma denies writes to those by default (SPEC R-HANDOFF),
@@ -429,7 +336,7 @@ have to go looking.
 Both toggles remove the **kernel** rule as well as the write-tool check, so an
 enabled hatch genuinely works rather than failing later with a bare
 `Operation not permitted`. Turning one on is strictly narrower than
-`[sandbox] disable = true`, which is the outcome these hatches exist to prevent.
+`--no-sandbox`, which is the outcome these hatches exist to prevent.
 
 ### Linux: prevent, not only detect (`linux_deny_tier`)
 

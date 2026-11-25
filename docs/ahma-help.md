@@ -1,6 +1,6 @@
 # `ahma_help` — guidance for the AI, from ahma
 
-**Status:** Stable. SPEC: [R-HELP](../SPEC.md).
+**Status:** tests-pass. SPEC: [R-HELP](../SPEC.md).
 
 ## Why
 

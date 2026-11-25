@@ -1,148 +1,54 @@
 # Code Complexity Analysis (`ahma simplify`)
 
-**Status: Stable.** `simplify` is a default cargo feature of `ahma_bin` — it ships in every
-standard build (`cargo install ahma_bin`, the release binaries, `cargo build --release`).
-SPEC.md's Quick Status table lists it `tests-pass`. Building with `--no-default-features`
-drops the feature; the `simplify` subcommand still parses but fails at run time with a message
-naming the missing feature.
+**Status: tests-pass.** Built into every standard `ahma` binary (cargo feature `simplify`, on
+by default). A `--no-default-features` build fails `ahma simplify` with an error naming the
+feature. Library use: depend on `ahma_simplify` (MIT OR Apache-2.0); `ahma_simplify::run(SimplifyArgs)`
+is the CLI entry point.
 
-Ahma includes a built-in code analyzer (`ahma simplify`) that runs one or more independent
-analysis **lenses** over your project and returns a structured AI prompt to fix what it finds,
-with minimal, targeted changes. Four lenses exist today: **complexity** (the original analysis —
-scores every source file, identifies the worst hotspot functions, and ranks files worst-first),
-**reuse** (duplicate-code-block detection, see below), **dead-code** (unreferenced exported
-symbols, see below), and **altitude** (thin-wrapper delegation-chain detection, see below).
-`--lens` selects which lenses run; the default, `all`, runs every lens.
+`ahma simplify` runs one or more analysis **lenses** over a project and returns a report plus,
+on request, a structured prompt telling an agent exactly which functions to change:
 
-Supports: **Rust, Python, JavaScript, TypeScript, Kotlin, Swift, Objective-C, C, C++, Java, C#,
-Go, CSS, HTML**. The reuse lens covers all of these, including the languages with no AST
-support, because it works on text rather than a parsed structure. The dead-code and altitude
-lenses cover a narrower set — Rust, TypeScript, JavaScript, Python, and Java — because each
-needs a parsed AST; see [Dead Code Lens](#dead-code-lens-unreferenced-exports) and
-[Altitude Lens](#altitude-lens) below.
+- **complexity**: scores every source file, names its worst functions, ranks files worst-first;
+- **reuse**: duplicated blocks of code;
+- **dead-code**: exported symbols nothing references;
+- **altitude**: chains of thin forwarding wrappers.
 
----
+`--lens` selects lenses; the default, `all`, runs every one.
 
 ## Why
 
-Complexity is invisible until it isn't: a file accretes nested conditionals and long functions
-one small change at a time, and nothing flags the point where it becomes expensive to modify
-safely. By the time a maintainer (human or AI) notices, the fix is a large, risky rewrite instead
-of a small one.
-
-`simplify` makes that cost visible before it compounds. A *file-level* score tells you which
-files in the project are worth worrying about at all; *function-level* hotspots inside those
-files tell you exactly which functions to touch, so refactoring effort goes where it pays off
-instead of being guessed at or applied uniformly across a file that is mostly fine. The scoring
-is deliberately calibrated for AI-assisted maintenance: an agent making a change has to hold the
-relevant code in its context window, and large, deeply nested functions are where
-misunderstanding and regression risk concentrate.
-
----
+A file accretes nested conditionals and long functions one small change at a time, and nothing
+flags the point where it becomes expensive to change safely. `simplify` makes that cost visible
+early, and points at the functions to fix rather than the whole file.
 
 ## Quick Start
 
 ```bash
-# Auto mode: run all lenses, prioritize fixes, and generate plans for the top 6 fixes
-ahma simplify . --auto 6
-
-# Auto mode with default (top 10 fixes)
-ahma simplify --auto
-
-# Analyze the current directory and get fix instructions for the worst file
-ahma simplify . --ai-fix 1
-
-# Rust files only
+ahma simplify . --auto 6                  # all lenses, plans for the 6 highest-impact fixes
+ahma simplify . --ai-fix 1                # fix prompt for the worst file
 ahma simplify . --extensions rust --ai-fix 1
-
-# Duplicate-code detection only — skips the AST parse, so it's fast
-ahma simplify . --lens reuse
-
-# Only the files you just changed
-ahma simplify . --diff
-
-# Verify improvement after editing
-ahma simplify . --verify src/my_module.rs
+ahma simplify . --lens reuse              # duplicates only; skips the AST parse, so it is fast
+ahma simplify . --diff                    # only files git reports as changed
+ahma simplify . --verify src/my_module.rs # before/after metrics for one file
 ```
 
-Or via the `simplify` MCP tool (requires `--tools simplify` at
-server startup):
+The same through MCP, with the `simplify` bundle (`--tools simplify` at startup). Argument
+names use hyphens, as in the CLI:
 
-```
-simplify(directory=".", auto=6)
-simplify(directory=".", ai_fix=1)
-```
-
----
-
-## Installation
-
-`ahma simplify` is built into the `ahma` binary — no separate install needed. The analyzer
-lives in its own crate, `ahma_simplify`, which the `ahma` binary (`ahma_bin`) links through
-its `simplify` cargo feature. That feature is **on by default**; a binary built with
-`--no-default-features` still lists the subcommand but fails with a message naming the
-feature when it is run.
-
-**Quick install (Linux/macOS):**
-```bash
-cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root ~/.local --locked --force
+```json
+{"directory": ".", "auto": 6}
+{"directory": ".", "ai-fix": 1}
+{"directory": ".", "extensions": ["rs"], "ai-fix": 1}
+{"directory": ".", "verify": "src/my_module.rs"}
+{"directory": ".", "lens": ["reuse"]}
 ```
 
-Or after `ahma` is installed: `ahma update`
+Agents: follow `/ahma simplify` in the ahma skill ([agent-skills.md](agent-skills.md)).
 
-**Windows (PowerShell 5.1+):**
-```powershell
-irm https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.ps1 | iex
-```
+## Languages
 
-**From source:**
-```bash
-cargo build --release -p ahma_bin
-```
-
-The `simplify` feature is enabled by default. To build without it (smaller binary, no
-`rust-code-analysis` toolchain compiled in):
-```bash
-cargo build --release -p ahma_bin --no-default-features
-```
-
-To use the analyzer as a library in your own Rust code, depend on the `ahma_simplify` crate
-(MIT OR Apache-2.0) directly: `ahma_simplify::run(SimplifyArgs)` is the same entry point the
-CLI calls.
-
----
-
-## Usage
-
-### Basic analysis
-
-```bash
-# Analyze all supported files, get fix prompt for the worst file
-ahma simplify <directory> --ai-fix 1
-
-# Get fix prompt for the 2nd worst file
-ahma simplify <directory> --ai-fix 2
-
-# Show top 20 issues in the report (default: 50)
-ahma simplify <directory> --limit 20
-```
-
-### Language filtering
-
-```bash
-# Single language (name or raw extension)
-ahma simplify . --extensions rust
-ahma simplify . --extensions rs
-
-# Multiple languages
-ahma simplify . --extensions rust,python
-
-# Kotlin only
-ahma simplify . --extensions kotlin
-```
-
-| Language name | Extensions scanned |
-|---------------|--------------------|
+| Language name | Extensions |
+|---|---|
 | `rust` | `.rs` |
 | `kotlin` | `.kt`, `.kts` |
 | `swift` | `.swift` |
@@ -151,400 +57,131 @@ ahma simplify . --extensions kotlin
 | `javascript` | `.js`, `.jsx` |
 | `typescript` | `.ts`, `.tsx` |
 | `java` | `.java` |
-| `c++` / `cpp` | `.cpp`, `.cc`, `.hpp`, `.hh` |
+| `c++` / `cpp` | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` |
+| C (by extension only: `c`, `h`) | `.c`, `.h` |
 | `c#` / `csharp` | `.cs` |
 | `go` | `.go` |
 | `html` | `.html`, `.htm` |
 | `css` | `.css` |
 
-Rust is analyzed with full AST metrics (`rust-code-analysis`). Kotlin, Swift, and the
-Lizard-supported languages go through the external analyzer registry described below.
+`--extensions` takes language names (case-insensitive) or raw extensions: `rust,python` or `rs,py`.
 
-### Verification
+rust-code-analysis gives full AST metrics for Rust, JavaScript, TypeScript, Java, Python and
+C/C++/Objective-C. Kotlin, Swift, Go and C# rely on the external analyzers below.
 
-After editing a file, re-analyze it to confirm improvement:
+### External analyzers
 
-```bash
-ahma simplify <directory> --verify src/my_module.rs
-```
+Unless `--no-external` is set, every installed analyzer that supports a language in the tree
+runs: detekt-cli and Gradle Detekt (Kotlin), Lizard (Kotlin, Swift, Java, Go, C#, Objective-C,
+JS, TS), and SwiftLint (Swift). Where two cover the same file, the worse value of each metric
+is used. `--no-external` is faster and needs none of them installed, at the cost of no
+Kotlin/Swift coverage and coarser metrics elsewhere.
 
-Output shows before/after metrics with a verdict:
+## Lenses
 
-| Verdict | Meaning |
-|---------|---------|
-| Significant improvement (≥10%) | Success — move to next issue |
-| Modest improvement (1–9%) | Acceptable |
-| No change | Hotspot functions may not have been modified |
-| Regression | Revert and try a different approach |
+| Lens | Finds | Languages | Report section |
+|---|---|---|---|
+| `complexity` | Files ranked by score, with their hotspot functions | all above | per-file ranking |
+| `reuse` | Repeated blocks of 4+ lines after stripping comments and whitespace | all above (textual) | `## Duplicate Code (Reuse Lens)` |
+| `dead-code` (also `dead_code`, `deadcode`) | Exported functions with no reference in the scanned files | Rust, TypeScript, JavaScript, Python, Java | `## Possibly Unreferenced Exports (Dead Code Lens)` |
+| `altitude` | Chains of 2+ forwarding hops (A → B → C), where each body is one statement making one call | Rust, TypeScript, JavaScript, Python, Java | `## Delegation Chains (Altitude Lens)` |
 
-`--verify` compares against the rust-code-analysis TOML baseline from the previous full
-analysis run in the same output directory. It does not currently support Kotlin, Swift, or
-Objective-C files, because their baselines come from the external analyzers (Detekt,
-SwiftLint, Lizard) and are not persisted for later comparison; run a full `ahma simplify`
-before and after your change for those languages instead.
+Every lens reports **candidates, not defects**, deterministically, capped by `--limit`.
 
-### Diff mode
+- **reuse**: identical-looking code can be coincidental; decide whether a shared helper is actually clearer. Comment stripping is textual, so a comment delimiter inside a string literal can cause a missed or spurious match.
+- **dead-code**: blind to a public API used only downstream, macro-generated call sites, trait-object dispatch and reflection. It already skips private functions, `main`, tests (`test_*`, `tests/`, `*_test(s).rs`), anything marked within 3 lines above by `#[allow(dead_code)]`, `#[cfg(test)]`, `@SuppressWarnings`, `# noqa`, `eslint-disable` or `pub use`, and common Rust trait methods (`new`, `default`, `from`, `fmt`, `drop`, `clone`, `eq`, `hash`, `next`, `poll`, …).
+- **altitude**: a facade, a trait impl delegating to a free function, or a platform shim is often deliberate. Name resolution is conservative: a callee name matching two definitions ends the chain. Only maximal chains are reported, and recursion terminates.
+- Kotlin is not covered by dead-code or altitude: its grammar names no callee field.
 
-```bash
-# Analyze only files git reports as changed, instead of the whole tree
-ahma simplify . --diff
-```
+## Score
 
-`--diff` restricts analysis to files that are staged, unstaged, or untracked-but-not-ignored
-according to git. It fails with a clear error if the directory is not a git repository or git
-is not installed, rather than silently falling back to a full scan.
-
-### Report output
-
-```bash
-# Write report to a directory (CODE_SIMPLICITY.md + CODE_SIMPLICITY.html)
-ahma simplify <directory> --output-path ./reports
-
-# Generate HTML report
-ahma simplify <directory> --html
-
-### Automatic exclusions and custom filtering
-
-`ahma simplify` is built for actionable maintenance — it analyzes real source code and automatically skips files that should never be refactored by hand or AI:
-
-* **`.gitignore` and `.ignore` aware**: Respects `.gitignore` and `.ignore` files at all directory levels, skipping untracked and build cache files automatically.
-* **Build systems and caches**: Automatically excludes directory structures across ecosystems: Cargo (`target`), Gradle (`.gradle`, `.gradle_user_home`, `gradle_cache`, `intermediates`), Node (`node_modules`, `.next`, `.nuxt`), Python (`venv`, `.venv`, `__pycache__`), Apple/Xcode (`Pods`, `DerivedData`, `.build`, `.cxx`), and C/C++ (`cmake-build-*`).
-* **Machine-generated code**:
-  * **Content header detection**: Inspects the first 2 KB for standard codegen headers (`@generated`, `DO NOT EDIT`, `autogenerated by uniffi`, `Code generated by ...`, `Generated by the protocol buffer compiler`, OpenAPI, Bindgen, etc.). Even if generated files are tracked in git, they are skipped.
-  * **Naming patterns**: Excludes UniFFI bindings/headers (`*FFI.h`, `*FFI.kt`, `*ffi.rs`), Protobuf/gRPC (`*.pb.go`, `*.pb.rs`, `*_pb2.py`), FlatBuffers (`*_generated.rs`), and Bindgen shims.
-* **Database migrations & test data**: Excludes schema migrations (`migrations/`, `db/migrations/`, `alembic/versions/`), minified assets (`*.min.js`, `*.min.css`), and test fixtures (`testdata/`, `fixtures/`, `__snapshots__/`, `*.snap`).
-
-For project-specific paths, pass `--exclude` / `-x`:
-
-```bash
-# Specific files, relative paths, directories, or globs
-ahma simplify <directory> --exclude 'stat3.kt,pkg/generated/,*.custom'
-```
-
-Report output is **Markdown and HTML only** — there is no JSON output format. With no
-`--output-path`, `--html`, or `--open`, the Markdown report is printed to stdout.
-
----
-
-## CLI Flags
-
-Authoritative source: `ahma_common/src/simplify_args.rs` (`SimplifyArgs`).
-
-| Flag | Type | Default | Purpose |
-|------|------|---------|---------|
-| `directory` (positional) | path | `.` | Project root to analyze |
-| `--auto` | integer (optional) | `10` (when flag given) | Run all lenses, prioritize fixes across lenses by impact, and output prioritized plans for top N fixes |
-| `--output` / `-o` | path | `analysis_results` | Working directory for intermediate per-file metrics; cleared and recreated on each run |
-| `--limit` / `-l` | integer | `50` | Number of issues shown in the report |
-| `--open` | flag | off | Open the generated report automatically after writing it |
-| `--html` | flag | off | Also render `CODE_SIMPLICITY.html` beside the Markdown report; implies writing to disk rather than stdout |
-| `--heml` | flag | off | Shorthand for `--html` and `--open` combined |
-| `--extensions` / `-e` | comma-separated list | all supported extensions | File extensions or language names to analyze (e.g. `rs,py`, `rust,kotlin`); language names are case-insensitive |
-| `--exclude` / `-x` | comma-separated list | none | Additional paths or globs to exclude (e.g. `stat3.kt`, `/generated/`, `*.custom`). Default exclusions already skip .gitignore, build caches, and generated code |
-| `--no-external` | flag | off | Disable external language-specific analyzers (Detekt, SwiftLint, Lizard); use only rust-code-analysis metrics |
-| `--output-path` | path | none (prints to stdout) | Directory to write `CODE_SIMPLICITY.md` / `CODE_SIMPLICITY.html` into, instead of printing to stdout |
-| `--ai-fix` | integer | none | Generate a structured AI fix prompt for the Nth most complex file (1-indexed) |
-| `--verify` | path | none | Re-analyze a specific file and compare against the baseline from the previous run |
-| `--lens` | comma-separated list | `all` | Which analysis lenses to run: `complexity`, `reuse`, `dead-code` (also accepted: `dead_code`, `deadcode`, case-insensitive), `altitude`, or `all`. Unknown values are a hard error listing the valid options. Selecting only non-complexity lenses skips the rust-code-analysis parse entirely (the dominant cost), so e.g. `--lens reuse` is substantially faster than a full run |
-| `--diff` | flag | off | Restrict analysis to files git reports as changed (staged, unstaged, and untracked-but-not-ignored) instead of walking the whole tree; fails if the directory isn't a git repository or git isn't installed, rather than silently falling back to a full scan |
-
-## MCP Tool Reference
-
-Tool name: `simplify` (requires `--tools simplify` at ahma startup).
-
-| Argument | Type | Default | Purpose |
-|----------|------|---------|---------|
-| `directory` | path | `.` | Project root to analyze |
-| `auto` | integer | — | Run all lenses, prioritize findings, and output action plans for top N fixes |
-| `ai_fix` | integer | — | Issue number for fix prompt (1 = worst file) |
-| `limit` | integer | 50 | Issues to include in report |
-| `verify` | path | — | Re-analyze a file vs. baseline |
-| `extensions` | array | all | Restrict to file types (e.g. `["rs","py"]`) |
-| `exclude` | array | — | Additional glob patterns to exclude |
-| `output_path` | path | — | Write report to directory instead of stdout |
-| `html` | boolean | false | Also generate HTML report |
-| `lens` | array | all | Which analysis lenses to run (e.g. `["reuse"]`, `["dead-code"]`, `["altitude"]`); see `--lens` above |
-| `diff` | boolean | false | Restrict analysis to files git reports as changed instead of the whole tree; see `--diff` above |
-
-### MCP tool invocation examples
-
-```
-# Via /ahma simplify skill subcommand
-/ahma simplify --auto 6
-/ahma simplify
-/ahma simplify rust
-/ahma simplify kotlin 2
-
-# Direct MCP tool call
-simplify(directory=".", auto=6)
-simplify(directory=".", ai_fix=1)
-simplify(directory=".", extensions=["rs"], ai_fix=1)
-simplify(directory=".", verify="src/my_module.rs")
-simplify(directory=".", lens=["reuse"])
-simplify(directory=".", diff=true)
-```
-
----
-
-## Score Interpretation
-
-Each file receives a composite score (0–100%):
+Each file gets a composite score (0–100%):
 
 ```
 Score = 0.4 × MI + 0.3 × Cognitive Density + 0.2 × Peak Cognitive + 0.1 × Length Score
 ```
 
 | Component | Weight | What it measures |
-|-----------|--------|-----------------|
-| **MI** | 40% | Function-weighted Maintainability Index; rewards decomposed, well-structured code |
-| **Cognitive Density** | 30% | Cognitive complexity normalised by SLOC; rewards focused, readable functions |
-| **Peak Cognitive** | 20% | Cognitive complexity of the single worst function |
-| **Length Score** | 10% | 100% at ≤300 SLOC, scaling down linearly above that |
+|---|---|---|
+| **MI** | 40% | Function-weighted Maintainability Index |
+| **Cognitive Density** | 30% | Cognitive complexity per SLOC |
+| **Peak Cognitive** | 20% | Cognitive complexity of the worst function |
+| **Length Score** | 10% | 100% at ≤300 SLOC, falling linearly above that |
 
-Cyclomatic complexity is reported for context only — it is already embedded inside the MI
-component and is not double-counted in the score.
+Cyclomatic complexity is reported for context only; MI already includes it. A file covered
+only by an external analyzer has no MI, so the score is
+`0.5 × Cognitive Density + 0.3 × Peak Cognitive + 0.2 × Length`, or
+`0.6 × Cyclomatic Score + 0.4 × Length` when only cyclomatic data exists.
 
-For files covered only by an external analyzer (Kotlin, Swift, or a Lizard-only language,
-where rust-code-analysis produces no metrics), there is no MI component, so the weight is
-redistributed: when cognitive complexity is available, the score is
-`0.5 × Cognitive Density + 0.3 × Peak Cognitive + 0.2 × Length`; when the analyzer reports
-only cyclomatic complexity (e.g. Lizard without cognitive data), it falls back to
-`0.6 × Cyclomatic Score + 0.4 × Length`.
-
-| Score Range | Status | Guidance |
-|-------------|--------|----------|
+| Score | Status | Guidance |
+|---|---|---|
 | 85–100% | Excellent | No action needed |
-| 70–84% | Good | Acceptable; fix only the worst outliers |
-| 55–69% | Fair | Plan a simplification sprint |
+| 70–84% | Good | Fix only the worst outliers |
+| 55–69% | Fair | Plan a simplification pass |
 | 40–54% | Poor | Prioritize before adding features |
-| 0–39% | Critical | Address now; maintenance cost is high |
+| 0–39% | Critical | Address now |
 
-A project score below 70% is a signal to run `--ai-fix` on the top 3–5 files.
+## Verify, diff, and the fix prompt
 
----
+- **`--ai-fix N`** appends a fix prompt for the Nth-worst file: its score, its hotspot functions, and an instruction to change just those.
+- **`--verify <file>`** re-analyzes one file against the baseline of the previous full run in the same output directory, with a verdict: significant improvement (≥10%), modest (1–9%), no change, or regression (revert). Kotlin, Swift and Objective-C baselines come from external analyzers and are not kept; run a full analysis before and after instead.
+- **`--diff`** analyzes only staged, unstaged and untracked-but-not-ignored files, and fails if the directory is not a git repository rather than falling back to a full scan.
 
-## External Analyzer Registry
+## Report output
 
-Rust files are analyzed directly with `rust-code-analysis` (full AST metrics). Other languages
-go through a registry of external analyzers, tried in order until one succeeds for a given
-file, unless `--no-external` is set:
-
-1. **Detekt CLI** — standalone `detekt-cli`, tried first for Kotlin so a Gradle project isn't
-   required.
-2. **Detekt (Gradle)** — falls back to a project's own Gradle-managed Detekt if the CLI isn't
-   available.
-3. **Lizard** — universal fallback for Kotlin, Swift, Java, Go, C#, Objective-C, JavaScript,
-   and TypeScript when the more specific analyzers above aren't available or don't apply.
-4. **SwiftLint** — dedicated Swift analyzer for richer cognitive and cyclomatic metrics than
-   Lizard alone provides.
-
-`--no-external` disables all of the above and reports only rust-code-analysis metrics, which
-is faster and doesn't require any of these tools to be installed, at the cost of no coverage
-for Kotlin/Swift/Objective-C files and coarser metrics for the Lizard-supported languages.
-
----
-
-## Reuse Lens: Duplicate Code Detection
-
-The `reuse` lens finds duplicated blocks of code so you can judge whether extracting a shared
-helper is worthwhile. Run it on its own with `--lens reuse`, or leave `--lens` at its default
-(`all`) to run it alongside the complexity lens.
+Markdown and HTML only. With no `--output-path`, `--html` or `--open`, the Markdown report is
+printed to stdout.
 
 ```bash
-# Duplicate-code detection only — skips the rust-code-analysis parse, so it's fast
-ahma simplify . --lens reuse
+ahma simplify . --output-path ./reports   # CODE_SIMPLICITY.md (+ .html with --html)
+ahma simplify . --html --open
 ```
 
-Key properties:
+### What is skipped
 
-- **Language-agnostic.** Detection is purely textual: it strips comments using each language's
-  comment syntax, collapses whitespace, then finds repeated blocks. This means it works on
-  every language `simplify` supports, including Swift, Go, and C#, which have no AST-based
-  complexity metrics.
-- **Minimum block size is 4 lines.** Shorter matches are not reported.
-- **Candidates for extraction, not defects.** Identical-looking code can be coincidental —
-  the reader decides whether a shared helper is actually clearer. The report lists duplicate
-  blocks to be evaluated, not a list of confirmed problems.
-- **Deterministic.** The same input always produces byte-identical output.
-- **Known limitation — string literals.** Comment stripping is textual, not a real
-  per-language lexer, so a comment delimiter that happens to appear inside a string literal
-  (e.g. `let url = "https://example.com";`) is misread as the start of a comment, which can
-  cause a missed or spurious match. A real per-language lexer would fix this but is out of
-  proportion for what this lens is for.
+- Files ignored by `.gitignore` and `.ignore`, at every level.
+- Build and cache directories: `target`, `.gradle`, `node_modules`, `.next`, `venv`, `__pycache__`, `Pods`, `DerivedData`, `.build`, `cmake-build-*`, ….
+- Generated code: by header in the first 2 KB (`@generated`, `DO NOT EDIT`, `Code generated by …`, protobuf, OpenAPI, bindgen, UniFFI), and by name (`*FFI.h`, `*.pb.go`, `*_pb2.py`, `*_generated.rs`, …).
+- Migrations, minified assets, fixtures and snapshots.
 
-For example, running the reuse lens on this repository surfaces 19 identical lines shared
-between `ahma_simplify/src/analysis/detekt.rs` and `ahma_simplify/src/analysis/checkstyle.rs`
-— both parse Checkstyle XML issues.
+Add your own with `--exclude 'stat3.kt,pkg/generated/,*.custom'`.
 
-Findings appear in the report under `## Duplicate Code (Reuse Lens)`, one entry per duplicate
-group, each listing the block's line count, occurrence count, every file/line location, and a
-sample of the duplicated code. The section is capped by `--limit`, same as the complexity
-findings.
+## CLI flags
 
----
+Authoritative source: `ahma_common/src/simplify_args.rs` (`SimplifyArgs`).
 
-## Dead Code Lens: Unreferenced Exports
+| Flag | Default | Purpose |
+|---|---|---|
+| `directory` (positional) | `.` | Project root |
+| `--auto [N]` | `10` when given | All lenses, fixes ranked by impact, plans for the top N |
+| `--ai-fix N` | — | Fix prompt for the Nth most complex file (1-indexed) |
+| `--lens` | `all` | `complexity`, `reuse`, `dead-code`, `altitude`, `all`; unknown values are an error |
+| `--extensions` / `-e` | all | Languages or extensions to analyze |
+| `--exclude` / `-x` | — | Extra paths or globs to skip |
+| `--diff` | off | Only files git reports as changed |
+| `--verify <file>` | — | Compare one file against the previous run |
+| `--limit` / `-l` | `50` | Issues shown in the report |
+| `--output-path <dir>` | stdout | Write `CODE_SIMPLICITY.md` / `.html` there |
+| `--html` | off | Also write `CODE_SIMPLICITY.html` |
+| `--open` | off | Open the report after writing it (`--heml` = `--html --open`) |
+| `--output` / `-o` | `analysis_results` | Working directory for per-file metrics; recreated each run |
+| `--no-external` | off | Skip Detekt, SwiftLint and Lizard |
 
-The `dead-code` lens finds exported functions and methods that have no reference anywhere in
-the scanned files. Run it on its own with `--lens dead-code` (also accepted: `dead_code`,
-`deadcode`, case-insensitive), or leave `--lens` at its default (`all`) to run it alongside the
-other lenses.
+The MCP tool takes the same names without the dashes in front (`ai-fix`, `output-path`, …),
+plus `working_directory`. An unknown argument name is ignored with a log warning, so check
+the spelling.
 
-```bash
-# Dead-code detection only
-ahma simplify . --lens dead-code
-```
+## CI
 
-**How it works.** The lens parses real tree-sitter ASTs to locate exported functions, then
-counts identifier occurrences across every scanned file. A symbol with exactly one occurrence —
-its own definition — is a candidate.
-
-**Language support.** Rust, TypeScript, JavaScript, Python, and Java only. Other languages are
-skipped because no AST grammar is available for them in this lens. This is narrower than the
-reuse lens, which covers every language `simplify` supports because it works on text rather
-than a parsed structure. Kotlin is deliberately excluded even though the complexity and reuse
-lenses both handle it: Kotlin's tree-sitter grammar declares no field names on call
-expressions, so the callee cannot be extracted the way it can for the other five languages.
-Kotlin coverage still comes from the complexity lens (via Detekt) and the reuse lens.
-
-**It reports candidates, never verdicts.** Acting on a finding without checking it first is how
-live code gets deleted. Four classes of false positive are structurally invisible to this lens:
-
-- A public API consumed only by a downstream crate — a library's entire public surface
-  legitimately looks unreferenced from inside the library itself.
-- Call sites generated by a macro.
-- Dispatch through a trait object.
-- Reflection or dynamic dispatch by string name.
-
-**Mitigations already applied**, so a finding has already survived some filtering before it
-reaches the report:
-
-- Private functions are skipped entirely — rustc/clippy already catch those.
-- `main` is skipped.
-- `test_`-prefixed functions, anything under a `tests/` directory, and anything in a
-  `*_test.rs`/`*_tests.rs` file are skipped.
-- A function is skipped if any of the 3 lines above it contains `#[allow(dead_code)]`,
-  `#[cfg(test)]`, `@SuppressWarnings`, `# noqa`, `eslint-disable`, or `pub use`.
-- For Rust, commonly trait-required names (`new`, `default`, `from`, `try_from`, `fmt`, `drop`,
-  `clone`, `eq`, `hash`, `next`, `poll`) are skipped, since a trait method reached only through
-  a trait object has no textual call site and these are overwhelmingly required implementations
-  rather than genuinely unused code.
-
-Output is deterministic, sorted by file then line.
-
-For example, running the dead-code lens against the whole ahma workspace surfaced 30
-candidates; run against just the `ahma_simplify` crate alone, it surfaced exactly one —
-`AnalysisConfidence::is_reliable` — which really is referenced nowhere.
-
-Findings appear in the report under `## Possibly Unreferenced Exports (Dead Code Lens)`, a
-table of Symbol / Kind / Visibility / Location, capped by `--limit`, same as the other lenses.
-
----
-
-## Altitude Lens
-
-The `altitude` lens finds thin-wrapper delegation chains: a function whose entire body is a
-single statement forwarding to another function, which itself only forwards to a third, and so
-on. Run it on its own with `--lens altitude`, or leave `--lens` at its default (`all`) to run it
-alongside the other lenses.
-
-```bash
-# Delegation-chain detection only
-ahma simplify . --lens altitude
-```
-
-The name comes from fixing a problem at the wrong *altitude*: a bandaid layered on shared
-infrastructure rather than a fix at the depth where it actually belongs. A long forwarding
-chain is the symptom — each layer adds a call frame and a name to learn, but no behaviour.
-
-**Candidates, not defects.** This is the most important thing to understand about this lens's
-output. A forwarding layer is frequently deliberate and correct:
-
-- a public API facade over an internal module,
-- a trait impl delegating to a free function,
-- a platform-abstraction shim.
-
-The report frames a chain as a question about where the logic belongs, not as a mistake — read
-every hop before deciding whether anything should be collapsed.
-
-Key properties:
-
-- **A thin wrapper** is a function whose body is exactly one statement making exactly one call.
-- **Only chains of 2 or more forwarding hops are reported** (A → B → C). A single forwarding
-  call is ordinary delegation and would drown the signal.
-- **AST-based**, so it covers the same five languages as the dead-code lens: Rust, TypeScript,
-  JavaScript, Python, and Java. Not Kotlin (its tree-sitter grammar declares no field names on
-  call expressions, so the callee cannot be extracted), and not Swift, Go, or C# (no grammar at
-  all in this analyzer). The reuse lens remains the only one covering every language.
-- **Name resolution is deliberately conservative.** The AST exposes only a call's trailing
-  identifier, with no type information, so two same-named functions in different modules are
-  indistinguishable. When a callee name matches more than one definition in the scanned corpus,
-  the chain stops there rather than guessing — a fabricated chain wastes more of a reader's time
-  than a missed one.
-- Recursive and mutually-recursive wrappers are detected and the walk terminates instead of
-  looping forever.
-- **Only maximal chains are reported** — the sub-chain B → C of a reported A → B → C is not
-  listed separately.
-- Deterministic output.
-
-Findings appear in the report under `## Delegation Chains (Altitude Lens)`, one entry per
-chain, listing its hop count, a description, and every caller → callee edge with file and line.
-The section is capped by `--limit`, same as the other lenses.
-
----
-
-## Report Generation and the AI Fix Prompt
-
-`ahma simplify` produces a Markdown report (`CODE_SIMPLICITY.md`) ranking files worst-to-best
-by score, with per-file function hotspots (complexity lens), and, depending on which lenses
-ran, a `## Duplicate Code (Reuse Lens)` section, a
-`## Possibly Unreferenced Exports (Dead Code Lens)` section, and/or a
-`## Delegation Chains (Altitude Lens)` section (see above). With `--html` it additionally
-renders `CODE_SIMPLICITY.html`. There is no other output format.
-
-`--ai-fix N` (CLI) / `ai_fix` (MCP) appends a structured fix prompt for the Nth-worst file
-(1-indexed) after the report: it names the file, its score, and its specific hotspot
-functions, and instructs the agent to make targeted changes to just those functions rather
-than rewriting the file. This is the same mechanism whether the report is printed to stdout
-or written to `--output-path`.
-
----
-
-## AI Workflow
-
-When using the `simplify` MCP tool or `/ahma simplify` chat command, follow this sequence:
-
-1. **Run analysis** — `simplify(directory=".", ai_fix=1)`
-2. **Read the structured fix prompt** in the output — it lists exact hotspot functions and constraints
-3. **Apply targeted changes** to only the listed hotspot functions
-4. **Verify improvement** — `simplify(directory=".", verify="<edited-file>")`
-5. **Iterate** — move to `ai_fix=2`, `ai_fix=3`, etc.
-
-### Anti-patterns to avoid
-
-- Do not refactor the whole file; follow the hotspot list exactly
-- Do not add comments to improve scores — structural change is required
-- Do not inline complex logic to reduce function count
-- Do not skip the verify step — metric confirmation is required
-
----
-
-## CI Integration
-
-The project itself tracks code simplicity on every push. The CI report is published at:
-[ahma-labs.github.io/ahma/CODE_SIMPLICITY.html](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html)
-
-To add simplify to your own CI pipeline:
+This project publishes its own report on every push:
+[ahma-labs.github.io/ahma/CODE_SIMPLICITY.html](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html).
 
 ```yaml
 - name: Code Simplicity Report
   run: ahma simplify . --limit 20 --html --output-path ./simplicity-report
 ```
 
----
-
 ## See Also
 
-- [agent-skills.md](agent-skills.md) — AI agent skill configuration
-- [../README.md](../README.md) — Main Ahma documentation
-- [../ahma_simplify/SPEC.md](../ahma_simplify/SPEC.md) — Full specification for `ahma simplify`
+- [agent-skills.md](agent-skills.md): the `/ahma simplify` agent workflow
+- [ahma_simplify/SPEC.md](../ahma_simplify/SPEC.md): the specification

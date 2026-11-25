@@ -30,7 +30,7 @@ there is live work for this project, its section opens by itself; any keystroke
 takes over.
 
 ```
- ahma · work · this project [f] 3 clients 2⟳ 1◷ 14✓   sync ● ahma ● hub · Unix socket · sandbox: …/github/ahma [ENFORCED]
+ ahma · work · this project [f] 3 clients 2⟳ 1◷ 14✓   async ● ahma ● hub · Unix socket · sandbox: …/github/ahma [ENFORCED]
 ▶─ claude-code (1) · …/github/ahma · qwen2.5-coder · ctx 38% (49k/128k) · ↑52k ↓6.1k ── ⢷⡪ ─── 2⟳ 1◷ 14✓ ──
    ⟳ cargo nextest run              [op_41]  1m12s        [P] [X]
    │ Compiling ahma_core v0.15.4
@@ -266,7 +266,17 @@ The TUI is the primary surface for approving or rejecting actions that require u
 
 - **Trust this folder?** — asked once, the first time you open a folder. **Yes** lets every tool that runs *inside* the folder's kernel sandbox — reads, edits, builds, tests — run without asking. Still asked every time: paths outside the folder, network access, `!` commands, tools on other MCP servers, and settings changes. **No** (or Enter/Esc) keeps per-tool questions. Never offered for your home directory or a filesystem root. Undo with `ahma permissions revoke tool '*' --workspace <dir>`.
 - **Tool approval** — a chat tool call awaiting your `y`/`a`/`n` in the banner above the input. Several calls to the same tool share one question, and `a` (always allow) covers the ones already queued.
-- **Sandbox scope grants** — a sandboxed command was blocked on an out-of-scope path and the "grant access?" modal asks whether to allow it (Enter/Esc always deny). The modal shows who is asking, what was blocked and why, what the agent says it needs (labelled as its claim), the minimum that would work, what a grant lets later commands do, and the risk; `[?]` adds the evidence line and the exact settings line. When a model is selected, an `advisor:` line recommends an answer from the evidence alone (never the agent's own words) and changes nothing; it is advice, and the audit records whether you followed it. Lower-case keys last this session: `[r]` read-only, `[y]` read+write (never saved; terminal hooks honour them too). Upper-case keys are saved in `~/.ahma/settings.toml`, bound to that session's workspace: `[R]` read-only, `[Y]` read+write. `[o]` read-only and `[w]` read+write cover the next command only. A key that saves a grant (`[R]`, `[Y]`, `[l]`, `[L]`) first opens the detail with the exact settings line; pressing it again saves. Granting keys pressed in the first moment after a question appears are ignored, because they were typed for something else; Enter, Esc and `n` always deny at once. `[l]` read-only and `[L]` read+write are saved for 24 hours and then end on their own (`ahma sandbox renew` extends them; `ahma permissions list --expiring 12h` shows what is about to end). The same request can also reach you as a prompt in your IDE, or as a `sandbox_grant` call the agent made — the agent can ask, never grant. Questions that arrive while one is open wait their turn, oldest first, and the title says how many are waiting; a new question never replaces the open one. The answers always stay at the bottom of the modal, whatever the terminal size; a long question scrolls above them with ↑↓ `j` `k`, PgUp/PgDn, `g`/`G` and the mouse wheel, and says how much is hidden. A saving key scrolls to the settings line first, and is refused with a hint if the terminal is too small to show it whole. With a web question open at the same time, the grant question is the one on screen and the one the keys answer; the web question waits underneath (SPEC R-PERM.3.10). A grant question that appears while help or settings is open is drawn over them and takes the keys: Esc denies it, and help or settings is still there afterwards.
+- **Sandbox scope grants**: a sandboxed command was blocked on an out-of-scope path. The modal shows who asks, what was blocked, the agent's stated need (labelled as its claim), the minimum that would work, what a grant lets later commands do, and the risk. `[?]` adds the evidence and the exact settings line. With a model selected, an `advisor:` line recommends an answer from the evidence alone (never the agent's words); it changes nothing, and the audit records whether you followed it.
+
+  | Keys | Grants | Lasts |
+  |---|---|---|
+  | `o` / `w` | read-only / read+write | the next command |
+  | `r` / `y` | read-only / read+write | this session (terminal hooks honour it) |
+  | `l` / `L` | read-only / read+write | saved for 24 h (`ahma sandbox renew` extends; `ahma permissions list --expiring 12h`) |
+  | `R` / `Y` | read-only / read+write | saved in `~/.ahma/settings.toml` for this workspace |
+  | Enter, Esc, `n` | deny | — |
+
+  A saving key first shows the settings line; press it again to save. Granting keys pressed in the first moment after a question appears are ignored. Questions queue oldest first and the title counts them; a new one never replaces the open one. The answers stay at the bottom; a long question scrolls above them (↑↓ `j` `k`, PgUp/PgDn, `g`/`G`, mouse wheel). A grant question is answered before a web question open at the same time (SPEC R-PERM.3.10), and is drawn over help or settings. The same question can reach you in your IDE, or as the agent's `sandbox_grant` call: the agent can ask, never grant.
 - **Web links** — a command run through the terminal hooks (Claude Code's Bash tool) was refused a link to a site you have not allowed ([open-links.md](open-links.md)). The TUI asks first, before Claude Code's dialog would when the agent runs the command again: the site on its own line, the address, the guidance, then `[n]` deny, `[s]` this site for this session (until Claude Code exits, not saved), `[r]` always for this site in this repo only (the usual lasting answer), `[a]` in all repos, `[d]` the site's domain and its subdomains in this repo only (`github.com` and `*.github.com`; only where one owner holds the domain, never for `someone.github.io`), and `[*]` any site in this repo only, where that would cover the link; each lasting answer names the site it saves. `[r]`, `[a]`, `[d]` and `[*]` first show the exact line they add to `[open_url]`, and a second press saves it. There is no "this time": the command was not paused, so the agent runs it again to open the link. Whatever you answer, Claude Code's dialog does not ask it too, and a deny is not asked again in that Claude Code session.
 - **Web egress** — a blocked outbound domain raises the "allow egress?" modal, with three tiers: `[o]` once, `[s]` this session, `[a]` always. `[a]` first shows the exact line it writes to `[web].always_allow`, and a second `[a]` saves it. As with grant questions, granting keys pressed in the first moment are ignored, and a second question waits its turn with the title saying how many are waiting. Cleartext `http://` is flagged rather than blocked.
 
@@ -284,8 +294,7 @@ and in particular never one scoped to the directory you happened to open it in
    (`$XDG_RUNTIME_DIR/ahma`, else `~/.ahma`), or `[http] unix_socket_path` in
    `~/.ahma/settings.toml`. Lowest latency, local only, and the same `AF_UNIX` socket on
    Windows (10 1803 or later). `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.
-2. **HTTP/3 (QUIC)** — when the server advertises `Alt-Svc: h3=…` _and_ local TLS material exists at `~/.ahma/tls/`. See [TLS provisioning](#tls-provisioning-for-quic) below.
-3. **HTTP/1.1 / HTTP/2** — plain TCP, always available as a fallback.
+2. **`http://localhost:3000`**: an `ahma serve http` you started yourself (its token is read for you), upgraded to HTTP/3 when it advertises `Alt-Svc` and `~/.ahma/tls/` has a certificate.
 
 The transport in use is shown in the TUI's status header (e.g. `HTTP/3 (QUIC)` or `Unix socket`).
 
@@ -303,20 +312,8 @@ Start the server with `--disable-quic` (or set `[http] disable_quic = true` in `
 
 ## TLS provisioning for QUIC
 
-HTTP/3 transport requires TLS. `ahma` manages a persistent self-signed certificate at `~/.ahma/tls/` (override with the `--tls-dir` flag; `AHMA_TLS_DIR` is retired and ignored):
-
-```bash
-# Generate certificate on first use (safe to re-run — idempotent)
-ahma tls init
-
-# Replace the certificate (e.g. after 30 days or key compromise)
-ahma tls rotate
-
-# Check certificate age and rotation status
-ahma tls status
-```
-
-The `ahma tls init` step is offered automatically during `install.sh`. The private key is stored with 0600 permissions.
+HTTP/3 needs a local certificate: `ahma setup` creates it (or `ahma tls init`). See
+[connection-modes.md](connection-modes.md#http3-and-tls).
 
 ## See also
 

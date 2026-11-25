@@ -185,7 +185,8 @@ same names.
 | `net-host` | a host sandboxed commands may reach under `--restrict-network` | a prompt, `ahma network allow` | `[network].allow` |
 | `tool` | a tool the agent may run in a workspace without asking again | a tool-approval prompt | `[permissions].tool_approvals` |
 | `log-target` | a file outside the workspace that a `.ahma/logs/*.log` symlink points at, readable (never writable) by live-log monitoring | a human's `always` answer to the question `logs_approve` raises, or `a` on the log in `ahma tui` | `[log_targets].approvals` |
-| `open-url` | a site whose http and https links commands ahma runs may open in your default browser, in one repo (the default) or in every repo | `ahma permissions grant open-url [SITE]` (*experimental*: hooked commands on macOS and Linux, [open-links.md](open-links.md)) | `[open_url]` |
+| `open-url` | a site whose http and https links commands ahma runs may open in your default browser, in one repo (the default) or in every repo | `ahma permissions grant open-url [SITE]` (in progress: hooked and MCP commands on macOS and Linux; [open-links.md](open-links.md)) | `[open_url]` |
+| `ssh-sign` | the SSH key broker signing with one key for one server (or `sshsig:` namespace) in a workspace | Claude Code's dialog (session), `ahma permissions grant ssh-sign` | `[[sandbox.ssh_sign]]` |
 
 `tool` and `log-target` grants are bound to the workspace they were granted in, and so
 is an `fs-scope` grant unless it was made `--global`; `web-domain` and `net-host` grants
@@ -308,7 +309,7 @@ on_redirect_to_new_domain = "prompt"   # or "policy" (default), "block"
 `git push` over SSH goes through ahma's [SSH key broker](ssh-agent-broker.md): it signs for a server once you allow that key for it (`ssh-sign` grants: the Claude Code dialog for a session, `ahma permissions grant ssh-sign` for good). An unencrypted ed25519 key in `~/.ssh` needs nothing else. MCP commands use it too; a refused one says so in an alert, and you grant with `ahma permissions grant ssh-sign`.
 
 The sandbox denies reads of your private keys (all of `~/.ssh` except `config`,
-`known_hosts` and public keys), and the broker signs with any other key —
+`config.d/`, `known_hosts*`, `*.pub` and `allowed_signers`), and the broker signs with any other key —
 passphrase-protected, RSA, ECDSA, security keys — only through your SSH agent.
 On the host, ssh reads the key file directly, so for such a key an **empty agent
 is invisible until the first sandboxed push** fails with
@@ -353,21 +354,21 @@ the AI, or a confirmed prompt:
 - any parent of your workspace (that would widen the sandbox above your project;
   the enclosing git repository root of a worktree or subdirectory workspace is allowed)
 - credential directories and everything inside them: `~/.ssh`, `~/.aws`, `~/.gnupg`,
-  `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/gcloud` (a key file is refused
+  `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`,
+  `~/.config/gcloud` (a key file is refused
   like the directory that holds it; ssh signs through the [SSH key broker](ssh-agent-broker.md) instead)
 - `~/.ahma` itself and everything in it — the ledger cannot authorize access to the ledger
 - OS system directories
 - a grant for any of these that is already in `settings.toml` (written by hand, or by an
   older ahma) is skipped at startup with a warning naming the revoke command; recorded
   is not the same as allowed
+- for network egress: blanket `*` wildcard (refused via AI grant tool; only human editing or explicit CLI can author), `localhost`, private RFC 1918 IP addresses, and link-local or cloud-metadata IPs (`169.254.169.254`)
 
 Some paths are allowed but flagged **high risk**, with a sentence saying what will run
 what a grant lets the agent write there: shell startup files (`~/.zshrc`, `~/.bashrc`,
 `~/.profile`, …) run in every new shell, `~/Library/LaunchAgents` and
 `~/.config/autostart` start programs at login, and a `.git/hooks` directory is run by
 git on commit, checkout and push. None of them asks first.
-
-- for network egress: blanket `*` wildcard (refused via AI grant tool; only human editing or explicit CLI can author), `localhost`, private RFC 1918 IP addresses, and link-local or cloud-metadata IPs (`169.254.169.254`)
 
 If a tool genuinely needs something under one of these, grant the *specific
 subdirectory* it needs. There's no flag to override this, deliberately: every
@@ -448,10 +449,10 @@ profile variable:
 `ahma doctor` and ahma's startup check leave these per-workspace servers alone;
 they still restart a sccache server stuck confined on the shared default port.
 
-Note what the `rust` profile deliberately does **not** do: it never makes
-`~/.cargo/bin`, `~/.cargo/config.toml`, or `~/.cargo/credentials.toml` writable.
-Granting all of `~/.cargo` would be simpler and would hand a sandboxed command
-your crates.io token and write access to every binary on your PATH.
+The `rust` profile never makes `~/.cargo/bin`, `config.toml` or `credentials.toml`
+writable. They stay **readable** (the `~/.cargo` rule is read+execute), so a sandboxed
+command can read your crates.io token; keep `--restrict-network` on if that matters
+(SPEC §11). Granting all of `~/.cargo` would also let it write every binary on your PATH.
 
 ## Limitations, stated plainly
 
@@ -466,8 +467,8 @@ what it does. Anything nobody thought to enumerate is readable.
 Practically: on macOS, treat anything *you* can read as readable by a sandboxed
 command unless it is on that list. Linux (Landlock) scopes both directions
 properly (SPEC R6.1.6). **On Windows, neither** — a Job Object bounds process
-lifetime, not filesystem paths, and AppContainer is not wired up yet (SPEC
-R6.3.9). ahma shows all of this in `ahma status` and in the TUI scope panel rather
+lifetime, not filesystem paths, and AppContainer isolation is built but switched
+off (SPEC R6.3.9, §11). ahma shows all of this in `ahma status` and in the TUI scope panel rather
 than burying it here.
 
 **Some paths inside your workspace are not writable, and the protection is not
@@ -476,7 +477,8 @@ git hook directories, ahma's own `.ahma/` tool definitions, container daemon
 sockets — are denied outright; editor and harness configuration is allowed but
 disclosed loudly when written. That deny tier is kernel-enforced on macOS,
 **application-layer only on Linux** (so a shell command through
-`run_terminal_command` can still write those paths), and unenforced on Windows.
+`run_terminal_command` can still write those paths), and application-layer only on
+Windows too, with no kernel filesystem boundary at all.
 Where the kernel does not hold it, ahma compares those paths before and after every
 command and reports a change as `TRUST-HANDOFF WRITE` in the result and the audit
 log — detection, not prevention. Using a container socket changes no file, so on
@@ -484,7 +486,7 @@ Linux it is neither prevented nor detected yet.
 See [`docs/security-sandbox.md`](security-sandbox.md#writable-but-not-everything-trust-handoff)
 and SPEC R-HANDOFF.
 
-**SSH credentials and agent authentication**: Sandboxed commands cannot read private keys: `~/.ssh` is denied as a whole, except `config`, `config.d/`, `known_hosts*`, public keys and `allowed_signers`. A sandboxed command's `$SSH_AUTH_SOCK` is ahma's [SSH key broker](ssh-agent-broker.md), so SSH operations (such as `git fetch` or `git push` over SSH) sign once a human allows that key for that server: with an unencrypted ed25519 key file itself, and with any other key through your SSH agent. If a command fails with `Permission denied (publickey)` and its key has a passphrase or is RSA, ECDSA or a security key, run `ssh-add` on the host to load it into the agent (e.g. `ssh-add ~/.ssh/id_rsa`).
+**SSH**: see [Git authentication](#git-authentication-ssh-and-https) and [ssh-agent-broker.md](ssh-agent-broker.md).
 
 ## Command reference
 
