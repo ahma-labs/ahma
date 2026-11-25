@@ -11,6 +11,8 @@
 //! sandbox is built from what ahma admits, so a forbid reaches the kernel only
 //! where ahma turns it into a profile rule (SPEC R-POLICY.4).
 
+pub mod export;
+
 use ahma_common::policy::{Action, PolicyOverlay, Request, Resource};
 use cedar_policy::{
     Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid,
@@ -86,17 +88,7 @@ pub fn default_dirs() -> Vec<PathBuf> {
 
 /// The machine-wide policy directory, for an administrator or MDM.
 pub fn system_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        PathBuf::from("/Library/Application Support/ahma/policy")
-    } else if cfg!(windows) {
-        std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("ahma")
-            .join("policy")
-    } else {
-        PathBuf::from("/etc/ahma/policy")
-    }
+    ahma_common::policy::system_policy_dir()
 }
 
 /// Every `*.cedar` file in `dirs`, in a stable order. A directory that does
