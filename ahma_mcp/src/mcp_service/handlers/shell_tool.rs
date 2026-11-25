@@ -117,6 +117,12 @@ impl AhmaMcpService {
             ),
         );
         properties.insert(
+            "read_only".to_string(),
+            schema::boolean_property(
+                "Run under a sandbox that cannot write any workspace, so the command never waits behind a build and never holds back an edit. For a command ahma cannot tell is read-only that only waits on or reads from outside the workspace: a CI watcher script, a cloud CLI. A workspace write then fails with \"Operation not permitted\"; run it again without this. Not honoured where the kernel cannot enforce it (Windows, ahma inside another sandbox); the result says so.",
+            ),
+        );
+        properties.insert(
             "timeout_seconds".to_string(),
             schema::integer_property(
                 "Kill the command if it is still running after this many seconds. Not a wait: the call still returns as soon as the command finishes, or hands back an operation id if it is slow (SPEC R2.6).",
@@ -143,6 +149,7 @@ impl AhmaMcpService {
         "session_id",
         "pty",
         "timeout_seconds",
+        "read_only",
         "execution_mode",
     ];
 

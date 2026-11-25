@@ -58,6 +58,9 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "b3sum",
     "echo",
     "true",
+    // Loop control: a polling loop's `break` and `continue` write nothing.
+    "break",
+    "continue",
     "date",
     "uname",
     "whoami",
@@ -297,6 +300,17 @@ fn program_is_read_only(program: &str, args: &[String]) -> bool {
                 _ => false,
             }
         }
+        // Cloud CLIs, for the forms that only look or wait on a cloud action
+        // (SPEC R2.7.4): each writes, at most, its own cache under the user's
+        // home, never a workspace. A writing form stays exclusive, and a file
+        // they are told to write is a redirection the caller places.
+        "aws" => aws_reads(args),
+        "kubectl" | "oc" => kubectl_reads(args),
+        "gcloud" => gcloud_reads(args),
+        "docker" | "podman" => matches!(
+            args.first().map(String::as_str),
+            Some("logs" | "ps" | "inspect" | "images" | "version" | "info" | "events" | "stats")
+        ),
         // `sysctl` reads unless it is setting a value (`-w`, `name=value`).
         "sysctl" => !has("-w") && !args.iter().any(|a| a.contains('=')),
         // `cargo`/`rustc`/`rustup` only to say what they are.
@@ -406,12 +420,84 @@ fn is_watcher(program: &str, args: &[String]) -> bool {
             }
             _ => false,
         },
+        // A wait on a cloud action: it writes nothing and may take as long as
+        // the action does.
+        "sleep" => true,
+        "aws" => {
+            args.get(1).map(String::as_str) == Some("wait")
+                || args.first().map(String::as_str) == Some("logs") && has_follow(args)
+        }
+        "kubectl" | "oc" => match args.first().map(String::as_str) {
+            Some("rollout") => args.get(1).map(String::as_str) == Some("status"),
+            Some("wait") => true,
+            Some("get" | "logs" | "events") => args
+                .iter()
+                .any(|a| a == "-w" || a == "--watch" || a == "-f" || a == "--follow"),
+            _ => false,
+        },
+        "gcloud" => args
+            .iter()
+            .any(|a| a == "--stream" || a == "wait" || a == "tail"),
+        "docker" | "podman" => match args.first().map(String::as_str) {
+            Some("logs") => has_follow(args),
+            Some("events" | "stats") => true,
+            _ => false,
+        },
         "tail" => args.iter().any(|a| {
             a.starts_with("--follow")
                 || (a.starts_with('-') && !a.starts_with("--") && a.contains(['f', 'F']))
         }),
         _ => false,
     }
+}
+
+fn has_follow(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-f" || a == "--follow")
+}
+
+/// `aws <service> <operation>` that only reads or waits: `wait`,
+/// `describe-*`, `list-*`, `get-*` other than downloads, `logs tail`, and
+/// `sts get-caller-identity`. `s3`/`s3api` reads are left out: their
+/// `cp`/`sync`/`get-object` write local files.
+fn aws_reads(args: &[String]) -> bool {
+    let service = args.first().map(String::as_str);
+    let op = args.get(1).map(String::as_str).unwrap_or_default();
+    if matches!(service, Some("s3" | "s3api" | "configure")) {
+        return false;
+    }
+    op == "wait"
+        || op.starts_with("describe-")
+        || op.starts_with("list-")
+        || (op.starts_with("get-") && op != "get-object")
+        || (service == Some("logs") && op == "tail")
+}
+
+/// `kubectl` subcommands that only read the cluster or wait on it.
+fn kubectl_reads(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("get" | "describe" | "logs" | "top" | "version" | "events" | "explain" | "wait") => {
+            true
+        }
+        Some("rollout") => args.get(1).map(String::as_str) == Some("status"),
+        Some("auth") => args.get(1).map(String::as_str) == Some("can-i"),
+        _ => false,
+    }
+}
+
+/// `gcloud …` that reads or waits: a describing, listing, logging or waiting
+/// verb, and no changing one anywhere on the line.
+fn gcloud_reads(args: &[String]) -> bool {
+    const READS: &[&str] = &["describe", "list", "log", "read", "wait", "tail", "info"];
+    const CHANGES: &[&str] = &[
+        "create", "delete", "deploy", "update", "set", "add", "remove", "apply", "import",
+        "export", "cp", "rsync", "submit", "run", "reset", "start", "stop", "patch",
+    ];
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .take_while(|a| !a.starts_with('-'))
+        .collect();
+    words.iter().any(|w| READS.contains(w)) && !words.iter().any(|w| CHANGES.contains(w))
 }
 
 /// The files `tee` writes, or `None` for an option this module does not model.
@@ -456,7 +542,10 @@ fn read_line(command: &str) -> Option<(Line, Reading)> {
     let mut reading = read_segments(&line.segs)?;
     for c in &inner {
         let (inner_line, inner_reading) = read_line(c)?;
-        if !inner_line.writes.is_empty() || !inner_reading.tee_files.is_empty() {
+        // Discarding output (`2>/dev/null`) writes no file; anything else a
+        // substitution writes is not placed by the caller, so it decides.
+        let discards_only = inner_line.writes.iter().all(|w| w == "/dev/null");
+        if !discards_only || !inner_reading.tee_files.is_empty() {
             return None;
         }
         if inner_reading.syncs.is_some() {
@@ -2178,6 +2267,59 @@ mod watch_and_redirect_tests {
     }
 
     const WS: &str = "/ws/repo";
+
+    /// Waiting on a cloud action (CI, a deploy, a cloud API) writes nothing
+    /// in any workspace, so it must not hold one: these are the lines an agent
+    /// actually ran to watch CI, and each held the workspace (and so blocked
+    /// every edit) for the whole run. Where the kernel enforces the read-only
+    /// lane they are read-only; elsewhere they are services, never exclusive.
+    #[test]
+    fn waiting_on_a_cloud_action_never_holds_the_workspace() {
+        // Plain reads: read-only where the kernel enforces it. Elsewhere only a
+        // wait is let past the queue on the program table's word alone.
+        for cmd in [
+            "gh run view 45624079467 --repo o/r --json jobs",
+            "aws ecs describe-services --cluster c --services s",
+            "kubectl get pods -o wide",
+        ] {
+            assert_eq!(at(cmd, true), Lane::ReadOnly, "{cmd}");
+        }
+        for cmd in [
+            "sleep 120 && gh pr checks 385 --repo o/r --watch --interval 60 > /tmp/ci.txt 2>&1",
+            "for i in $(seq 40); do gh pr checks 382 --repo o/r >/dev/null 2>&1; rc=$?; [ $rc -ne 1 ] && break; sleep 15; done; gh pr checks 382 --repo o/r --watch --interval 60 > /tmp/ci.txt 2>&1",
+            "sleep 90; for i in $(seq 160); do out=$(gh pr checks 384 --repo o/r 2>/dev/null); [ -n \"$out\" ] && ! echo \"$out\" | grep -q pending && break; sleep 30; done; echo \"$out\" | cut -f1,2",
+            "gh run watch 45624079467 --repo o/r --interval 60 > /tmp/run.txt 2>&1",
+            "aws cloudformation wait stack-create-complete --stack-name app",
+            "aws ecs wait services-stable --cluster c --services s",
+            "kubectl rollout status deployment/app --timeout=10m",
+            "kubectl wait --for=condition=available deployment/app --timeout=300s",
+            "kubectl get pods --watch",
+            "docker logs -f app > /tmp/app.log",
+            "gcloud builds log --stream 1234",
+        ] {
+            for enforced in [true, false] {
+                assert_ne!(
+                    at(cmd, enforced),
+                    Lane::Exclusive,
+                    "a cloud wait must not hold the workspace (read-only enforced: {enforced}): {cmd}"
+                );
+            }
+        }
+    }
+
+    /// The same programs still take their turn when they write the workspace.
+    #[test]
+    fn a_cloud_wait_that_writes_the_workspace_still_takes_its_turn() {
+        for cmd in [
+            "gh pr checks 385 --watch > ci.log",
+            "aws s3 cp s3://b/k ./k",
+            "docker logs -f app > app.log",
+            "kubectl get pods -o yaml > pods.yaml",
+            "gh run download 123",
+        ] {
+            assert_eq!(at(cmd, true), Lane::Exclusive, "{cmd}");
+        }
+    }
 
     /// Classify at a fake site: the workspace is `/ws/repo`, judged lexically.
     fn at(cmd: &str, read_only_enforced: bool) -> Lane {

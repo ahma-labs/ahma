@@ -77,7 +77,10 @@ pub fn is_framing_only<S: AsRef<str>>(segment: &[S]) -> bool {
     let at = segment.iter().take_while(|w| is_frame(w.as_ref())).count();
     let words = &segment[at..];
     matches!(words, [w] if matches!(w.as_ref(), "done" | "fi"))
-        || (words.is_empty() && segment.iter().all(|w| is_assignment(w.as_ref())))
+        // Keywords and assignments only, with at least one assignment: a
+        // loop body's `do out=$(…)` sets a variable and runs nothing. A bare
+        // keyword (`then`) still frames whatever the next segment runs.
+        || (words.is_empty() && segment.iter().any(|w| is_assignment(w.as_ref())))
         || is_for_header(words)
 }
 
@@ -1087,6 +1090,8 @@ mod tests {
             &["for", "f", "in", "a"],
             &["for", "f"],
             &["then", "fi"],
+            &["do", "out=x"],
+            &["then", "A=1", "B=2"],
         ] {
             assert!(is_framing_only(seg), "{seg:?}");
         }

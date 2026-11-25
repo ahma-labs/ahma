@@ -54,6 +54,16 @@ status()                                     → ── Finished since your last
   read-only where the kernel enforces that lane, `service` where it does not. The whole line
   counts, though: a watcher chained with a program ahma does not know (or writing into the
   workspace) makes the line wait its turn, and then the next rule applies.
+- **Neither does waiting on a cloud action** (SPEC R2.7.12): `aws … wait`, `kubectl rollout
+  status`, `kubectl wait`, `gcloud builds log --stream`, `docker logs -f`, `sleep`, and polling
+  loops made of them and of `gh` reads (`for …; do out=$(gh pr checks 87 2>/dev/null); …;
+  sleep 30; done`). Write a redirection's path out (`> /tmp/ci.log`): a target in a variable
+  (`> $LOG`) cannot be placed, so the line waits its turn.
+- **`read_only: true` for a script ahma cannot read.** A project script that only polls CI or
+  a cloud API, passed to `run_terminal_command` with `"read_only": true`, runs in the read-only
+  lane: it never waits and never holds back an edit, and the kernel refuses it any workspace
+  write (it fails with `Operation not permitted`; run it again without the flag). Not
+  honoured on Windows or in an ahma nested in another sandbox, and the result says so.
 - **Doubt holds the workspace for 30 seconds, not for the whole run.** A line that waits only
   because ahma cannot prove it reads — every program in it is one ahma does not know, with
   no redirection, no heredoc and no reader writing through its arguments — takes the lease
