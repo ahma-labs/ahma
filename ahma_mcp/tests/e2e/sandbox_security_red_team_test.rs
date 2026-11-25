@@ -909,14 +909,17 @@ async fn red_team_command_write_escape_blocked() {
     // then runs the server unsandboxed and the write cannot be blocked.
     skip_if_os_sandbox_unenforced!();
 
-    let temp_dir = TempDir::new().unwrap();
-    let outside_dir = TempDir::new().unwrap();
+    // Scope and target outside temp: under `--disable-temp-files` a scope in
+    // temp is refused before the command runs, which would pass this test for
+    // the wrong reason. The control write inside the scope proves it ran.
+    let (scope_dir, outside_dir) = scope_and_outside_dirs("write");
+    let control_file = scope_dir.path().join("control.txt");
     let outside_file = outside_dir.path().join("pwned.txt");
 
     let tools_dir = get_workspace_tools_dir();
     let client = ClientBuilder::new()
         .tools_dir(&tools_dir)
-        .working_dir(temp_dir.path())
+        .working_dir(scope_dir.path())
         .no_sandbox(false)
         .arg("--disable-temp-files")
         .build()
@@ -926,7 +929,11 @@ async fn red_team_command_write_escape_blocked() {
     // Attempt to write to a file outside the sandbox using absolute path
     let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
-            "command": format!("echo 'hacked' > {}", outside_file.display()),
+            "command": format!(
+                "echo ran > '{}'; echo hacked > '{}'",
+                control_file.display(),
+                outside_file.display()
+            ),
             "execution_mode": "Synchronous"
         }))
         .unwrap(),
@@ -934,8 +941,13 @@ async fn red_team_command_write_escape_blocked() {
 
     // The command might "succeed" (exit code 0) if the shell handles the error gracefully,
     // or fail (exit code 1). Key check is: file MUST NOT exist.
-    let _ = client.call_tool(params).await;
+    let result = client.call_tool(params).await;
 
+    assert!(
+        control_file.exists(),
+        "the control failed: the command did not write inside its scope, so it never ran \
+         and this test proves nothing. Result: {result:?}"
+    );
     assert!(
         !outside_file.exists(),
         "SECURITY: Should not be able to write to file outside sandbox: {}",
@@ -966,8 +978,11 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
     // Landlock the spawned child runs with application-level checks only and
     // the out-of-scope read genuinely succeeds.
     skip_if_landlock_unavailable!();
-    let temp_dir = TempDir::new().unwrap();
-    let outside_dir = TempDir::new().unwrap();
+    // Outside temp, with a control read inside the scope: see
+    // `red_team_command_write_escape_blocked` for why.
+    let (scope_dir, outside_dir) = scope_and_outside_dirs("read");
+    let control_file = scope_dir.path().join("control.txt");
+    fs::write(&control_file, "control-visible\n").unwrap();
     let outside_file = outside_dir.path().join("secret.txt");
     {
         let mut f = fs::File::create(&outside_file).unwrap();
@@ -977,7 +992,7 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
     let tools_dir = get_workspace_tools_dir();
     let client = ClientBuilder::new()
         .tools_dir(&tools_dir)
-        .working_dir(temp_dir.path())
+        .working_dir(scope_dir.path())
         .no_sandbox(false)
         .arg("--disable-temp-files")
         .build()
@@ -987,7 +1002,11 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
     // Attempt to read the outside file
     let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
-            "command": format!("cat {}", outside_file.display()),
+            "command": format!(
+                "cat '{}'; cat '{}'",
+                control_file.display(),
+                outside_file.display()
+            ),
             "execution_mode": "Synchronous"
         }))
         .unwrap(),
@@ -995,9 +1014,19 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
 
     let result = client.call_tool(params).await;
 
-    // A rejected call (Err) is a block; a returned result must indicate
-    // failure whether the server reported it as JSON or plain text.
-    if let Ok(tools_res) = result {
+    // The control must have been read, or the command never ran; the secret
+    // must not have been, and the command must report the refusal.
+    let tools_res = result.expect("the command must run, or the control proves nothing");
+    let text = result_text(&tools_res);
+    assert!(
+        text.contains("control-visible"),
+        "the control failed: the command did not read inside its scope. Result: {text}"
+    );
+    assert!(
+        !text.contains("secret content"),
+        "SECURITY: a sandboxed command read a file outside its scope on Linux. Result: {text}"
+    );
+    {
         assert!(
             blocked_shell_result_indicates_failure(&tools_res),
             "SECURITY: Should not be able to read file outside sandbox on Linux. Result: {}",
@@ -1037,18 +1066,9 @@ async fn red_team_truncate_outside_scope_blocked() {
         return;
     }
 
-    // Both directories outside temp, so `--disable-temp-files` (which keeps the
-    // outside file's directory out of the scope) cannot also refuse the scope
-    // itself. Siblings in the test's working directory; each removed on drop.
-    let base = std::env::current_dir().expect("current directory");
-    let scope_dir = tempfile::Builder::new()
-        .prefix("ahma-redteam-truncate-scope-")
-        .tempdir_in(&base)
-        .unwrap();
-    let outside_dir = tempfile::Builder::new()
-        .prefix("ahma-redteam-truncate-outside-")
-        .tempdir_in(&base)
-        .unwrap();
+    // Both directories outside temp, so `--disable-temp-files` cannot refuse
+    // the scope itself before the command runs.
+    let (scope_dir, outside_dir) = scope_and_outside_dirs("truncate");
     // The control: a file in the scope the same command must truncate, which
     // proves the command ran under the sandbox rather than not at all.
     let inside_file = scope_dir.path().join("mine.txt");
@@ -1110,4 +1130,18 @@ fn landlock_abi_at_least(min: i64) -> bool {
         )
     };
     abi >= min
+}
+
+/// A scope directory and a sibling outside it, both outside temp, for tests
+/// that run with `--disable-temp-files` (which refuses a scope in temp before
+/// any command runs). Created in the test's working directory, removed on drop.
+fn scope_and_outside_dirs(what: &str) -> (TempDir, TempDir) {
+    let base = std::env::current_dir().expect("current directory");
+    let make = |kind: &str| {
+        tempfile::Builder::new()
+            .prefix(&format!("ahma-redteam-{what}-{kind}-"))
+            .tempdir_in(&base)
+            .unwrap()
+    };
+    (make("scope"), make("outside"))
 }
