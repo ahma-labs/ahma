@@ -18,8 +18,9 @@ async fn test_operation_timeout_enforcement() {
         None,
         Some(Duration::from_millis(100)),
     );
-    // Force the operation to appear old enough to timeout immediately
-    op.start_time = SystemTime::now() - Duration::from_millis(200);
+    // Old enough to be past its limit and the sweep's grace (5 s, SPEC
+    // R2.6.6), so the sweep times it out at once.
+    op.start_time = SystemTime::now() - Duration::from_secs(10);
 
     monitor.add_operation(op).await;
 

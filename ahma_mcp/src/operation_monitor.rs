@@ -1331,6 +1331,13 @@ pub(crate) fn is_stall(reason: &str) -> bool {
     reason.starts_with(STALLED)
 }
 
+/// How far past its time limit an operation may run before the sweep stops it
+/// (SPEC R2.6.6). A command's own limit stops it at the limit and reports what
+/// it printed; the sweep is the backstop for one whose own limit did not end
+/// it. Acting at the limit itself raced that stop and, under load, won, losing
+/// the output.
+pub(crate) const BACKSTOP_GRACE: Duration = Duration::from_secs(5);
+
 fn timeout_reason(
     op: &Operation,
     now: SystemTime,
@@ -1339,7 +1346,7 @@ fn timeout_reason(
 ) -> Option<String> {
     let timeout = op.timeout_duration.unwrap_or(default_timeout);
     let elapsed = now.duration_since(op.start_time).ok()?;
-    if elapsed > timeout {
+    if elapsed > timeout + BACKSTOP_GRACE {
         return Some(format!(
             "Operation timed out after {:.1}s (limit: {:.1}s)",
             elapsed.as_secs_f64(),
@@ -2064,6 +2071,44 @@ mod tests {
             monitor.get_operation("quiet").await.is_some(),
             "with idle watchdog off, a quiet op must keep running"
         );
+    }
+
+    /// SPEC R2.6.6: the command's own time limit stops it and reports what it
+    /// printed. This sweep is the backstop for a command whose own limit did
+    /// not end it, so it waits a little past the limit: acting at the limit
+    /// itself raced the command's own stop under load and won, and the output
+    /// before the stop was lost (`a_shell_command_stopped_at_its_limit_prints_what_it_printed`).
+    #[tokio::test]
+    async fn the_sweep_leaves_a_command_to_its_own_limit_first() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        add_backdated_op(
+            &monitor,
+            "just-past",
+            Duration::from_secs(2),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+        add_backdated_op(
+            &monitor,
+            "long-past",
+            Duration::from_secs(1) + BACKSTOP_GRACE + Duration::from_secs(2),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+
+        monitor.check_timeouts().await;
+
+        let completed = monitor.get_completed_operations().await;
+        assert!(
+            !completed.iter().any(|o| o.id == "just-past"),
+            "within the grace, the command's own limit reports first"
+        );
+        let op = completed
+            .iter()
+            .find(|o| o.id == "long-past")
+            .expect("swept");
+        assert_eq!(op.state, OperationStatus::TimedOut);
     }
 
     #[tokio::test]
