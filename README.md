@@ -1,529 +1,168 @@
 # Ahma
 
-_Use your existing command line workflows through MCP with a repo-scoped sandbox, tracked and cancellable operations, and less pressure to fall back to insecure terminal access._
+<img src="./assets/ahma.png" alt="Ahma logo" align="right" width="120">
 
-## Why Ahma helps
+[![CI](https://github.com/ahma-labs/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://ahma-labs.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://ahma-labs.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](docs/licensing.md) [![Rust](https://img.shields.io/badge/Rust-1.95%2B-B7410E.svg)](https://www.rust-lang.org/)
 
-- **When the agent only needs the repo, broad terminal access is too much**: ahma starts inside a kernel-enforced workspace boundary, so normal project work does not require wider filesystem access.
-- **When builds, tests, and checks take time, you still want to see and stop them**: every command is a tracked operation — visible in `ahma tui`, cancellable, with its full output kept in a file. A long command hands back an operation id so the agent keeps working, and collects the result with `await` ([docs/settings.md](docs/settings.md#sync-or-async-toolsexecution_mode)).
-- **When independent tasks are forced through one terminal, work gets serialized**: ahma can start separate operations concurrently and track them cleanly.
-- **When safety is noisy, people disable it**: ahma aims to make the safe path the practical path, reducing pressure to use broad or insecure override modes just to get work done.
+Ahma runs an AI agent's shell commands inside your operating system's own kernel sandbox,
+confined to the project. Builds, tests, git, formatters and log tails run as tracked,
+cancellable operations. It works through MCP in any client, and through hooks in the native
+terminals of Claude Code, Codex, Copilot CLI, Cursor and Antigravity.
 
-|                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |                                     |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------: |
-| [![CI](https://github.com/ahma-labs/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://ahma-labs.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://ahma-labs.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://ahma-labs.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/ahma-labs/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](#license) [![Rust](https://img.shields.io/badge/Rust-1.95%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
+## Stance
 
-Ahma is an MCP server for running real project work through existing CLI tools with tighter filesystem boundaries and less blocking. It is aimed at the common case: builds, tests, formatters, git operations, log inspection, and other deterministic command-line tasks that agents already try to run.
+**The kernel enforces, you decide, a model only advises.**
 
-**Concurrent, but never racing.** An agent is fastest when a ten-minute test run overlaps its own reasoning, and least trustworthy when that overlap lets two writers change the same tree at once — a build racing a `git checkout`, or an edit landing mid-test so the verdict describes neither the old code nor the new. Ahma keeps the overlap and removes the race. Long commands return an operation id and the model keeps working; anything that may write a workspace runs one at a time, in the order it was sent, across every agent and session on the machine, behind a kernel lock that cannot go stale; reads skip the line under a sandbox that cannot write. The harness's own file edits — Claude Code, Codex, Copilot CLI, Cursor, Antigravity, and VS Code's agents — are held back by opt-in pre-edit hooks while a writer runs, and any change that slips past is named in the result it could have skewed. Details: [docs/workspace-queue.md](docs/workspace-queue.md).
+- **Defaults.** Ahma ships default policies: the workspace, temp and your toolchain's caches.
+- **Questions.** When a command needs more, the kernel's refusal becomes one question to you, answered once and remembered at the tier you pick: once, this session, this repo, or always.
+- **The model.** A local model you trust can explain the question and recommend an answer. It never answers.
+- **Nothing silent.** Nothing widens silently, every gap is disclosed, and when nobody can be asked the answer is no.
+
+The aim is to make the safe path the easy one, so nobody is pushed into "allow everything".
 
 ## Quickstart
 
-**macOS — first-time install**
-
 ```bash
+# macOS / Linux
 curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 ```
-
-**Linux — first-time install**
-
-```bash
-curl -sSf https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.sh | bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-```
-
-The installer also runs `ahma setup`, which configures MCP entries and agent skills for the
-editors it detects (Cursor, VS Code, Claude Code, …) — restart your editor afterward. [Terminal
-hooks](#terminal-hooks) are opt-in and not part of this default (pass `--hooks`, or select them
-at the prompt) since they're experimental and could interfere with your workflow until
-sandbox-exception handling is fully hardened. Run `ahma setup` again any time to reconfigure, or
-see [MCP Server Connection Modes](#mcp-server-connection-modes) below to wire up `mcp.json` by
-hand.
-
-**Windows (PowerShell 5.1+) — first-time install**
 
 ```powershell
+# Windows (PowerShell 5.1+)
 irm https://raw.githubusercontent.com/ahma-labs/ahma/main/scripts/install.ps1 | iex
 ```
 
-**Update an existing install:**
+The installer verifies the release's build provenance, installs `ahma` in `~/.local/bin`
+(put it on your `PATH`), and runs `ahma setup`. That adds ahma to the MCP config of every
+editor it finds (Cursor, VS Code, Claude Code, …). For Cursor and Claude Code it also
+installs terminal hooks, so the agent's own terminal and file edits are sandboxed too. Other
+clients get hooks only with `--hooks`, and setup says why. Restart the editor afterwards.
 
 ```bash
-ahma update              # latest release
-ahma update main         # build from branch
+ahma hooks status    # what is actually sandboxed, and why
+ahma setup           # see what is allowed, where it comes from, and change it
+ahma doctor          # check ahma's health; fixes only with your OK
+ahma update          # update to the latest release
 ```
 
-<details>
-<summary><strong>Advanced — install a specific branch (requires <a href="https://rustup.rs/">Rust</a>)</strong></summary>
-
-Use this if you need to test an unreleased branch before the next binary release. Replace
-`<branch-name>` below with the real branch you want (e.g. `main`).
-
-The workspace uses `reqwest` with the `http3` feature, so source builds require `RUSTFLAGS='--cfg reqwest_unstable'`. The `ahma update <branch-name>` command sets this automatically; the snippets below are only needed if you are installing for the first time without an existing `ahma` binary.
-
-**Linux / macOS**
-
-```bash
-# First time (no ahma yet)
-RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/ahma-labs/ahma --branch <branch-name> ahma_bin --bin ahma --root ~/.local --locked --force
-export PATH="$HOME/.local/bin:$PATH"
-
-# After ahma is installed — the subcommand handles RUSTFLAGS automatically
-ahma update <branch-name>
-```
-
-**Windows (PowerShell 5.1+)**
-
-```powershell
-$env:RUSTFLAGS='--cfg reqwest_unstable'
-cargo install --git https://github.com/ahma-labs/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
-```
-
-**macOS:** re-sign after the first-time install — `codesign --force --sign - --options runtime "$(command -v ahma)"` — see the note below; `ahma update <branch-name>` does this for you on subsequent updates.
-
-</details>
-
-<details>
-<summary><strong>Alternative — install with Cargo (<code>cargo binstall</code> or <code>cargo install</code>)</strong></summary>
-
-Prefer the Rust toolchain to the curl/irm installer? Both routes below install the same
-`ahma` binary. **The interactive customization is identical** — it lives in the `ahma setup`
-wizard (MCP entries, agent skills, optional terminal hooks/TLS), which the shell installer
-simply runs for you at the end. Run it yourself after either command, and re-run it any time
-to reconfigure:
-
-```bash
-ahma setup --cli    # interactive wizard (same prompts as the curl installer)
-ahma setup --auto   # non-interactive defaults
-```
-
-**Prebuilt, attested binary — no compile** (needs [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall); works on Linux, macOS, and Windows):
-
-```bash
-# cargo binstall downloads the CI-built, Sigstore-attested GitHub Release asset — no toolchain, no RUSTFLAGS.
-cargo binstall --git https://github.com/ahma-labs/ahma ahma_bin
-ahma verify --self   # confirm the SLSA-3 build-provenance attestation (binstall skips the installer's auto-verify)
-ahma setup
-```
-
-**From source** (needs [Rust](https://rustup.rs/)):
-
-```bash
-# http3/QUIC needs the reqwest_unstable cfg; the curl installer and `ahma update` set it for you,
-# but a bare `cargo install --git` does not read the repo's .cargo/config.toml, so pass it here:
-RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/ahma-labs/ahma ahma_bin --locked
-ahma setup
-```
-
-Notes:
-- `cargo binstall ahma` / `cargo install ahma` from **crates.io** are not yet available (ahma isn't published there) — use the `--git` forms above.
-- Ensure `~/.cargo/bin` is on your `PATH` (rustup adds it during setup).
-- **macOS:** a Cargo-installed binary is ad-hoc signed. If it is ever `SIGKILL`ed under memory pressure, re-sign it once with the hardened runtime (the curl installer does this automatically): `codesign --force --sign - --options runtime "$(command -v ahma)"`.
-
-</details>
-
-See [docs/installation.md](docs/installation.md) for platform details, source builds, and branch installs from local checkouts.
-
-### Example workflow
-
-Ask your agent to run a normal project task such as:
-
-> Run formatters, linting, tests, and a build for this repo. Start independent steps concurrently where possible and keep me updated on failures.
-
-With ahma, that workflow stays inside the repo boundary and the long-running steps can begin immediately as background operations. The agent can inspect results, continue other work, or start additional safe commands without waiting on one giant terminal session.
-
-### Without ahma / with ahma
-
-| Workflow detail | Without ahma | With ahma |
-|---|---|---|
-| **Filesystem access** | Often tied to a broad terminal with a larger blast radius | Kernel-enforced to the workspace scope |
-| **Approval friction** | Repeated trust decisions or pressure to relax safety settings | Repo-scoped access is established up front |
-| **Long-running work** | One blocked terminal session at a time | Tracked, cancellable operations; the agent keeps thinking while they run and collects results with `await` |
-| **Parallel tasks** | Often serialized, or unordered and racing | Reads run at once; writers to one workspace run one at a time, in the order sent — across every session |
-| **Operational visibility** | Raw terminal output | Operation IDs, progress notifications, and structured tool calls |
-
-### What Ahma does
-
-Ahma complements IDE and CLI MCP clients by making normal command-line work safer and less blocking. It is most useful where the client either exposes a broad terminal directly or has no terminal model at all.
-
-| Capability | Native IDE/CLI terminal | Ahma `run_terminal_command` |
-|---|---|---|
-| **Write protection** | None — full filesystem access | Kernel-enforced to workspace only (Seatbelt on macOS, Landlock on Linux) |
-| **Execution** | Synchronous — AI blocks until done, nothing to watch or stop | `async` (default) lets the AI keep working while long commands run, safely: the [workspace write queue](docs/workspace-queue.md) runs writers one at a time in arrival order; `sync` waits for each result |
-| **Parallel operations** | Sequential tool calls | Reads run concurrently under a write-denying sandbox; writers are ordered per workspace, with per-operation status tracking |
-| **Structured tool schema** | Raw shell strings | Typed parameters, validation, subcommands via `.ahma/*.json` |
-| **Live log monitoring** | Raw output only | Pattern-matched alerts streamed to AI (error/warn/info levels) |
-| **PoLP enforcement** | Any command, any argument | Call directly, or define a JSON file to restrict which arguments can be passed to a command line tool |
-
-## OS Support
-
-- **macOS** — Full support with kernel-level sandboxing (Seatbelt). Prebuilt binaries are Apple Silicon only; on Intel Macs use [Source Installation](#source-installation) below.
-- **Linux (Ubuntu, RHEL)** — Intel and ARM. Full support with Landlock (kernel ≥ 5.13)
-- **Raspberry Pi** — 64-bit and 32-bit. Use `--no-sandbox` until kernel-level sandboxing is supported (Landlock requires kernel ≥ 5.13)
-- **Windows** — Full support. Uses the built-in PowerShell (5.1+) included with Windows 10/11
-
-## Source Installation
-
-If you prefer to build from source (required for Intel Macs, since prebuilt binaries are Apple Silicon only):
-
-**Linux / macOS**
-
-```bash
-git clone https://github.com/ahma-labs/ahma.git
-cd ahma
-cargo build --release -p ahma_bin
-mkdir -p ~/.local/bin
-mv target/release/ahma ~/.local/bin/
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc — reload your shell after
-```
-
-**Windows (PowerShell)**
-
-```powershell
-git clone https://github.com/ahma-labs/ahma.git
-cd ahma
-cargo build --release -p ahma_bin
-Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
-```
-
-See [docs/installation.md](docs/installation.md) for supported binary platforms and installer behavior.
-
-## Security Sandbox
-
-Ahma enforces **kernel-level filesystem sandboxing** by default — Landlock on Linux, Seatbelt on macOS, Job Objects on Windows. The sandbox scope is set once at startup and cannot be changed. The AI has full access within the workspace, and **writes** outside it are blocked unconditionally on Linux and macOS. *Reads* are a different story per platform — see [What the sandbox does *not* cover](#what-the-sandbox-does-not-cover) below.
-
-**Network egress** is unrestricted by default. Pass `--restrict-network` (or set `[network] restrict = true`) to route every sandboxed subprocess through a guarded local proxy that forwards only the allowed hosts and refuses private/loopback/cloud-metadata addresses. When a subprocess reaches a host not on the list and an MCP client capable of `elicitation/create` is attached (e.g. an IDE), the proxy raises an interactive approval prompt instead of denying outright — the human can allow it once, for the session, or persist it to `[network] allow`; declining, a timeout, or no capable client all fail safe to a deny. Ahma's own web tool (`fetch_webpage`) is governed separately by the `[web]` policy.
-
-The reachable set is the **union** of your `[network] allow` and the hosts each enabled sandbox profile declares its toolchain needs — `index.crates.io` and `static.crates.io` for Rust, `registry.npmjs.org` for Node, `proxy.golang.org` for Go, each shipped with a stated reason. Without that, turning restriction on broke `cargo build` on the very first command, which is why almost nobody turned it on. Every host is listed with the source that granted it (`ahma permissions list`, and at startup), so you can see which single line removes it: `[network] deny_profile_hosts` drops one profile's hosts, `[network] profile_hosts = false` drops all of them, and both keep the profile's *file* access — trusting a toolchain with a directory is not the same as trusting it with the internet. Everything is denied only when `allow` is empty **and** no profile contributes a host. Listening is not restricted on any platform (no kernel can say "loopback only"), so ahma discloses it and asks for servers on `127.0.0.1`. See [docs/network-egress.md](docs/network-egress.md).
-
-**When the sandbox blocks something you actually wanted**, ahma asks you — in your IDE if it can prompt, in the ahma TUI if one is attached, and otherwise by failing the command with the exact `ahma sandbox grant …` line that fixes it. It never fails *open*: if nobody can be asked, the answer is no. Grants live in `~/.ahma/settings.toml`, the one directory the sandbox never includes — so a sandboxed command can never grant itself anything.
-
-See [docs/permissions.md](docs/permissions.md) for how permissions work, and [docs/security-sandbox.md](docs/security-sandbox.md) for platform details, nested sandbox detection, temp directory access, and example `mcp.json` configs.
-
-### What the sandbox does *not* cover
-
-Ahma sandboxes the **real host process in place** — there is no image, no rootfs, no VM. That is its strength (near-instant startup; per-session scope and egress that can be tailored per run) and the source of its limits. It is **not** a full container/VM isolation boundary:
-
-- **Network restriction is kernel-enforced on macOS and modern Linux, advisory elsewhere.** `--restrict-network` routes HTTP(S) through the guarded proxy via `HTTP_PROXY`. On **macOS** the Seatbelt profile *denies all outbound IP egress except the proxy*, so even a tool that ignores `HTTP_PROXY` or opens a raw socket cannot reach the network directly. On **Linux** (kernel **6.7+**) Landlock restricts each sandboxed subprocess's outbound **TCP** to the proxy port — port-only (Landlock can't filter by address) and TCP-only, so **UDP** and a rogue service on the same port number are residual gaps; on kernels **< 6.7** it degrades to advisory. On other platforms it is advisory (a tool that bypasses the proxy env vars is not contained). On all, the proxy itself allow-lists domains and blocks private/loopback/cloud-metadata targets; for hard, complete confinement run ahma inside a container/VM.
-- **No resource limits.** Unlike a container's cgroups, ahma does not cap CPU, memory, PIDs, or I/O — a runaway build can exhaust host resources. (A container *memory limit* is a cgroup ceiling with OOM-kill on breach, not a reservation; both a container and ahma allocate host memory dynamically and share the host kernel, so "fixed vs dynamic memory" is **not** a real difference — the difference is that a container *can* cap it and ahma does not.)
-- **No process/namespace isolation.** A sandboxed tool shares the host PID, network, and user namespaces: it can see other host processes and bind local ports. There is no seccomp syscall filtering and no UID remapping. On macOS it can *signal* only the process tree it started itself (`kill` of another session's build is refused; `[sandbox] signal_other_processes = true` opts out); on Linux and Windows signals are not confined. On macOS the **GPU is withheld** by default — Metal cannot open a device inside a sandboxed command, so GPU work falls back to the CPU or fails until `[sandbox] allow_gpu = true` opts in (a capability, not a path; no prompt can grant it).
-- **On macOS the sandbox is a write boundary, not a read boundary.** APFS firmlinks defeat read subpath matching, so the Seatbelt profile grants global file-*read* — writes stay scoped, reads are wide open. A denylist compensates: credential directories and private key material are explicitly denied, but a denylist only denies what someone thought to name, so treat it as narrower than a container's mount namespace, not equivalent to it. On **Linux** reads *are* scoped (Landlock); on **Windows**, treat neither reads nor writes as OS-confined. Job Objects give process containment, not a path boundary. AppContainer spawn isolation is *written* — per-command container, scoped ACL grants, launcher re-entry — and on `windows-latest` its boundary holds both ways. It is still switched off, because ordinary tools cannot run inside it yet: writing to `NUL` is denied, and so is looking at any folder above the scope. So Windows currently has no OS-enforced path boundary at all. Two consequences to know for the day it is switched on: `--restrict-network` becomes **mutually exclusive** with it (an AppContainer blocks loopback, so the egress proxy would be unreachable; ahma refuses the combination loudly rather than pretending egress is gated), and `%TEMP%` is redirected into the container's own folder. While it is off, `--restrict-network` works on Windows exactly as it does elsewhere. The login **keychain** is *allowed* by default (read+write) so `gh` and other Keychain-backed tools work — it is encrypted at rest and secret extraction is still gated by `securityd`; set `[sandbox] allow_keychain = false` (or `--no-allow-keychain`) to block it. See SPEC R6.2.2/R6.2.3.
-- **Files the agent legitimately writes can be run later by something outside the sandbox.** This is the interesting one, and it does not require breaking the sandbox at all: a git hook, an editor task set to run on folder-open, a harness settings hook, a planted `bin/python` a language-extension picks up. The agent writes a file it is entitled to write; your `git`, your IDE's extension host, or your harness executes it afterwards. Ahma's answer is two-tier — **deny writes** to paths no legitimate task touches (hook directories under the real git dir, container daemon sockets, key material, ahma's own config), and **allow but disclose loudly** for paths you genuinely ask an agent to edit (editor and harness configuration), naming the file *and* the trigger that will execute it. Blocking the second set would break "set up my editor for this project"; prompting on every one of them is the permission fatigue ahma exists to avoid. Two deny-tier paths *do* have legitimate authors — installing a repo's own git hook, and editing a project's `.ahma/` tool definitions — so each has a narrow opt-in, off by default and announced at startup when on: `--allow-git-hooks` and `--allow-project-tool-config` (or the matching `[sandbox]` keys). The denial message names the flag, so you find it when you hit it rather than by searching these docs. **Enforcement is uneven and you should know where:** the deny tier is kernel-enforced on macOS, but on Linux it is application-layer only (Landlock can't carve a deny hole inside a directory it has allowed), so a shell command run through `run_terminal_command` can still write those paths unless you opt into `[sandbox] linux_deny_tier = "namespace"`, which mounts them read-only in each command's own namespace where the host allows unprivileged user namespaces (stock Ubuntu 23.10+ does not; ahma says so at startup — [details](docs/security-sandbox.md#prevented-where-the-host-allows-it-linux-opt-in)); on Windows there is no proven filesystem enforcement yet. Where the kernel does not hold the deny tier, ahma compares it before and after every command and puts a `TRUST-HANDOFF WRITE` alert at the top of the result when something changed — it detects the write, it does not prevent or undo it. Whichever tier applies, the write is recorded: every execution — and every sandbox denial — appends to `audit.jsonl` next to the operation logs, written *before* the process starts, so the record survives a crash, a kill, or a session you have long since closed. Output tells you what a command printed; this is what tells you it happened. See SPEC R-HANDOFF and [docs/execution-audit-log.md](docs/execution-audit-log.md).
-- **The shared package cache is a cross-project channel.** Cargo needs write access to `$CARGO_HOME/registry` and `$CARGO_HOME/git` for `cargo add`/`cargo update` to work at all, and the shipped Rust profile grants it by default. That cache is shared by every project on your machine, so an agent working in one project can edit an extracted crate's source and have it compiled and run — as a build script or proc macro — the next time you build a *different* project. Narrowing the workspace scope does not help, because the cache was never inside it. Pass `--no-package-cache-write` (or `[sandbox] package_cache_write = false`) to downgrade those caches to read-only; the toolchain still runs, only `cargo add`/`cargo update` stop working inside the sandbox. Related: build scripts and proc macros are ordinary programs that run with the sandbox's full write set — adding a dependency is adding code that executes locally. See SPEC R-HANDOFF.8.
-
-For hard multi-tenant isolation or resource governance, run ahma **inside** a container/VM — the two compose. Ahma's job is a fast, in-place, scope- and egress-tailored guard for an agent working on your own machine, not a substitute for full virtualization.
-
-## Terminal Hooks
-
-The ahma MCP server only sandboxes the tools an agent calls explicitly. **Terminal hooks** extend the same kernel sandbox to the shell commands an agent runs through its *native* terminal/Bash tool — which never pass through MCP. Supported clients: **Cursor, Claude Code, Codex, GitHub Copilot CLI, and Antigravity** (VS Code and Claude Desktop have no execution-hook mechanism).
-
-```bash
-ahma hooks install      # user-scoped hooks for all supported clients
-ahma hooks install --no-edit-guard  # shell hook only (the default also confines the client's Edit/Write tools to the scope)
-ahma hooks status       # shows the EFFECTIVE state (active vs installed-but-inactive)
-ahma hooks uninstall    # remove them
-```
-
-`install` only writes the hook file. In the default `auto` mode a hook is **active** only when an ahma MCP server is detected for that client; otherwise commands pass through **unsandboxed**. Always confirm with `ahma hooks status`, which prints the effective verdict and why. Force the behaviour with `AHMA_HOOKS=on|off` (alias `AHMA_DISABLE_HOOKS=1`).
-
-**Fail-safe behaviour:** if ahma is *active* but cannot sandbox a command (broken install, missing kernel support), the command is **blocked**, not run unsandboxed — `ahma hooks doctor` diagnoses it and `ahma hooks approve-unsandboxed` grants a loud, session-only override. ahma never silently runs a command unsandboxed while it believes hooks are active.
-
-See [docs/installation.md](docs/installation.md#terminal-hooks) for the per-client config paths and full details.
-
-## Configuration Reference
-
-Sandbox scope, logging, execution behaviour, and HTTP transport options are configured with **CLI flags** or `~/.ahma/settings.toml`. `AHMA_*` variables are **not** a configuration source — a client-owned config file can carry an environment variable, so security settings must not be reachable that way. See **[docs/environment-variables.md](docs/environment-variables.md)** for the retirement status of each variable and the handful that are still live.
-
-## Live Log Monitoring
-
-Ahma can run any streaming command (e.g. `adb logcat`, `tail -f`, `docker logs -f`) through an LLM to detect issues in real time. The tool returns an operation ID immediately; alerts are pushed as MCP progress notifications whenever the LLM finds a problem matching your description.
-
-See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the Android logcat example, and how to use cloud or local LLM providers.
-
-## Optional advanced topics
-
-- **Custom tools**: If you want to expose your own command-line tools through ahma, start with [docs/custom-tools.md](docs/custom-tools.md).
-- **Agent skills**: Optional agent-specific setup is documented in [docs/agent-skills.md](docs/agent-skills.md).
-- **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [docs/simplify.md](docs/simplify.md).
-- **Built-in file tools**: read, edit (unique-match, read-before-edit, atomic), `multi_edit`, `apply_patch`, and `.gitignore`-aware search, for clients without their own. See [docs/file-tools.md](docs/file-tools.md).
-
----
-
-## More features
-
-### TUI — one view of everything being done for you
-
-```bash
-ahma tui
-ahma tui --connect http://localhost:8080
-```
-
-Open it in a project and you see what every attached editor is doing there —
-plus every hooked shell command, and your own — as one borderless list of
-sections, one per client session. A closed section says what it is running or
-last ran; clicking a header opens it (and closes the previous one) with a short
-animation, and a task inside expands into its live output.
-
-- **Already current when you open it.** The hub replays recent history with
-  true timestamps and the output each command was printing, including work from
-  sessions that have since closed.
-- **Approval gates** — tool approvals, sandbox grants, egress — are answered
-  here.
-- **Chat is a toggle** (`i`), not the screen: `/connect` connects an LLM (checked
-  before it is saved), each window keeps its own conversation (`/resume`), and
-  every window shows its model, context fill and token spend. Esc or Ctrl-C
-  stops a running reply.
-- **Sync or async**: the status header shows how tool calls return; `/sync` and
-  `/async` switch it (saved to settings).
-- **Trust a folder once**: the first open asks "Trust this folder?"; yes lets
-  tools work inside it without asking, while anything outside it, network
-  access and settings changes still ask.
-- **New here?** `/intro` is ahma in one screen; `/settings <words>` finds any
-  setting; `/doctor` checks ahma's health and fixes things only with your OK.
-
-See [docs/tui.md](docs/tui.md) and [docs/doctor.md](docs/doctor.md).
-
-### `ahma web` — the same view in your browser *(experimental)*
-
-```bash
-ahma web
-```
-
-The work view, chat and permission questions of `ahma tui` in a browser tab, for the directory
-you run it in. It returns to the prompt at once, copies a single-use pairing code to your
-clipboard for you to paste into the page, and stops by itself a minute after its last tab
-closes. It listens on this machine only (127.0.0.1 and ::1, no option to widen it), refuses
-requests that did not come from its own page, serves a first-party page with no runtime
-dependencies, and is trusted with less than the terminal: no host commands, and no answer that
-is saved to settings. ahma's macOS sandbox keeps the commands it runs off the clipboard; use
-`--no-copy` to type the code instead. See [docs/web.md](docs/web.md).
-
-### `ahma desktop` — the same view in a window of its own *(experimental)*
-
-```bash
-ahma desktop
-```
-
-The `ahma web` view in a native window on the operating system's own web engine (macOS and
-Windows), so it adds no browser engine to ahma. The window and its server are one process, so
-there is no pairing code: nothing else can pair with it. Closing the window stops it. On Linux
-it opens `ahma web` instead. See [docs/desktop.md](docs/desktop.md).
-
-### `ahma_help` — guidance for the AI, from ahma
-
-An agent that hits `Operation not permitted` can ask `ahma_help` what to do instead of
-retrying, copying caches into the project, or interrupting you. It says whether temp
-space is available and where, to look for the tool's own cache/temp option first, and
-to ask you for `ahma sandbox grant <dir>` only when nothing else works. See
-[docs/ahma-help.md](docs/ahma-help.md).
-
-### `ahma setup` — see what is allowed, and say what you want
-
-Instead of finding out about the sandbox when a command is blocked, run `ahma setup`
-(or `/setup` in `ahma tui`). It shows your settings and the repository's, with where each
-value comes from; everything that is granted or switched on, and how to take it back; and
-a plan of proposed changes: the GPU for a local model, a project script that only reads
-sources, a toolchain profile that was switched off. Tell it what you want to allow or
-deny and the model you connected can propose changes. Every item says why, what it
-allows and how to undo it, and nothing changes until you answer `y` for that one item.
-`ahma setup --plan` prints the plan without the TUI. See [docs/setup.md](docs/setup.md).
-
-### One hub per user
-
-Whatever starts ahma — an editor, `ahma tui`, or a shell hook — there is one
-hub per user hosting the MCP endpoint and the observability hub, so
-everything shows up in one place. It runs no commands itself: every tool call
-runs in a kernel-sandboxed worker, one per session, each locked to its own
-project.
-
-See [docs/hub.md](docs/hub.md).
-
-### Bundle Audit — supply-chain checks for MTDF bundles *(experimental)*
-
-```bash
-ahma bundle audit    /path/to/bundle
-ahma bundle checksum /path/to/bundle
-ahma bundle verify   /path/to/bundle
-```
-
-`audit` scans for embedded secrets, missing path validation, and prompt-injection payloads in tool JSON files before they are loaded. `checksum`/`verify` record and re-check a SHA-256 manifest — a **corruption** check, not a signature: the manifest is unsigned and sits inside the bundle, so anyone who can edit a bundle file can rewrite it too. Real tamper-evidence needs a signed bundle index, which is not implemented; `audit` is the control that exists today.
-
-See [docs/bundle-audit.md](docs/bundle-audit.md).
-
-### ahma_core — embedding Ahma in Rust applications
-
-The `ahma_core` crate exposes the sandbox, MCP service, and local-LLM agent runtime as a library for embedding in other Rust applications.
-
-See [docs/ahma-core-library.md](docs/ahma-core-library.md).
-
-### SSH key broker — `git push` over SSH inside the sandbox *(experimental)*
-
-A sandboxed command never reads a private key, but it can still sign in over SSH: each
-hooked command gets an SSH agent of its own, served by ahma outside the sandbox, that signs
-only for a server the connection proves it is talking to, and only after you allowed that key
-for that server in that workspace — once per session in Claude Code's own dialog, or for good
-with `ahma permissions grant ssh-sign`. See [docs/ssh-agent-broker.md](docs/ssh-agent-broker.md).
-
-### Opening web links — `gh … --web` inside the sandbox *(experimental)*
-
-A sandboxed command can't start a browser itself, so ahma opens `http`/`https` links for it,
-outside the sandbox, in your default browser — only for sites you allowed, for the repo you
-are in by default or every repo with `--all-repos`, with `ahma permissions grant open-url github.com`. Each command's `BROWSER` is ahma's
-own helper, and a whole-line `open https://…` runs as it. A link to any other site is asked
-about: over MCP in your client's own prompt while the command waits; from a hook it is refused
-with one line, and when the command runs again Claude Code's own dialog asks you (yes opens it
-this time). A link sends its whole address to that site, so allow only sites you
-trust. See [docs/open-links.md](docs/open-links.md).
-
-### Task Vaults — one directory per task *(experimental)*
-
-```bash
-ahma serve stdio --task-vault ~/.ahma/tasks/my-question
-```
-
-The vault's `workdir/` becomes the entire sandbox scope, and `rm` moves its targets to the
-vault's `trash/` instead of deleting them. See [docs/task-vault.md](docs/task-vault.md).
-
-## MCP Server Connection Modes
-
-`ahma` supports **STDIO** (default — IDE spawns a subprocess per workspace), **HTTP Bridge** (proxy for web clients and debugging), and **HTTP Streaming** (MCP Streamable HTTP with event replay and full-duplex).
-
-See [docs/connection-modes.md](docs/connection-modes.md) for `mcp.json` examples for VS Code, Cursor, Claude Code, and Antigravity, plus HTTP streaming usage.
-
-## Contributing
-
-Issues and pull requests are welcome. This project is AI friendly and provides the following:
-
-- **`AGENTS.md`/`CLAUDE.md`**: Instructions for AI agents to use the MCP server to contribute to the project.
-- **`SPEC.md`**: the product requirements and how the parts fit together; each crate's own `SPEC.md` holds the requirements that crate implements. AI keeps them current as you work.
-- **[docs/build-and-test-performance.md](docs/build-and-test-performance.md)**: why `target/` used to grow to tens of GB, what the build/test layout does about it, and the measurements behind the rules in `AGENTS.md`.
-
-## Working well with Claude (Sonnet / Opus)
-
-Claude models treat strongly imperative language in tool descriptions ("MANDATORY", "do NOT use any other pathway", "under any circumstances") as a prompt-injection signal and downweight it. The recommended way to get Claude to route work through ahma is to add a decision-rule snippet to your workspace `AGENTS.md` or `CLAUDE.md`:
+Other install routes (`cargo binstall`, source builds, Intel Macs, branches):
+[docs/installation.md](docs/installation.md). Writing `mcp.json` by hand:
+[docs/connection-modes.md](docs/connection-modes.md).
+
+## What is enforced, per platform
+
+| | Writes | Reads | Network, with `--restrict-network` |
+|---|---|---|---|
+| **macOS** (Seatbelt; Apple Silicon binaries, Intel from source) | Workspace and your grants | Open, apart from a credential denylist | Kernel: only ahma's proxy is reachable |
+| **Linux** (Landlock, kernel 5.13+; x86_64 and arm64, incl. Raspberry Pi) | Workspace and your grants | Workspace, system and toolchain directories, and your grants | Kernel pins TCP to the proxy on 6.7+; advisory before; UDP not filtered |
+| **Windows** (Job Objects) | **Not confined** | **Not confined** | Advisory proxy only |
+
+Windows has no OS path boundary yet: AppContainer isolation is written but switched off.
+Use ahma inside WSL2 for a Landlock boundary. Details:
+[docs/security-sandbox.md](docs/security-sandbox.md).
+
+**Not covered** ([details](docs/security-sandbox.md), [all known gaps](SPEC.md#11-known-gaps)):
+
+- **Kernel exploits.** The kernel is shared. A kernel bug escapes, and ahma does not filter system calls yet.
+- **Network is open unless you restrict it.** Even with `--restrict-network`, an allowed host such as `github.com` can carry data out.
+- **Writes that something trusted runs later** (git hooks, editor tasks, harness settings).
+  - macOS denies them.
+  - Linux detects them after the fact (`TRUST-HANDOFF WRITE`), unless you set `linux_deny_tier = "namespace"`.
+  - The shared package cache is a cross-project channel (`--no-package-cache-write`).
+- **On macOS, other processes' environments are readable.** A sandboxed command can read the arguments and environment of your other processes, so API keys in an editor's or agent's environment are exposed (fix planned, SPEC R-HARDEN.2).
+- **No CPU, memory or process limits.**
+- **Commands that bypass ahma.** A native terminal without hooks is not sandboxed. Check with `ahma hooks status`.
+
+## How it compares
+
+Ahma isn't alone in this approach. Anthropic sandboxes Claude Code's own shell with the same
+operating-system mechanisms (Seatbelt on macOS, bubblewrap on Linux); in its auto-allow mode a
+command that runs inside the sandbox needs no prompt at all
+([Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing),
+[how Anthropic contains Claude](https://www.anthropic.com/engineering/how-we-contain-claude)).
+OpenAI Codex and Cursor do the same. Ahma brings that boundary to every agent you use, under
+one set of permissions.
+
+| Approach | What bounds the agent |
+|---|---|
+| Nothing / "YOLO" | Your whole user account; the model decides |
+| Probabilistic guardrails (e.g. Claude Code auto mode) | A classifier's judgement: a useful layer, not a boundary |
+| Docker / Podman containers | The shared kernel plus whatever you mounted (often tokens, `~/.ssh`, the Docker socket) |
+| Docker Sandboxes | A microVM with its own kernel; stronger against kernel bugs, but a VM per agent, and the workspace is still mounted read-write |
+| Other kernel sandboxes (Claude Code sandbox, Codex, Cursor, nono, …) | The same kernel mechanisms, each covering one harness |
+| **ahma** | The kernel, per command, across every agent, with one permission ledger and one view of all sessions |
+
+Sources, details and an honest list of where a microVM is stronger:
+[docs/how-ahma-compares.md](docs/how-ahma-compares.md). The two compose: run ahma inside a VM
+for hard isolation.
+
+## Features
+
+| | |
+|---|---|
+| [Kernel sandbox](docs/security-sandbox.md) | Per-command Seatbelt or Landlock scope; nested-sandbox detection; temp access; trust-handoff denials |
+| [Permissions](docs/permissions.md) | One ledger in `~/.ahma`; grants for one command, a session, a lease, a repo or always; asked in your client, the TUI or the harness's own dialog |
+| [`ahma setup`](docs/setup.md) | What is allowed and why, and a plan of proposed changes applied one `y` at a time (`--plan` to print it) |
+| [`ahma doctor`](docs/doctor.md) | Health checks and fixes, each with your OK (`/doctor` in the TUI) |
+| [`ahma_help`](docs/ahma-help.md) | Guidance for an agent that hits `Operation not permitted`, so it stops retrying and asks well |
+| [Network egress](docs/network-egress.md) | `--restrict-network`: a deny-by-default proxy, toolchain hosts from profiles, private and metadata addresses blocked |
+| [Audit log](docs/execution-audit-log.md) | `audit.jsonl`: every execution and every denial, written before the process starts |
+| [Operations and write queue](docs/workspace-queue.md) | Long commands return an operation id. Writers to one workspace run one at a time, in order, across every session; reads skip the queue |
+| [Settings](docs/settings.md) | `~/.ahma/settings.toml`, sync or async mode, provenance of every value; `AHMA_*` variables are retired ([env vars](docs/environment-variables.md)) |
+| [Terminal hooks](docs/installation.md#terminal-hooks) | The same sandbox for the agent's native terminal, and an edit guard for its file edits |
+| [Connection modes](docs/connection-modes.md) | stdio, Unix socket and HTTP; token auth by default; MCP 2025-11-25 and 2026-07-28 |
+| [Per-user hub](docs/hub.md) | One hub per user; every session runs in its own sandboxed worker; updates without dropping sessions |
+| [Session isolation](docs/session-isolation.md) | Each HTTP client session gets its own scope and worker |
+| [Session-health notifications](docs/session-health-notifications.md) | The client is told when its session was rebuilt, or a grant is waiting on a human |
+| [TUI](docs/tui.md) | `ahma tui`: every session's work live, approvals, chat with a connected model |
+| [LLM providers](docs/llm-providers.md) | `ahma llm add`: local or cloud models for chat, the advisor and log monitoring |
+| [Live log monitoring](docs/live-log-monitoring.md) | `livelog` and `monitor_level`: a model watches a stream and pushes alerts |
+| [Custom tools](docs/custom-tools.md) | MTDF JSON definitions: typed arguments for any CLI |
+| [File tools](docs/file-tools.md) | Read, edit, `multi_edit`, `apply_patch`, search, for clients without their own |
+| [`ahma simplify`](docs/simplify.md) | Code complexity analysis with fix instructions for an agent |
+| [Agent skills](docs/agent-skills.md) | The `ahma` skill: teaches an agent to use ahma well |
+| [`ahma_core`](docs/ahma-core-library.md) | Embed the sandbox and MCP service in a Rust application |
+| [Release signing](docs/release-signing.md) | Sigstore build-provenance on every release; `ahma verify` |
+
+## v0.22 Experimental Features
+
+| | |
+|---|---|
+| [`ahma web`](docs/web.md) | The TUI's view in a browser tab, loopback only, paired with a one-time code |
+| [`ahma desktop`](docs/desktop.md) | The same view in a native window (macOS, Windows) |
+| [SSH key broker](docs/ssh-agent-broker.md) | `git push` over SSH with no key in the sandbox: signs per host after consent (macOS, Linux; in progress) |
+| [Opening web links](docs/open-links.md) | `gh … --web` from the sandbox opens your browser, for sites you allowed (macOS, Linux; in progress) |
+| [Task vaults](docs/task-vault.md) | One directory per task as the whole scope; `rm` moves to the vault's trash |
+| [Bundle audit](docs/bundle-audit.md) | Checks MTDF bundles for secrets, missing path validation and injection payloads |
+
+## Getting an agent to use ahma
+
+Strongly imperative tool descriptions read to Claude as prompt injection, so put a decision
+rule in your project's `AGENTS.md` or `CLAUDE.md` instead:
 
 ```markdown
 ## When to use ahma vs the native terminal
 
-For commands run during this project, prefer ahma's `run_terminal_command` (via `CallMcpTool` on Cursor) when any of these apply:
-
-- the command writes to disk — the kernel-enforced sandbox keeps writes inside the workspace
-- the command runs for more than a few seconds — `run_terminal_command` is async, returns an operation_id, and lets the agent continue other work while it runs
-- the output should be watched for errors mid-run — set `monitor_level` to get pushed alerts
-- several commands touch the same repo — writers run one at a time in the order sent (a queued one says `NOT started`; don't resend it), while reads like `git status` answer immediately
-
-For reading, searching, and editing files (read, grep, glob, find, edit) keep using the IDE's native file tools — they are faster and cheaper than going through MCP. Clients with native file tools (Claude Code, Cursor, VS Code) don't see ahma's `read_file`/`write_file`/`replace_in_file`/`list_dir`/`file_search`/`grep_search` in `tools/list` at all; those stay available only to clients without native equivalents (ahma's own agent loop, the TUI).
-
-The downstream effect: `cargo`, `git`, `pytest`, build scripts, formatters, and long log tails go through ahma; file reads and edits stay on native tooling.
+Prefer ahma's `run_terminal_command` when the command writes to disk (the sandbox keeps
+writes in the workspace), runs more than a few seconds (it returns an operation_id; `await`
+it later), should be watched for errors (`monitor_level`), or shares the repo with other
+commands (writers run in order; a queued one says `NOT started`, don't resend it).
+Keep reading, searching and editing files on the native tools.
 ```
 
-Workspace-level rules in `AGENTS.md` reach Claude as operator-trusted content (higher weight than tool descriptions), and the capability-led bullets give it a clear decision rule rather than a mandate to override.
+## Further reading
+
+- Simon Willison, [The lethal trifecta for AI agents](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/)
+- Anthropic, [How we contain Claude across products](https://www.anthropic.com/engineering/how-we-contain-claude)
+
+## Contributing
+
+Issues and pull requests are welcome.
+- [AGENTS.md](AGENTS.md) is how to work in this repo, for people and agents alike.
+- [SPEC.md](SPEC.md) and each crate's `SPEC.md` say what ahma must do.
+- [docs/build-and-test-performance.md](docs/build-and-test-performance.md) explains the build layout.
 
 ## License
 
-Ahma is licensed **per crate**, not under a single repository-wide license.
-The root `Cargo.toml` groups crates in one workspace, but each member crate's
-`Cargo.toml` is the authoritative declaration for that crate.
-
-## Licensing Architecture
-
-Ahma uses a dual-tier licensing model to keep the core library reusable while ensuring the end-user product stays open-source.
-
-| Crate | License | Why it is here |
-|---|---|---|
-| `ahma_mcp` | MIT OR Apache-2.0 | Core MCP service, sandbox, and command execution |
-| `ahma_bundle` | MIT OR Apache-2.0 | Tool-bundle supply-chain audit and content checksum (`ahma bundle`) |
-| `ahma_common` | MIT OR Apache-2.0 | Shared runtime types and configuration |
-| `ahma_llm_monitor` | MIT OR Apache-2.0 | Log-monitoring and LLM client support |
-| `ahma_harness_guard` | MIT OR Apache-2.0 | Small-model harness guards (argument healing, loop detection, skill injection) |
-| `ahma_log_monitor` | MIT OR Apache-2.0 | Live log monitor: level detection, redaction, context snapshots (`monitor_level`) |
-| `ahma_simplify` | MIT OR Apache-2.0 | Code complexity analysis (`ahma simplify`); optional in `ahma_bin`, feature `simplify` (default on) |
-| `ahma_test_support` | MIT OR Apache-2.0 | Test helpers for workspace crates |
-| `ahma_update` | MIT OR Apache-2.0 | Self-update: release download, Sigstore verification (`ahma verify`), git installs |
-| `ahma_vault` | MIT OR Apache-2.0 | Task vault: isolated per-task directories, two-phase trash, audit log |
-| `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
-| `ahma_tui` | AGPL-3.0 | Terminal dashboard and approval flow |
-| `ahma_bin` | AGPL-3.0 | Shipped `ahma` binary |
-
-`MIT OR Apache-2.0` is used for the embeddable libraries, transports, and
-tooling crates so other Rust applications can adopt Ahma's protocol and secure
-sandboxing without copyleft obligations on their surrounding application code.
-`ahma_mcp`, `ahma_core`, `ahma_common`, and `ahma_http_mcp_client` carry this dual
-license so developers can embed Ahma's MCP server and sandbox execution primitives directly. The Apache side of the dual license adds an
-explicit patent grant, and the MIT side preserves the standard Rust dual-license
-option used by many libraries.
-
-`AGPL-3.0` is used for the end-user and network-exposed product crates
-that define the shipped product surface and security-relevant runtime behavior.
-That includes the shipped `ahma` binary and the user-facing TUI.
-
-### AGPL + Build Verification: Supply Chain Defense
-
-
-- **AGPL requires source disclosure**: anyone distributing a modified `ahma` binary or
-  running a modified version over a network must publish the corresponding source.
-  Closed-source backdoored forks cannot be legally distributed as "ahma".
-
-- **Build verification closes the gap AGPL cannot**: source transparency is only useful if
-  you can verify the binary you installed actually came from that source.
-  Every prebuilt release is verified using GitHub Build Provenance Attestations (SLSA Level 3)
-  backed by Sigstore, ensuring the binary was built directly from the official repository
-  by the CI pipeline. The installer verifies this attestation before writing anything to disk.
-
-`ahma update` and `ahma verify --self` check this attestation automatically, but that check
-runs *in-band* — inside the very binary whose integrity is in question. For the higher standard,
-verify **out-of-band** instead: an independent tool queries Sigstore's public transparency log
-directly, so the result doesn't depend on trusting the artifact you're trying to verify.
-
-```bash
-gh attestation verify ahma-release-linux-x86_64.tar.gz \
-  --repo ahma-labs/ahma
-```
-
-Together they protect against:
-
-| Attack | AGPL | Verification |
-|--------|------|--------------|
-| Backdoored binary from unofficial mirror | — | ✓ Verification fails |
-| Closed-source fork distributed as "ahma" | ✓ AGPL violation | ✓ Verification fails |
-| DNS/CDN hijack serving a tampered binary | — | ✓ Hash mismatch |
-| Compromised GitHub release assets | — | ✓ Verification fails (cannot attest outside build workflow) |
-| Modified binary without modified source | ✓ AGPL violation | ✓ Verification fails |
-
-Building from source is always an option. AGPL means the source is always
-public and auditable:
-```bash
-cargo install --git https://github.com/ahma-labs/ahma ahma_bin --bin ahma --root ~/.local --locked
-```
-
-See [docs/release-signing.md](docs/release-signing.md) for the release verification
-architecture, manual verification commands, and trust model details.
-
-### Common uses
-
-| If you want to... | Typical answer |
-|---|---|
-| Embed `ahma_mcp`, `ahma_core`, or `ahma_http_mcp_client` in your own application | Allowed under **MIT OR Apache-2.0** for those crates |
-| Distribute a modified `ahma` binary | Allowed under **AGPL-3.0** — source must be published |
-| Offer a modified `ahma` service to remote users | Allowed under AGPL — source-availability obligations apply |
-| Use Ahma internally for local or private workflows | Allowed subject to the applicable crate terms |
-
-### Security provenance
-
-Trust in Ahma comes from three independently verifiable facts:
-
-1. **Published source** — GitHub, auditable by anyone, required open by AGPL for any fork
-2. **Signed binaries** — RSA-2048 signature from a key held only in GitHub Actions secrets
-3. **Reproducible build** — `--locked` Cargo.lock, deterministic CI pipeline in `build.yml`
-
-The license split supports a single published origin for the security-focused
-product crates. The license does not by itself make a modified fork safe — but
-combined with cryptographic signing it makes an unsigned or differently-signed
-impostor immediately detectable.
-
-The repository root includes `MIT_LICENSE.txt`, `APACHE_LICENSE.txt`, and
-`AGPL_LICENSE.txt` because different workspace crates use different licenses.
-When in doubt, check the target crate's `Cargo.toml` first.
+Per crate: the embeddable engine is MIT OR Apache-2.0, and the shipped `ahma` binary and its
+interfaces are AGPL-3.0. See [docs/licensing.md](docs/licensing.md).

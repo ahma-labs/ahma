@@ -4,42 +4,22 @@
 > **`AHMA_*` variables in the RETIRED sections below are ignored** (R-CFG1.2), logged as a `WARN`.
 > Configure Ahma via `~/.ahma/settings.toml` or CLI flags instead.
 > Run `ahma settings init` to create a pre-documented settings file, or `ahma settings show` to inspect effective values.
-> This does **not** cover the three [Terminal Hooks](#live--terminal-hooks) variables below, which
+> This does **not** cover the two [Terminal Hooks](#live--terminal-hooks) variables below, which
 > remain live (hooks are invoked directly by the editor, not by `ahma`, so there is no CLI flag to
 > replace them), or variables read by the `scripts/install.sh` / `install.ps1` bootstrap installers,
 > which run before any `ahma` binary exists.
 
 > [!IMPORTANT]
-> **Retirement binds every binary and every subcommand, not just `ahma serve`.**
-> A variable listed as RETIRED is ignored by `ahma`, by `ahma-tui`, and by subcommands with
-> their own configuration resolution (`ahma update`, `ahma uninstall`) alike. A surface that
-> kept honoring a retired name would give one variable two meanings in one product — setting
-> it would change one binary's behaviour and not the other's, which is worse than either
-> answer on its own. `ahma_common::config::warn_retired_env` is the single function that
-> states the verdict — it lives at the bottom of the dependency graph so every crate can
-> reach it, and it returns only *whether* a variable was set, never its value, so a caller
-> cannot accidentally honor one. Every surface calls it rather than re-reading the variable.
->
-> **The tables below are enforced, not just documentation.**
-> `ahma_mcp/tests/unit/retired_env_drift_test.rs` parses every RETIRED table here and fails the
-> build if any production source reads one of these names directly. Adding a row extends the
-> guard automatically. This exists because the tables and the code had genuinely drifted:
-> `AHMA_PREFER_MUSL` was listed as retired while `ahma update` still honored it, and
-> `AHMA_LOG_TARGET`, `AHMA_TLS_DIR` and the two `AHMA_INSECURE_SKIP_*` variables each warned
-> in their own words instead of through the shared verdict. Nothing noticed, because the only
-> thing tying the docs to the code was someone remembering.
->
-> The one deliberate exception is the **bootstrap installers**, `scripts/install.sh`,
-> `scripts/install.ps1` and `scripts/install-local.sh`. They read `AHMA_INSTALL_DIR` because
-> they run *before* any `ahma` binary exists: there is no CLI to pass `--install-dir` to and
-> no settings file to read. Once `ahma` exists, `ahma update --install-dir` is the supported
-> way to install somewhere other than `~/.local/bin`.
+> Retired names are ignored by every binary and subcommand (`ahma`, `ahma-tui`, `ahma update`,
+> `ahma uninstall`) with one `WARN`. A test (`retired_env_drift_test.rs`) fails the build if code
+> reads a RETIRED name. Exception: the bootstrap installers (`scripts/install.sh`, `install.ps1`,
+> `install-local.sh`) read `AHMA_INSTALL_DIR`, because they run before `ahma` exists.
 
 ## Variable classification
 
 | Class | Meaning |
 |-------|---------|
-| **LIVE** | Still read and honored. Only the three [terminal-hook](#live--terminal-hooks) variables are in this class. |
+| **LIVE** | Still read and honored. Only the two [terminal-hook](#live--terminal-hooks) variables are in this class. |
 | **RETIRED** | Set by user, **ignored** with a startup `WARN`. Use the CLI flag or `~/.ahma/settings.toml` instead. |
 | **INTERNAL** | Set only by Ahma itself for parent→child process communication. Never set these manually. |
 | **PLATFORM** | Standard OS/ecosystem variables read by Ahma (e.g. `RUST_LOG`, `HOME`). Not `AHMA_*` prefixed. |
@@ -54,7 +34,7 @@ All previously accepted. Now ignored with a `WARN`. Use `~/.ahma/settings.toml` 
 | Variable | Replacement | Default |
 |---|---|---|
 | `AHMA_TOOLS_DIR` | `--tools-dir` CLI flag or `tools.tools_dir` in settings.toml | auto-detect `.ahma/` |
-| `AHMA_TIMEOUT` | `--timeout` flag or `tools.timeout_secs` in settings.toml | `360` |
+| `AHMA_TIMEOUT` | `--timeout` flag or `tools.timeout_secs` in settings.toml | `1800` |
 | `AHMA_SYNC` | `--sync` / `--async`, or `tools.execution_mode` in settings.toml | `"async"` |
 | `AHMA_HOT_RELOAD` | none — tool hot-reload was removed entirely (agent-writable tools dir); use the `restart` tool | n/a |
 | `AHMA_SKIP_PROBES` | `--skip-probes` flag or `tools.skip_probes = true` in settings.toml | `false` |
@@ -140,12 +120,12 @@ meant setting one changed the chat client's behaviour but not the server's.
 ## LIVE — Terminal Hooks
 
 These are the **only** `AHMA_*` variables still honored. They are used by hook subprocesses spawned
-by editors, set **before** the hook binary runs (by the editor or the user's shell profile), and
-cannot be replaced by CLI flags since hooks are invoked directly by the editor, not by ahma.
+by editors, set **before** the hook binary runs (by the editor or the user's shell profile), because
+hooks are invoked directly by the editor, not by ahma.
 
 | Variable | Default | Description |
 |---|---|---|
-| `AHMA_HOOKS` | `auto` | `on` = always sandbox, `off` = pass through, `auto` = sandbox when MCP server detected |
+| `AHMA_HOOKS` | `auto` | `on` = always sandbox, `off` = pass through, `auto` = sandbox when an ahma MCP server entry is found in a detected editor config |
 | `AHMA_DISABLE_HOOKS` | off | Alias for `AHMA_HOOKS=off`. Set to `1` to disable hook routing. |
 
 ```bash
@@ -154,6 +134,8 @@ AHMA_HOOKS=off
 # or
 AHMA_DISABLE_HOOKS=1
 ```
+
+A hook command line can also pass `--hooks on|off|auto`, which overrides both variables.
 
 ---
 
@@ -170,6 +152,8 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_HELD_WORKSPACE_LEASE` | Every command ahma runs while it holds a workspace write-queue lease | Comma-separated ids of the workspace leases the command already runs under (SPEC R2.7.7). A nested ahma started by that command reads it only to *skip waiting* for the lease its own ancestor holds, which would otherwise deadlock (`cargo nextest` spawning `ahma`). A marker, not a setting: it can never grant a lease or widen anything. |
 | `AHMA_SANDBOX_RUN` | Every command ahma runs inside its kernel sandbox, except one declared in `tools.long_running` | Names the one command a process was started by, so that what the command leaves running can be found and stopped when it ends (SPEC R-PROC.5). A marker, not a setting: removing it only means a leftover process is found later, by `ahma doctor`. |
 | `AHMA_OUTER_SANDBOX_PID` | Every command ahma runs inside its kernel sandbox | The pid of the ahma that sandboxed the command. A nested ahma (ahma's test suite or `ahma serve` run through `run_terminal_command`) reads it only to *name* the outer sandbox it defers to on macOS, where Seatbelt cannot nest (SPEC R7.6). A marker, not a setting. |
+| `AHMA_SPAWN_DEPTH` | Every ahma that spawns another ahma | How many ahma processes deep this one is; a backstop that stops a runaway spawn chain. A marker, not a setting. |
+| `AHMA_ASKPASS_COMMAND` | macOS, an approved one-time `sudo` run (SPEC R-ESCAPE) | The command text shown in the password dialog of `ahma askpass`. |
 | `AHMA_LINK_SOCK` | Every command ahma runs on macOS and Linux, from a terminal hook or over MCP (not a persistent shell session's) | The socket of the command's own link broker (SPEC R-LINK.1), which ahma's link helper — the command's `BROWSER` and `GH_BROWSER`, and `ahma open-url` — sends each web link to. The broker answers only that command's process group and opens only links to sites a human allowed ([open-links.md](open-links.md)); setting it yourself reaches nothing. ahma also sets `BROWSER` and `GH_BROWSER` for those commands, replacing yours. |
 
 ---
@@ -230,16 +214,7 @@ ahma settings show
 # 4. Remove AHMA_* variables from your shell profile
 ```
 
-For options that **must** be CLI flags (security-tier, R-CFG2.3), add them to the `args` array
-in your IDE's `mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "ahma": {
-      "command": "ahma",
-      "args": ["serve", "stdio", "--timeout", "600", "--sandbox-scope", "/home/user/projects"]
-    }
-  }
-}
-```
+Most options can live in `~/.ahma/settings.toml`. The two most dangerous are CLI-only
+(R-CFG2.3), so they are visible where ahma is launched: `--no-sandbox` and
+`--insecure-skip-verify`. Put them in your client's `args`, e.g.
+`"args": ["serve", "stdio", "--no-sandbox"]`.

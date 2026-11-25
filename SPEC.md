@@ -21,8 +21,9 @@ reaches for, unrestricted terminal access, is both too powerful and too opaque.
 Every requirement below serves one of these. When two requirements seem to conflict, the
 invariant decides.
 
-1. **The kernel is the boundary.** Commands run under Landlock (Linux), Seatbelt (macOS) or
-   Job Objects (Windows) with a write scope fixed for the session. The scope is committed
+1. **The kernel is the boundary.** Commands run under Landlock (Linux) or Seatbelt (macOS)
+   with a write scope fixed for the session; Windows has only Job Objects and no path
+   boundary yet (R6.3.3). The scope is committed
    once and never widened afterwards (R5.1). Application-layer checks are defence in depth,
    never the boundary.
 2. **Nothing is silent.** ahma never silently disables enforcement, drops an argument,
@@ -149,7 +150,7 @@ What each mode does is R2.1; the `initialize` instructions describe the session'
 
 `tests-pass`: implemented and covered by tests. `in-progress`: partly done; what is missing
 is listed in §11 Known gaps. `experimental`: implemented and tested, behind an opt-in, and
-may change.
+may change. `planned`: agreed and specified, not started.
 
 | Component | Status | Notes |
 |---|---|---|
@@ -193,6 +194,9 @@ may change.
 | Release signing (R-SIGN) | in-progress | Developer-ID signing wired, awaiting the Apple secrets (R-SIGN.1); Windows is a stated assumption (R-SIGN.3) |
 | OpenTelemetry export | tests-pass | `otel` cargo feature, off by default |
 | Code complexity analysis (`ahma simplify`) | tests-pass | `ahma_simplify/SPEC.md` |
+| Hardening roadmap (R-HARDEN) | planned | Landlock ABI, same-user isolation, seccomp, network restricted by default, macOS home reads, credentials at the boundary (R-HARDEN.1–8) |
+| One policy decision point (R-POLICY.1–2) | planned | One `decide`, one precedence for every userspace permission |
+| Team policy in Cedar (R-POLICY.3–6) | planned | Forbid-only Cedar files that narrow; `ahma policy validate`, `explain`, `export`, `verify` |
 
 ---
 
@@ -1159,6 +1163,85 @@ needs no pairing, as below.
 - **R-DESK.1 — The system's engine, or none.** The window uses the operating system's own web engine (WKWebView on macOS, WebView2 on Windows), so it adds no engine to the binary, and is compiled in only for those targets. Linux has no system engine: WebKitGTK is a shared library that headless machines lack, and linking it would stop `ahma` from starting at all, so there `ahma desktop` says so and runs `ahma web`. A machine where the engine cannot start (Windows without the WebView2 runtime) does the same.
 - **R-DESK.2 — Linked, so nothing pairs.** The window and its server are one process. The server mints the one tab token before the window opens and accepts no pairing code at all (a request to pair is refused as `closed`); the window gives the token to the page through a script the engine injects before the page's own code, which defines it only on the server's own origin, as a frozen property that cannot be changed. The window navigates only within its server's origin; any other address, and any request for a new window, opens in the default browser instead. Developer tools are off.
 - **R-DESK.3 — On the main thread, and gone with its window.** A window's event loop runs on the thread the process started on, so `ahma`'s main thread waits for work the async runtime hands it, and returns when the runtime says it is done (also on a panic). A plain `ahma desktop` returns to the prompt as `ahma web` does (R-GUI.12); closing the window stops the server and closes its hub MCP session, and a server that stops (the session ended, SIGTERM) closes the window. Decisions made in it are audited under the surface `desktop` (R-GUI.7).
+
+### R-HARDEN: Hardening roadmap
+
+**Status: planned** (open: §11). A sandbox on the shared host kernel has limits a microVM does
+not ([docs/how-ahma-compares.md](docs/how-ahma-compares.md)). These requirements close the ones
+ahma can close without a VM. They keep invariant 1, and they keep the stance: default
+policies, a human decides, a model only advises. Each one lands as its own change, starting
+with a red-team test that fails.
+
+- **R-HARDEN.1 — Landlock at the newest ABI ahma knows.**
+  - Ahma **must** handle, best effort, every filesystem access right of the newest Landlock ABI it supports, so an access that an older ABI cannot express is never left open silently.
+  - In particular, `truncate(2)` (ABI 3, Linux 6.2) **must** be denied outside the write scope.
+  - On a kernel too old to deny it, the gap **must** be disclosed (invariant 2).
+  - Today ahma handles ABI 2.
+- **R-HARDEN.2 — Same-user processes stay out of reach.** A sandboxed command **must not** read another process's environment, memory or arguments, or signal or connect to an abstract Unix socket of a process outside its own sandbox.
+  - On Linux the reads are refused by Landlock's ptrace scoping (tested). Signals and abstract sockets **must** be scoped with Landlock ABI 6 where the kernel has it.
+  - On macOS, another process's arguments and environment (`KERN_PROCARGS2`) **must** be refused, as signals already are (R6.2.6), while `pgrep`, `lsof` and `ahma ps` keep working (R6.2.8). Open today (§11).
+- **R-HARDEN.3 — A Linux system-call baseline.** Every command **must** run under a seccomp filter that refuses what a build or test does not need and kernel exploits commonly reach:
+  - `AF_ALG` sockets, `io_uring`, `keyctl`/`add_key`, `bpf`, `perf_event_open`, `userfaultfd`, and `ptrace` of a process the command did not start.
+  - With `--restrict-network` on, also UDP and raw sockets, which Landlock cannot filter before ABI 10.
+  - A profile may lift one entry with a stated reason, shown at startup as profile hosts are (R-PERM.5).
+- **R-HARDEN.4 — Network restricted by default.** Once shipped profiles cover the common toolchains (PyPI, RubyGems and container registries as well as today's), `[network] restrict` **must** default to `true`, so the exfiltration leg of the lethal trifecta is closed unless the human opens it. Until then the default stays off, because a default that breaks the first command is a default people turn off ([network-egress.md](docs/network-egress.md)).
+  - Profile hosts keep toolchains working from the first command (R-PERM.5.3).
+  - An unlisted host is asked (R-WEB.16), and the advisor may recommend (R-PERM.8).
+  - `restrict = false` opts out and is disclosed at startup.
+- **R-HARDEN.5 — macOS home reads by allowlist, as an option.**
+  - Under `[sandbox] home_reads = "allowlist"`, reads under `$HOME` **must** be denied except for the workspace, the enabled profiles' paths and the human's grants. The grant ladder (R-PERM.3) asks for the rest.
+  - The default stays the credential denylist (R6.2.3) until the breakage is measured.
+- **R-HARDEN.6 — Windows says what it lacks.** Until R6.3.3 closes, every Windows startup disclosure, `ahma doctor` and the docs **must** say there is no OS path boundary, and point to WSL2 for one.
+- **R-HARDEN.7 — Detection is not called protection.** A guard that only detects (the Linux deny tier's `detect`, R6.1.7) **must** be named and disclosed as an audit, never as a boundary. Prevention **must** be the default wherever the host allows unprivileged user namespaces.
+- **R-HARDEN.8 — Irreversible remote actions are gated at the credential.**
+  - HTTPS tokens (`gh`, cloud CLIs, model keys) **should** stay outside the sandbox. The egress proxy injects them per host after consent, as R-CRED does for SSH signatures.
+  - Ahma **must not** offer command-name deny rules as a security control: any equivalent command bypasses them.
+
+### R-POLICY: One policy decision point, and team policy in Cedar
+
+**Status: planned** (open: §11).
+
+**Problem.** Ahma's userspace permission decisions are made in about ten places, and each orders the same inputs its own way:
+- `fetch_webpage` checks `always_allow` before a session deny (R-WEB.2).
+- The egress proxy checks a session answer before the allowlist (R-WEB.16).
+- The link broker checks grants before a session deny (R-LINK.4).
+- SSH signing, grant admission (R5.4.5) and tool approvals (R-PERM.1.1) each have their own order again.
+
+The same question can therefore be answered differently on two surfaces. That breaks invariant 7.
+
+**Why Cedar, and where it stops.**
+- [Cedar](https://www.cedarpolicy.com/) is a policy language with deny by default, forbid that overrides permit, and a symbolic compiler that can prove properties of a policy set.
+- Security teams already write it for AWS Bedrock AgentCore Policy, Docker's MCP governance and NVIDIA OpenShell.
+- It is a good *shape* for ahma's decisions, and a good *format* for a team that wants to narrow what every developer's ahma allows.
+- It is not the interface for one person. `settings.toml`, `ahma setup` and the advisor stay.
+- It cannot be evaluated per system call, so it reaches the kernel only through what it admits.
+- A rule written in Cedar is unbypassable only where it is enforced. A tool-name rule at a gateway is bypassed by the same command in a shell, so ahma's boundary stays the kernel (invariant 1).
+
+- **R-POLICY.1 — One decision point.** Every userspace permission decision **must** be made by one function, `ahma_common::policy::decide`. That covers path-grant admission, an egress host, a `fetch_webpage` URL, a link, an SSH signature and a tool approval.
+  - Its input is a request shaped principal, action, resource and context, plus the facts the domain matched.
+  - Each domain keeps its own matching (host patterns, path prefixes). The order lives in one place.
+  - Kernel profiles are built only from what it admits.
+- **R-POLICY.2 — One precedence.** Every decision is evaluated in this order:
+  1. A forbid: the built-in hard denylist (R5.4.5), `never_allow` (R-WEB.2), or team policy (R-POLICY.3).
+  2. This session's answer from a human.
+  3. A standing permit: saved grants, allowlists.
+  4. The default: allow, ask, or deny when nobody can be asked.
+
+  A forbid always wins, and nothing permits what a forbid covers. Where this order is stricter than a domain's order today, the change **must** land with a test that shows it.
+- **R-POLICY.3 — Team policy narrows, never widens (experimental).**
+  - **Where it lives.** Cedar files in the trusted tier only (R-CFG2): `~/.ahma/policy/*.cedar` and a system directory (`/etc/ahma/policy/`, `/Library/Application Support/ahma/policy/`, `%ProgramData%\ahma\policy\`), never a project's `.ahma/`. The directories **must** be on the write-grant hard denylist.
+  - **Forbid only.** A file **must** contain only `forbid` statements. A `permit` fails validation.
+  - **When it loads.** Files are loaded once at startup (R-CFG4). A file that fails to parse or validate **must** fail closed: tool calls are refused with the `ahma policy validate` line to run.
+  - **The schema.** It ships with ahma. Paths and hosts are entity hierarchies, so `in` matches a subtree or a parent domain.
+- **R-POLICY.4 — What reaches the kernel.**
+  - A forbidden scope root **must** be dropped from the profile, and disclosed.
+  - A forbidden literal subpath inside an allowed scope **must** become a Seatbelt deny on macOS. On Linux, Landlock cannot carve one, so it is held by the kernel only under `linux_deny_tier = "namespace"` and otherwise in userspace (file tools, edit guard, grants).
+  - A forbid with a condition is held in userspace only.
+  - Each limit **must** be disclosed at startup and in `ahma doctor` (invariant 2).
+- **R-POLICY.5 — Every decision explains itself.** `ahma policy explain` **must** name the stage and the policy that decided. The audit log **must** record the stage of every decision.
+- **R-POLICY.6 — Export and proof.**
+  - `ahma policy export --cedar` **must** render the effective policy for review. Built-in forbids, saved grants and allowlists are included; session state is omitted, and the output says so.
+  - `ahma policy verify` **should** prove stated invariants with Cedar's symbolic compiler where a solver is installed, for example "nothing permits a write under `~/.ssh` or a policy directory". Without a solver it **must** fail with the line that installs one.
 
 ---
 
@@ -2321,6 +2404,7 @@ files with the code that implements them.
 | R-CFG | Configuration sources, tiers, retirement of `AHMA_*` | this file §3.5 |
 | R5–R7 | Sandbox scope, platform enforcement, nested sandboxes | this file §4 |
 | R-HANDOFF, R-PERM, R-DOCTOR | Trust handoff, permissions, doctor | this file §4 |
+| R-HARDEN, R-POLICY | Hardening roadmap; one policy decision point and team policy in Cedar | this file §4 |
 | R-LOG, R9 | Project logging, safe live-log access | this file §4.5 |
 | R-WEB (R-NET: R-WEB.16.8's name for subprocess egress approval) | Web and subprocess egress | this file §4.6 |
 | R-HTTP | Outbound HTTP | this file §4.7 |
@@ -2422,9 +2506,13 @@ Every requirement not yet met is listed here and nowhere else as a status; the b
 - **SSH key broker, remaining** (R-CRED.3, R-CRED.7): asking at the MCP client (elicitation) or the TUI while a command waits — today an MCP command is refused with the line and the human grants with `ahma permissions grant ssh-sign`; forwarding the client's `SSH_AUTH_SOCK` as a session option; denying a direct connect to the human's agent socket on Linux, where Landlock does not mediate a unix-socket connect (R-CRED.11) — masking it in the opt-in mount-namespace tier (R6.1.7) is the likely route, as for container sockets.
 - **Kernel denial records off macOS** (R-DENY.1): Linux and Windows still judge refusals from text; Landlock's audit records need privileges an ordinary user rarely has.
 - **One run outside the sandbox from MCP and the TUI** (R-ESCAPE): offered in Claude Code's dialog for hooked commands only.
-- **`ahma permissions grant`** (R-PERM.2.1): granting goes through each kind's own command (`ahma sandbox grant`, `ahma egress allow`, `ahma network allow`); the unified `grant` verb covers `ssh-sign` only.
+- **`ahma permissions grant`** (R-PERM.2.1): granting goes through each kind's own command (`ahma sandbox grant`, `ahma egress allow`, `ahma network allow`); the unified `grant` verb covers `ssh-sign` and `open-url` only.
 - **A hook question asked in a live MCP session** (R-PERM.6.1 rung 1): a hook denial is asked in Claude Code's dialog (R-PERM.10) or the TUI, never through a live MCP session for the same workspace.
 - **A shared helper started outside the sandbox serves a sandboxed client** (R-PROC.5, R-HANDOFF.6): a tool that keeps one helper for the whole machine and finds it through a file or a loopback port (a Gradle or Kotlin daemon, an editor's language server) lets a sandboxed build hand its work to a helper the IDE started unconfined, which then runs it outside the sandbox with no message. R-PROC.5 ends the helpers a sandboxed command starts; nothing general stops a sandboxed client from reaching one it did not start, because the kernel rule would have to know each tool's rendezvous. Reasoned from the mechanics, not reproduced. The route is one helper per workspace, as data in the tool's profile (R-PERM.5.5), as `sccache` has; `--restrict-network` refuses loopback and so closes it for helpers reached by port.
 - **Container daemon sockets on Linux** (R-HANDOFF.6): Landlock at the ABI ahma uses does not mediate `connect(2)` to a pathname unix socket, and ahma has no other rule there, so a command whose user may reach a daemon socket (the `docker` group for `/var/run/docker.sock`, rootless Docker or podman under `$XDG_RUNTIME_DIR`) can use it. Masking the sockets in the opt-in mount-namespace tier (R6.1.7) is the likely route.
-- **The hub's token protects least where there is no filesystem boundary** (R-HUB.13): on Windows a command can read `hub.token` and connect; on Linux a command can reach the socket and the token is the only barrier (the runtime directory is in no Landlock ruleset and the token is never in an argument or environment variable; that a command cannot read a holder's memory or `/proc/<pid>/environ` rests on Landlock's ptrace scoping, which has no ahma test yet); under macOS deferral to an outer sandbox (R7.6) that sandbox, not ahma's, decides whether a command can connect or read the token. A hub socket the operator places in a directory a sandbox can read puts its token there too.
+- **The hub's token protects least where there is no filesystem boundary** (R-HUB.13): on Windows a command can read `hub.token` and connect; on Linux a command can reach the socket and the token is the only barrier (the runtime directory is in no Landlock ruleset and the token is never in an argument or environment variable; that a command cannot read a holder's memory or `/proc/<pid>/environ` rests on Landlock's ptrace scoping, pinned by `red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder`); under macOS deferral to an outer sandbox (R7.6) that sandbox, not ahma's, decides whether a command can connect or read the token. A hub socket the operator places in a directory a sandbox can read puts its token there too.
+- **Hardening roadmap and one decision point** (R-HARDEN.1–8, R-POLICY.1–6): planned, none implemented yet.
+- **Suspected, under test: `truncate(2)` outside the scope on Linux** (R-HARDEN.1): ahma's Landlock ruleset handles ABI 2, and truncation is a separate access right only from ABI 3. A sandboxed command may be able to truncate a file it cannot open for writing.
+- **Another process's environment is readable on macOS** (R-HARDEN.2): the Seatbelt profile allows `process-info*` and `sysctl-read` for every process (`sandbox/seatbelt.rs`), so `sysctl(KERN_PROCARGS2)` returns the arguments and the whole environment of any process of the same user that is outside the sandbox. Measured 2026-11-25: a command under ahma's profile read all 60 environment entries of the running ahma hub. An API key in an editor's, agent's or hub's environment is therefore readable by a sandboxed command. Linux refuses the same read (`/proc/<pid>/environ`) through Landlock's ptrace scoping, pinned by `red_team_a_sandboxed_command_cannot_read_the_hubs_token_or_its_holder`.
+- **The crates.io token is readable** (R-PERM.5, R6.2.3): the shipped `rust` profile grants `~/.cargo` read+execute, so `~/.cargo/credentials.toml` is readable by a sandboxed command on macOS and Linux; it is on no read denylist. Cargo needs it only to publish. Denying it on macOS is one Seatbelt rule; Linux needs the ruleset to grant `~/.cargo` piecewise.
 - **Explicit hook allow on Cursor and Antigravity** (R5.5.5): their PreToolUse allow contract is unverified, so the shell hook sends a plain `allow`.

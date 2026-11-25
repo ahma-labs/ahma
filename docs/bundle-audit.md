@@ -2,11 +2,11 @@
 
 > **Experimental.**
 
-Ahma can audit and verify MTDF tool bundles (directories of `.ahma/*.json` files) for supply-chain risks. This closes the "plugin marketplace contains malware" attack class by treating third-party bundles as untrusted by default.
+`ahma bundle audit` statically checks a directory of MTDF `.json` tool files for embedded secrets, prompt-injection text and missing path validation. You run it; nothing runs it when a bundle loads.
 
 ## Why bundle auditing?
 
-Third-party security analyses of cloud agent tool ecosystems consistently find a meaningful fraction of available plugins that contain embedded secrets, prompt-injection payloads, or malicious commands. Ahma's bundle auditor applies static analysis rules before any bundle is loaded.
+Third-party analyses of agent tool ecosystems keep finding plugins with embedded secrets, prompt-injection payloads or malicious commands. The checks here are substring heuristics: a clean report means none matched, not that the bundle is safe. Read what each tool's `command` does.
 
 ## Auditing a bundle
 
@@ -24,12 +24,12 @@ Auditing bundle: /path/to/bundle-dir
 Files checked: 3 | Findings: 2
 
 [CRITICAL] bad-tool.json: Possible embedded secret matching prefix `sk-`
-           Recommendation: Remove credentials from the bundle JSON.
+         Recommendation: Remove credentials from the bundle JSON.
 
 [WARNING ] curl-tool.json: Path-like argument may be missing `format: "path"` — potential sandbox escape
-           Recommendation: Add "format": "path" to all path-type arguments.
+         Recommendation: Add `"format": "path"` to all path-type arguments.
 
-FAIL Bundle audit found critical issues.
+Error: Bundle audit found critical issues.
 ```
 
 ## Audit findings
@@ -37,9 +37,9 @@ FAIL Bundle audit found critical issues.
 | Severity | Trigger | Risk |
 |----------|---------|------|
 | `critical` | Embedded secret prefix (`sk-`, `AKIA`, `ghp_`, `glpat-`, `AIzaSy`, …) | Credential exfiltration |
-| `critical` | Prompt-injection markers in `description` or `hints` | Agent manipulation |
-| `warning` | Path-like argument names without `format: "path"` | Sandbox path escape |
-| `warning` | Description length > 512 characters | Possible injection payload |
+| `critical` | Injection marker (e.g. `ignore previous`, `jailbreak`, `system:`, `assistant:`) in the top-level `description` | Agent manipulation |
+| `warning` | File mentions a `path`/`file`/`dir` key but no `"format": "path"` anywhere (one warning per file) | Sandbox path escape |
+| `warning` | Top-level `description` longer than 512 characters ("Unusually long description — possible prompt injection payload") | Possible injection payload |
 
 ## Creating a content manifest
 
@@ -58,9 +58,11 @@ a deprecated alias.
 
 ```bash
 ahma bundle verify /path/to/bundle-dir
-# PASS: every file matches the manifest
-# FAIL: one or more files differ from the manifest
+# PASS: every file the manifest lists is unchanged
+# FAIL: a listed file is missing or differs
 ```
+
+A `.json` file added after `checksum` is **not** detected.
 
 > **This is a corruption check, not a signature — and the distinction is not a
 > technicality.**

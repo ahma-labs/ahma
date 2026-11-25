@@ -18,35 +18,14 @@ the proxy on macOS, Landlock restricts outbound TCP to the proxy port on Linux
 allows it, `ahma network allow <host>`, so a tool that prints the proxy's answer,
 or `curl -v`, says why it failed.
 
-Almost nobody turned it on, because with an empty `[network] allow` the first
-command failed:
-
-```
-$ ahma serve --restrict-network
-$ cargo build
-    Updating crates.io index
-error: failed to get `serde` as a dependency
-  caused by: failed to fetch `https://index.crates.io/`
-```
-
-To get anywhere you had to already know that cargo resolves against
-`index.crates.io`, downloads from `static.crates.io`, hits `crates.io` for the
-API, and clones git dependencies from `github.com`. Then repeat that research for
-npm and Go. That research *was* the adoption barrier, so the configuration
-everyone actually ran was the unrestricted one.
-
-That matters more than a usability complaint. The eighth escape in Pillar
-Security's 2026 series landed on an eval sandbox whose single sanctioned egress
-path — a package-registry proxy — turned out to carry a zero-day, and that one
-trusted component was therefore the entire boundary. The lesson is not "never
-allow egress". It is that the sanctioned path has to be **deliberate and
-narrow**. A path nobody can configure is neither, because the configuration
-people fall back to permits everything.
+With an empty `[network] allow`, restricted mode used to break the first `cargo build`,
+because cargo needs `index.crates.io`, `static.crates.io`, `crates.io` and `github.com`.
+Profiles now supply those hosts, so a narrow, deliberate allowlist works out of the box.
 
 ## The mechanism: profiles already solved this for paths
 
 A [sandbox profile](permissions.md) is a pre-answered bundle of grant questions.
-`rust`, `node`, `go`, `android`, `apple`, `common` and `gh` each declare the filesystem paths their
+`rust`, `node`, `go`, `android`, `apple`, `common`, `gh` and `sccache` each declare the filesystem paths their
 toolchain needs, ship enabled by default, and are refusable individually through
 `[sandbox] profiles`.
 
@@ -100,7 +79,25 @@ trust it.
 | `proxy.golang.org` | The default `GOPROXY` module mirror | [proxy.golang.org](https://proxy.golang.org/) |
 | `sum.golang.org` | The default `GOSUMDB` checksum database — module authentication fails closed without it | same |
 
-### `common`
+### `android`
+
+| Host | Why |
+|---|---|
+| `dl.google.com` | Google's Maven repository (AndroidX, the Android Gradle plugin) and SDK component downloads |
+| `maven.google.com` | The documented alias of Google's Maven repository; Gradle's `google()` resolves against it |
+| `repo.maven.apache.org` | Maven Central: Gradle's `mavenCentral()` and Maven's default remote repository |
+| `repo1.maven.org` | Maven Central's canonical host; older POMs and Maven settings name it directly |
+| `services.gradle.org` | Gradle wrapper distributions (`gradlew` downloads the pinned Gradle version) |
+| `plugins.gradle.org` | The Gradle plugin portal: `plugins {}` blocks resolve plugin ids and artifacts here |
+
+### `apple`
+
+| Host | Why |
+|---|---|
+| `github.com` | SwiftPM dependencies are git repositories, overwhelmingly hosted on GitHub |
+| `cdn.cocoapods.org` | The CocoaPods spec CDN (`trunk` source) that `pod install` resolves against |
+
+### `common`, `sccache`
 
 Nothing. A shared cache directory is not an ecosystem and reaches nothing of its
 own; every host belongs to the toolchain that fetches it. Inventing an entry here
@@ -135,7 +132,7 @@ logs.
   that is exactly the kind of thing that should be an explicit decision.
 * **`index.golang.org`** — a feed of new module versions, consumed by tooling
   that watches the ecosystem, never by a build.
-* **PyPI, RubyGems, Maven Central, Docker Hub, …** — there is no shipped profile
+* **PyPI, RubyGems, Docker Hub, …** — there is no shipped profile
   for those toolchains, so there is nothing to hang the hosts on. Add them to
   `[network] allow` yourself, or contribute a profile.
 
@@ -236,7 +233,7 @@ removing `go` from `[sandbox] profiles` would answer a different — usually wro
 
 ```toml
 [sandbox]
-profiles = ["rust", "node", "go", "android", "apple", "common", "gh"]
+profiles = ["rust", "node", "go", "android", "apple", "common", "gh", "sccache"]
 
 [network]
 restrict = true
@@ -244,23 +241,11 @@ allow = ["artifacts.internal.example"]   # composes with the profile hosts
 deny_profile_hosts = ["go"]              # keep ~/.go, drop proxy.golang.org
 ```
 
-## The default stays opt-in — on purpose
+## The default stays opt-in, for now
 
-`[network] restrict` still defaults to `false`, and this work does not change
-that.
-
-That is a deliberate decision, not an unfinished job. Profiles make restricted
-mode survive a first `cargo build`, `npm install` or `go mod download`, but
-flipping the default on today would still break the first command for everyone
-whose toolchain has no shipped profile — which is most toolchains. Making
-restricted mode painless enough that defaulting it on becomes a responsible
-decision is the *point* of this change; making that decision is a separate one,
-to be taken on evidence.
-
-The same note is in the code, in
-`ahma_mcp::egress::host_grants` and on
-`ahma_common::config::NetworkSettings::restrict`, so a later reader does not
-"finish the job" by flipping it.
+`[network] restrict` defaults to `false`: most toolchains have no shipped profile yet (PyPI,
+RubyGems, Docker Hub), so turning it on would break their first command. Restricting by
+default is planned once they do (SPEC R-HARDEN.4); until then, turn it on yourself.
 
 ## Managing network grants and permissions
 

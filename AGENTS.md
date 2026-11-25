@@ -677,11 +677,23 @@ Before committing: `cargo fmt --all && cargo clippy --all-targets && cargo nexte
   result in their report (or as files in the session's scratch directory, outside the
   repo); the main agent reads it and applies it. Give each subagent the rule in its prompt:
   no edits inside the repo, no state-changing git commands, no builds.
-* **No git worktrees** — not for the main agent, not for subagents (`isolation: worktree`).
-  Each one is a cold `target/` (see [Target Directory & Cache
-  Management](#target-directory--cache-management)), a second sandbox scope, and a place
-  for work to be stranded. **Work on a normal feature branch in the main checkout**,
-  branched from a fresh `origin/main` (`/ahmadev land` step 1).
+* **No git worktrees** — not for the main agent, not for subagents (`isolation: worktree`),
+  not `git worktree add`, not `EnterWorktree`. Each one is a cold `target/` (see [Target
+  Directory & Cache Management](#target-directory--cache-management)), a second sandbox
+  scope, and a place for work to be stranded. **Work on a normal feature branch in the main
+  checkout**, branched from a fresh `origin/main` (`/ahmadev land` step 1). If
+  `git worktree list` shows anything besides the main checkout, land or rescue its work,
+  then `git worktree remove <path>` and `git worktree prune`.
+* **When a branch lands, delete it and go back to main**, in the same session:
+  `git switch main && git pull --ff-only && git branch -D <branch>` (`-D`, because a squash
+  merge is never seen as "merged" by `git branch -d` or `--merged`). PRs merged outside an
+  agent's `land` run (in the GitHub UI, or by a session that ended first) leave stale
+  branches that pile up, so at the start of any branch-and-PR work, sweep them with
+  `scripts/prune-merged-branches.sh` (`--dry-run` to preview). It deletes a branch only when
+  its upstream is gone **and** `gh` finds its PR merged, because a `[gone]` upstream alone is
+  not proof: a PR closed unmerged also deletes its branch. It also prunes stale worktrees.
+  It lists everything else, without deleting it. A branch with no upstream or no merged PR
+  may be unlanded work, so ask the human before deleting it.
 * **Integrate separate lines of work through CI, as separate PRs**, landed one after the
   other — not by merging branches locally. A large change is a sequence of small PRs, each
   branched after the previous one merges.

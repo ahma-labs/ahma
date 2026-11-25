@@ -473,11 +473,11 @@ Multi-agent: spawn subagents per independent fix.
 
 Triggered by a bare trailing integer (e.g. `/ahma simplify 3`):
 
-1. `simplify(directory=".", ai_fix=<N>)` — read the structured fix prompt
+1. `simplify` with `{"directory": ".", "ai-fix": <N>}` (hyphenated; `ai_fix` is ignored) — read the structured fix prompt
 2. Edit only the listed hotspot functions (no signature/API/behavior changes, no whole-file refactor)
 3. `simplify(directory=".", verify="<edited-file>")` — see the verdict table in
-   [docs/simplify.md#verification](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md#verification)
-4. Iterate with `ai_fix=<N+1>` until the project score is satisfactory
+   [docs/simplify.md#verify-diff-and-the-fix-prompt](https://github.com/ahma-labs/ahma/blob/main/docs/simplify.md#verify-diff-and-the-fix-prompt)
+4. Iterate with `"ai-fix": <N+1>` until the project score is satisfactory
 
 ### Anti-Patterns to Avoid
 

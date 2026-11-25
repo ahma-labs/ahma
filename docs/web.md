@@ -123,17 +123,7 @@ used to be `ahma web allow|deny|…` are `ahma egress …`.
 
 ## Building the page
 
-The page lives in `ahma_gui/web/` and is plain TypeScript compiled with `tsc`, the only
-development dependency. `cargo build` never runs Node. After changing the source:
-
-```bash
-cd ahma_gui/web
-npm ci --ignore-scripts
-npm run build
-npm test
-```
-
-and commit the result in `ahma_gui/web/dist/`; CI fails if it differs from a fresh compile.
+Developers: the page's source and build steps are in `ahma_gui/web/`.
 
 ## See also
 

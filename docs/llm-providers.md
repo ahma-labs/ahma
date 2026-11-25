@@ -35,6 +35,21 @@ name          = "azure-openai"
 base_url      = "https://my-resource.openai.azure.com/openai/v1"
 default_model = "my-gpt-4o-deployment"   # the deployment name
 api_key       = "${AZURE_OPENAI_KEY}"
+
+[[providers]]
+name          = "anthropic"
+base_url      = "https://api.anthropic.com/v1"
+default_model = "<model>"
+api_key       = "${ANTHROPIC_API_KEY}"
+```
+
+Or manage them from the command line, or with `/connect` in `ahma tui`:
+
+```bash
+ahma llm add --name openai --base-url https://api.openai.com/v1 --model gpt-4o-mini --api-key '${OPENAI_API_KEY}'
+ahma llm list
+ahma llm test openai
+ahma llm remove openai
 ```
 
 ### Configuring the provider in a tool file
@@ -84,7 +99,9 @@ export OPENAI_API_KEY="$(cat ~/.secrets/openai-key)"
 ahma serve stdio
 ```
 
-Or in a `.env` file that is **not committed to version control**.
+ahma does not read `.env` files. The variable must be in the environment ahma runs in: export
+it before your editor starts, or set it in the `env` block of the ahma entry in your MCP
+client config.
 
 ## LM Studio (`[lmstudio]` in `~/.ahma/settings.toml`)
 
@@ -114,25 +131,8 @@ loaded model in the app):
 model = "openai/gpt-oss-20b"
 ```
 
-### Using LM Studio as a named provider in tool definitions
-
-The LM Studio settings are exposed as a named provider available in `livelog`
-tools:
-
-```json
-{
-  "tool_type": "livelog",
-  "livelog": {
-    "llm_provider": {
-      "base_url": "http://localhost:1234/v1",
-      "model": "openai/gpt-oss-20b"
-    }
-  }
-}
-```
-
-> **Tip**: You can reference the LM Studio base URL and model from `settings.toml`
-> directly — the `ahma settings show` command prints the currently configured values.
+The `[lmstudio]` settings register a provider named `lmstudio` for chat. A `livelog` tool
+still inlines it: `"llm_provider": {"base_url": "http://localhost:1234/v1", "model": "openai/gpt-oss-20b"}`.
 
 ## Provider compatibility table
 

@@ -1,11 +1,11 @@
 # Session-Health and Pending-Grant Notifications
 
 **Status:** stable — SPEC R8.8. Everything below is observable behavior pinned by tests;
-treat it as a contract.
+treat it as a contract. Not delivered to 2026-07-28 stdio clients (see Recipes).
 
 ## Why
 
-The stdio proxy hides a dead bridge session from the MCP client: it rebuilds the
+The stdio proxy hides a lost hub connection from the MCP client: it rebuilds the
 connection and replays the handshake, which is the right default but leaves the client
 blind. Likewise, a `sandbox_grant` request can wait on a human surface (TUI modal, CLI
 hint) that the client cannot see. These notifications tell a client what happened —
@@ -55,10 +55,16 @@ absent from pre-R8.8 servers — treat missing as `0`):
 
 ## Recipes
 
-**Foreign client (Claude Code, Cursor, any MCP client):** nothing to do.
+**Foreign client on 2025-11-25 (Cursor, VS Code, any MCP client):** nothing to do.
 The mirror arrives as an ordinary logging notification and is surfaced by the
 client's existing log/notification UI. To do better, parse `params.data.kind`
 from notifications with `logger == "ahma.session"`.
+
+**2026-07-28 stdio client (Claude Code):** none of these notifications, the heartbeat
+included, are delivered; the protocol allows no unsolicited messages there (SPEC R-HUB.4.4).
+After a reconnect to a different ahma version the client gets
+`notifications/tools/list_changed`. Grant questions reach it as `input_required` on a tool
+call.
 
 **Ahma-aware client (TUI, custom integrations):** handle the
 `notifications/ahma/session_event` method (unknown methods are safe to ignore,

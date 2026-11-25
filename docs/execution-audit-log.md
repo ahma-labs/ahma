@@ -19,12 +19,6 @@ Output is not provenance. It tells you what a command printed — not that the
 command happened, when, in which directory, what it actually was after argument
 construction, or what it wrote that a trusted component will execute later.
 
-The question this answers is the fifth one the Pillar Security trust-handoff
-research puts to anyone running agents: *when trusted components execute
-agent-influenced content, is it auditable?* For a task vault the answer was
-already yes. For `run_terminal_command` — the overwhelmingly common path — it was
-no.
-
 ## Format
 
 One JSON object per line, `type`-tagged, with an RFC 3339 `timestamp` (UTC,
@@ -172,6 +166,14 @@ at runtime.
 }
 ```
 
+### `link_opened` / `link_refused`
+
+The link broker opened, or did not open, a web link a command asked for
+([open-links.md](open-links.md), SPEC R-LINK.9). `url` holds the scheme, host, port and path,
+and only the lengths of the query and fragment. `link_refused` adds `why` (not a web link,
+over the per-command cap, no grant, opener failed); `url` is absent when the argument was not
+a web link.
+
 ## Redaction
 
 Argument summaries, command strings, and paths pass through the same secret
@@ -207,10 +209,8 @@ there, because it is still believed.
 
 ## Configuration
 
-There is none, by design. Auditing that has to be switched on is auditing that is
-off on the machines where it would have mattered, and an off switch on an audit
-log is a feature request from the wrong side of the threat model. The location
-follows `--log-dir` / the `log_dir` setting with everything else.
+None, by design: an audit log you can switch off is off where it matters. The location
+follows `--log-dir` / `log_dir`.
 
 ## Related
 

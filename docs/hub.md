@@ -5,28 +5,17 @@
 
 There is **one ahma hub per user**, and it hosts both halves of ahma's
 background presence: the MCP endpoint your editors connect to, and the
-event stream that `ahma tui` watches. Whoever needs it first starts it —
-an editor's `ahma serve stdio`, `ahma tui`, or a hooked command — and everyone
-else attaches to the same one.
+event stream that `ahma tui` watches. Whoever needs it first starts it (an
+editor's `ahma serve stdio`, `ahma tui`, `ahma web` or `ahma desktop`) and everyone else
+attaches to the same one. A hooked command only reports to a hub that is already running.
 
 ## Why one
 
-Three Claude Code windows, a Cursor window and a TUI used to produce two
-independent singletons with two rendezvous points and two lifetimes: an MCP
-bridge on the machine-global `/tmp/ahma.sock`, and a hub that `ahma tui` would
-*become* if it happened to start first. That had consequences nobody chose:
-
-- Quitting the terminal window running the TUI took the event stream away from
-  every attached editor.
-- A TUI started in one directory made that directory the sandbox scope for
-  every editor session that attached afterwards.
-- The first client to start the bridge configured the rest: a second window's
-  `--tools` was ignored, and a first window's `--no-sandbox` unsandboxed
-  everybody.
-- Hooked shell commands reported to neither and were invisible everywhere.
-
-One hub fixes those by construction, and the trade is deliberate: several
-clients share one process. The **sandbox** is not shared — see below.
+Earlier releases ran an MCP bridge on a machine-global `/tmp/ahma.sock` and an event hub
+hosted by whichever `ahma tui` started first. Quitting a TUI broke attached editors, a TUI's
+launch directory became every later session's scope, the first client's `--tools` or
+`--no-sandbox` applied to everyone, and hooked commands were invisible. One hub fixes those by
+construction. Clients share one process, but not a sandbox (below).
 
 ## What it does and does not do
 
@@ -63,6 +52,9 @@ owned by someone else or reachable by group or others. It holds:
 | `hub.sock` | The one socket: the MCP endpoint editors proxy to, and the event stream (instances, operations and approvals). Only the lock holder binds or removes it. `0600`. |
 | `hub.token` | The secret every client must present (see below). `0600`, new each time a hub starts, removed when it stops. |
 | `history.jsonl` | The last hour of operations, so recent work survives a restart. `0600`. |
+| `hub.last-exit.json` | Why and when the last hub exited, and what it interrupted; `await` on an old operation id reads it (SPEC R-LIFECYCLE.4). |
+| `locks/` | Workspace write-queue locks ([workspace-queue.md](workspace-queue.md)). |
+| `mcp.sock`, `mcp.token`, `serve-http-<port>.token` | An `ahma serve unix` or `serve http` you started yourself, and their tokens (SPEC R-HUB.14). |
 
 Both halves share the socket. `/mcp` and `/health` are ordinary HTTP; the
 event stream is an HTTP upgrade (`GET /events` with `Upgrade: ahma-hub`), after
@@ -76,11 +68,6 @@ the hub reads the same setting, and the lock goes beside it. It checks ownership
 on the directory it picked itself — the `0700` one above. A directory you named
 is your decision; if it is writable by other users and has no sticky bit to stop
 them unlinking your socket, ahma says so at startup and carries on.
-
-The old machine-global `/tmp/ahma.sock` is retired: every local user could see
-it, and since nothing owned the path, pre-create it. A `0600` socket inside a
-world-writable directory is still squattable, which is why the directory is
-checked and not only the socket.
 
 On **Windows** (10 1803 or later) it is the same kind of `AF_UNIX` socket
 file, with the same lock; access control comes from the per-user profile ACL

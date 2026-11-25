@@ -12,17 +12,25 @@ that drives ahma's tools, as an embeddable Rust library.
 ahma_core = { git = "https://github.com/ahma-labs/ahma.git" }
 ```
 
+ahma's HTTP stack needs `--cfg reqwest_unstable`. Add to your project's `.cargo/config.toml`:
+
+```toml
+[build]
+rustflags = ["--cfg", "reqwest_unstable"]
+```
+
 ## Available primitives (MIT OR Apache-2.0)
 
 | Type | Purpose |
 |------|---------|
-| `Sandbox` / `SandboxMode` | Kernel-level filesystem sandbox |
+| `Sandbox` / `SandboxMode` / `SandboxOptions` | Kernel-level filesystem sandbox |
 | `OperationMonitor` | Async operation tracking and cancellation |
 | `MonitorConfig` / `OperationStatus` | Monitor configuration and status |
 | `AhmaMcpService` | Full MCP server service |
 | `Adapter` | CLI tool execution adapter |
 | `LlmClient` | OpenAI- and Anthropic-compatible LLM client |
-| `agent::execute_agent_turn`, `McpChatConfig`, `AgentEvent` | One chat turn: model reply plus the ahma tool calls it makes, over MCP |
+| `agent::{execute_agent_turn, spawn_agent_task}`, `McpChatConfig`, `AgentEvent`, `AgentApprovalGate` | One chat turn: model reply plus the ahma tool calls it makes, over MCP; every tool call passes the approval gate |
+| `advisor` | A model that recommends (never gives) an answer to a scope-grant question (R-PERM.8) |
 | `approvals` | Per-workspace "always allow" tool grants in the permission ledger |
 | `tool_menu` | Which tools a model is offered; how a small model asks for more |
 
@@ -35,6 +43,8 @@ those crates.
 | Crate | License | Key types |
 |-------|---------|----------|
 | `ahma_tui` | AGPL-3.0 | `run_tui` and the terminal UI |
+| `ahma_gui` | AGPL-3.0 | The `ahma web` / `ahma desktop` surface |
+| `ahma_bin` | AGPL-3.0 | The `ahma` binary |
 
 Embedding any of these AGPL crates means any modified version offered to remote users
 over a network must publish its modified source code (AGPL-3.0 §13).

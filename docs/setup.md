@@ -1,6 +1,6 @@
 # Setup — `ahma setup`, `/setup` and `ahma setup --plan`
 
-**Status:** Stable. SPEC: [R-SETUP.3, R-SETUP.4](../SPEC.md).
+**Status:** tests-pass. SPEC: [R-SETUP.3, R-SETUP.4](../SPEC.md).
 
 ## Why
 

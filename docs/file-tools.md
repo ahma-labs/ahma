@@ -1,21 +1,14 @@
 # Built-in File Tools
 
-**Status:** stable.
+**Status:** tests-pass.
 
 ahma ships its own file tools — read, write, edit, patch, list, find and search
 — for clients that have none of their own (ahma's own agent in `ahma tui`, the
-`agent` sub-agent tool, and MCP clients without native file tools). Clients
-that already have native equivalents (Claude Code, Cursor, VS Code) are not
-offered them, so a model never has two ways to write the same file.
-
-## Why
-
-An edit tool that is easy to get wrong gets wrong edits. The old
-`replace_in_file` replaced **every** occurrence of its match, never checked the
-model had seen the file, wrote in place, and answered "Replaced 3
-occurrence(s)" — a one-line fix could silently rewrite a file, over a version
-the user had changed a second earlier. The rules below are the ones the best
-current harnesses converged on, applied to every write path.
+`agent` sub-agent tool, and MCP clients without native file tools). Clients with native equivalents (Claude Desktop, Claude Code, GitHub Copilot
+CLI, Cursor, VS Code) are not offered `read_file`, `write_file`,
+`replace_in_file`, `multi_edit`, `apply_patch`, `list_dir`, `file_search`,
+`grep_search` or `todo_write`, so a model never has two ways to write the same
+file. `fetch_webpage` is offered to every client.
 
 ## The rules
 
@@ -78,7 +71,8 @@ Models trained on other harnesses can use those names: `Read`, `Write`, `Edit`,
 | `apply_patch` | `patch`, `base_dir` | `*** Begin Patch` format: Add / Delete / Update (with `@@` anchors, `*** Move to:`); whitespace-tolerant context matching; all or nothing |
 | `list_dir` | `path` | One level, sorted |
 | `file_search` | `pattern`, `base_dir` | Glob on the relative path; `.gitignore` respected, hidden skipped; newest first; ≤ 1000 |
-| `grep_search` | `query`, `is_regex`, `case_sensitive`, `include_pattern`, `context`, `output_mode` (`content`/`files`/`count`), `max_results` | `.gitignore` respected; binary and >10 MB files skipped |
+| `grep_search` | `query`, `base_dir`, `is_regex`, `case_sensitive`, `include_pattern`, `context`, `output_mode` (`content`/`files`/`count`), `max_results` | `.gitignore` respected; binary and >10 MB files skipped |
+| `todo_write` | `todos[]` (`content`, `status`) | Replaces the session's task checklist (shown in `ahma tui`) |
 | `fetch_webpage` | `url`, `query` | Readable text, ≤ 50,000 chars; `query` keeps matching lines. Governed by `[web]`; a redirect to another host follows `[web] on_redirect_to_new_domain` ([permissions.md](permissions.md#web-domains-and-redirects)) |
 
 ## See also

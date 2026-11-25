@@ -37,11 +37,12 @@ brings `tough 0.22.0` with it. Verify with:
 cargo tree -i tough      # tough v0.22.0 └── sigstore v0.14.0
 ```
 
-The same change removed the transitive crates behind **RUSTSEC-2024-0370**
-(`proc-macro-error`) and **RUSTSEC-2026-0215** (`smallstr`), whose `deny.toml`
-ignores were deleted.
+The same change removed **RUSTSEC-2026-0215** (`smallstr`). **RUSTSEC-2024-0370**
+returned later through a path that is never compiled; see its entry below.
 
-### Still open: RUSTSEC-2023-0071 (`rsa` Marvin Attack)
+---
+
+## RUSTSEC-2023-0071 — `rsa` (Marvin Attack) — **Accepted**
 
 `sigstore`'s own `verify` feature enables `fulcio` → `oauth` → `openidconnect`,
 which is the only reason `rsa` is in the graph. ahma signs nothing and never
@@ -49,3 +50,30 @@ performs an RSA private-key operation; `openidconnect` uses `rsa` for public-key
 JWT signature verification only. The `deny.toml` ignore stays until `sigstore`
 stops chaining those features, or `openidconnect` moves off `rsa`. Upstream to
 watch: <https://github.com/sigstore/sigstore-rs>.
+
+---
+
+## RUSTSEC-2026-0387 — `crypto-bigint` 0.5 timing variability — **Accepted**
+
+| | |
+|---|---|
+| **Crate** | `crypto-bigint` 0.5.5, via `sigstore` → `openidconnect` → `elliptic-curve` 0.13 |
+| **Fixed in** | `>= 0.7.6`, a breaking API change `elliptic-curve` 0.13 and `openidconnect` 4.0 have not adopted |
+| **Why it is tolerable** | ahma's use of `sigstore` is public-key verification of release attestations only (`ahma verify`, `ahma update`), never a private-key operation with a secret |
+| **Closes when** | `sigstore` stops chaining `fulcio` → `oauth`, or `openidconnect` upgrades |
+
+## RUSTSEC-2024-0370 — `proc-macro-error` unmaintained — **Accepted**
+
+| | |
+|---|---|
+| **Crate** | `proc-macro-error`, via `tao`'s Linux windowing stack (`gtk` 0.18 → `glib-macros` / `gtk3-macros`) |
+| **Why it is tolerable** | "Unmaintained", not a vulnerability, in a build-time proc macro. `ahma_gui` uses `tao` only on macOS and Windows, where it uses no gtk; no Linux build links `tao`. The lockfile lists it because Cargo locks every platform |
+| **Closes when** | Never reached on a shipped target. Re-check with `cargo tree -i proc-macro-error --target <triple>` |
+
+## RUSTSEC-2026-0543 — `chrono` unmaintained — **Accepted**
+
+| | |
+|---|---|
+| **Crate** | `chrono`, via `rmcp` (non-optional), `oauth2` 5.0 (`ahma_http_mcp_client`) and `sigstore` 0.14 (`ahma_update`) |
+| **Why it is tolerable** | "Unmaintained", not a vulnerability; no flaw is reported in the code ahma runs, which formats and compares timestamps. ahma's own code uses `jiff` (R-TIME.1) and turns on no `chrono` feature |
+| **Closes when** | `cargo tree -i chrono` shows nothing. A vulnerability advisory for `chrono` would fail the check by itself, since this entry covers only this id |

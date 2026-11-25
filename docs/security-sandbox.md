@@ -1,12 +1,12 @@
 # Security Sandbox
 
-Ahma enforces **kernel-level filesystem sandboxing** by default. The sandbox scope is set once at server startup and cannot be changed. What that buys you is **not** one guarantee across all three platforms, and it must not be stated as one (SPEC R6.1.6, R6.2.2, R6.3.9):
+Ahma enforces **kernel-level filesystem sandboxing** by default. Each session locks its scope once; it widens only by grants a human approves ([permissions.md](permissions.md)). What that buys you is **not** one guarantee across all three platforms, and it must not be stated as one (SPEC R6.1.6, R6.2.2, R6.3.9):
 
 | | Writes outside the scope | Reads outside the scope |
 |---|---|---|
 | **Linux** (Landlock) | denied by the kernel | denied by the kernel |
 | **macOS** (Seatbelt) | denied by the kernel | **not confined** — the profile grants blanket read; a credential denylist compensates ([below](#macos-seatbelt)) |
-| **Windows** (Job Objects) | **not confined by path** — process-lifetime containment only; AppContainer is pending | **not confined** |
+| **Windows** (Job Objects) | **not confined by path**: process-lifetime containment only; AppContainer is built but off. Use WSL2 for a boundary | **not confined** |
 
 Within the scope the agent has full access, with deliberate exceptions — see [Writable, but not everything](#writable-but-not-everything-trust-handoff).
 
@@ -23,14 +23,7 @@ Trust-based security ("do you trust this tool?") doesn't protect against mistake
 The sandbox scope is the root directory boundary — for writes everywhere it is enforced, and for reads on Linux (see the table above):
 
 - **STDIO mode**: the IDE reports the workspace through `roots/list`, so setting `"cwd": "${workspaceFolder}"` in `mcp.json` makes the sandbox "just work". The launch directory is not itself trusted as a scope: it becomes the scope only by being *reported* through `roots/list` or *named* explicitly, never by being inferred from where the process started or from project-marker files (SPEC R5.2.1).
-- **HTTP mode**: Set once when the server starts. Configure via:
-  1. `--sandbox-scope <path>` CLI flag (highest priority)
-  2. `scopes = [...]` in `~/.ahma/settings.toml`
-  3. MCP client `roots/list` (an **empty** answer is not a workspace and falls through)
-  4. A user elicitation answer
-  5. `container_root` from settings, narrowed to the project in use
-
-There is **no** sixth source and no invented directory. With none of the five available, ahma refuses tool calls and says how to fix it — it does not pick somewhere to run. (It used to: `sandbox_directory` defaulted to an auto-created `~/sandbox`, so a client reporting no roots silently locked there and every command failed with an ordinary-looking shell error such as `fatal: not a git repository`.)
+- **HTTP / hub**: each session's own subprocess locks its scope once (R5.1), from the first of: (1) an explicit `--sandbox-scope`, `scopes` in `~/.ahma/settings.toml`, or a task vault; (2) the client's `roots/list` (an empty answer falls through); (3) `[sandbox] container_root`, narrowed to the project in use. A client with no roots may be asked through its prompt. With none of these, ahma refuses tool calls and says how to fix it; it never invents a directory.
 
 ### Container root and auto-narrowing
 
@@ -60,9 +53,11 @@ On Linux, Ahma uses [Landlock](https://docs.kernel.org/userspace-api/landlock.ht
 **Requirements**: Linux kernel 5.13 or newer (released June 2021). The server refuses to start on older kernels unless sandbox is explicitly disabled.
 
 ```bash
-uname -r                            # check kernel version
-cat /sys/kernel/security/lsm        # verify landlock is active
+uname -r   # 5.13 or newer
 ```
+
+ahma probes Landlock itself at startup, because the `lsm` file can be wrong in containers
+(SPEC R6.1.5). `ahma status` shows whether the sandbox is enforcing.
 
 A Landlock rule is an allow-list of file descriptors, so the read-only set is expressed as explicitly as the writable one and anything unnamed is unreadable. This is the position the phrase "outside the scope is denied" actually describes, and it holds **only** here (SPEC R6.1.6).
 
@@ -117,7 +112,7 @@ or per-invocation with `--no-allow-keychain` (and `--allow-keychain` to force it
 
 ### Windows (Job Objects; AppContainer pending)
 
-On Windows, Ahma applies a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) at startup, which guarantees child processes are killed when the server exits. A Job Object does **not** restrict filesystem access by path in either direction — not writes, not reads. Path confinement would arrive with per-command AppContainer isolation. That is written — per-session container SID, scoped ACL grants, launcher re-entry — and on `windows-latest` its boundary holds both ways: inside the container a command can write and read the scope and is denied outside it. It is still switched off, because ordinary tools cannot run inside it yet: writing to `NUL` is denied, and so is looking at any folder above the scope, which breaks path canonicalization and Windows PowerShell 5.1 started from a short (8.3) path. The honest position today is **process-lifetime containment and no kernel filesystem boundary** (SPEC R6.3.9). The `appcontainer_dacl_diagnostics` test measures the boundary without depending on a shell, through a probe mode of `ahma.exe` that reports raw OS error codes and the container token; it runs on every Windows CI leg. ahma's own path validation still binds the paths ahma resolves, but it cannot bind what a spawned command does with its own syscalls — so the scope shown on Windows is a scope ahma honours, not one the OS enforces.
+A Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) kills child processes when the server exits. It does **not** restrict file access by path, for writes or reads. Per-command AppContainer isolation is built, and holds both ways on CI, but is switched off: ordinary tools cannot write `NUL` or look at folders above the scope inside it (SPEC R6.3.3, §11). So on Windows ahma checks the paths it resolves itself, but the OS enforces no boundary on what a command does (R6.3.9). **For a boundary on Windows, run ahma inside WSL2**, where Landlock applies.
 
 PowerShell (5.1+) is the shell. See [SPEC.md R6.3](../SPEC.md) for the GA gate this section has to clear.
 
@@ -224,9 +219,9 @@ What this does **not** do, on purpose:
 
 ## Signals: a command may stop only what it started
 
-The profile also grants `process-info*`, so `pgrep` and `lsof` work under it (SPEC R6.2.8). `/bin/ps` and `top` are setuid root, and no sandbox can execute a setuid binary (a kernel rule, not a missing allow), so `ahma ps [FILTER]` lists processes instead — pid, parent, start, whether the process is itself sandboxed, command line — and is read-only and never queued. Denying process information protected nothing and left agents unable to see what they were waiting for. The same holds for every setuid or setgid program (`sudo`, `su`, `login`, …). When a shell says it could not run one (`bash: /bin/ps: Operation not permitted`), ahma explains that and offers no grant: the file's setuid bit tells it apart from a refused redirect, which prints the same line and is a write you may grant. Nothing inside the system program trees (`/bin`, `/sbin`, `/usr` except `/usr/local`, `/lib*`, `/System`) is ever granted, since every sandbox already reads and runs them, and `ahma doctor` offers to remove a grant saved there before this rule (SPEC R6.2.8.1, R-PERM.4.3).
+The profile also grants `process-info*`, so `pgrep` and `lsof` work under it (SPEC R6.2.8). `/bin/ps` and `top` are setuid root, and no sandbox can execute a setuid binary (a kernel rule, not a missing allow), so `ahma ps [FILTER]` lists processes instead — pid, parent, start, whether the process is itself sandboxed, command line — and is read-only and never queued. Denying all process information left agents unable to see what they were waiting for, but the blanket allow also hands a sandboxed command the **arguments and full environment of every process you run** (`sysctl(KERN_PROCARGS2)`), API keys in an editor's or agent's environment included. That is open; narrowing it is planned (SPEC §11, R-HARDEN.2). Until then keep secrets out of long-lived environments, or keep `--restrict-network` on. The same holds for every setuid or setgid program (`sudo`, `su`, `login`, …). When a shell says it could not run one (`bash: /bin/ps: Operation not permitted`), ahma explains that and offers no grant: the file's setuid bit tells it apart from a refused redirect, which prints the same line and is a write you may grant. Nothing inside the system program trees (`/bin`, `/sbin`, `/usr` except `/usr/local`, `/lib*`, `/System`) is ever granted, since every sandbox already reads and runs them, and `ahma doctor` offers to remove a grant saved there before this rule (SPEC R6.2.8.1, R-PERM.4.3).
 
-On macOS the Seatbelt profile grants `(allow signal (target same-sandbox))`, so a sandboxed command can `kill` the process tree it started under the same profile and nothing else. A `kill` aimed at another session's build, a server from an earlier command, or any other process of yours is refused by the kernel, and ahma explains the `kill: (N) - Operation not permitted` it sees as a boundary rather than a dead pid: the agent is told the pid belongs to something outside its sandbox and that a human must stop it (SPEC R6.2.6). `[sandbox] signal_other_processes = true` is the explicit opt-out, logged at startup. (Linux and Windows do not confine signals; the README's *What the sandbox does not cover* says so.)
+On macOS the Seatbelt profile grants `(allow signal (target same-sandbox))`, so a sandboxed command can `kill` the process tree it started under the same profile and nothing else. A `kill` aimed at another session's build, a server from an earlier command, or any other process of yours is refused by the kernel, and ahma explains the `kill: (N) - Operation not permitted` it sees as a boundary rather than a dead pid: the agent is told the pid belongs to something outside its sandbox and that a human must stop it (SPEC R6.2.6). `[sandbox] signal_other_processes = true` is the explicit opt-out, logged at startup. Linux and Windows do not confine signals yet (planned for Linux, SPEC R-HARDEN.2).
 
 ## Tools that bring their own sandbox (SwiftPM, xcodebuild)
 
@@ -270,9 +265,11 @@ A build that fails with `sccache: error: Operation not permitted` (often shown b
 
 The Seatbelt profile is `(deny default)` and grants no `iokit-open`, so Metal cannot open the GPU inside a sandboxed command: llama.cpp reports `failed to create command queue`, a Metal probe sees no device, and GPU-accelerated tests fall back to the CPU or fail. This is a **capability**, not a path, so no prompt can grant it and the `sandbox_grant` tool is the wrong tool; ahma recognises the failure and tells the agent so instead of letting it hunt for a directory to request, with the one command a human runs: `ahma settings set sandbox.allow_gpu true`. A run that *succeeded* after falling back to the CPU gets the same note, because nothing else would say why it was slow. `[sandbox] allow_gpu = true` enables it by adding only the Metal user-client classes Apple's own profiles use (`AGX*` on Apple silicon, `IOAccel*`/`IGAccel*` on AMD and Intel, the IOGPUFamily client a paravirtualised GPU presents in a VM, and `IOSurface`), never a blanket IOKit allow, which would also hand over cameras and HID devices (SPEC R6.2.7). While the GPU is withheld, every scope display says so. With it on, Metal compute works in full (buffers, shaders compiled at runtime, dispatch), which is what whisper.cpp, llama.cpp and MLX need; CI proves it on every macOS run. A WebKit view needs no setting: it runs in the default sandbox, and its "Could not create a sandbox extension" messages are noise. A failed Metal buffer allocation (whisper.cpp and llama.cpp report `failed to allocate buffer` through ggml) is recognised the same way. A sandboxed command may allocate pseudo-terminals of its own (test runners and `script` need them), never another process's terminal (SPEC R6.2.11).
 
-Launching an app through LaunchServices (`open App.app`, `open -a`, `open <URL>`) is never allowed: LaunchServices starts the app outside every sandbox. Run the app's binary directly (`App.app/Contents/MacOS/App`) to keep it confined; ahma says so when `open` is refused (SPEC R6.2.10). A web link is opened another way: a command's `BROWSER` is ahma's link helper, which opens `http`/`https` links outside the sandbox for sites you allowed, and a whole-line `open https://…` runs as it ([open-links.md](open-links.md), SPEC R-LINK). When some other form of `open` is refused a web link, ahma names the exact `ahma open-url '<URL>'` to run instead, and never offers to run it outside the sandbox.
 
-The hub and the workers it spawns start in ahma's runtime directory, never in the checkout the hub happened to be launched from: a worker's scope comes from its own client's `roots/list`, and its tools directory and operation logs follow that scope. Before this, every worker inherited the first checkout's directory, logged into it, and loaded that checkout's `.ahma/` as the trusted tool set of every other project (SPEC R-HUB.12).
+
+## Opening apps and web links
+
+Launching an app through LaunchServices (`open App.app`, `open -a`, `open <URL>`) is never allowed: LaunchServices starts the app outside every sandbox. Run the app's binary directly (`App.app/Contents/MacOS/App`) to keep it confined; ahma says so when `open` is refused (SPEC R6.2.10). A web link is opened another way: a command's `BROWSER` is ahma's link helper, which opens `http`/`https` links outside the sandbox for sites you allowed, and a whole-line `open https://…` runs as it ([open-links.md](open-links.md), SPEC R-LINK). When some other form of `open` is refused a web link, ahma names the exact `ahma open-url '<URL>'` to run instead, and never offers to run it outside the sandbox.
 
 ## Clipboard: denied
 
@@ -287,13 +284,13 @@ to keep the code off the clipboard ([docs/web.md](web.md)).
 
 ## Network egress
 
-The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the domains in `[network] allow` — deny-all when that list is empty — and refuses private, loopback and cloud-metadata addresses. The README's *What the sandbox does not cover* section states what that restriction is and is not on each platform. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).
+The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the allowed hosts (`[network] allow` plus each enabled profile's hosts) and refuses private, loopback and cloud-metadata addresses. It is kernel-enforced on macOS (only the proxy is reachable) and on Linux 6.7+ (TCP only, pinned to the proxy port; UDP is not filtered), and advisory elsewhere. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).
 
 ## Nested Sandbox Environments (Cursor, Claude Code, VS Code, Docker)
 
 When ahma runs inside a host that may provide its own kernel sandbox (Cursor's agent sandbox, Claude Code's Bash sandbox, VS Code, Docker), ahma does **not** try to mimic or coexist with the host's internals (such as the build-cache environment variables Cursor injects), and it does **not** stand down because the host *might* be sandboxing. It applies **its own sandbox on every execution path**, defers only when the kernel proves an outer sandbox is enforcing, and **always tells you which one is active**.
 
-ahma can *name* a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`, `VSCODE_*`, `/.dockerenv`/`container`). A marker only proves which harness launched the process. Claude Code, for example, sets `CLAUDECODE=1` for every process it starts whether or not its Bash sandbox is enabled — and it is off by default. An earlier release let terminal hooks pass commands through unchanged on that marker, so a Claude Code session ran every Bash command unsandboxed for days while `ahma hooks status` said ACTIVE and the disclosure was written to a hook field Claude Code does not render. That is why markers now name, and never decide (SPEC R7.2).
+ahma can *name* a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`, `VSCODE_*`, `/.dockerenv`/`container`). A marker only proves which harness launched the process. Claude Code sets `CLAUDECODE=1` whether or not its Bash sandbox is on (off by default), so markers name a host and never decide enforcement (SPEC R7.2).
 
 **A client's own terminal is outside unless hooked.** ahma confines what it runs. A client's own terminal (VS Code's, Claude Desktop's, Zed's, LM Studio's, or Claude Code's Bash tool without ahma's hook) runs outside every boundary ahma has. The `status` tool and the TUI session list say so for each connected client (SPEC R7.8).
 
@@ -339,45 +336,14 @@ If ahma cannot apply its own sandbox and this is not a recognized nesting case, 
 
 ## HTTP Transport Authentication
 
-When `ahma serve http` is started with `--require-token <token>` or `--require-token-path <file>`, every `/mcp` endpoint requires **bearer token authentication** (without either, there is none — bind to loopback):
+`ahma serve http` and `ahma serve unix` require a bearer token on every route but `/health`
+by default, because a sandboxed command can reach a loopback port or a Unix socket (SPEC
+R-HUB.14). Setup, client configuration and `--allow-unauthenticated`:
+[connection-modes.md](connection-modes.md#authentication-on-by-default).
 
-```jsonc
-// mcp.json
-{
-  "mcpServers": {
-    "ahma": {
-      "url": "http://localhost:4000/mcp",
-      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
-    }
-  }
-}
-```
-
-- Start the server with `--require-token <token>` (or `auth.require_token` in `~/.ahma/settings.toml`; `AHMA_REQUIRE_TOKEN` is retired and ignored).
 - The `Authorization: Bearer` scheme is **case-insensitive** (RFC 7235 §2.1).
-- The `/health` endpoint is explicitly **exempt** from authentication so orchestrators can probe liveness without credentials.
-- Bearer tokens are compared in **constant time** to prevent timing attacks.
-- **Hot-reload**: Send `SIGHUP` to swap the token without restarting; the new token is read from config and applied atomically.
-
-**Manual override** (when you know the outer environment is safe):
-
-```bash
-ahma --no-sandbox
-```
-
-Common `mcp.json` for nested environments (VS Code with workspace scoping):
-
-```json
-{
-    "servers": {
-        "Ahma": {
-            "type": "stdio",
-            "command": "ahma",
-            "args": ["--log-monitor"]
-        }
-    }
-}
-```
+- Tokens are compared in **constant time**.
+- **Hot-reload** (Unix, `--require-token-path` only): `SIGHUP` re-reads the token file and swaps the token atomically.
 
 ## Package Manager Cache Write (`--no-package-cache-write`)
 
@@ -450,8 +416,8 @@ default. There is no special flag for it — the supported remedy is the standar
    other projects never see it (SPEC R5.4.11). Credential/config files are never
    auto-granted and the path is risk-classified before it is offered. A grant you approve
    at the prompt takes effect **immediately** for the running session and persists; answer
-   for this session only if that is all you want. (If granted via CLI or offline editing,
-   restart the server for it to take effect.)
+   for this session only if that is all you want. (A grant made with `ahma sandbox grant` or by
+   editing the file applies from the server's next command; no restart is needed.)
 3. **Re-run** the original command.
 
 If a maintenance script bootstraps tools (e.g. `cargo install cargo-binstall`),
@@ -494,3 +460,8 @@ agent's word — see
 
 `--task-vault <dir>` makes a per-task directory's `workdir/` the whole sandbox scope and
 turns `rm` into a recoverable move to `trash/`. See [task-vault.md](task-vault.md).
+
+## See also
+
+- [how-ahma-compares.md](how-ahma-compares.md): kernel sandboxing next to containers, microVMs and other agent sandboxes, and where each is weaker.
+- SPEC [§4 Security](../SPEC.md#4-security---kernel-enforced-sandboxing), [R-HARDEN](../SPEC.md#r-harden-hardening-roadmap) and [§11 Known gaps](../SPEC.md#11-known-gaps).
