@@ -1,7 +1,7 @@
 //! GitHub CLI Tool Configuration Example
 //!
 //! This example demonstrates how to load and validate the gh (GitHub CLI) tool configuration
-//! from the examples/configs directory.
+//! bundled with ahma (the repository's `.ahma/`).
 //!
 //! # Usage
 //!
@@ -13,6 +13,6 @@ use ahma_mcp::schema_validation::MtdfValidator;
 use std::path::PathBuf;
 
 fn main() {
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/configs/gh.json");
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.ahma/gh.json");
     MtdfValidator::run_example_validation("gh tool", &config_path);
 }

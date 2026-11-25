@@ -1,7 +1,7 @@
 //! Tool Examples Configuration Validation Tests
 //!
-//! This test module validates that all tool configuration examples in the examples/configs
-//! directory are valid and conform to the MTDF schema. These tests run directly against
+//! This test module validates that the tool definitions ahma bundles (the repository's
+//! `.ahma/`) are valid and conform to the MTDF schema. These tests run directly against
 //! the validation logic rather than spawning cargo processes, making them fast and reliable.
 //!
 //! # Performance Note

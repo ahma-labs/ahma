@@ -104,10 +104,6 @@ otel = ["ahma_common/otel"]
 
 # Tool configuration examples
 [[example]]
-name = "rust_tool"
-path = "examples/rust_tool.rs"
-
-[[example]]
 name = "file-tools"
 path = "examples/file-tools.rs"
 
@@ -118,10 +114,6 @@ path = "examples/gh_tool.rs"
 [[example]]
 name = "git_tool"
 path = "examples/git_tool.rs"
-
-[[example]]
-name = "kotlin_tool"
-path = "examples/kotlin_tool.rs"
 
 [[example]]
 name = "python_tool"

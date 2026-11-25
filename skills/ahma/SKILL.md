@@ -228,7 +228,6 @@ Place `*.json` files in `.ahma/` at the project root to define project-local too
 path: `--tools-dir`). Ahma loads them once at startup — no watch mode; call the `restart` tool
 after editing one. Canonical guide with the full config format, subcommand/sequence-tool
 examples, reserved names, and validation:
-[.ahma/README.md](https://github.com/ahma-labs/ahma/blob/main/.ahma/README.md) ·
 [docs/custom-tools.md](https://github.com/ahma-labs/ahma/blob/main/docs/custom-tools.md).
 
 Minimal example:

@@ -145,10 +145,7 @@ fn test_json_tool_configuration_count_invariant() {
     // Verify core tools exist
     let has_python = json_files.iter().any(|f| f.contains("python"));
 
-    assert!(
-        has_python,
-        "python.json must exist (either in .ahma or examples/configs)"
-    );
+    assert!(has_python, "python.json must exist in .ahma");
 
     println!(
         "OK Tool configuration count validated: {} JSON files",
