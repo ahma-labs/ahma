@@ -31,7 +31,7 @@
 //! backtrack pathologically on adversarial input, and it returns at most **one**
 //! hit (the first) to avoid a prompt storm from a multi-line failure.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ahma_common::config::ScopeAccess;
 
@@ -46,6 +46,10 @@ pub struct DenialHit {
     pub access: ScopeAccess,
     /// Which signature matched — for logs and the prompt's "why".
     pub pattern: &'static str,
+    /// The program the line says was refused, when it says so: Seatbelt's
+    /// `Sandbox: cp(42) deny(1) …`, or a tool's own `cp: <path>: …` prefix.
+    /// What a refusal is charged to (SPEC R-PERM.10.1); `None` names nobody.
+    pub program: Option<String>,
 }
 
 /// How many lines a keyword-only denial line may look back to find the path it
@@ -112,7 +116,8 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
         }
 
         // Shape 1: keyword and path on the same line (most specific).
-        if let Some(hit) = scan_line(line) {
+        if let Some(mut hit) = scan_line(line) {
+            hit.program = line_program(line);
             return Some(hit);
         }
 
@@ -127,6 +132,7 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
                 path,
                 access,
                 pattern: "multi-line denial",
+                program: None,
             });
         }
 
@@ -145,6 +151,25 @@ pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
         }
     }
     None
+}
+
+/// The program a refusal line names as refused: Seatbelt's
+/// `Sandbox: <name>(<pid>) deny(1) …`, or the `<program>: ` prefix tools print
+/// their errors under (`cp: /x: Operation not permitted`, `/bin/cp: …`), by
+/// file name. A prefix with a space or no letter in it names nobody
+/// (`Caused by:`, `2>&1`). A word that is no program (`error:`) is harmless:
+/// a refusal is charged to it only when the command ran a program by that
+/// name (`harness_asks::refused_programs`).
+fn line_program(line: &str) -> Option<String> {
+    let name = match line.split_once("Sandbox: ") {
+        Some((_, rest)) => rest.split_once('(')?.0,
+        None => line.trim_start().split_once(": ")?.0,
+    };
+    let name = Path::new(name).file_name()?.to_str()?;
+    // zsh prefixes its errors `zsh:1:` with the line number.
+    let name = name.split(':').next()?;
+    (!name.is_empty() && !name.contains(char::is_whitespace) && name.contains(char::is_alphabetic))
+        .then(|| name.to_string())
 }
 
 /// True for cargo's report of a failed compiler probe through a wrapper:
@@ -216,6 +241,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
             path,
             access: ScopeAccess::Rw,
             pattern: "seatbelt file-write",
+            program: None,
         });
     }
     if is_seatbelt
@@ -226,6 +252,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
             path,
             access: ScopeAccess::Ro,
             pattern: "seatbelt file-read",
+            program: None,
         });
     }
 
@@ -245,6 +272,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
             path,
             access: ScopeAccess::Rw,
             pattern: "read-only / not-permitted",
+            program: None,
         });
     }
 
@@ -264,6 +292,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
                 path,
                 access: ScopeAccess::Ro,
                 pattern: "windows access-denied",
+                program: None,
             });
         }
     }
@@ -278,6 +307,7 @@ fn scan_line(line: &str) -> Option<DenialHit> {
             path,
             access: ScopeAccess::Ro,
             pattern: "permission denied",
+            program: None,
         });
     }
 
@@ -520,6 +550,35 @@ pub fn scan_signal_denial(output: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R-PERM.10.1: the line that says what was refused also says who,
+    /// so the refusal is charged to that program and not to every program on
+    /// the command line.
+    #[test]
+    fn a_refusal_line_names_the_program_refused() {
+        let program = |text: &str| scan_denial(text).and_then(|h| h.program);
+        let cases = [
+            ("cp: /x/y: Operation not permitted", Some("cp")),
+            ("/bin/cp: /x/y: Operation not permitted", Some("cp")),
+            (
+                "cp: cannot create regular file '/x/y': Permission denied",
+                Some("cp"),
+            ),
+            (
+                "kernel[0]: Sandbox: codesign(4242) deny(1) file-write-create /x/y",
+                Some("codesign"),
+            ),
+            ("zsh:1: operation not permitted: /x/y", Some("zsh")),
+            (
+                "error: failed to open: /x/y\nCaused by:\n  Operation not permitted (os error 1)",
+                None,
+            ),
+            ("Sandbox: my tool(7) deny(1) file-write-data /x/y", None),
+        ];
+        for (text, want) in cases {
+            assert_eq!(program(text).as_deref(), want, "{text}");
+        }
+    }
 
     /// SPEC R6.2.8, field case: `bash: /bin/ps: Operation not permitted` was
     /// read as a refused **write** of `/bin/ps`, offered as a read+write grant,

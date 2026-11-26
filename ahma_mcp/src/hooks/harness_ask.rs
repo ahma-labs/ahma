@@ -69,9 +69,17 @@ pub(super) fn harness_pid() -> Option<u32> {
     None
 }
 
-/// Remember that a hooked command in `cwd`'s workspace was refused `path`.
-/// Best-effort: a store that cannot be written only means no question later.
-pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, command: &str) {
+/// Remember that a hooked command in `cwd`'s workspace was refused `path`,
+/// charged to `program` when the refusal named one the command ran (SPEC
+/// R-PERM.10.1). Best-effort: a store that cannot be written only means no
+/// question later.
+pub(super) fn record_refusal(
+    cwd: &Path,
+    path: &Path,
+    access: ScopeAccess,
+    command: &str,
+    program: Option<&str>,
+) {
     let Some(dir) = harness_asks::default_dir() else {
         return;
     };
@@ -87,7 +95,7 @@ pub(super) fn record_refusal(cwd: &Path, path: &Path, access: ScopeAccess, comma
         at: ahma_common::session_grants::now_secs(),
         harness_pid: harness_pid(),
         command_digest: Some(CommandDigest::of(command)),
-        programs: ahma_common::harness_asks::command_programs(command),
+        programs: ahma_common::harness_asks::refused_programs(command, program),
     };
     if let Err(e) = harness_asks::record_refusal(&dir, &workspace_for(cwd), refusal) {
         tracing::debug!("harness question not recorded: {e:#}");
@@ -583,6 +591,12 @@ pub(super) struct Trial {
     question: Question,
     workspace: PathBuf,
     session_file: Option<PathBuf>,
+    /// When the approved run started: a write under the folder since then is
+    /// what shows a write grant was used (SPEC R-PERM.10.3).
+    started: std::time::SystemTime,
+    /// Whether the approved command runs a program the refusal was charged
+    /// to: all a read grant can show, since a read leaves no trace.
+    ran_refused_program: bool,
 }
 
 /// How the approved run ended, as far as a grant is concerned.
@@ -600,35 +614,121 @@ pub(super) enum TrialOutcome {
     Stopped,
 }
 
+/// What the approved run shows about the folder it was granted (SPEC
+/// R-PERM.10.3). A run that never touched the folder is no evidence: field
+/// case 2026-11-26, a yes before an unrelated `cargo nextest run` saved a
+/// write grant on `~/.local/bin` because the tests passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Evidence {
+    /// It wrote under the folder (a write grant), or ran the program that
+    /// was refused (a read grant).
+    Used,
+    /// A write grant, and nothing under the folder changed during the run.
+    WroteNothing,
+    /// A write grant on a folder too large to look through.
+    TooMuchToCheck,
+    /// A read grant, and the run did not run the program that was refused.
+    OtherProgram,
+}
+
+impl Evidence {
+    /// Why a run with this evidence decides nothing, as a clause.
+    fn why_undecided(self) -> &'static str {
+        match self {
+            Evidence::Used => "the run used it",
+            Evidence::WroteNothing => {
+                "this run wrote nothing there, so it showed nothing about the grant"
+            }
+            Evidence::TooMuchToCheck => "there is too much there to see whether this run used it",
+            Evidence::OtherProgram => {
+                "this run did not run the program that was refused, so it showed nothing about \
+                 the grant"
+            }
+        }
+    }
+}
+
 /// What a trial's run says about the grant.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TrialVerdict {
     Keep,
     Drop(&'static str),
-    Undecided,
+    /// Nothing is saved and the session grant stays; the clause says why.
+    Undecided(&'static str),
 }
 
-/// Keep a grant on `dir` when the run succeeded, or failed past it: not on
-/// `dir` again, not unrunnable, and `dir` exists (it was there, or the run
-/// made it). Drop it when the same folder was refused again, the command
-/// cannot run in any sandbox, or nothing exists there. A stopped run decides
-/// nothing.
-pub(super) fn trial_verdict(dir: &Path, outcome: TrialOutcome) -> TrialVerdict {
+/// Keep a grant on `dir` when the run succeeded, or failed past it (not on
+/// `dir` again, not unrunnable), `dir` exists, and `evidence` shows the run
+/// used it. Drop it when the same folder was refused again, the command
+/// cannot run in any sandbox, or nothing exists there. A stopped run, or one
+/// that never used the folder, decides nothing.
+pub(super) fn trial_verdict(dir: &Path, outcome: TrialOutcome, evidence: Evidence) -> TrialVerdict {
     let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     match outcome {
-        TrialOutcome::Succeeded => TrialVerdict::Keep,
-        TrialOutcome::Stopped => TrialVerdict::Undecided,
+        TrialOutcome::Stopped => {
+            TrialVerdict::Undecided("the run ended before it showed whether the grant helped")
+        }
         TrialOutcome::Unrunnable => {
             TrialVerdict::Drop("the command cannot run inside the sandbox at all")
         }
         TrialOutcome::Refused(path) if canonical(&path).starts_with(canonical(dir)) => {
             TrialVerdict::Drop("the same folder was refused again")
         }
-        TrialOutcome::Refused(_) | TrialOutcome::Failed if dir.exists() => TrialVerdict::Keep,
-        TrialOutcome::Refused(_) | TrialOutcome::Failed => {
+        _ if !dir.exists() => {
             TrialVerdict::Drop("nothing exists there, and the run did not create it")
         }
+        _ if evidence == Evidence::Used => TrialVerdict::Keep,
+        _ => TrialVerdict::Undecided(evidence.why_undecided()),
     }
+}
+
+/// How many entries [`folder_written_since`] looks through before it gives up.
+const WRITE_WALK_CAP: usize = 20_000;
+
+/// Some volumes keep coarse timestamps (FAT's two seconds).
+const MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether anything under `dir`, or `dir` itself, was written at or after
+/// `since`: a file or folder made or changed, or one removed (its folder's
+/// time changes, so a lock made and deleted counts). `None` when more than
+/// `cap` entries had to be looked at. Symlinks are not followed. A missing
+/// `dir` was not written.
+pub(super) fn folder_written_since(
+    dir: &Path,
+    since: std::time::SystemTime,
+    cap: usize,
+) -> Option<bool> {
+    let since = since.checked_sub(MTIME_SLACK).unwrap_or(since);
+    let fresh = |m: &std::fs::Metadata| m.modified().is_ok_and(|t| t >= since);
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return Some(false);
+    };
+    if fresh(&meta) {
+        return Some(true);
+    }
+    let mut pending = vec![dir.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(folder) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > cap {
+                return None;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if fresh(&meta) {
+                return Some(true);
+            }
+            if meta.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Some(false)
 }
 
 /// Spend an approval `token` for `command` in `cwd`: apply the session grant
@@ -697,9 +797,14 @@ pub(super) fn apply_approval(token: &str, cwd: &Path, command: &str) -> Option<A
             q.dir.display()
         ),
         trial: Some(Trial {
+            ran_refused_program: q.programs.is_empty()
+                || harness_asks::command_programs(command)
+                    .iter()
+                    .any(|p| q.programs.contains(p)),
             question: q,
             workspace,
             session_file,
+            started: std::time::SystemTime::now(),
         }),
         link_this_run: None,
     })
@@ -713,7 +818,18 @@ pub(super) fn finish_trial(trial: Trial, outcome: TrialOutcome) -> String {
     let home = ahma_common::config::ahma_home_dir();
     let other_repo =
         ahma_common::scope_grant::other_repository(&q.dir, &trial.workspace, home.as_deref());
-    match trial_verdict(&q.dir, outcome) {
+    let evidence = if q.access.is_write() {
+        match folder_written_since(&q.dir, trial.started, WRITE_WALK_CAP) {
+            Some(true) => Evidence::Used,
+            Some(false) => Evidence::WroteNothing,
+            None => Evidence::TooMuchToCheck,
+        }
+    } else if trial.ran_refused_program {
+        Evidence::Used
+    } else {
+        Evidence::OtherProgram
+    };
+    match trial_verdict(&q.dir, outcome, evidence) {
         // Another repository (SPEC R-PERM.11): a yes in a dialog is often a task typed into the
         // wrong terminal, so it never becomes permanent here. A human keeps it by typing the grant.
         TrialVerdict::Keep if other_repo.is_some() => format!(
@@ -760,9 +876,9 @@ pub(super) fn finish_trial(trial: Trial, outcome: TrialOutcome) -> String {
                 q.dir.display()
             )
         }
-        TrialVerdict::Undecided => format!(
-            "ahma: the run ended before it showed whether the grant on {} helped; it applies \
-             for this session only. To keep it, run `ahma sandbox grant {}`.",
+        TrialVerdict::Undecided(why) => format!(
+            "ahma: the grant on {} applies for this session only: {why}. To keep it, run `ahma \
+             sandbox grant {}`.",
             q.dir.display(),
             q.dir.display()
         ),
@@ -894,7 +1010,13 @@ mod tests {
         let cache = tmp.path().join("tool-cache");
         std::fs::create_dir_all(&cache).unwrap();
         let cache = dunce::canonicalize(&cache).unwrap();
-        record_refusal(&ws, &cache.join("x.lock"), ScopeAccess::Rw, "make heavy");
+        record_refusal(
+            &ws,
+            &cache.join("x.lock"),
+            ScopeAccess::Rw,
+            "make heavy",
+            None,
+        );
         if harness_pid().is_none() {
             // No harness above this test process to bound a grant: nothing
             // is asked anywhere, which `next_ask` already pins.
@@ -1155,6 +1277,7 @@ mod tests {
             &cache.join("heavy.lock.holder"),
             ScopeAccess::Rw,
             "make heavy",
+            None,
         );
 
         let env = HookEnvironment {
@@ -1254,6 +1377,8 @@ mod tests {
         // SPEC R-PERM.10.3: a yes is a trial; nothing is saved before the run.
         assert!(!remembered(), "saved before the run showed it helped");
         let trial = approval.trial.expect("a folder grant is a trial");
+        // The approved run used the folder it was granted.
+        std::fs::write(cache.join("heavy.lock"), "").unwrap();
         let line = finish_trial(trial, TrialOutcome::Succeeded);
         assert!(line.contains("remembered"), "{line}");
         assert!(
@@ -1590,7 +1715,10 @@ mod tests {
             },
             workspace: ws.clone(),
             session_file: None,
+            started: std::time::SystemTime::now(),
+            ran_refused_program: true,
         };
+        std::fs::write(other.join(".git/FETCH_HEAD"), "").unwrap();
         let line = finish_trial(trial, TrialOutcome::Succeeded);
         assert!(line.contains("another repository"), "{line}");
         assert!(line.contains("this session"), "{line}");
@@ -1646,35 +1774,158 @@ mod tests {
     }
 
     /// SPEC R-PERM.10.3: a grant is kept only when the run shows it helped.
-    /// Field case: a yes saved a grant on `/Applications/Google`, a folder
+    /// Field cases: a yes saved a grant on `/Applications/Google`, a folder
     /// that does not exist, for a program that could not run in any sandbox;
-    /// it stayed in settings.toml for good.
+    /// and (2026-11-26) a yes before an unrelated `cargo nextest run` saved a
+    /// write grant on `~/.local/bin` because the tests passed, though they
+    /// never touched it. A run that did not use the folder decides nothing.
     #[test]
     fn a_grant_is_kept_only_when_the_run_shows_it_helped() {
+        use Evidence::{OtherProgram, TooMuchToCheck, Used, WroteNothing};
         let tmp = tempfile::tempdir().unwrap();
         let dir = dunce::canonicalize(tmp.path()).unwrap().join("cache");
         let missing = tmp.path().join("Google");
         std::fs::create_dir_all(&dir).unwrap();
         let elsewhere = tmp.path().join("other");
-        let cases: [(&Path, TrialOutcome, &str); 8] = [
-            (&dir, TrialOutcome::Succeeded, "keep"),
-            (&missing, TrialOutcome::Succeeded, "keep"),
-            (&dir, TrialOutcome::Failed, "keep"),
-            (&dir, TrialOutcome::Refused(elsewhere.clone()), "keep"),
-            (&dir, TrialOutcome::Refused(dir.join("x.lock")), "drop"),
-            (&dir, TrialOutcome::Unrunnable, "drop"),
-            (&missing, TrialOutcome::Failed, "drop"),
-            (&dir, TrialOutcome::Stopped, "undecided"),
+        let cases: [(&Path, TrialOutcome, Evidence, &str); 13] = [
+            (&dir, TrialOutcome::Succeeded, Used, "keep"),
+            (&dir, TrialOutcome::Succeeded, WroteNothing, "undecided"),
+            (&dir, TrialOutcome::Succeeded, TooMuchToCheck, "undecided"),
+            (&dir, TrialOutcome::Succeeded, OtherProgram, "undecided"),
+            (&missing, TrialOutcome::Succeeded, WroteNothing, "drop"),
+            (&dir, TrialOutcome::Failed, Used, "keep"),
+            (&dir, TrialOutcome::Failed, WroteNothing, "undecided"),
+            (&dir, TrialOutcome::Refused(elsewhere.clone()), Used, "keep"),
+            (
+                &dir,
+                TrialOutcome::Refused(dir.join("x.lock")),
+                Used,
+                "drop",
+            ),
+            (&dir, TrialOutcome::Unrunnable, Used, "drop"),
+            (&missing, TrialOutcome::Failed, WroteNothing, "drop"),
+            (&dir, TrialOutcome::Stopped, Used, "undecided"),
+            (&dir, TrialOutcome::Stopped, WroteNothing, "undecided"),
         ];
-        for (dir, outcome, want) in cases {
-            let label = format!("{outcome:?}");
-            let got = match trial_verdict(dir, outcome) {
+        for (dir, outcome, evidence, want) in cases {
+            let label = format!("{outcome:?} {evidence:?}");
+            let got = match trial_verdict(dir, outcome, evidence) {
                 TrialVerdict::Keep => "keep",
                 TrialVerdict::Drop(_) => "drop",
-                TrialVerdict::Undecided => "undecided",
+                TrialVerdict::Undecided(_) => "undecided",
             };
             assert_eq!(got, want, "{} {label}", dir.display());
         }
+    }
+
+    /// Set `path`'s modified time to `when`; a folder too, which on Windows
+    /// opens only with backup semantics.
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS; FILE_WRITE_ATTRIBUTES.
+            options.custom_flags(0x0200_0000).access_mode(0x100);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+        options.open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    /// SPEC R-PERM.10.3: what counts as the run having written the folder.
+    #[test]
+    fn a_write_under_the_folder_is_seen_and_an_untouched_one_is_not() {
+        use std::time::{Duration, SystemTime};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("cache");
+        let deep = dir.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("old.bin"), "x").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let age_all = || {
+            for p in [
+                deep.join("old.bin"),
+                deep.clone(),
+                dir.join("a"),
+                dir.clone(),
+            ] {
+                set_mtime(&p, old);
+            }
+        };
+        age_all();
+        let since = SystemTime::now() - Duration::from_secs(600);
+        assert_eq!(
+            folder_written_since(&dir, since, 100),
+            Some(false),
+            "untouched"
+        );
+        assert_eq!(
+            folder_written_since(&tmp.path().join("missing"), since, 100),
+            Some(false),
+            "nothing there"
+        );
+
+        std::fs::write(deep.join("new.bin"), "y").unwrap();
+        set_mtime(&deep, old);
+        assert_eq!(
+            folder_written_since(&dir, since, 100),
+            Some(true),
+            "a new file"
+        );
+        std::fs::remove_file(deep.join("new.bin")).unwrap();
+
+        age_all();
+        let lock = dir.join("a").join("x.lock");
+        std::fs::write(&lock, "").unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(
+            folder_written_since(&dir, since, 100),
+            Some(true),
+            "a lock made and removed leaves its folder's time"
+        );
+
+        age_all();
+        assert_eq!(folder_written_since(&dir, since, 2), None, "past the cap");
+    }
+
+    /// SPEC R-PERM.10.1, R-PERM.10.3 (field case 2026-11-26): `cp` was refused
+    /// a write to a folder in a line that also ran `cargo`. The next `cargo
+    /// nextest run` is not asked about it; the next `cp` is, and names `cp`.
+    #[test]
+    fn a_refusal_asks_before_the_program_that_was_refused_and_no_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let ws = dunce::canonicalize(&ws).unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bin = dunce::canonicalize(&bin).unwrap();
+        let line = format!(
+            "cargo build --release && cp target/release/ahma {b}/ahma.new && chmod +x \
+             {b}/ahma.new && mv {b}/ahma.new {b}/ahma",
+            b = bin.display()
+        );
+        record_refusal(
+            &ws,
+            &bin.join("ahma.new"),
+            ScopeAccess::Rw,
+            &line,
+            Some("cp"),
+        );
+        assert_eq!(
+            next_ask(&ws, "session-culprit", "cargo nextest run", &[]),
+            None,
+            "an unrelated cargo command is not asked about cp's refusal"
+        );
+        let (question, _token) = next_ask(
+            &ws,
+            "session-culprit",
+            &format!("cp target/release/ahma {}/", bin.display()),
+            &[],
+        )
+        .expect("the program that was refused asks");
+        assert_eq!(question.programs, vec!["cp".to_string()]);
     }
 
     /// The question's grant is bound to the harness asking now, never to a
