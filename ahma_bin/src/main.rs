@@ -36,6 +36,11 @@ fn main() -> Result<()> {
     if let Some(code) = ahma_mcp::links::helper::dispatch(&argv) {
         std::process::exit(code);
     }
+    // ssh's ProxyCommand under --restrict-network (SPEC R-WEB.16.14): started
+    // by ssh inside the command's sandbox, for every connection.
+    if let Some(code) = ahma_mcp::egress::ssh_proxy::dispatch(&argv) {
+        std::process::exit(code);
+    }
     // `sudo`'s password dialog (SPEC R-ESCAPE.4 (b)): before arguments are parsed or settings
     // read, since a prompt must not depend on either.
     let mut args = std::env::args();

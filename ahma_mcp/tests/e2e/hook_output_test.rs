@@ -265,3 +265,33 @@ fn a_hooked_command_goes_through_the_egress_proxy_when_restricted() {
         "SECURITY: the egress proxy must refuse an unlisted host for a hooked command: {refused:?}"
     );
 }
+
+/// SPEC R-WEB.16.14: under restriction, git over ssh goes through ahma's
+/// egress proxy (ssh does not read `HTTP_PROXY`, so without ahma's
+/// `GIT_SSH_COMMAND` it connected directly and was refused by the kernel, or
+/// failed to resolve). The proxy answers for a host nothing allowed before
+/// resolving it, so this needs no internet: what proves the route is the
+/// proxy's own refusal, naming the command that allows the host.
+#[test]
+fn a_hooked_git_over_ssh_goes_through_the_egress_proxy_when_restricted() {
+    let (home, _ws, ws) = workspace();
+    std::fs::create_dir_all(home.path().join(".ahma")).unwrap();
+    std::fs::write(
+        home.path().join(".ahma/settings.toml"),
+        "[network]\nrestrict = true\n",
+    )
+    .unwrap();
+    let answer = hooked(
+        home.path(),
+        &ws,
+        "GIT_TERMINAL_PROMPT=0 git ls-remote git@unlisted.example:x/y.git 2>&1; true",
+        None,
+    );
+    assert!(
+        answer
+            .stdout
+            .contains("ahma network allow unlisted.example"),
+        "SECURITY: git over ssh must be routed through the egress proxy and refused there: \
+         {answer:?}"
+    );
+}
