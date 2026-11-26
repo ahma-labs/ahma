@@ -1628,6 +1628,19 @@ pub struct DoctorArgs {
     /// The folder to check (trust, logs). Defaults to the current directory.
     #[arg(long)]
     pub path: Option<std::path::PathBuf>,
+    /// A question or request in your own words, such as `ahma doctor turn temp off` or `ahma doctor why are my builds slow`. Opens ahma tui with `/doctor <words>`: the model you connected (`/connect`) answers from this report and can point you at a fix, a setting or a command, but never applies one. Without a terminal, the report is printed instead.
+    #[arg(trailing_var_arg = true, conflicts_with_all = ["fix", "path"], value_name = "WORDS")]
+    pub words: Vec<String>,
+}
+
+impl DoctorArgs {
+    /// The TUI command these words ask (SPEC R-DOCTOR.12), or `None` for the
+    /// plain report.
+    pub fn tui_command(&self) -> Option<String> {
+        let words = self.words.join(" ");
+        let words = words.trim();
+        (!words.is_empty()).then(|| format!("/doctor {words}"))
+    }
 }
 
 /// Arguments for `ahma permissions`.
@@ -4924,6 +4937,28 @@ mod tests {
     }
 
     // ─── CLI subcommand parsing ───────────────────────────────────────────────
+
+    /// SPEC R-DOCTOR.12: the words after `ahma doctor` are the doctor's first
+    /// question, asked in `ahma tui` as `/doctor <words>`.
+    #[test]
+    fn words_after_doctor_become_the_tuis_first_question() {
+        let cli = Cli::try_parse_from(["ahma", "doctor", "turn", "temp", "off"]).unwrap();
+        let Subcommands::Doctor(args) = cli.command else {
+            panic!("doctor");
+        };
+        assert_eq!(args.tui_command().as_deref(), Some("/doctor turn temp off"));
+
+        let cli = Cli::try_parse_from(["ahma", "doctor"]).unwrap();
+        let Subcommands::Doctor(args) = cli.command else {
+            panic!("doctor");
+        };
+        assert_eq!(args.tui_command(), None, "no words: the plain report");
+
+        assert!(
+            Cli::try_parse_from(["ahma", "doctor", "--fix", "why"]).is_err(),
+            "--fix offers the report's fixes; a question goes to the TUI"
+        );
+    }
 
     #[test]
     fn test_cli_parse_serve_stdio() {

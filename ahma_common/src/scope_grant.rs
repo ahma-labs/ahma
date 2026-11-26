@@ -1329,6 +1329,24 @@ pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf])
     }
 }
 
+/// The directories the kernel sandbox lets every command write for temp
+/// files, unless `[sandbox] disable_temp`: `/tmp` under Landlock,
+/// `/private/tmp` and `/private/var/folders` under Seatbelt; none where there
+/// is no boundary. The one list the Seatbelt and Landlock rules, ahma's own
+/// temp scopes (SPEC R5.2.5), `ahma_help` (R-HELP.2) and the doctor
+/// (R-DOCTOR.11) all read, so what they say about temp cannot drift from what
+/// the kernel allows.
+pub fn temp_write_roots() -> Vec<PathBuf> {
+    let roots: &[&str] = if cfg!(target_os = "macos") {
+        &["/private/tmp", "/private/var/folders"]
+    } else if cfg!(target_os = "linux") {
+        &["/tmp"]
+    } else {
+        &[]
+    };
+    roots.iter().map(PathBuf::from).collect()
+}
+
 /// Credential paths under home, `/`-separated, that a sandboxed command may
 /// not read by default (SPEC R5.4.5, R6.2.3). On Linux nothing in home is
 /// readable unless granted; this list is what the macOS profile denies

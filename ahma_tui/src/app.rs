@@ -4019,8 +4019,7 @@ fn handle_doctor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
         run_doctor_report(state);
         return true;
     }
-    if let Some(n) = rest.strip_prefix("fix") {
-        let n = n.trim();
+    if let Some(n) = doctor_fix_argument(rest) {
         match n.parse::<usize>().ok().and_then(|n| n.checked_sub(1)) {
             Some(i) if i < state.doctor_fixes.len() => {
                 state.doctor_confirm = Some(state.doctor_fixes[i].clone());
@@ -4041,6 +4040,41 @@ fn handle_doctor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
         ask_doctor(state, rest, cmd);
     }
     true
+}
+
+/// The argument of `/doctor fix <n>`: `fix` alone, or `fix` and a number.
+/// Other words that start with "fix" (`fix my temp access`) are a question.
+fn doctor_fix_argument(rest: &str) -> Option<&str> {
+    let n = rest.strip_prefix("fix")?;
+    let n = n.trim();
+    (n.is_empty() || (rest.starts_with("fix ") && n.parse::<usize>().is_ok())).then_some(n)
+}
+
+/// The slash command a subcommand opened the TUI with (`ahma setup`'s
+/// `/setup`, `ahma doctor <words>`'s `/doctor <words>`), run once the first
+/// frame is set up. A doctor question is a chat turn whose answer arrives
+/// through the hub, which the session subscribes to only after this, so the
+/// report is shown at once and the question waits in
+/// [`crate::state::AppState::pending_command`] until the hub is healthy
+/// (SPEC R-DOCTOR.12). A fix number needs the report's list first.
+pub(crate) fn run_initial_command(command: &str, state: &mut crate::state::AppState) {
+    let doctor_rest = command
+        .strip_prefix("/doctor")
+        .filter(|r| r.is_empty() || r.starts_with(' '))
+        .map(str::trim);
+    match doctor_rest {
+        Some(rest) if doctor_fix_argument(rest).is_some() => {
+            run_doctor_report(state);
+            dispatch_nav_command(command, state);
+        }
+        Some(rest) if !rest.is_empty() && !rest.starts_with(['[', '<']) => {
+            run_doctor_report(state);
+            state.pending_command = Some(command.to_string());
+        }
+        _ => {
+            dispatch_nav_command(command, state);
+        }
+    }
 }
 
 fn doctor_findings(state: &crate::state::AppState) -> Vec<ahma_common::doctor::Finding> {
@@ -6173,6 +6207,11 @@ pub(crate) fn handle_source_event(
             state.set_hub_healthy(healthy);
             if let Some(ref tx) = state.mcp_source_tx {
                 let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetHubHealthy(healthy));
+            }
+            // The hub can carry an answer now: ask what the TUI was opened
+            // with (SPEC R-DOCTOR.12).
+            if healthy && let Some(command) = state.pending_command.take() {
+                dispatch_nav_command(&command, state);
             }
         }
         SourceEvent::OperationsUpdated { ops } => {
@@ -10074,6 +10113,48 @@ mod tests {
         assert!(!f.state.setup_view.open, "the view steps aside");
         let typed: String = f.state.chat_input.lines().join("\n");
         assert!(typed.starts_with("/setup set "), "{typed:?}");
+    }
+
+    /// SPEC R-DOCTOR.12: `ahma doctor <words>` opens on the report at once,
+    /// and asks the words when the hub can carry the answer back: a turn sent
+    /// before the session subscribes would lose its reply. `ahma setup`'s
+    /// `/setup` needs no hub and runs at once.
+    #[test]
+    fn a_doctor_question_at_startup_waits_for_the_hub() {
+        use crate::state::AppState;
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::HOME_SEAM_GUARD.lock();
+        // SAFETY: nextest runs this test in its own process; set before any read.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.workspace = home.path().to_string_lossy().into_owned();
+
+        super::run_initial_command("/doctor turn temp off", &mut state);
+        assert_eq!(
+            state.pending_command.as_deref(),
+            Some("/doctor turn temp off")
+        );
+        assert!(
+            format!("{:?}", state.chat).contains("ahma doctor"),
+            "the report is shown at once"
+        );
+
+        super::handle_source_event(
+            crate::mcp_source::SourceEvent::HubHealthChanged { healthy: true },
+            &mut state,
+        );
+        assert_eq!(state.pending_command, None, "asked once the hub is up");
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        super::run_initial_command("/doctor fix 1", &mut state);
+        assert_eq!(state.pending_command, None, "a fix needs no model");
+        assert_eq!(super::doctor_fix_argument("fix 2"), Some("2"));
+        assert_eq!(super::doctor_fix_argument("fix"), Some(""));
+        assert_eq!(
+            super::doctor_fix_argument("fix my temp access"),
+            None,
+            "words are a question"
+        );
     }
 
     /// `/doctor` reports; `/doctor fix 1` shows the exact change; only `y`

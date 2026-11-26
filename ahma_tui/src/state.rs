@@ -2281,6 +2281,9 @@ pub struct AppState {
     pub doctor_fixes: Vec<ahma_common::doctor::Fix>,
     /// A doctor fix waiting for the user's `y` (SPEC R-DOCTOR.2).
     pub doctor_confirm: Option<ahma_common::doctor::Fix>,
+    /// A command the TUI was opened with that waits for the hub, because its
+    /// answer arrives through it (`ahma doctor <words>`, SPEC R-DOCTOR.12).
+    pub pending_command: Option<String>,
     pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
     pub mcp_connections: McpConnectionManager,
 
@@ -3107,6 +3110,7 @@ impl AppState {
             trust_prompt: None,
             doctor_fixes: Vec::new(),
             doctor_confirm: None,
+            pending_command: None,
             tools_list: vec![],
             mcp_connections,
 
