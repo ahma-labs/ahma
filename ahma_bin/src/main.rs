@@ -318,6 +318,28 @@ async fn run() -> Result<()> {
             )
             .await
         }
+        // `ahma doctor <words>` in a terminal: the words are the doctor's first
+        // question, asked in the TUI (SPEC R-DOCTOR.12). Without a terminal
+        // the report is printed, and says where to ask.
+        Subcommands::Doctor(doctor_args)
+            if doctor_args.tui_command().is_some() && stdio_is_terminal() =>
+        {
+            tracing::info!("Opening the doctor in ahma tui");
+            ahma_tui::run_tui(
+                None,
+                None,
+                None,
+                tui_token_prefs(
+                    cli.minimize_tokens,
+                    cli.no_minimize_tokens,
+                    cli.small_model_harness,
+                    cli.no_small_model_harness,
+                    cli.context_length,
+                ),
+                doctor_args.tui_command(),
+            )
+            .await
+        }
         Subcommands::Tls(tls_args) => {
             tracing::info!("TLS subcommand");
             dispatch_tls(tls_args)

@@ -2792,7 +2792,7 @@ pub(crate) fn check_stdio_not_interactive() -> Result<()> {
 pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
     use std::io::{BufRead, IsTerminal, Write};
 
-    let workspace = match args.path {
+    let workspace = match args.path.clone() {
         Some(p) => p,
         None => std::env::current_dir().context("cannot read the current directory")?,
     };
@@ -2803,6 +2803,13 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
         input
     });
     print!("{}", ahma_common::doctor::render(&findings));
+    if let Some(ask) = args.tui_command() {
+        // Reached only without a terminal: the TUI asks in one (R-DOCTOR.12).
+        println!(
+            "\nAsk that in a terminal: `ahma doctor {}` opens ahma tui with `{ask}`.",
+            args.words.join(" ")
+        );
+    }
     let fixes = ahma_common::doctor::fixes(&findings);
     if fixes.is_empty() {
         println!("\nNothing to fix.");

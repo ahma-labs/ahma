@@ -72,6 +72,7 @@ pub enum FindingId {
     GitAuth,
     ConfinedDaemon,
     GrantPromptPace,
+    TempAccess,
 }
 
 /// One thing the doctor noticed.
@@ -406,6 +407,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
     }
     check_confined_daemons(&input.confined_daemons, &mut findings);
     check_decision_habits(&input.audit_entries, &mut findings);
+    check_temp_access(settings.as_ref(), &mut findings);
     check_logs(&input.workspace, &mut findings);
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     findings
@@ -837,6 +839,68 @@ fn check_settings(input: &DoctorInput, out: &mut Vec<Finding>) -> Option<AhmaSet
             None
         }
     }
+}
+
+/// Where temp stands (SPEC R-DOCTOR.11). Temp is open by default (R5.2.5): a
+/// trade most people want, and the doctor is where they learn it was made for
+/// them and how to undo it. A note, never a fix: nothing is wrong either way.
+fn check_temp_access(settings: Option<&AhmaSettings>, out: &mut Vec<Finding>) {
+    let default_settings;
+    let settings = match settings {
+        Some(s) => s,
+        None => {
+            default_settings = AhmaSettings::default();
+            &default_settings
+        }
+    };
+    let roots = crate::scope_grant::temp_write_roots();
+    let where_ = if roots.is_empty() {
+        "the temp directory".to_string()
+    } else {
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" and ")
+    };
+    let (title, detail) = if settings.sandbox.disable_temp {
+        (
+            "Temp folders are closed ([sandbox] disable_temp)",
+            format!(
+                "Your agents' commands, ahma's file tools and native edits cannot write {where_}; \
+                 tools that need scratch space must use a gitignored folder in the workspace. To \
+                 open temp again: `ahma settings unset sandbox.disable_temp`."
+            ),
+        )
+    } else if !settings.sandbox.tmp_access {
+        (
+            "Temp is open to commands, closed to ahma's own tools ([sandbox] tmp_access = false)",
+            format!(
+                "Commands may write {where_}; ahma's file tools and `working_directory` ask about \
+                 it. To accept it in ahma's tools too: `ahma settings unset sandbox.tmp_access`. \
+                 To close it everywhere: `ahma settings set sandbox.disable_temp true`."
+            ),
+        )
+    } else {
+        (
+            "Temp folders are open to your agents",
+            format!(
+                "Commands, ahma's file tools and native edits may write {where_}, where \
+                 compilers, package managers and scripts expect scratch space. It is shared with \
+                 every program on this machine, so a file an agent leaves there is visible to \
+                 them. To close it everywhere: `ahma settings set sandbox.disable_temp true` (or \
+                 `disable_temp = true` under [sandbox] in ~/.ahma/settings.toml); tools that need \
+                 scratch space then fail until pointed at a gitignored folder in the workspace."
+            ),
+        )
+    };
+    out.push(Finding {
+        level: Level::Info,
+        id: FindingId::TempAccess,
+        title: title.into(),
+        detail,
+        fix: None,
+    });
 }
 
 fn check_missing_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
@@ -1604,6 +1668,79 @@ mod tests {
             confined_daemons: Vec::new(),
             audit_entries: Vec::new(),
         }
+    }
+
+    fn temp_finding(findings: &[Finding]) -> &Finding {
+        findings
+            .iter()
+            .find(|f| f.id == FindingId::TempAccess)
+            .expect("the doctor always says where temp stands")
+    }
+
+    /// SPEC R-DOCTOR.11: temp is open by default (R5.2.5), and the doctor says
+    /// so once, with what it allows and the one command that closes it. A note,
+    /// not a fix: nothing is wrong, and a default report has nothing to fix.
+    #[test]
+    fn the_doctor_says_temp_is_open_and_how_to_close_it() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        AhmaSettings::default()
+            .save_to(&home.path().join("settings.toml"))
+            .unwrap();
+        let findings = run(&input(home.path(), ws.path()));
+        let temp = temp_finding(&findings);
+        assert_eq!(temp.level, Level::Info);
+        assert_eq!(temp.fix, None, "a note, not a fix");
+        assert!(
+            temp.detail
+                .contains("ahma settings set sandbox.disable_temp true"),
+            "{}",
+            temp.detail
+        );
+        for root in crate::scope_grant::temp_write_roots() {
+            assert!(
+                temp.detail.contains(&root.display().to_string()),
+                "names {}: {}",
+                root.display(),
+                temp.detail
+            );
+        }
+        assert!(fixes(&findings).is_empty(), "{findings:?}");
+    }
+
+    /// Closed temp says how to open it again; ahma's tools alone closed says
+    /// which half is closed.
+    #[test]
+    fn the_doctor_says_how_to_reopen_closed_temp() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let mut settings = AhmaSettings::default();
+        settings.sandbox.disable_temp = true;
+        settings
+            .save_to(&home.path().join("settings.toml"))
+            .unwrap();
+        let findings = run(&input(home.path(), ws.path()));
+        let temp = temp_finding(&findings);
+        assert!(
+            temp.detail
+                .contains("ahma settings unset sandbox.disable_temp"),
+            "{}",
+            temp.detail
+        );
+
+        let mut settings = AhmaSettings::default();
+        settings.sandbox.tmp_access = false;
+        settings
+            .save_to(&home.path().join("settings.toml"))
+            .unwrap();
+        let findings = run(&input(home.path(), ws.path()));
+        let temp = temp_finding(&findings);
+        assert!(
+            temp.detail
+                .contains("ahma settings unset sandbox.tmp_access"),
+            "{}",
+            temp.detail
+        );
     }
 
     #[test]

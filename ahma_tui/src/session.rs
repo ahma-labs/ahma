@@ -189,10 +189,11 @@ impl Session {
             crate::app::offer_folder_trust(&mut state);
             crate::app::maybe_show_intro_on_first_run(&mut state);
         }
-        // `ahma setup` opens straight onto /setup. After the trust question and the
-        // intro so neither is skipped; the command is the one the user could type.
+        // `ahma setup` opens straight onto /setup, `ahma doctor <words>` onto the
+        // doctor. After the trust question and the intro so neither is skipped;
+        // the command is the one the user could type.
         if let Some(command) = initial_command {
-            crate::app::dispatch_nav_command(&command, &mut state);
+            crate::app::run_initial_command(&command, &mut state);
             // `ahma setup` is a task, not a session: when its view is done, so is
             // the program. (`/setup` typed inside a running TUI just closes it.)
             state.setup_exit_on_close = state.setup_view.open;

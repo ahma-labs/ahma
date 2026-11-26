@@ -19,6 +19,7 @@ anything.
 ahma doctor                 # report only; changes nothing
 ahma doctor --fix           # offers each fix in turn: y applies it, anything else skips
 ahma doctor --path ~/proj   # check a different folder (trust, logs)
+ahma doctor turn temp off   # opens ahma tui and asks the doctor in your words
 ```
 
 In `ahma tui`:
@@ -65,6 +66,7 @@ Example report:
 | A build helper (sccache, a Gradle or Kotlin daemon) left running inside a sandbox, by shape: confined, orphaned, your own executable. New ones no longer arise: a sandboxed command's processes end with it ([security-sandbox.md](security-sandbox.md#helpers-left-running-inside-a-sandbox-sccache-gradle-and-kotlin-daemons), SPEC R-PROC.5) | warn | sccache: restart it (`--stop-server` / `--start-server`); Gradle/Kotlin: stop it. Refused if the doctor is itself sandboxed |
 | How grant prompts are being answered: median time-to-decision, share under three seconds, advisor followed | info / warn | none — a habit, not a file |
 | A session started in a subfolder of a git checkout whose root `.claude/settings.json` carries ahma's shell hook (Claude Code reads that file only from the folder a session starts in, so the hook never ran) | warn | none — start the session at the git root, or `ahma hooks install` for a user-level hook |
+| Whether temp folders are open to your agents (`/tmp`, or `/private/tmp` and `/private/var/folders` on macOS; on by default, SPEC R5.2.5) | info | none — the finding names the command that closes temp (`ahma settings set sandbox.disable_temp true`), or reopens it |
 | A session started in a folder that holds git checkouts (one or two folders below) whose own `.claude` settings declare hooks: Claude Code loads none of them there | info; warn when ahma's shell hook is among them and your own settings carry none | none — start the session in the checkout it works on, or `ahma hooks install` |
 
 Every applied fix is written through the same strict read-modify-write the
@@ -72,6 +74,11 @@ rest of ahma uses (it will not rewrite a file it cannot parse) and appended to
 `~/.ahma/permissions-audit.jsonl`.
 
 ## Asking the doctor
+
+`ahma doctor <words>` (for example `ahma doctor turn temp off`) opens `ahma tui` on the
+report and asks your words as `/doctor <words>` once the TUI is connected to the hub.
+`ahma doctor fix 2` opens it on fix 2's confirmation. Without a terminal it prints the
+report and says to ask in one.
 
 `/doctor <question>` sends your question to the chat model together with the
 current report and rules it must keep: it cannot change ahma's settings (they
