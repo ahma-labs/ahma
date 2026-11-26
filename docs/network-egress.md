@@ -322,6 +322,10 @@ SPEC R-LISTEN records the evidence.
   raises an MCP `elicitation/create` prompt when a capable client is attached
   (SPEC R-WEB.16.8), so profiles reduce the prompt volume rather than replacing
   the mechanism.
+* A command run through a terminal hook (Claude Code's Bash, with `ahma setup`'s
+  hooks) is restricted the same way, but an unlisted host is **refused, not
+  asked**: a hook has no MCP client to ask. Allow it with
+  `ahma network allow <host>`, which the refusal names.
 * Allowlisting is by **hostname**. The proxy re-resolves the host and refuses
   private/loopback/link-local/cloud-metadata addresses, so an allowed name cannot
   DNS-rebind to `127.0.0.1` — but it cannot distinguish two tenants of one
