@@ -96,9 +96,12 @@ pub fn open_tunnel(proxy: &str, host: &str, port: u16) -> io::Result<TcpStream> 
             ),
         )
     })?;
-    write!(
-        stream,
-        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
+    // One write: the proxy reads the request head with a single `read`, and
+    // `write!` on an unbuffered stream sends each piece separately. A refusal
+    // sent while part of the head is still unread ends in a reset that
+    // discards the refusal itself (seen on macOS CI as `ConnectionReset`).
+    stream.write_all(
+        format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes(),
     )?;
     let head = read_head(&mut stream)?;
     let status_line = head.lines().next().unwrap_or_default();
@@ -217,10 +220,12 @@ mod tests {
             s.read_exact(&mut buf).unwrap();
             s.write_all(&buf).unwrap();
         });
-        let proxy = proxy("localhost").await;
+        // The address itself, not `localhost`: the proxy may try `::1` first,
+        // where another process can hold the same port number (seen on macOS CI).
+        let proxy = proxy("127.0.0.1").await;
         let addr = proxy.local_addr.to_string();
         let got = tokio::task::spawn_blocking(move || {
-            let mut tunnel = open_tunnel(&addr, "localhost", port).expect("tunnel opens");
+            let mut tunnel = open_tunnel(&addr, "127.0.0.1", port).expect("tunnel opens");
             let mut banner = [0u8; 14];
             tunnel.read_exact(&mut banner).unwrap();
             tunnel.write_all(b"ping").unwrap();
