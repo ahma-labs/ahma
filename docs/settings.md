@@ -270,7 +270,7 @@ sandbox.disable                               = false  # default (ignored; --no-
 Three `[sandbox]` keys are worth knowing:
 
 - **`profiles`** — the shipped toolchain carve-outs (`rust`, `node`, `go`,
-  `android`, `apple`, `common`, `gh`, `sccache`). These used to be hard-coded in the sandbox backends, invisible and
+  `python`, `ruby`, `android`, `apple`, `common`, `gh`, `sccache`). These used to be hard-coded in the sandbox backends, invisible and
   un-refusable; they are now data you can inspect and disable. Set to `[]` to
   enable none of them.
 - **`package_cache_write`** (default `true`) — whether package-manager caches

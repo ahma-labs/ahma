@@ -395,7 +395,7 @@ profiles = ["rust"]   # only rust; drop node, go, android, apple, common, gh, sc
 # profiles = []       # nothing — grant every toolchain path explicitly
 ```
 
-Built-in: `rust`, `node`, `go`, `android`, `apple`, `common`, `gh`, `sccache`. All enabled by default.
+Built-in: `rust`, `node`, `go`, `python`, `ruby`, `android`, `apple`, `common`, `gh`, `sccache`. All enabled by default.
 A profile whose toolchain is not installed grants paths that do not exist, which is
 harmless; `android` (Gradle, Maven, the SDK, Kotlin/Native) and `apple` (Xcode
 DerivedData, SwiftPM and CocoaPods caches, simulators read-only) exist so an iOS or

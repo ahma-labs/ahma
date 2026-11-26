@@ -315,6 +315,8 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
             include_str!("../../profiles/common.toml"),
             include_str!("../../profiles/gh.toml"),
             include_str!("../../profiles/sccache.toml"),
+            include_str!("../../profiles/python.toml"),
+            include_str!("../../profiles/ruby.toml"),
         ];
         SOURCES
             .iter()
@@ -1014,8 +1016,8 @@ mod tests {
         let profiles = builtin_profiles();
         assert_eq!(
             profiles.len(),
-            8,
-            "all eight shipped profiles parse: {:?}",
+            10,
+            "all ten shipped profiles parse: {:?}",
             profiles.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
         for p in profiles {
@@ -1342,6 +1344,10 @@ mod tests {
         assert!(of("android").contains(&"services.gradle.org".to_string()));
         assert!(of("android").contains(&"dl.google.com".to_string()));
         assert!(of("apple").contains(&"cdn.cocoapods.org".to_string()));
+        // SPEC R-HARDEN.4's prerequisite: restriction on by default must not
+        // break `pip install` or `bundle install` on the first command.
+        assert_eq!(of("python"), ["pypi.org", "files.pythonhosted.org"]);
+        assert_eq!(of("ruby"), ["rubygems.org", "index.rubygems.org"]);
         assert!(
             of("common").is_empty(),
             "a shared cache directory is not an ecosystem and reaches nothing of its own; \

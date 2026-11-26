@@ -1,0 +1,30 @@
+# Ruby toolchain sandbox profile.
+name = "ruby"
+description = "Ruby toolchain: rbenv-installed rubies and user-installed gems"
+deny_write = []
+
+# Read and executed. Narrow on purpose: `~/.gem/credentials` holds a RubyGems
+# API key and `~/.bundle/config` can hold private gem-server passwords, so
+# neither directory is granted as a whole.
+[[rules]]
+path = "~/.rbenv"
+access = "rx"
+
+[[rules]]
+path = "~/.gem/ruby"
+access = "rx"
+
+[[rules]]
+path = "~/.gem/specs"
+access = "rx"
+
+# Hostnames this toolchain must reach when `--restrict-network` is on.
+# Verified 2026-11-26 against live fetches: no cross-host redirect.
+
+[[hosts]]
+host = "rubygems.org"
+reason = "gem downloads (/gems/<name>-<version>.gem) and the API `gem push` and `gem install` use"
+
+[[hosts]]
+host = "index.rubygems.org"
+reason = "the compact index Bundler resolves dependencies against"

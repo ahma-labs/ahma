@@ -1,0 +1,37 @@
+# Python toolchain sandbox profile.
+name = "python"
+description = "Python toolchain: pyenv and uv-managed interpreters, the pip cache"
+deny_write = []
+
+# Interpreters, read and executed. Narrow on purpose: uv keeps `uv auth`
+# credentials under its data directory (`uv/credentials`), so the directory
+# as a whole is not granted, only the interpreters and installed tools in it.
+[[rules]]
+path = "~/.pyenv"
+access = "rx"
+
+[[rules]]
+path = "${XDG_DATA_HOME:-~/.local/share}/uv/python"
+access = "rx"
+
+[[rules]]
+path = "${XDG_DATA_HOME:-~/.local/share}/uv/tools"
+access = "rx"
+
+# pip's cache on macOS (on Linux it is under ~/.cache, which `common` grants,
+# as is uv's cache on both).
+[[rules]]
+path = "~/Library/Caches/pip"
+access = "rx"
+
+# Hostnames this toolchain must reach when `--restrict-network` is on. See the
+# rust profile for the rationale; these widen nothing unless restriction is on.
+# Verified 2026-11-26 against live fetches: no cross-host redirect.
+
+[[hosts]]
+host = "pypi.org"
+reason = "the package index (the simple API pip and uv resolve against, and the JSON API)"
+
+[[hosts]]
+host = "files.pythonhosted.org"
+reason = "wheel and sdist downloads; every file URL in pypi.org's index points here"

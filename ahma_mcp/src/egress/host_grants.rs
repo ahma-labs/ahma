@@ -277,6 +277,10 @@ mod tests {
             "nodejs.org",
             "proxy.golang.org",
             "sum.golang.org",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "rubygems.org",
+            "index.rubygems.org",
         ] {
             assert!(list.allows(host), "{host} must be reachable out of the box");
         }
@@ -293,7 +297,9 @@ mod tests {
             "storage.googleapis.com",
             "objects.githubusercontent.com",
             "raw.githubusercontent.com",
-            "pypi.org",
+            // Publishing is an explicit decision: the python profile names the
+            // index and its file host exactly, never the upload endpoint.
+            "upload.pypi.org",
         ] {
             assert!(
                 !list.allows(host),
