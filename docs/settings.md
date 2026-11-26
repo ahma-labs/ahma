@@ -359,6 +359,15 @@ It is a `[sandbox]` key, so a repository's own `.ahma/settings.toml` cannot
 turn it off (R-CFG2.2). What it needs and what it does not cover:
 [security-sandbox.md](security-sandbox.md#prevented-where-the-host-allows-it-linux-opt-in).
 
+### macOS: home reads by allowlist (`home_reads`)
+
+| Key | Values | Default | Effect |
+|---|---|---|---|
+| `home_reads` | `"denylist"`, `"allowlist"` | `"denylist"` | `"allowlist"` makes file contents under your home unreadable, apart from the workspace, enabled profiles, your read-only grants, `~/.gitconfig`, `~/.config/git`, the ssh client files and the keychain (when `allow_keychain` is on). Metadata stays readable. A tool that reads elsewhere in home fails with `Operation not permitted` until you grant the path. Ignored off macOS. |
+
+What it covers and what breaks:
+[security-sandbox.md](security-sandbox.md#home-reads-by-allowlist-opt-in) (SPEC R-HARDEN.5).
+
 ### Linux: the system-call baseline (`syscall_filter`)
 
 | Key | Values | Default | Effect |

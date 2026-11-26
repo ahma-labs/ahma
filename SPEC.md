@@ -1196,8 +1196,10 @@ with a red-team test that fails.
   - An unlisted host is asked (R-WEB.16), and the advisor may recommend (R-PERM.8).
   - `restrict = false` opts out and is disclosed at startup.
 - **R-HARDEN.5 — macOS home reads by allowlist, as an option.**
-  - Under `[sandbox] home_reads = "allowlist"`, reads under `$HOME` **must** be denied except for the workspace, the enabled profiles' paths and the human's grants. The grant ladder (R-PERM.3) asks for the rest.
+  - Under `[sandbox] home_reads = "allowlist"`, reading a file's contents under `$HOME` **must** be denied except for the workspace, the enabled profiles' paths, the human's grants, and what Linux also grants for client configuration (`client_config_read_paths`: `~/.gitconfig`, `~/.config/git`, the ssh client files), plus `~/.CFUserTextEncoding` and the keychain when `allow_keychain` is on. A denied path is opened with a read-only grant.
+  - Metadata **must** stay readable: Seatbelt checks `file-read-metadata` on every ancestor that path resolution walks, so denying it would break any workspace in home. The rule is a `file-read*` deny on home followed at once by a `file-read-metadata` allow, placed right after the blanket read allow so every later allow re-opens its own part of home (`seatbelt::home_read_rules`). A `file-read-data` deny is not equivalent: measured on macOS CI, a later `file-read*` allow on the workspace did not reopen it.
   - The default stays the credential denylist (R6.2.3) until the breakage is measured.
+  - **tests-pass**: `home_reads_allowlist_is_kernel_enforced` (macOS CI; a control read with the option off comes first), plus ordering tests in `seatbelt.rs`.
 - **R-HARDEN.6 — Windows says what it lacks.** Until R6.3.3 closes, every Windows startup disclosure, `ahma doctor` and the docs **must** say there is no OS path boundary, and point to WSL2 for one.
 - **R-HARDEN.7 — Detection is not called protection.** A guard that only detects (the Linux deny tier's `detect`, R6.1.7) **must** be named and disclosed as an audit, never as a boundary. Prevention **must** be the default wherever the host allows unprivileged user namespaces.
 - **R-HARDEN.8 — Irreversible remote actions are gated at the credential.**

@@ -101,7 +101,28 @@ On macOS, Ahma uses Apple's built-in `sandbox-exec` with a generated Seatbelt pr
 
 What keeps secrets unreadable on macOS is therefore an explicit **denylist**, not the scope (SPEC R6.2.3). Each entry is emitted as a `(deny file-read* …)` placed *after* the blanket allow and *before* the workspace-scope allows, so SBPL's last-match-wins ordering keeps them denied by default while an explicit scope grant still wins. The set covers plaintext credential directories, ahma's own control plane, private key material, and container daemon sockets; it is tuned so no common build/test/VCS tool breaks — notably `~/.ssh` is denied as a whole, so a private key is unreadable whatever it is called, while the files ssh needs that hold no secret (`config`, `config.d/`, `known_hosts*`, `*.pub`, `allowed_signers`, the `agent/` socket directory) are let back in. Every path on this list is also one no grant can open. On Linux, where the sandbox reads nothing in home by default, those same ssh files plus `~/.gitconfig` and `~/.config/git` are granted read-only, so git has its identity and credential helper. The effective set is owned by `sandbox/credential_reads.rs`, not by this page: inspect it with `ahma permissions list`, extend it via `[sandbox] deny_credential_reads`, or re-allow a default via `[sandbox] allow_credential_reads`.
 
-> **A denylist is a weaker guarantee than a scope, and is worth reading as one.** A scope denies everything it does not name; a denylist denies only what it *does* name, so any secret nobody thought to enumerate is readable. It is the best available answer on this platform — not an equivalent of the Linux position above.
+> **A denylist is a weaker guarantee than a scope, and is worth reading as one.** A scope denies everything it does not name; a denylist denies only what it *does* name, so any secret nobody thought to enumerate is readable. It is the default on this platform — not an equivalent of the Linux position above.
+
+#### Home reads by allowlist (opt-in)
+
+`[sandbox] home_reads = "allowlist"` (SPEC R-HARDEN.5) closes most of that gap for your home directory, where the secrets nobody enumerated usually are. The contents of every file under home become unreadable, apart from:
+
+- the workspace and anything else in scope;
+- the enabled [profiles](permissions.md#sandbox-profiles)' paths (`~/.cargo`, `~/.npm`, `~/.gradle`, …);
+- paths you granted (`ahma sandbox grant --read-only <path>`);
+- what Linux also grants: `~/.gitconfig`, `~/.config/git` and the ssh client files;
+- `~/.CFUserTextEncoding`, and the login keychain when `allow_keychain` is on.
+
+```toml
+[sandbox]
+home_reads = "allowlist"   # default "denylist"
+```
+
+- **Metadata stays readable.** Resolving a path inside a workspace in your home stats each of its ancestors, so a command can still learn that a file exists, and its size. It cannot read the file's contents or list the directory.
+- **What breaks.** A tool that keeps its configuration or install somewhere no profile names, such as `~/.pyenv`, `~/.local/bin` or `~/Library/Application Support/<app>`, fails with `Operation not permitted`. Grant that path read-only, or turn the option off.
+- **Why it is off by default.** It stays off until that breakage has been measured on real projects.
+
+It is a `[sandbox]` key, so a repository's own settings cannot turn it off. Off macOS it is ignored.
 
 #### The hub is out of bounds
 

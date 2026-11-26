@@ -89,6 +89,17 @@ impl Sandbox {
         };
         let system_rules = self.get_macos_system_rules();
         let credential_deny_rules = self.get_macos_credential_deny_rules();
+        // SPEC R-HARDEN.5: home by allowlist, opt-in. Right after the blanket
+        // read allow, before every rule that re-opens part of home.
+        let home_read_rules = if super::credential_reads::home_reads_allowlist() {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
+            home_read_rules(
+                Path::new(&home),
+                super::credential_reads::keychain_access_allowed(),
+            )
+        } else {
+            String::new()
+        };
         let keychain_rules = self.get_macos_keychain_rules();
         let profile_rules = self.get_macos_profile_rules();
         // The read-only lane grants no temp writes either: a workspace under
@@ -133,7 +144,7 @@ impl Sandbox {
 (allow process*)
 {signal_rules}{gpu_rules}(allow sysctl-read)
 (allow process-info*)
-{system_rules}{git_dir_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
+{system_rules}{home_read_rules}{git_dir_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 {working_dir_write}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
 (allow file-read* (literal "/dev/tty"))
@@ -756,19 +767,61 @@ fn pasteboard_denies() -> String {
 /// `deny` per path, canonical where it exists (macOS checks the resolved path,
 /// `/private/var` for `/var`), quoted for SBPL.
 pub(crate) fn policy_deny_rules(denies: &ahma_common::policy::KernelDenies) -> String {
-    let quote = |p: &std::path::Path| {
-        let p = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        p.display()
-            .to_string()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-    };
     let mut rules = String::new();
     for p in &denies.read {
         rules.push_str(&format!("(deny file-read* (subpath \"{}\"))\n", quote(p)));
     }
     for p in &denies.write {
         rules.push_str(&format!("(deny file-write* (subpath \"{}\"))\n", quote(p)));
+    }
+    rules
+}
+
+/// A path for an SBPL string: canonical where it exists (macOS checks the
+/// resolved path), with `\\` and `"` escaped.
+fn quote(p: &Path) -> String {
+    let p = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    p.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// `[sandbox] home_reads = "allowlist"` (SPEC R-HARDEN.5): the contents of
+/// files under `home` are unreadable, then let back in by exact path for what
+/// git, ssh and CoreFoundation read for their own configuration — the set
+/// Linux grants ([`super::credential_reads::client_config_read_paths`]) — and
+/// the login keychain when `allow_keychain` is on. Emitted right after the
+/// blanket read allow, so every later allow (workspace, profiles, grants)
+/// re-opens its own part of home, and every later deny still holds.
+///
+/// Metadata is let back in at once, because resolving a path inside a
+/// workspace in home stats each of its ancestors. A command can therefore
+/// still learn that a file exists, and its size, but not what it holds; a
+/// directory listing is denied with the rest.
+///
+/// The deny is `file-read*`, the same operation every later allow names. A
+/// `file-read-data` deny was measured on macOS CI (PR #396) to survive a
+/// later `(allow file-read* (subpath <workspace>))`: Seatbelt does not order
+/// a rule on one operation against a wildcard the way last-match-wins
+/// suggests. A wildcard deny reopened by wildcard allows is what the
+/// credential denylist already relies on.
+pub(crate) fn home_read_rules(home: &Path, keychain: bool) -> String {
+    let mut rules = format!(
+        "(deny file-read* (subpath \"{0}\"))\n(allow file-read-metadata (subpath \"{0}\"))\n",
+        quote(home)
+    );
+    let mut allow = |p: &Path| {
+        let kind = if p.is_dir() { "subpath" } else { "literal" };
+        rules.push_str(&format!("(allow file-read* ({kind} \"{}\"))\n", quote(p)));
+    };
+    for p in super::credential_reads::client_config_read_paths(home) {
+        allow(&p);
+    }
+    // Read by CoreFoundation at every process start; holds a text encoding.
+    allow(&home.join(".CFUserTextEncoding"));
+    if keychain {
+        allow(&home.join("Library").join("Keychains"));
     }
     rules
 }
@@ -1106,6 +1159,72 @@ mod tests {
             ))
             .unwrap_or_else(|| panic!("policy deny missing:\n{profile}"));
         assert!(deny > allow, "the deny must be the last word:\n{profile}");
+    }
+
+    /// SPEC R-HARDEN.5: under `home_reads = "allowlist"` a file's contents
+    /// under home are denied, its metadata is not (ancestors of a workspace in
+    /// home must stay stat-able), and what git, ssh and CoreFoundation read
+    /// for their own configuration is let back in, by exact path.
+    #[test]
+    fn home_read_allowlist_denies_contents_and_lets_client_config_back() {
+        let dir = tempdir().unwrap();
+        let home = dunce::canonicalize(dir.path()).unwrap();
+        std::fs::write(home.join(".gitconfig"), "[user]\n").unwrap();
+        std::fs::create_dir_all(home.join("Library/Keychains")).unwrap();
+
+        let rules = super::home_read_rules(&home, false);
+        let deny = format!("(deny file-read* (subpath \"{}\"))", home.display());
+        let metadata = format!(
+            "(allow file-read-metadata (subpath \"{}\"))",
+            home.display()
+        );
+        let git = format!(
+            "(allow file-read* (literal \"{}\"))",
+            home.join(".gitconfig").display()
+        );
+        let deny_at = rules.find(&deny).unwrap_or_else(|| panic!("{rules}"));
+        let git_at = rules.find(&git).unwrap_or_else(|| panic!("{rules}"));
+        assert!(git_at > deny_at, "{rules}");
+        assert!(rules.contains(".CFUserTextEncoding"), "{rules}");
+        assert!(!rules.contains("Keychains"), "keychain off: {rules}");
+        let metadata_at = rules.find(&metadata).unwrap_or_else(|| panic!("{rules}"));
+        assert!(
+            metadata_at > deny_at,
+            "metadata must stay readable: {rules}"
+        );
+        assert!(
+            super::home_read_rules(&home, true).contains("Library/Keychains"),
+            "keychain on: its reads come back"
+        );
+    }
+
+    /// The home deny must sit after the blanket read allow and before every
+    /// rule that re-opens part of home (workspace, profiles, grants), or it is
+    /// either dead or swallows them. Off by default: no rule at all.
+    #[test]
+    fn home_read_deny_sits_between_the_blanket_allow_and_the_workspace() {
+        let home = dunce::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+        let dir = tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, Default::default()).unwrap();
+        let deny = format!("(deny file-read* (subpath \"{}\"))", home.display());
+
+        assert!(!sb.generate_seatbelt_profile_test(&root).contains(&deny));
+
+        super::super::credential_reads::set_home_reads_allowlist(true);
+        let profile = sb.generate_seatbelt_profile_test(&root);
+        super::super::credential_reads::set_home_reads_allowlist(false);
+        let blanket = profile.find("(allow file-read*)\n").expect("blanket allow");
+        let deny_at = profile
+            .find(&deny)
+            .unwrap_or_else(|| panic!("home deny missing:\n{profile}"));
+        let workspace = profile
+            .find(&format!(
+                "(allow file-read* (subpath \"{}\"))",
+                root.display()
+            ))
+            .expect("workspace read allow");
+        assert!(blanket < deny_at && deny_at < workspace, "{profile}");
     }
 
     /// The exec-config denies are worthless unless they are the *last* word:
