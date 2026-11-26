@@ -47,6 +47,7 @@ pub mod host_grants;
 pub mod host_pattern;
 pub mod net_prompt;
 pub mod proxy;
+pub mod ssh_proxy;
 pub mod web_audit;
 pub mod web_prompt;
 

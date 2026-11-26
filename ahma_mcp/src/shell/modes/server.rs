@@ -164,7 +164,7 @@ pub(crate) async fn maybe_start_egress_proxy(
             return None;
         }
     };
-    sandbox::set_egress_proxy_env(proxy.env_vars());
+    sandbox::set_egress_proxy_env(restricted_command_env(proxy.env_vars(), proxy.local_addr));
     // macOS enforcement (R-NET): the Seatbelt profile denies all outbound IP
     // egress except this proxy address, so a subprocess that ignores HTTP_PROXY
     // still cannot reach the network directly. No-op on other platforms.
@@ -207,6 +207,29 @@ pub(crate) fn local_ports_disclosure(ports: &[u16]) -> Option<String> {
              advisory and blocks no port."
         )
     })
+}
+
+/// The environment every restricted command gets: the proxy variables, and
+/// on Unix a `GIT_SSH_COMMAND` that sends git's ssh through the proxy too
+/// (SPEC R-WEB.16.14). Applied after the scrub that drops an inherited
+/// `GIT_SSH_COMMAND`, so this one is the only one a command sees.
+fn restricted_command_env(
+    mut vars: Vec<(String, String)>,
+    proxy_addr: std::net::SocketAddr,
+) -> Vec<(String, String)> {
+    if cfg!(unix) {
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|e| dunce::canonicalize(&e).unwrap_or(e));
+        match exe.and_then(|e| crate::egress::ssh_proxy::git_ssh_command(&e, proxy_addr)) {
+            Some(cmd) => vars.push(("GIT_SSH_COMMAND".to_string(), cmd)),
+            None => tracing::warn!(
+                "--restrict-network: git over ssh cannot use the egress proxy, because ahma's \
+                 own path needs shell quoting; git@ remotes will not connect (SPEC R-WEB.16.14)"
+            ),
+        }
+    }
+    vars
 }
 
 /// Announce the active egress restriction loudly (SPEC R7): what is reachable,

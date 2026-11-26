@@ -298,10 +298,23 @@ docker-compose service, a test server on a random port.
 Either way, a local service that forwards to the internet (a local HTTP proxy, a browser's
 remote-debugging port) is a way out that ahma cannot see.
 
+## Git over SSH
+
+SSH does not read `HTTP_PROXY`. So while restriction is on, ahma gives every command a
+`GIT_SSH_COMMAND` whose `ProxyCommand` is `ahma ssh-proxy`: git's ssh connects through
+the egress proxy, which decides as it does for HTTPS. `git push` to `git@github.com:…`
+works when `github.com` is allowed (the `rust`, `gh` and `apple` profiles allow it), and an
+unlisted host is asked about, or refused with the `ahma network allow <host>` command.
+
+It replaces your own `GIT_SSH_COMMAND` and `core.sshCommand` for these commands.
+`~/.ssh/config` still applies, keys and agents included, except its `ProxyCommand` and
+`ProxyJump`: the command line's `ProxyCommand` wins. Plain `ssh`, which reads no such
+variable, still cannot connect under restriction.
+
 ## The default stays opt-in, for now
 
 `[network] restrict` defaults to `false`. Restricting by default is planned for macOS
-(SPEC R-HARDEN.4) once `git` over SSH works under it and it has been used day to day. On
+(SPEC R-HARDEN.4) once it has been used day to day. On
 Linux it stays opt-in: a test server on a random port cannot be reached under restriction
 there ([Local services](#local-services)). Until then, turn it on yourself.
 
@@ -345,8 +358,8 @@ SPEC R-LISTEN records the evidence.
 
 ## Limits you still have
 
-* SSH does not use the proxy, so `ssh` and `git` over SSH (`git@github.com:…` remotes)
-  cannot connect under restriction. Use an HTTPS remote, or leave restriction off.
+* Plain `ssh` (not through `git`) cannot connect under restriction: it does not use the
+  proxy, and only git reads the variable ahma sets ([Git over SSH](#git-over-ssh)).
 * Interactive approval still applies: a subprocess reaching an unlisted host
   raises an MCP `elicitation/create` prompt when a capable client is attached
   (SPEC R-WEB.16.8), so profiles reduce the prompt volume rather than replacing

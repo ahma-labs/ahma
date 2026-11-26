@@ -155,6 +155,7 @@ A hook command line can also pass `--hooks on|off|auto`, which overrides both va
 | `AHMA_SPAWN_DEPTH` | Every ahma that spawns another ahma | How many ahma processes deep this one is; a backstop that stops a runaway spawn chain. A marker, not a setting. |
 | `AHMA_ASKPASS_COMMAND` | macOS, an approved one-time `sudo` run (SPEC R-ESCAPE) | The command text shown in the password dialog of `ahma askpass`. |
 | `AHMA_LINK_SOCK` | Every command ahma runs on macOS and Linux, from a terminal hook or over MCP (not a persistent shell session's) | The socket of the command's own link broker (SPEC R-LINK.1), which ahma's link helper — the command's `BROWSER` and `GH_BROWSER`, and `ahma open-url` — sends each web link to. The broker answers only that command's process group and opens only links to sites a human allowed ([open-links.md](open-links.md)); setting it yourself reaches nothing. ahma also sets `BROWSER` and `GH_BROWSER` for those commands, replacing yours. |
+| `GIT_SSH_COMMAND` | Every command ahma runs on macOS and Linux while `--restrict-network` is on | `ssh -o ProxyCommand="'<ahma>' ssh-proxy <proxy> %h %p"`, so `git` over SSH goes through the egress proxy, which allows or refuses the host as it does for HTTPS (SPEC R-WEB.16.14). Replaces yours and any `core.sshCommand`; `~/.ssh/config` still applies, apart from its `ProxyCommand`/`ProxyJump`. |
 
 ---
 
