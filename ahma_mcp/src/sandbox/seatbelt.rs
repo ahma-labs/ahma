@@ -276,13 +276,21 @@ impl Sandbox {
     fn get_macos_network_rules(&self) -> String {
         match *self.egress_proxy_addr.read() {
             None => "(allow network*)\n".to_string(),
-            Some(addr) => format!(
-                "(allow network*)\n\
-                 (deny network-outbound (remote ip \"*:*\"))\n\
-                 (allow network-outbound (remote ip \"{}:{}\"))\n",
-                addr.ip(),
-                addr.port()
-            ),
+            // SBPL takes only `*` or `localhost` as the host of a `remote ip`
+            // address: `(remote ip "127.0.0.1:<port>")` makes sandbox-exec
+            // refuse the whole profile ("host must be * or localhost"), so
+            // with this rule every command failed to start on macOS (found by
+            // `a_hooked_command_goes_through_the_egress_proxy_when_restricted`
+            // on CI, 2026-11-26). The proxy always binds loopback.
+            Some(addr) => {
+                debug_assert!(addr.ip().is_loopback(), "the egress proxy binds loopback");
+                format!(
+                    "(allow network*)\n\
+                     (deny network-outbound (remote ip \"*:*\"))\n\
+                     (allow network-outbound (remote ip \"localhost:{}\"))\n",
+                    addr.port()
+                )
+            }
         }
     }
 
@@ -864,7 +872,7 @@ mod tests {
             "enforcement must deny all outbound IP egress, got:\n{p}"
         );
         assert!(
-            p.contains("(allow network-outbound (remote ip \"127.0.0.1:34567\"))"),
+            p.contains("(allow network-outbound (remote ip \"localhost:34567\"))"),
             "enforcement must re-allow exactly the proxy address, got:\n{p}"
         );
 
