@@ -1676,6 +1676,8 @@ fn default_sandbox_profiles() -> Vec<String> {
         "common".to_string(),
         "gh".to_string(),
         "sccache".to_string(),
+        "python".to_string(),
+        "ruby".to_string(),
     ]
 }
 

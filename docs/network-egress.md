@@ -25,7 +25,7 @@ Profiles now supply those hosts, so a narrow, deliberate allowlist works out of 
 ## The mechanism: profiles already solved this for paths
 
 A [sandbox profile](permissions.md) is a pre-answered bundle of grant questions.
-`rust`, `node`, `go`, `android`, `apple`, `common`, `gh` and `sccache` each declare the filesystem paths their
+`rust`, `node`, `go`, `python`, `ruby`, `android`, `apple`, `common`, `gh` and `sccache` each declare the filesystem paths their
 toolchain needs, ship enabled by default, and are refusable individually through
 `[sandbox] profiles`.
 
@@ -78,6 +78,29 @@ trust it.
 |---|---|---|
 | `proxy.golang.org` | The default `GOPROXY` module mirror | [proxy.golang.org](https://proxy.golang.org/) |
 | `sum.golang.org` | The default `GOSUMDB` checksum database — module authentication fails closed without it | same |
+
+### `python`
+
+| Host | Why | Source |
+|---|---|---|
+| `pypi.org` | The package index: the simple API pip and uv resolve against, and the JSON API | verified 2026-11-26 against a live fetch |
+| `files.pythonhosted.org` | Wheel and sdist downloads; every file URL in `pypi.org`'s index points here, and answers `200` with no further redirect | same |
+
+The profile reads pyenv's interpreters (`~/.pyenv`), uv's managed interpreters and
+tools (`~/.local/share/uv/python`, `…/uv/tools`) and pip's macOS cache. Not uv's
+data directory as a whole: `uv auth` keeps credentials there.
+
+### `ruby`
+
+| Host | Why | Source |
+|---|---|---|
+| `rubygems.org` | Gem downloads (`/gems/<name>-<version>.gem`, answered directly) and the API `gem install` uses | verified 2026-11-26 against a live fetch |
+| `index.rubygems.org` | The compact index Bundler resolves against | same |
+
+The profile reads rbenv's rubies (`~/.rbenv`) and user-installed gems
+(`~/.gem/ruby`, `~/.gem/specs`). Not `~/.gem` or `~/.bundle` as a whole:
+`~/.gem/credentials` holds your RubyGems API key, and `~/.bundle/config` can hold
+private gem-server passwords.
 
 ### `android`
 
@@ -132,9 +155,17 @@ logs.
   that is exactly the kind of thing that should be an explicit decision.
 * **`index.golang.org`** — a feed of new module versions, consumed by tooling
   that watches the ecosystem, never by a build.
-* **PyPI, RubyGems, Docker Hub, …** — there is no shipped profile
-  for those toolchains, so there is nothing to hang the hosts on. Add them to
-  `[network] allow` yourself, or contribute a profile.
+* **`upload.pypi.org`** (for `python`) and publishing endpoints generally.
+  Publishing a package is a decision to make explicitly, not a side effect of a
+  build being able to fetch.
+* **uv's interpreter downloads** (`uv python install` fetches GitHub release
+  assets from `objects.githubusercontent.com`), for the same reason as the
+  `rust` exclusion above.
+* **Docker Hub and other container registries.** `docker pull` and
+  `docker build` fetch from the daemon, which runs outside the sandbox, and a
+  sandboxed command cannot reach the daemon's socket anyway. Only a registry
+  client run as a command (`crane`, `skopeo`, `oras`) needs a registry host; add
+  yours to `[network] allow`.
 
 If you need one of these, add it to `[network] allow`; it composes with
 everything above.
@@ -233,7 +264,7 @@ removing `go` from `[sandbox] profiles` would answer a different — usually wro
 
 ```toml
 [sandbox]
-profiles = ["rust", "node", "go", "android", "apple", "common", "gh", "sccache"]
+profiles = ["rust", "node", "go", "python", "ruby", "android", "apple", "common", "gh", "sccache"]
 
 [network]
 restrict = true
