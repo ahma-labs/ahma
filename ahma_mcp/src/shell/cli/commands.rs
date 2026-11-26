@@ -1741,7 +1741,33 @@ fn print_profile_entry(
     for line in profile_env_lines(&profile.name, &here) {
         println!("{line}");
     }
+    for line in profile_service_lines(&profile.name) {
+        println!("{line}");
+    }
     print_profile_hosts(settings, &profile.name, hosts);
+}
+
+/// The host services one profile declares, as `ahma permissions list` shows
+/// them (SPEC R-PROC.6): what each holds, where it has to run, the line that
+/// puts it there, and what a sandboxed agent gets from it (R-PERM.5.2).
+fn profile_service_lines(profile: &str) -> Vec<String> {
+    crate::sandbox::profiles::host_services(&[profile.to_string()])
+        .into_iter()
+        .flat_map(|s| {
+            [
+                format!(
+                    "      host service: `{}`'s server on 127.0.0.1:{}, which holds {}. It has to \
+                     run outside the sandbox; one started inside it cannot reach them. To put it \
+                     there, run `{}` in your own terminal.",
+                    s.program,
+                    s.port(),
+                    s.resource,
+                    s.restart_line()
+                ),
+                format!("        cost: {}", s.cost),
+            ]
+        })
+        .collect()
 }
 
 /// The variables one profile sets, as `ahma permissions list` shows them for
@@ -4791,6 +4817,24 @@ mod tests {
                 .all(|l| l.contains("never over a value you set"))
         );
         assert!(profile_env_lines("rust", std::path::Path::new("/w")).is_empty());
+    }
+
+    /// A host service is listed under its profile with what it holds, where it
+    /// has to run, the line that puts it there, and what it costs (SPEC
+    /// R-PROC.6, R-PERM.5.2).
+    #[test]
+    fn a_profile_lists_its_host_services_with_their_cost() {
+        let lines = profile_service_lines("android").join("\n");
+        assert!(lines.contains("adb"), "{lines}");
+        assert!(lines.contains("USB devices"), "{lines}");
+        assert!(lines.contains("127.0.0.1:"), "{lines}");
+        assert!(lines.contains("outside the sandbox"), "{lines}");
+        assert!(
+            lines.contains("`adb kill-server && adb start-server`"),
+            "{lines}"
+        );
+        assert!(lines.contains("cost:"), "{lines}");
+        assert!(profile_service_lines("rust").is_empty());
     }
 
     #[test]

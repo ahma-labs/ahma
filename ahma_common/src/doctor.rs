@@ -102,10 +102,16 @@ pub enum Fix {
         ide_mcp: Option<PathBuf>,
         clean_grants: Vec<String>,
     },
-    /// Restart a build daemon that is running inside a sandbox, from a process
-    /// that is not (SPEC R-DOCTOR.7). Refused when the doctor itself is
-    /// confined: the restarted daemon would inherit that sandbox too.
-    RestartDaemon { name: String },
+    /// Restart a daemon that is running inside a sandbox, from a process that
+    /// is not (SPEC R-DOCTOR.7): `name stop…`, then `name start…` (sccache's
+    /// `--stop-server`/`--start-server`, or what a profile declares for a host
+    /// service, R-PROC.6). Refused when the doctor itself is confined: the
+    /// restarted daemon would inherit that sandbox too.
+    RestartDaemon {
+        name: String,
+        stop: Vec<String>,
+        start: Vec<String>,
+    },
     /// Stop a confined helper that has no restart protocol of its own (a
     /// Gradle or Kotlin daemon, …): the next build starts a fresh, unconfined
     /// one. Only ever offered, never applied without the user's `y`.
@@ -135,9 +141,11 @@ impl Fix {
                 paths.len(),
                 join_paths(paths)
             ),
-            Fix::RestartDaemon { name } => format!(
-                "Restart the {name} server from this (unsandboxed) process: `{name} --stop-server` \
-                 then `{name} --start-server`"
+            Fix::RestartDaemon { name, stop, start } => format!(
+                "Restart the {name} server from this (unsandboxed) process: `{name} {}` then \
+                 `{name} {}`",
+                stop.join(" "),
+                start.join(" ")
             ),
             Fix::StopProcess { name, pid } => format!(
                 "Stop the sandboxed {name} daemon (pid {pid}) so the next build starts a fresh one \
@@ -166,7 +174,7 @@ impl Fix {
                 apply_remove_missing_scopes(paths, now)
             }
             Fix::ForgetMissingWorkspaces(paths) => apply_forget_missing_workspaces(paths, now),
-            Fix::RestartDaemon { name } => apply_restart_daemon(name),
+            Fix::RestartDaemon { name, stop, start } => apply_restart_daemon(name, stop, start),
             Fix::StopProcess { name, pid } => apply_stop_process(name, *pid),
             Fix::RevokeScopes(keys) => apply_revoke_scopes(keys, now),
             Fix::RepairAntigravityPermissions {
@@ -346,6 +354,21 @@ pub struct ConfinedDaemon {
     pub pid: u32,
     /// The checkout it can still write, when the probe could tell.
     pub confined_to: Option<PathBuf>,
+    /// Set when a profile declares the program a host service (SPEC
+    /// R-PROC.6): how it restarts, and what it holds.
+    pub service: Option<ServiceRestart>,
+}
+
+/// How a host service a profile declares is stopped and started, and what it
+/// holds (SPEC R-PROC.6). Filled by `ahma_mcp`, which owns the profiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRestart {
+    /// The arguments that stop it (`kill-server`).
+    pub stop: Vec<String>,
+    /// The arguments that start it (`start-server`).
+    pub start: Vec<String>,
+    /// What only the machine can give it (`USB devices`).
+    pub resource: String,
 }
 
 impl DoctorInput {
@@ -3171,6 +3194,7 @@ mod confined_daemon_tests {
                 name: "sccache".into(),
                 pid: 4242,
                 confined_to: Some(PathBuf::from("/Users/me/github/alt4/neubit4")),
+                service: None,
             }],
             &mut out,
         );
@@ -3197,6 +3221,7 @@ mod confined_daemon_tests {
                 name: "java".into(),
                 pid: 90823,
                 confined_to: None,
+                service: None,
             }],
             &mut out,
         );
@@ -3212,6 +3237,51 @@ mod confined_daemon_tests {
             })
         );
     }
+
+    /// A host service started inside a sandbox cannot reach what it holds
+    /// (adb's server, USB devices), so the advice and the fix come from the
+    /// profile that declares it, not from sccache's protocol (SPEC R-PROC.6).
+    #[test]
+    fn a_confined_host_service_is_restarted_by_its_own_commands() {
+        let mut out = Vec::new();
+        check_confined_daemons(
+            &[ConfinedDaemon {
+                name: "adb".into(),
+                pid: 9143,
+                confined_to: None,
+                service: Some(ServiceRestart {
+                    stop: vec!["kill-server".into()],
+                    start: vec!["start-server".into()],
+                    resource: "USB devices".into(),
+                }),
+            }],
+            &mut out,
+        );
+        let f = out.first().expect("a finding");
+        assert!(
+            f.detail
+                .starts_with("One thing to do: run `adb kill-server && adb start-server`"),
+            "{}",
+            f.detail
+        );
+        assert!(f.detail.contains("USB devices"), "{}", f.detail);
+        assert!(!f.detail.contains("--start-server"), "{}", f.detail);
+        let fix = f.fix.clone().expect("a fix");
+        assert_eq!(
+            fix,
+            Fix::RestartDaemon {
+                name: "adb".into(),
+                stop: vec!["kill-server".into()],
+                start: vec!["start-server".into()],
+            }
+        );
+        assert!(
+            fix.describe()
+                .contains("`adb kill-server` then `adb start-server`"),
+            "{}",
+            fix.describe()
+        );
+    }
 }
 
 /// What a confined helper is, and the one thing to do about it, by program.
@@ -3219,6 +3289,26 @@ mod confined_daemon_tests {
 /// only the advice is per program, and the fallback advice is generic.
 fn confined_daemon_advice(d: &ConfinedDaemon) -> (String, String, Fix) {
     let name = d.name.as_str();
+    if let Some(s) = &d.service {
+        let (stop, start) = (s.stop.join(" "), s.start.join(" "));
+        return (
+            format!(
+                "the server `{name}` starts when none is running, and it holds {res}: started \
+                 inside a sandbox it cannot reach them, so it finds none, and every `{name}` \
+                 command on this machine asks it",
+                res = s.resource
+            ),
+            format!(
+                "run `{name} {stop} && {name} {start}` in a terminal that is not inside any \
+                 sandbox (a plain Terminal window, not an agent's shell)"
+            ),
+            Fix::RestartDaemon {
+                name: name.to_string(),
+                stop: s.stop.clone(),
+                start: s.start.clone(),
+            },
+        );
+    }
     match name {
         "sccache" => (
             "a shared compiler cache: every Rust build on this machine compiles through it, \
@@ -3231,6 +3321,8 @@ fn confined_daemon_advice(d: &ConfinedDaemon) -> (String, String, Fix) {
             ),
             Fix::RestartDaemon {
                 name: name.to_string(),
+                stop: vec!["--stop-server".into()],
+                start: vec!["--start-server".into()],
             },
         ),
         "java" => (
@@ -3316,36 +3408,42 @@ fn apply_stop_process(name: &str, pid: u32) -> anyhow::Result<String> {
 // is the very fault being repaired, so `Fix::RestartDaemon` refuses in that case.
 use crate::seatbelt::this_process_is_confined;
 
-/// Stop and start a `--stop-server`/`--start-server` style daemon (sccache's
-/// protocol; the only one ahma restarts on its own).
-fn apply_restart_daemon(name: &str) -> anyhow::Result<String> {
+/// Stop and start a daemon with its own commands: sccache's `--stop-server` /
+/// `--start-server`, or a host service's as its profile declares them.
+fn apply_restart_daemon(name: &str, stop: &[String], start: &[String]) -> anyhow::Result<String> {
+    let (stop_line, start_line) = (
+        format!("{name} {}", stop.join(" ")),
+        format!("{name} {}", start.join(" ")),
+    );
     if this_process_is_confined() {
         anyhow::bail!(
             "this `ahma doctor` is itself running inside a sandbox, so a server it started \
-             would be confined too. Run `{name} --stop-server && {name} --start-server` from a \
-             plain terminal instead."
+             would be confined too. Run `{stop_line} && {start_line}` from a plain terminal \
+             instead."
         );
     }
-    let stop = std::process::Command::new(name)
-        .arg("--stop-server")
-        .output();
-    if let Err(e) = stop {
-        anyhow::bail!("could not run `{name} --stop-server`: {e}");
+    if let Err(e) = std::process::Command::new(name).args(stop).output() {
+        anyhow::bail!("could not run `{stop_line}`: {e}");
     }
-    let start = std::process::Command::new(name)
-        .arg("--start-server")
-        .env("SCCACHE_IDLE_TIMEOUT", "0")
+    let mut cmd = std::process::Command::new(name);
+    cmd.args(start);
+    if name == "sccache" {
+        // A server started here should not idle out and be restarted later
+        // by whichever sandboxed build finds it gone.
+        cmd.env("SCCACHE_IDLE_TIMEOUT", "0");
+    }
+    let started = cmd
         .output()
-        .map_err(|e| anyhow::anyhow!("could not run `{name} --start-server`: {e}"))?;
-    if !start.status.success() {
+        .map_err(|e| anyhow::anyhow!("could not run `{start_line}`: {e}"))?;
+    if !started.status.success() {
         anyhow::bail!(
-            "`{name} --start-server` failed: {}",
-            String::from_utf8_lossy(&start.stderr).trim()
+            "`{start_line}` failed: {}",
+            String::from_utf8_lossy(&started.stderr).trim()
         );
     }
     Ok(format!(
-        "Restarted the {name} server outside any sandbox. Nothing more to do: every checkout's \
-         builds use it from their next command."
+        "Restarted the {name} server outside any sandbox. Nothing more to do: every command \
+         that uses it reaches it from its next run."
     ))
 }
 

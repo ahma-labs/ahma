@@ -455,27 +455,133 @@ fn stop(leftovers: &[Leftover]) {
 /// The line a command's result carries for what ahma stopped after it
 /// (SPEC R-PROC.5): which processes, why, and the two ways to keep one.
 pub fn note(stopped: &[Leftover]) -> Option<String> {
-    if stopped.is_empty() {
-        return None;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let services = super::profiles::host_services(super::profiles::enabled_profile_names());
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let services = Vec::new();
+    note_with(stopped, &services)
+}
+
+/// [`note`], given the host services the enabled profiles declare. A stopped
+/// process that is one of them is a host service started inside the sandbox
+/// (SPEC R-PROC.6): keeping it there is not the fix, so its sentence says
+/// where it has to run instead, and the line that puts it there.
+fn note_with(stopped: &[Leftover], services: &[super::profiles::HostService]) -> Option<String> {
+    let (hosted, plain): (Vec<&Leftover>, Vec<&Leftover>) = stopped
+        .iter()
+        .partition(|l| services.iter().any(|s| s.program == l.name));
+    let mut out: Vec<String> = Vec::new();
+    if let Some((which, verb)) = which(&plain) {
+        out.push(format!(
+            "ahma: stopped {which}, which this command left running. A process started inside \
+             the sandbox keeps this command's confinement for life, so it would serve other \
+             programs while able to write only this workspace; {verb} ended with the command \
+             instead. To keep a server running, start it as its own background command (it \
+             lives as long as that command does); for a `run_terminal_command` line a human can \
+             instead declare the command in `tools.long_running` (`ahma settings explain \
+             tools.long_running`)."
+        ));
     }
+    let mut said: Vec<&str> = Vec::new();
+    for s in services {
+        let mine: Vec<&Leftover> = hosted
+            .iter()
+            .copied()
+            .filter(|l| l.name == s.program)
+            .collect();
+        if mine.is_empty() || said.contains(&s.program.as_str()) {
+            continue;
+        }
+        said.push(&s.program);
+        let (which, _) = which(&mine).unwrap_or_default();
+        out.push(format!(
+            "ahma: stopped {which}, the server `{p}` starts when none is running. It holds {res}, \
+             so it has to run outside the sandbox: started inside it, it is confined for life and \
+             cannot reach {res}, so it finds none, and every later `{p}` would ask it. A human \
+             runs `{line}` once, in a terminal outside the sandbox; this command and every later \
+             one then reach that server (SPEC R-PROC.6).",
+            p = s.program,
+            res = s.resource,
+            line = s.restart_line(),
+        ));
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+/// The processes named for a note, and the pronoun for them.
+fn which(stopped: &[&Leftover]) -> Option<(String, &'static str)> {
     let mut names: Vec<String> = stopped
         .iter()
         .map(|l| format!("`{}` (pid {})", l.name, l.pid))
         .collect();
     names.dedup();
-    let (which, verb) = if names.len() == 1 {
-        (names[0].clone(), "it")
-    } else {
-        (names.join(", "), "them")
-    };
-    Some(format!(
-        "ahma: stopped {which}, which this command left running. A process started inside the \
-         sandbox keeps this command's confinement for life, so it would serve other programs \
-         while able to write only this workspace; {verb} ended with the command instead. To \
-         keep a server running, start it as its own background command (it lives as long as \
-         that command does); for a `run_terminal_command` line a human can instead declare the \
-         command in `tools.long_running` (`ahma settings explain tools.long_running`)."
-    ))
+    match names.len() {
+        0 => None,
+        1 => Some((names.remove(0), "it")),
+        _ => Some((names.join(", "), "them")),
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::*;
+    use crate::sandbox::profiles::HostService;
+
+    fn adb() -> HostService {
+        HostService {
+            profile: "android".into(),
+            program: "adb".into(),
+            start: vec!["start-server".into()],
+            stop: vec!["kill-server".into()],
+            default_port: 5037,
+            port_env: Some("ANDROID_ADB_SERVER_PORT".into()),
+            resource: "USB devices".into(),
+            cost: "the agent drives every attached device".into(),
+        }
+    }
+
+    fn left(pid: u32, name: &str) -> Leftover {
+        Leftover {
+            pid,
+            name: name.into(),
+        }
+    }
+
+    /// Field case 2026-11-26: a sandboxed `adb devices` started adb's server,
+    /// which could not reach the phone over USB and listed nothing, and the
+    /// result said only that a process was stopped. A host service is named
+    /// as one, with the line a human types outside the sandbox (SPEC R-PROC.6).
+    #[test]
+    fn a_host_service_started_inside_the_sandbox_is_named_with_its_restart_line() {
+        let line = note_with(&[left(42, "adb")], &[adb()]).expect("a note");
+        assert!(line.contains("`adb` (pid 42)"), "{line}");
+        assert!(line.contains("USB devices"), "{line}");
+        assert!(line.contains("outside the sandbox"), "{line}");
+        assert!(
+            line.contains("`adb kill-server && adb start-server`"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("tools.long_running"),
+            "keeping it inside the sandbox is not the fix: {line}"
+        );
+    }
+
+    /// Anything else stopped keeps the R-PROC.5 sentence, beside the service's.
+    #[test]
+    fn other_leftovers_keep_their_own_note() {
+        let plain = note_with(&[left(7, "server")], &[adb()]).expect("a note");
+        assert!(plain.contains("tools.long_running"), "{plain}");
+        assert!(!plain.contains("adb"), "{plain}");
+
+        let both = note_with(&[left(7, "server"), left(42, "adb")], &[adb()]).expect("a note");
+        assert!(both.contains("`server` (pid 7)"), "{both}");
+        assert!(
+            both.contains("`adb kill-server && adb start-server`"),
+            "{both}"
+        );
+        assert!(note_with(&[], &[adb()]).is_none());
+    }
 }
 
 #[cfg(all(test, unix))]

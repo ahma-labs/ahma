@@ -290,6 +290,18 @@ Paths with spaces are read whole: `/Applications/Google Chrome.app` is no longer
 
 What `ahma doctor` still reports is a helper from before this rule, or one you declared may stay. A long-lived helper started by a sandboxed command inherits the sandbox and outlives the command. A sccache server started that way serves every session on the machine but can write only the checkout it was born in, so every other checkout's Rust build fails under its own `target/` with a bare `Operation not permitted`. `ahma doctor` finds any such process by its shape — confined, reparented to launchd, your own executable — and names the restart (`sccache --stop-server && sccache --start-server` from a plain terminal); `ahma doctor --fix` runs it, and an unconfined ahma server restarts a confined sccache on its own at startup (SPEC R-DOCTOR.7).
 
+## Host services: adb's server finds no phone
+
+Some servers do not do a command's work but hold something only your machine can give: adb's server holds the USB devices. Any `adb` command starts that server when none is running, so if the first `adb` after a restart runs inside the sandbox, the server is confined for life. It cannot open the phone's USB interface, so `adb devices` lists nothing and prints no error (SPEC R-PROC.6).
+
+The fix is to start the server outside the sandbox, once, from your own terminal:
+
+```bash
+adb kill-server && adb start-server
+```
+
+Sandboxed `adb` commands (an agent's, or ahma's `adb-*` tools) then reach it on 127.0.0.1:5037. ahma never starts it for you. When a sandboxed command does start one, ahma stops it as the command ends (as for any server, R-PROC.5), and the result names it as a host service and gives that line. A kernel denial of a USB device says the same, and `ahma doctor` finds a confined adb server wherever adb is installed and can restart it. The `android` profile declares the service, and `ahma permissions list` shows it with its cost. The agent then drives every attached device: it installs apps, runs a shell, and reads what the device lets adb read. Through `adb connect`, `forward` and `reverse` the server also reaches network ports the sandbox does not. Under `--restrict-network` a sandboxed client cannot reach the server's loopback port.
+
 ### sccache: `Operation not permitted`
 
 A build that fails with `sccache: error: Operation not permitted` (often shown by cargo as ``process didn't exit successfully: `sccache …/rustc -vV` ``) is a sandbox problem, not a problem in your code, and re-running it fails the same way. The path in that message is the compiler sccache wraps, not what the sandbox refused, so ahma never offers a grant on it. ahma's failure note says which of these applies (SPEC R-DOCTOR.9):

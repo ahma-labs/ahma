@@ -421,6 +421,17 @@ packages come from: Gradle's init scripts and `gradle.properties`, Maven's
 only the cache directories under them are writable. A profile creates a missing cache
 directory only inside a toolchain home that already exists, never the home itself.
 
+### Profiles that declare host services
+
+A profile may declare a server that has to run outside the sandbox (`[[services]]`:
+the program, how it starts and stops, its loopback port, what it holds, and what it
+costs). The `android` profile declares adb's server, which holds the USB devices;
+one started inside the sandbox cannot reach them. `ahma permissions list` shows each
+service under its profile with the line that starts it outside the sandbox
+(`adb kill-server && adb start-server`) and its cost. ahma never starts one itself
+([security-sandbox.md](security-sandbox.md#host-services-adbs-server-finds-no-phone),
+SPEC R-PROC.6).
+
 ### Profiles that set environment variables
 
 A profile may also set variables on sandboxed commands, each with a stated reason,

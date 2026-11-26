@@ -139,7 +139,9 @@ fn looks_like_gpu_denial(line: &str) -> bool {
         || (metal && lower.contains("failed to allocate"))
         || (metal && lower.contains("failed to initialize"))
         || (lower.contains("mtlbuffer") && lower.contains("nil"))
-        || (lower.contains("deny(") && lower.contains("iokit-open"))
+        || (lower.contains("deny(")
+            && lower.contains("iokit-open")
+            && !super::kernel_denials::is_usb_user_client(line))
 }
 
 #[cfg(test)]
@@ -171,6 +173,14 @@ mod tests {
         assert!(note.contains("not a path"), "{note}");
         assert!(gpu_denial_note("", "MTLCreateSystemDefaultDevice() returned nil").is_some());
         assert!(gpu_denial_note("Permission denied: /etc/shadow", "").is_none());
+        assert!(
+            gpu_denial_note(
+                "Sandbox: adb(9143) deny(1) iokit-open IOUSBHostDeviceUserClient",
+                ""
+            )
+            .is_none(),
+            "a USB device is not the GPU"
+        );
         set_allow_gpu(true);
         let allowed = gpu_denial_note("failed to create command queue", "")
             .expect("a Metal failure with the GPU allowed is still explained");

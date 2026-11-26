@@ -137,6 +137,24 @@ pub enum DenialClass {
     /// Something no grant or setting allows (opening an app, a setuid
     /// program, a service the sandbox withholds).
     Unfixable { why: String },
+    /// A device only a server outside the sandbox reaches (SPEC R-PROC.6):
+    /// USB, which adb's server holds for a phone. Not this process's to have,
+    /// so no grant, setting or escape is offered.
+    HostService { resource: &'static str },
+}
+
+/// The IOKit user-client classes of a USB device or interface (`IOUSBHost*`,
+/// the older `IOUSB*UserClientV*`, `AppleUSB*`).
+const USB_USER_CLIENT_PREFIXES: &[&str] = &["IOUSB", "AppleUSB"];
+
+/// The resource a USB denial names, as host services declare it.
+const USB_DEVICES: &str = "USB devices";
+
+/// Whether a denial target (or a line holding one) names a USB user client.
+pub fn is_usb_user_client(target: &str) -> bool {
+    target
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '(')
+        .any(|w| USB_USER_CLIENT_PREFIXES.iter().any(|p| w.starts_with(p)))
 }
 
 /// Sort a denial by what can change it.
@@ -164,6 +182,11 @@ pub fn classify(denial: &KernelDenial) -> DenialClass {
         {
             DenialClass::Capability {
                 setting: "allow_gpu",
+            }
+        }
+        "iokit-open" | "iokit-open-user-client" if is_usb_user_client(&denial.target) => {
+            DenialClass::HostService {
+                resource: USB_DEVICES,
             }
         }
         "signal" => DenialClass::Capability {
@@ -226,6 +249,27 @@ pub fn one_line(denial: &KernelDenial, class: &DenialClass) -> String {
              {}`.",
             target.split(':').next().unwrap_or(target)
         ),
+        DenialClass::HostService { resource } => {
+            let servers: Vec<String> = super::profiles::declared_host_services()
+                .into_iter()
+                .filter(|s| s.resource == *resource)
+                .map(|s| format!("`{}` ({}'s server)", s.restart_line(), s.program))
+                .collect();
+            let how = if servers.is_empty() {
+                "a human starts that server in a terminal outside the sandbox".to_string()
+            } else {
+                format!(
+                    "a human runs {} once, in a terminal outside the sandbox",
+                    servers.join(" or ")
+                )
+            };
+            format!(
+                "Blocked: {what}. {resource} are reached through a server that runs outside the \
+                 sandbox; no grant or setting gives them to a sandboxed process, and a server \
+                 started inside it can never reach them. {how}; sandboxed commands then reach \
+                 that server (SPEC R-PROC.6)."
+            )
+        }
         DenialClass::Unfixable { why } => format!(
             "Blocked: {what}. No grant or setting changes this: {why}. If the command must do \
              it, run the same command again: in Claude Code ahma asks the human once whether to \
@@ -347,6 +391,15 @@ mod tests {
                 "unfixable",
             ),
             (
+                "Sandbox: adb(9143) deny(1) iokit-open IOUSBHostDeviceUserClient".to_string(),
+                "host",
+            ),
+            (
+                "Sandbox: adb(9143) deny(1) iokit-open-user-client IOUSBHostInterfaceUserClient"
+                    .to_string(),
+                "host",
+            ),
+            (
                 "Sandbox: Google Chrome(18339) deny(1) mach-register \
                  com.google.Chrome.MachPortRendezvousServer.18339"
                     .to_string(),
@@ -366,12 +419,25 @@ mod tests {
                 DenialClass::Capability { .. } => "signal",
                 DenialClass::Network { .. } => "net",
                 DenialClass::Unfixable { .. } => "unfixable",
+                DenialClass::HostService { .. } => "host",
             };
             assert_eq!(got, want, "{line}");
             let said = one_line(&denial, &class);
             assert!(said.starts_with("Blocked"), "{said}");
             if want == "never" || want == "unfixable" {
                 assert!(!said.contains("sandbox grant"), "{said}");
+            }
+            if want == "host" {
+                // A server outside the sandbox reaches the device; nothing
+                // a grant, a setting or a run outside the sandbox can give
+                // to this one process (SPEC R-PROC.6).
+                assert!(!said.contains("sandbox grant"), "{said}");
+                assert!(said.contains("USB devices"), "{said}");
+                assert!(said.contains("outside the sandbox"), "{said}");
+                assert!(
+                    said.contains("`adb kill-server && adb start-server`"),
+                    "the restart line comes from the profile that declares the server: {said}"
+                );
             }
             if want == "unfixable" {
                 // The escape is offered on a re-run; a script for the human
