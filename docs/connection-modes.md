@@ -30,7 +30,8 @@ ahma serve stdio
 
 ### mcp.json examples
 
-`ahma setup` writes these for the editors it finds. By hand:
+`ahma setup` writes the stdio entry for the editors it finds (it never writes an HTTP or
+Unix-socket entry: those need the server's token, below). By hand:
 
 **VS Code** (user profile `mcp.json` or `.vscode/mcp.json`):
 

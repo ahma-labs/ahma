@@ -15,22 +15,6 @@ use crate::wizard_prompt::{prompt_multi_select, prompt_multi_select_all};
 /// The embedded skill content to install globally.
 const SKILL_CONTENT: &str = include_str!("../../skills/ahma/SKILL.md");
 
-fn prompt_transport() -> &'static str {
-    println!("\nSelect how MCP clients like your IDE or TUI connect to ahma:");
-    println!("  1) stdio  (recommended - private ahma instance per project)");
-    println!("  2) http   (one shared server over localhost TCP)");
-    println!("  3) unix   (one shared server over localhost Unix socket)");
-    print!("  Mode [default 1]: ");
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    let _ = io::stdin().read_line(&mut input);
-    match input.trim() {
-        "2" => "http",
-        "3" => "unix",
-        _ => "stdio",
-    }
-}
-
 /// A thing the wizard can set up. Listed in alphabetical order (by label) for
 /// uniform, simple presentation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,7 +57,6 @@ impl SetupAction {
 /// is genuinely setup's business.
 fn configure_mcp(
     platform: Platform,
-    transport: &str,
     servers_entry: &serde_json::Value,
     scoped_servers_entry: &serde_json::Value,
     home: &Path,
@@ -84,16 +67,10 @@ fn configure_mcp(
 
     match format {
         McpConfigFormat::Toml => {
-            merge_codex_toml(&path, build_codex_toml_value(transport))?;
+            merge_codex_toml(&path, build_codex_toml_value())?;
         }
         McpConfigFormat::Json(servers_key) => {
-            let entry = select_mcp_json_entry(
-                platform,
-                transport,
-                servers_entry,
-                scoped_servers_entry,
-                home,
-            );
+            let entry = select_mcp_json_entry(platform, servers_entry, scoped_servers_entry);
             merge_mcp_json(&path, servers_key, entry)?;
         }
     }
@@ -102,13 +79,7 @@ fn configure_mcp(
         let ide_dir = home.join(".antigravity");
         if ide_dir.exists() {
             let ide_path = ide_dir.join("mcp.json");
-            let entry = select_mcp_json_entry(
-                platform,
-                transport,
-                servers_entry,
-                scoped_servers_entry,
-                home,
-            );
+            let entry = select_mcp_json_entry(platform, servers_entry, scoped_servers_entry);
             let _ = merge_mcp_json(&ide_path, "mcpServers", entry);
         }
     }
@@ -116,25 +87,18 @@ fn configure_mcp(
     Ok(Some(platform.mcp_display_name()))
 }
 
-/// Choose which JSON MCP entry shape a platform gets: Claude Desktop's
-/// type-less entry, the plain entry for platforms that answer `roots/list`,
-/// or the scope-carrying entry for platforms that don't (see
-/// `build_scoped_servers_entry` for why the scope can't be injected here).
+/// Choose which JSON MCP entry shape a platform gets: the typed entry for
+/// platforms that answer `roots/list`, or the type-less one for Claude Desktop
+/// and the platforms that don't (see `build_scoped_servers_entry` for why no
+/// scope is injected into it).
 fn select_mcp_json_entry(
     platform: Platform,
-    transport: &str,
     servers_entry: &serde_json::Value,
     scoped_servers_entry: &serde_json::Value,
-    home: &Path,
 ) -> serde_json::Value {
-    if platform == Platform::ClaudeDesktop {
-        // Claude Desktop's entry omits the `"type"` wrapper field.
-        build_claude_desktop_mcp_entry(transport, home)
-    } else if platform.sends_roots_list() {
+    if platform != Platform::ClaudeDesktop && platform.sends_roots_list() {
         servers_entry.clone()
     } else {
-        // No roots/list means ahma cannot discover the workspace, so the
-        // entry has to carry the scope explicitly.
         scoped_servers_entry.clone()
     }
 }
@@ -142,11 +106,10 @@ fn select_mcp_json_entry(
 async fn execute_actions(
     actions: &[SetupAction],
     platforms: &[Platform],
-    transport: &str,
     interactive: bool,
 ) -> Result<()> {
     if actions.contains(&SetupAction::Mcp) {
-        setup_mcp_config(platforms, transport, interactive).await?;
+        setup_mcp_config(platforms, interactive).await?;
     }
     if actions.contains(&SetupAction::Hooks) {
         setup_terminal_hooks(platforms, interactive).await?;
@@ -165,8 +128,9 @@ async fn execute_actions(
 /// Interactively this asks just two questions: **what** to set up (actions),
 /// then **where** to apply it (platforms). Only per-platform actions (MCP
 /// servers, terminal hooks) trigger the platform question; TLS and skills are
-/// global. When MCP is selected, the connection transport is requested as a
-/// follow-up detail of that action.
+/// global. MCP entries are always stdio, a pipe to the per-user hub: an
+/// `http` or `unix` entry would need the server's token, which a client config
+/// cannot hold safely (R-SETUP.5).
 pub async fn run(args: SetupArgs) -> Result<()> {
     if args.plan {
         return crate::setup_plan::run_plan_command(args.path, args.apply);
@@ -195,9 +159,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
 
     // Question 2: which platforms to apply the per-platform actions to.
     let platforms = select_platforms_for(&actions, interactive);
-    let transport = select_transport_for(&actions, interactive);
-
-    execute_actions(&actions, &platforms, transport, interactive).await?;
+    execute_actions(&actions, &platforms, interactive).await?;
 
     if interactive {
         print_wizard_footer();
@@ -213,16 +175,6 @@ fn select_platforms_for(actions: &[SetupAction], interactive: bool) -> Vec<Platf
         return Vec::new();
     }
     select_platforms(actions, interactive)
-}
-
-/// The connection transport is a required detail of the MCP action alone, and is
-/// only ever asked for — every non-interactive path takes the stdio default.
-fn select_transport_for(actions: &[SetupAction], interactive: bool) -> &'static str {
-    if interactive && actions.contains(&SetupAction::Mcp) {
-        prompt_transport()
-    } else {
-        "stdio"
-    }
 }
 
 /// The line saying setup could not ask, when it was not told `--auto` and has
@@ -381,23 +333,6 @@ fn select_platforms(actions: &[SetupAction], interactive: bool) -> Vec<Platform>
         .collect()
 }
 
-/// The URL a shared-transport client entry is written with.
-///
-/// The Unix arm resolves the **per-user** `serve unix` socket (SPEC R-HUB.2) at
-/// setup time rather than hardcoding the retired machine-global
-/// `/tmp/ahma.sock`: this string is baked into the user's client config, so a
-/// stale literal here outlives every later fix.
-fn mcp_shared_transport_url(transport: &str) -> Option<String> {
-    match transport {
-        "http" => Some("http://localhost:3000/mcp".to_string()),
-        "unix" => Some(format!(
-            "unix://{}#/mcp",
-            ahma_common::hub::serve_unix_socket_path(None)
-        )),
-        _ => None,
-    }
-}
-
 /// Resolve the command string used in MCP configurations.
 ///
 /// Under test isolation this returns "ahma" so unit tests match without depending
@@ -425,10 +360,7 @@ fn resolve_ahma_command() -> String {
     "ahma".to_string()
 }
 
-fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
-    if let Some(url) = mcp_shared_transport_url(transport) {
-        return json!({ "type": "http", "url": url });
-    }
+fn build_mcp_servers_entry() -> serde_json::Value {
     json!({
         "type": "stdio",
         "command": resolve_ahma_command(),
@@ -437,7 +369,7 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
 }
 
 /// The stdio entry for clients whose config file omits the `"type"` field
-/// (Antigravity, LM Studio).
+/// (Antigravity, LM Studio, and Claude Desktop, whose older versions reject it).
 ///
 /// It used to also pre-create `~/sandbox` and pin these clients to it with
 /// `--sandbox-scope`, on the belief that they never send `roots/list`. Both
@@ -451,34 +383,14 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
 ///
 /// A roots-empty client now reaches its scope through elicitation (R5.3.1) or
 /// the user's own `[sandbox] container_root` (R5.2.3).
-fn build_scoped_servers_entry(transport: &str, _home: &Path) -> serde_json::Value {
-    if let Some(url) = mcp_shared_transport_url(transport) {
-        return json!({ "url": url });
-    }
+fn build_scoped_servers_entry() -> serde_json::Value {
     json!({
         "command": resolve_ahma_command(),
         "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     })
 }
 
-/// Build the MCP entry for Claude Desktop.
-///
-/// Claude Desktop's `claude_desktop_config.json` uses `mcpServers` with the
-/// same `command`/`args` shape as Claude Code but without a `"type"` wrapper
-/// field — omitting it ensures compatibility with all Desktop versions.
-/// HTTP and Unix transports are passed through as-is for users running a
-/// shared ahma server.
-fn build_claude_desktop_mcp_entry(transport: &str, _home: &Path) -> serde_json::Value {
-    if let Some(url) = mcp_shared_transport_url(transport) {
-        return json!({ "type": "http", "url": url });
-    }
-    json!({
-        "command": resolve_ahma_command(),
-        "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
-    })
-}
-
-fn print_mcp_restart_hints(interactive: bool, configured: &[&str], transport: &str) {
+fn print_mcp_restart_hints(interactive: bool, configured: &[&str]) {
     if !interactive || configured.is_empty() {
         return;
     }
@@ -486,45 +398,25 @@ fn print_mcp_restart_hints(interactive: bool, configured: &[&str], transport: &s
     for platform in configured {
         println!("    - {}", platform);
     }
-    match transport {
-        "http" => println!(
-            "  Start the HTTP server before opening tools: ahma serve http --tools simplify"
-        ),
-        "unix" => println!(
-            "  Start the Unix socket server before opening tools: ahma serve unix --socket-path {} --tools simplify",
-            ahma_common::hub::serve_unix_socket_path(None)
-        ),
-        _ => {}
-    }
     println!();
 }
 
-async fn setup_mcp_config(
-    platforms: &[Platform],
-    transport: &str,
-    interactive: bool,
-) -> Result<()> {
+async fn setup_mcp_config(platforms: &[Platform], interactive: bool) -> Result<()> {
     let home = ahma_common::config::ahma_home_dir()
         .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
-    let servers_entry = build_mcp_servers_entry(transport);
-    let scoped_servers_entry = build_scoped_servers_entry(transport, &home);
+    let servers_entry = build_mcp_servers_entry();
+    let scoped_servers_entry = build_scoped_servers_entry();
 
     let mut configured = Vec::new();
 
     for platform in platforms.iter().copied().filter(|p| p.supports_mcp()) {
-        if let Some(name) = configure_mcp(
-            platform,
-            transport,
-            &servers_entry,
-            &scoped_servers_entry,
-            &home,
-        )? {
+        if let Some(name) = configure_mcp(platform, &servers_entry, &scoped_servers_entry, &home)? {
             configured.push(name);
         }
     }
 
-    print_mcp_restart_hints(interactive, &configured, transport);
+    print_mcp_restart_hints(interactive, &configured);
 
     Ok(())
 }
@@ -557,8 +449,8 @@ pub fn detect_mcp_config_drifts() -> Vec<McpConfigDrift> {
         return Vec::new();
     };
 
-    let servers_entry = build_mcp_servers_entry("stdio");
-    let scoped_servers_entry = build_scoped_servers_entry("stdio", &home);
+    let servers_entry = build_mcp_servers_entry();
+    let scoped_servers_entry = build_scoped_servers_entry();
 
     PLATFORMS
         .iter()
@@ -585,12 +477,11 @@ fn detect_platform_mcp_drift(
     }
     match format {
         McpConfigFormat::Toml => {
-            let recommended = build_codex_toml_value("stdio");
+            let recommended = build_codex_toml_value();
             detect_toml_drift(platform, path, recommended)
         }
         McpConfigFormat::Json(servers_key) => {
-            let recommended =
-                select_mcp_json_entry(platform, "stdio", servers_entry, scoped_servers_entry, home);
+            let recommended = select_mcp_json_entry(platform, servers_entry, scoped_servers_entry);
             detect_json_drift(platform, path, servers_key, recommended)
         }
     }
@@ -834,39 +725,17 @@ pub(crate) fn merge_mcp_json(
     Ok(())
 }
 
-fn build_codex_toml_value(transport: &str) -> toml::Value {
+fn build_codex_toml_value() -> toml::Value {
     let mut table = toml::map::Map::new();
-    match transport {
-        "http" => {
-            table.insert(
-                "url".to_string(),
-                toml::Value::String("http://localhost:3000/mcp".to_string()),
-            );
-        }
-        "unix" => {
-            table.insert(
-                "url".to_string(),
-                toml::Value::String(format!(
-                    "unix://{}#/mcp",
-                    ahma_common::hub::serve_unix_socket_path(None)
-                )),
-            );
-        }
-        _ => {
-            table.insert(
-                "command".to_string(),
-                toml::Value::String(resolve_ahma_command()),
-            );
-            let args = vec![
-                toml::Value::String("serve".to_string()),
-                toml::Value::String("stdio".to_string()),
-                toml::Value::String("--tools".to_string()),
-                toml::Value::String("simplify".to_string()),
-                toml::Value::String("--log-monitor".to_string()),
-            ];
-            table.insert("args".to_string(), toml::Value::Array(args));
-        }
-    }
+    table.insert(
+        "command".to_string(),
+        toml::Value::String(resolve_ahma_command()),
+    );
+    let args = ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
+        .into_iter()
+        .map(|a| toml::Value::String(a.to_string()))
+        .collect();
+    table.insert("args".to_string(), toml::Value::Array(args));
     toml::Value::Table(table)
 }
 
@@ -1181,7 +1050,7 @@ mod tests {
     fn test_merge_codex_toml_new_file() -> Result<()> {
         let tmp = tempdir()?;
         let path = tmp.path().join("config.toml");
-        let val = build_codex_toml_value("stdio");
+        let val = build_codex_toml_value();
 
         merge_codex_toml(&path, val)?;
 
@@ -1204,7 +1073,7 @@ mod tests {
             "[other]\nkey = \"val\"\n[mcp_servers.Other]\ncommand = \"other\"",
         )?;
 
-        let val = build_codex_toml_value("http");
+        let val = build_codex_toml_value();
 
         merge_codex_toml(&path, val)?;
 
@@ -1216,8 +1085,8 @@ mod tests {
             Some("other")
         );
         assert_eq!(
-            parsed["mcp_servers"]["Ahma"]["url"].as_str(),
-            Some("http://localhost:3000/mcp")
+            parsed["mcp_servers"]["Ahma"]["command"].as_str(),
+            Some("ahma")
         );
         Ok(())
     }
@@ -1230,7 +1099,7 @@ mod tests {
         // every command run there failed with an ordinary-looking shell error.
         let tmp = tempdir().unwrap();
         let fake_home = tmp.path();
-        let entry = build_scoped_servers_entry("stdio", fake_home);
+        let entry = build_scoped_servers_entry();
 
         let args = entry["args"].as_array().expect("args must be an array");
         assert!(
@@ -1294,20 +1163,18 @@ mod tests {
 
     #[test]
     fn test_default_mcp_entry_has_no_tmp_or_injected_scope() {
-        assert_no_tmp_and_no_injected_scope(&build_mcp_servers_entry("stdio"), "default stdio");
+        assert_no_tmp_and_no_injected_scope(&build_mcp_servers_entry(), "default stdio");
     }
 
     #[test]
     fn test_claude_desktop_entry_has_no_tmp_or_injected_scope() {
-        let tmp = tempdir().unwrap();
-        let entry = build_claude_desktop_mcp_entry("stdio", tmp.path());
+        let entry = build_scoped_servers_entry();
         assert_no_tmp_and_no_injected_scope(&entry, "Claude Desktop");
     }
 
     #[test]
     fn test_antigravity_entry_has_no_tmp_or_injected_scope() {
-        let tmp = tempdir().unwrap();
-        let entry = build_scoped_servers_entry("stdio", tmp.path());
+        let entry = build_scoped_servers_entry();
         assert_no_tmp_and_no_injected_scope(&entry, "Antigravity");
     }
 
@@ -1316,7 +1183,7 @@ mod tests {
     #[test]
     fn test_scoped_entry_creates_no_directory() {
         let tmp = tempdir().unwrap();
-        let _ = build_scoped_servers_entry("stdio", tmp.path());
+        let _ = build_scoped_servers_entry();
         let created: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
@@ -1372,53 +1239,11 @@ mod tests {
         assert!(!cli.opens_guided_view(), "--cli is the line wizard");
     }
 
-    // ─── mcp_shared_transport_url ─────────────────────────────────────────────
-
-    #[test]
-    fn test_mcp_shared_transport_url_variants() {
-        assert_eq!(
-            mcp_shared_transport_url("http").as_deref(),
-            Some("http://localhost:3000/mcp")
-        );
-        assert_eq!(
-            mcp_shared_transport_url("unix").as_deref(),
-            Some(
-                format!(
-                    "unix://{}#/mcp",
-                    ahma_common::hub::serve_unix_socket_path(None)
-                )
-                .as_str()
-            ),
-            "the Unix entry names the per-user hub socket, not /tmp/ahma.sock"
-        );
-        assert_eq!(mcp_shared_transport_url("stdio"), None);
-        assert_eq!(mcp_shared_transport_url("bogus"), None);
-    }
-
     // ─── build_mcp_servers_entry ──────────────────────────────────────────────
 
     #[test]
-    fn test_build_mcp_servers_entry_http() {
-        let entry = build_mcp_servers_entry("http");
-        assert_eq!(entry["type"], "http");
-        assert_eq!(entry["url"], "http://localhost:3000/mcp");
-        assert!(entry.get("args").is_none());
-    }
-
-    #[test]
-    fn test_build_mcp_servers_entry_unix() {
-        let entry = build_mcp_servers_entry("unix");
-        assert_eq!(entry["type"], "http");
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::hub::serve_unix_socket_path(None)
-        );
-        assert_eq!(entry["url"], expected);
-    }
-
-    #[test]
     fn test_build_mcp_servers_entry_stdio() {
-        let entry = build_mcp_servers_entry("stdio");
+        let entry = build_mcp_servers_entry();
         assert_eq!(entry["type"], "stdio");
         assert_eq!(entry["command"], "ahma");
         let args = entry["args"].as_array().unwrap();
@@ -1429,54 +1254,11 @@ mod tests {
 
     // ─── build_scoped_servers_entry ───────────────────────────────────────────
 
-    #[test]
-    fn test_build_scoped_servers_entry_http_returns_url_only() {
-        let tmp = tempdir().unwrap();
-        let entry = build_scoped_servers_entry("http", tmp.path());
-        assert_eq!(entry["url"], "http://localhost:3000/mcp");
-        assert!(entry.get("command").is_none());
-        // Shared-transport path must NOT pre-create the sandbox directory.
-        assert!(!tmp.path().join("sandbox").exists());
-    }
-
-    #[test]
-    fn test_build_scoped_servers_entry_unix_returns_url_only() {
-        let tmp = tempdir().unwrap();
-        let entry = build_scoped_servers_entry("unix", tmp.path());
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::hub::serve_unix_socket_path(None)
-        );
-        assert_eq!(entry["url"], expected);
-        assert!(entry.get("command").is_none());
-    }
-
     // ─── build_claude_desktop_mcp_entry ───────────────────────────────────────
 
     #[test]
-    fn test_build_claude_desktop_mcp_entry_http() {
-        let tmp = tempdir().unwrap();
-        let entry = build_claude_desktop_mcp_entry("http", tmp.path());
-        assert_eq!(entry["type"], "http");
-        assert_eq!(entry["url"], "http://localhost:3000/mcp");
-    }
-
-    #[test]
-    fn test_build_claude_desktop_mcp_entry_unix() {
-        let tmp = tempdir().unwrap();
-        let entry = build_claude_desktop_mcp_entry("unix", tmp.path());
-        assert_eq!(entry["type"], "http");
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::hub::serve_unix_socket_path(None)
-        );
-        assert_eq!(entry["url"], expected);
-    }
-
-    #[test]
     fn test_build_claude_desktop_mcp_entry_stdio_has_no_type() {
-        let tmp = tempdir().unwrap();
-        let entry = build_claude_desktop_mcp_entry("stdio", tmp.path());
+        let entry = build_scoped_servers_entry();
         assert!(entry.get("type").is_none());
         assert_eq!(entry["command"], "ahma");
         assert_eq!(entry["args"][0], "serve");
@@ -1485,30 +1267,8 @@ mod tests {
     // ─── build_codex_toml_value ───────────────────────────────────────────────
 
     #[test]
-    fn test_build_codex_toml_value_http() {
-        let v = build_codex_toml_value("http");
-        let t = v.as_table().unwrap();
-        assert_eq!(
-            t.get("url").unwrap().as_str(),
-            Some("http://localhost:3000/mcp")
-        );
-        assert!(t.get("command").is_none());
-    }
-
-    #[test]
-    fn test_build_codex_toml_value_unix() {
-        let v = build_codex_toml_value("unix");
-        let t = v.as_table().unwrap();
-        let expected = format!(
-            "unix://{}#/mcp",
-            ahma_common::hub::serve_unix_socket_path(None)
-        );
-        assert_eq!(t.get("url").unwrap().as_str(), Some(expected.as_str()));
-    }
-
-    #[test]
     fn test_build_codex_toml_value_stdio() {
-        let v = build_codex_toml_value("stdio");
+        let v = build_codex_toml_value();
         let t = v.as_table().unwrap();
         assert_eq!(t.get("command").unwrap().as_str(), Some("ahma"));
         let args = t.get("args").unwrap().as_array().unwrap();
@@ -1576,7 +1336,7 @@ mod tests {
         let tmp = tempdir()?;
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "this = = = not valid toml [[[")?;
-        merge_codex_toml(&path, build_codex_toml_value("stdio"))?;
+        merge_codex_toml(&path, build_codex_toml_value())?;
         let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
         assert_eq!(
             parsed["mcp_servers"]["Ahma"]["command"].as_str(),
@@ -1591,7 +1351,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         // mcp_servers exists but is a string.
         std::fs::write(&path, "mcp_servers = \"oops\"")?;
-        merge_codex_toml(&path, build_codex_toml_value("stdio"))?;
+        merge_codex_toml(&path, build_codex_toml_value())?;
         let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
         assert!(parsed["mcp_servers"].is_table());
         assert_eq!(
@@ -1791,9 +1551,9 @@ mod tests {
     fn test_configure_mcp_claude_code_writes_claude_json() -> Result<()> {
         let tmp = tempdir()?;
         let home = tmp.path();
-        let servers = build_mcp_servers_entry("stdio");
-        let scoped = build_scoped_servers_entry("stdio", home);
-        let name = configure_mcp(Platform::ClaudeCode, "stdio", &servers, &scoped, home)?;
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
+        let name = configure_mcp(Platform::ClaudeCode, &servers, &scoped, home)?;
         assert_eq!(name, Some("Claude Code"));
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json"))?)?;
@@ -1805,9 +1565,9 @@ mod tests {
     fn test_configure_mcp_cursor_writes_cursor_mcp_json() -> Result<()> {
         let tmp = tempdir()?;
         let home = tmp.path();
-        let servers = build_mcp_servers_entry("stdio");
-        let scoped = build_scoped_servers_entry("stdio", home);
-        let name = configure_mcp(Platform::Cursor, "stdio", &servers, &scoped, home)?;
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
+        let name = configure_mcp(Platform::Cursor, &servers, &scoped, home)?;
         assert_eq!(name, Some("Cursor"));
         let path = home.join(".cursor").join("mcp.json");
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -1819,9 +1579,9 @@ mod tests {
     fn test_configure_mcp_antigravity_uses_scoped_entry() -> Result<()> {
         let tmp = tempdir()?;
         let home = tmp.path();
-        let servers = build_mcp_servers_entry("stdio");
-        let scoped = build_scoped_servers_entry("stdio", home);
-        let name = configure_mcp(Platform::Antigravity, "stdio", &servers, &scoped, home)?;
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
+        let name = configure_mcp(Platform::Antigravity, &servers, &scoped, home)?;
         assert_eq!(name, Some("Antigravity"));
         let path = home.join(".gemini").join("config").join("mcp_config.json");
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -1841,9 +1601,9 @@ mod tests {
     fn test_configure_mcp_lmstudio_uses_scoped_entry() -> Result<()> {
         let tmp = tempdir()?;
         let home = tmp.path();
-        let servers = build_mcp_servers_entry("stdio");
-        let scoped = build_scoped_servers_entry("stdio", home);
-        let name = configure_mcp(Platform::LmStudio, "stdio", &servers, &scoped, home)?;
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
+        let name = configure_mcp(Platform::LmStudio, &servers, &scoped, home)?;
         assert_eq!(name, Some("LM Studio"));
         let path = home.join(".lmstudio").join("mcp.json");
         assert!(path.exists());
@@ -1854,15 +1614,15 @@ mod tests {
     fn test_configure_mcp_codex_writes_toml() -> Result<()> {
         let tmp = tempdir()?;
         let home = tmp.path();
-        let servers = build_mcp_servers_entry("http");
-        let scoped = build_scoped_servers_entry("http", home);
-        let name = configure_mcp(Platform::Codex, "http", &servers, &scoped, home)?;
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
+        let name = configure_mcp(Platform::Codex, &servers, &scoped, home)?;
         assert_eq!(name, Some("Codex CLI"));
         let path = home.join(".codex").join("config.toml");
         let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
         assert_eq!(
-            parsed["mcp_servers"]["Ahma"]["url"].as_str(),
-            Some("http://localhost:3000/mcp")
+            parsed["mcp_servers"]["Ahma"]["command"].as_str(),
+            Some("ahma")
         );
         Ok(())
     }
@@ -1871,10 +1631,56 @@ mod tests {
     fn test_configure_mcp_copilot_returns_none() -> Result<()> {
         let tmp = tempdir()?;
         let home = tmp.path();
-        let servers = build_mcp_servers_entry("stdio");
-        let scoped = build_scoped_servers_entry("stdio", home);
-        let name = configure_mcp(Platform::Copilot, "stdio", &servers, &scoped, home)?;
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
+        let name = configure_mcp(Platform::Copilot, &servers, &scoped, home)?;
         assert_eq!(name, None);
+        Ok(())
+    }
+
+    /// R-SETUP.5: every entry setup writes, for every platform, is a stdio
+    /// command. A `url` entry for `serve http`/`serve unix` carries no token and
+    /// is refused with a 401 the moment the client connects.
+    #[test]
+    fn every_platform_gets_a_stdio_command_and_no_url() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
+        for platform in PLATFORMS.iter().copied().filter(|p| p.supports_mcp()) {
+            let Some((path, format)) = platform.mcp_config(home) else {
+                continue;
+            };
+            configure_mcp(platform, &servers, &scoped, home)?;
+            let text = std::fs::read_to_string(&path)?;
+            let (command, args, url) = match format {
+                McpConfigFormat::Toml => {
+                    let v: toml::Value = toml::from_str(&text)?;
+                    let e = &v["mcp_servers"]["Ahma"];
+                    let args: Vec<String> = e["args"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|a| a.as_str().unwrap().to_string())
+                        .collect();
+                    (e.get("command").is_some(), args, e.get("url").is_some())
+                }
+                McpConfigFormat::Json(key) => {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    let e = &v[key]["Ahma"];
+                    let args: Vec<String> = e["args"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|a| a.as_str().unwrap().to_string())
+                        .collect();
+                    (e.get("command").is_some(), args, e.get("url").is_some())
+                }
+            };
+            assert!(command, "{platform:?}: no command in {text}");
+            assert_eq!(args[..2], ["serve", "stdio"], "{platform:?}: {text}");
+            assert!(!url, "{platform:?} must get no url entry: {text}");
+        }
         Ok(())
     }
 
@@ -1896,22 +1702,13 @@ mod tests {
         Ok(())
     }
 
-    // ─── print_mcp_restart_hints (smoke; covers transport match arms) ─────────
+    // ─── print_mcp_restart_hints (smoke) ─────────────────────────────────────
 
     #[test]
-    fn test_print_mcp_restart_hints_noninteractive_is_noop() {
-        // Non-interactive returns early; just exercise the guard.
-        print_mcp_restart_hints(false, &["Cursor"], "http");
-    }
-
-    #[test]
-    fn test_print_mcp_restart_hints_interactive_transport_arms() {
-        // Exercise each transport branch (http / unix / stdio default).
-        print_mcp_restart_hints(true, &["Cursor"], "http");
-        print_mcp_restart_hints(true, &["Cursor"], "unix");
-        print_mcp_restart_hints(true, &["Cursor"], "stdio");
-        // Empty configured list returns early even when interactive.
-        print_mcp_restart_hints(true, &[], "http");
+    fn test_print_mcp_restart_hints_guards() {
+        print_mcp_restart_hints(false, &["Cursor"]);
+        print_mcp_restart_hints(true, &["Cursor"]);
+        print_mcp_restart_hints(true, &[]);
     }
 
     // ─── env seam helper (AHMA_TEST_HOME redirects ahma_home_dir in debug) ─────
@@ -1952,7 +1749,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_actions_empty_is_noop() -> Result<()> {
         // No action selected -> all four guards are false -> Ok with no side effects.
-        execute_actions(&[], &[], "stdio", false).await?;
+        execute_actions(&[], &[], false).await?;
         Ok(())
     }
 
@@ -2067,11 +1864,6 @@ mod tests {
     // immediately and these return their documented default without blocking.
 
     #[test]
-    fn test_prompt_transport_eof_defaults_to_stdio() {
-        assert_eq!(prompt_transport(), "stdio");
-    }
-
-    #[test]
     fn test_prompt_multi_select_eof_uses_default_all() {
         // Empty input (EOF) -> default "all" -> every option selected.
         let chosen = prompt_multi_select("Pick:", &["a", "b", "c"], "all");
@@ -2136,7 +1928,7 @@ mod tests {
     fn test_merge_mcp_json_unchanged_entry_writes_no_backup() -> Result<()> {
         let tmp = tempdir()?;
         let path = tmp.path().join("mcp.json");
-        let entry = build_mcp_servers_entry("stdio");
+        let entry = build_mcp_servers_entry();
 
         merge_mcp_json(&path, "mcpServers", entry.clone())?;
         merge_mcp_json(&path, "mcpServers", entry.clone())?;
@@ -2155,7 +1947,7 @@ mod tests {
     fn test_merge_codex_toml_unchanged_entry_writes_no_backup() -> Result<()> {
         let tmp = tempdir()?;
         let path = tmp.path().join("config.toml");
-        let value = build_codex_toml_value("stdio");
+        let value = build_codex_toml_value();
 
         merge_codex_toml(&path, value.clone())?;
         merge_codex_toml(&path, value)?;
@@ -2288,8 +2080,8 @@ mod tests {
         // Simulate Antigravity being installed by creating ~/.gemini
         std::fs::create_dir_all(home.join(".gemini").join("config")).unwrap();
 
-        let servers = build_mcp_servers_entry("stdio");
-        let scoped = build_scoped_servers_entry("stdio", home);
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
 
         let drift = detect_platform_mcp_drift(Platform::Antigravity, home, &servers, &scoped);
         assert!(
@@ -2317,8 +2109,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let home = tmp.path();
         // Neither ~/.gemini nor mcp_config.json exists
-        let servers = build_mcp_servers_entry("stdio");
-        let scoped = build_scoped_servers_entry("stdio", home);
+        let servers = build_mcp_servers_entry();
+        let scoped = build_scoped_servers_entry();
 
         let drift = detect_platform_mcp_drift(Platform::Antigravity, home, &servers, &scoped);
         assert!(
