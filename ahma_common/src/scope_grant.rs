@@ -979,6 +979,24 @@ fn auto_execution_warning(path: &Path, home: Option<&Path>) -> Option<String> {
              without anyone asking"
         ));
     }
+    let folders = program_folders(env_path_folders(), home);
+    match program_folder_hit(path, &folders) {
+        Some((_, true)) => {
+            return Some(format!(
+                "your shell runs the programs in '{shown}' by name, as you and outside the sandbox: \
+             whatever a grant lets the agent write there runs later without anyone asking"
+            ));
+        }
+        Some((folder, false)) => {
+            return Some(format!(
+                "'{shown}' holds '{}', whose programs your shell runs by name, as you and outside \
+             the sandbox: whatever a grant lets the agent write there runs later without anyone \
+             asking",
+                folder.display()
+            ));
+        }
+        None => {}
+    }
     let home = home?;
     const SHELL_STARTUP: &[&str] = &[
         ".zshrc",
@@ -1009,6 +1027,84 @@ fn auto_execution_warning(path: &Path, home: Option<&Path>) -> Option<String> {
         ));
     }
     None
+}
+
+/// Whether something trusted runs what is written at `path` later, as the
+/// human and outside the sandbox (SPEC R-HANDOFF.1): git hooks, shell start-up
+/// files, login items, and a folder on `PATH` or one holding it. A dialog's
+/// yes never saves a write grant on such a path (R-PERM.10.3), and the doctor
+/// reports one it saved (R-DOCTOR).
+pub fn runs_later(path: &Path, home: Option<&Path>) -> bool {
+    let home = home.map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    auto_execution_warning(&path, home.as_deref()).is_some()
+}
+
+/// The absolute entries of a `PATH` value, canonical where they exist.
+fn path_entries(path_var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    path_var
+        .map(|var| {
+            std::env::split_paths(var)
+                .filter(|d| d.is_absolute())
+                .map(|d| dunce::canonicalize(&d).unwrap_or(d))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// This process's `PATH` entries ([`path_entries`]), read once: every grant
+/// check asks, and a process's `PATH` does not change under it.
+fn env_path_folders() -> &'static [PathBuf] {
+    static FOLDERS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    FOLDERS.get_or_init(|| path_entries(std::env::var_os("PATH").as_deref()))
+}
+
+/// The folders whose programs a shell runs by name: `entries` (a `PATH`'s,
+/// [`path_entries`]), plus the per-user ones installers add (`~/.local/bin`,
+/// `~/bin`, `~/.cargo/bin`) and, on Unix, `/usr/local/bin` and
+/// `/opt/homebrew/bin`, whether or not this process's `PATH` names them: the
+/// human's terminal may. A filesystem root, and home or a folder above it,
+/// are left out: neither is ever granted, and counting one would mark every
+/// grant beneath it.
+fn program_folders(entries: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        candidates.extend(
+            [".local/bin", "bin", ".cargo/bin"]
+                .iter()
+                .map(|r| home.join(r)),
+        );
+    }
+    #[cfg(unix)]
+    candidates.extend(["/usr/local/bin", "/opt/homebrew/bin"].map(PathBuf::from));
+    let mut folders: Vec<PathBuf> = Vec::new();
+    for dir in candidates {
+        let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+        if !folders.contains(&dir) {
+            folders.push(dir);
+        }
+    }
+    for dir in entries {
+        let above_home = home.is_some_and(|h| h.starts_with(dir));
+        if dir.parent().is_some() && !above_home && !folders.contains(dir) {
+            folders.push(dir.clone());
+        }
+    }
+    folders
+}
+
+/// The program folder `path` lies in (`true`) or holds (`false`), if any.
+fn program_folder_hit<'a>(path: &Path, folders: &'a [PathBuf]) -> Option<(&'a Path, bool)> {
+    folders
+        .iter()
+        .find(|f| path.starts_with(f))
+        .map(|f| (f.as_path(), true))
+        .or_else(|| {
+            folders
+                .iter()
+                .find(|f| f.starts_with(path))
+                .map(|f| (f.as_path(), false))
+        })
 }
 
 /// The main repository of the worktree at `dir`, whose `.git` file is
@@ -3278,6 +3374,10 @@ mod denylist_by_prefix_tests {
             ("Library/LaunchAgents", "log in"),
             (".config/autostart", "log in"),
             ("proj/.git/hooks", "git"),
+            (".local/bin", "by name"),
+            (".local/bin/ahma", "by name"),
+            (".cargo/bin", "by name"),
+            ("bin", "by name"),
         ] {
             let w = warnings(&h.join(rel), &h).join(" | ");
             assert!(
@@ -3285,6 +3385,52 @@ mod denylist_by_prefix_tests {
                 "{rel}: the warning must name what runs it ({trigger}): {w}"
             );
         }
+    }
+
+    /// SPEC R-HANDOFF.1 (field case 2026-11-26): a dialog's yes saved a write
+    /// grant on `~/.local/bin`, a folder on `PATH`, shown at normal risk.
+    /// Whatever an agent writes there runs later, by name, as the human and
+    /// outside the sandbox. Every absolute `PATH` entry counts, and so does a
+    /// folder holding one; a relative entry, a filesystem root, and home or a
+    /// folder above it name no program folder (home is never granted anyway,
+    /// and counting it would mark every grant).
+    #[test]
+    fn a_folder_on_path_is_one_whose_programs_run_later() {
+        let home = tempfile::tempdir().unwrap();
+        let h = dunce::canonicalize(home.path()).unwrap();
+        let tools = h.join("tools").join("bin");
+        std::fs::create_dir_all(&tools).unwrap();
+        let var = std::env::join_paths([
+            tools.clone(),
+            PathBuf::from("relative/bin"),
+            PathBuf::from("/"),
+            h.clone(),
+            h.parent().unwrap().to_path_buf(),
+        ])
+        .unwrap();
+        let folders = program_folders(&path_entries(Some(&var)), Some(&h));
+        assert!(folders.contains(&tools), "{folders:?}");
+        assert!(
+            folders.contains(&h.join(".local").join("bin")),
+            "{folders:?}"
+        );
+        for never in [PathBuf::from("relative/bin"), PathBuf::from("/"), h.clone()] {
+            assert!(!folders.contains(&never), "{never:?} in {folders:?}");
+        }
+        assert!(
+            !folders.iter().any(|f| h.starts_with(f)),
+            "nothing at or above home: {folders:?}"
+        );
+
+        let hit =
+            |p: &Path| program_folder_hit(p, &folders).map(|(f, inside)| (f.to_path_buf(), inside));
+        assert_eq!(hit(&tools.join("x")), Some((tools.clone(), true)));
+        assert_eq!(
+            hit(&h.join("tools")),
+            Some((tools.clone(), false)),
+            "holds one"
+        );
+        assert_eq!(hit(&h.join("caches").join("tool")), None);
     }
 }
 

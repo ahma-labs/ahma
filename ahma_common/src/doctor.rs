@@ -57,6 +57,7 @@ pub enum FindingId {
     RefusedGrants,
     GlobalGrants,
     OtherRepositoryWrites,
+    DialogGrantRunsLater,
     MissingApprovals,
     Trust,
     Hub,
@@ -380,6 +381,7 @@ pub fn run(input: &DoctorInput) -> Vec<Finding> {
         check_refused_scopes(settings, &mut findings);
         check_global_scopes(settings, &mut findings);
         check_cross_repo_grants(settings, input.home_dir.as_deref(), &mut findings);
+        check_dialog_grants_that_run_later(settings, input.home_dir.as_deref(), &mut findings);
         check_missing_workspaces(settings, &mut findings);
         check_trust(settings, &input.workspace, &mut findings);
     }
@@ -982,6 +984,55 @@ fn check_global_scopes(settings: &AhmaSettings, out: &mut Vec<Finding>) {
         ),
         fix: None,
     });
+}
+
+/// Saved write grants a dialog's yes made on a path whose contents run later, as the human and
+/// outside the sandbox (SPEC R-HANDOFF.1, R-PERM.10.3): a folder on `PATH`, a git hook, a shell
+/// start-up file. A dialog no longer saves one; this finds those an older ahma saved (field case
+/// 2026-11-26: `~/.local/bin`). A warning, with the revoke as the fix and the grant command as the
+/// way to keep it; a grant a human typed is theirs to make and is not reported.
+fn check_dialog_grants_that_run_later(
+    settings: &AhmaSettings,
+    home: Option<&Path>,
+    out: &mut Vec<Finding>,
+) {
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for scope in &settings.sandbox.persistent_scopes {
+        let Some(ws) = scope.workspace.as_deref() else {
+            continue;
+        };
+        if !scope.access.is_write()
+            || crate::grant::GrantedBy::parse(scope.granted_by.as_deref()).is_deliberate()
+            || !crate::scope_grant::runs_later(&scope.path, home)
+        {
+            continue;
+        }
+        let on = scope
+            .granted_at
+            .as_deref()
+            .map(|d| format!(" on {d}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "Commands in {} may write {}, and what is written there runs later as you, outside \
+             the sandbox: a yes in a dialog granted this{on}, and no one has confirmed it. Revoke \
+             it unless you meant it; to keep it, run `ahma sandbox grant {} --workspace {}`.",
+            ws.display(),
+            scope.path.display(),
+            scope.path.display(),
+            ws.display()
+        ));
+        found.push((scope.path.clone(), ws.to_path_buf()));
+    }
+    if !found.is_empty() {
+        out.push(Finding {
+            level: Level::Warn,
+            id: FindingId::DialogGrantRunsLater,
+            title: "A dialog let a workspace write where programs run from".into(),
+            detail: lines.join(" "),
+            fix: Some(Fix::RevokeScopes(found)),
+        });
+    }
 }
 
 /// Saved grants that let one workspace's commands write another repository (SPEC R-PERM.11).
@@ -1771,6 +1822,61 @@ mod tests {
         );
         assert!(render(&findings).contains("fix 1: Remove 1 granted folder"));
         assert_eq!(findings[0].level, Level::Warn, "most serious first");
+    }
+
+    /// SPEC R-HANDOFF.1, R-PERM.10.3 (field case 2026-11-26): an older ahma saved a dialog's yes
+    /// on `~/.local/bin`, a folder on `PATH`. The doctor reports it with a revoke; the same grant
+    /// typed by a human, and a read grant, are not reported.
+    #[test]
+    fn a_dialog_grant_on_a_folder_on_path_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let h = dunce::canonicalize(home.path()).unwrap();
+        let ws = h.join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let bin = h.join(".local").join("bin");
+        let tools = h.join("bin");
+        let cache = h.join("caches").join("tool");
+        for d in [&bin, &tools, &cache] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let grant = |path: &Path, access: ScopeAccess, by: &str| PersistentScope {
+            path: path.to_path_buf(),
+            access,
+            workspace: Some(ws.clone()),
+            granted_by: Some(by.into()),
+            granted_at: Some("2026-11-26".into()),
+            note: None,
+            expires_at: None,
+        };
+        let dialog = crate::scope_grant::GRANTED_BY_HARNESS_DIALOG;
+        let mut settings = AhmaSettings::default();
+        settings.sandbox.persistent_scopes = vec![
+            grant(&bin, ScopeAccess::Rw, dialog),
+            grant(&tools, ScopeAccess::Ro, dialog),
+            grant(&cache, ScopeAccess::Rw, dialog),
+            grant(&tools, ScopeAccess::Rw, "cli"),
+        ];
+        settings.save_to(&h.join("settings.toml")).unwrap();
+
+        let findings = run(&input(&h, &ws));
+        let report = render(&findings);
+        let warn = findings
+            .iter()
+            .find(|f| f.id == FindingId::DialogGrantRunsLater)
+            .unwrap_or_else(|| panic!("{report}"));
+        assert_eq!(warn.level, Level::Warn);
+        assert_eq!(
+            warn.fix,
+            Some(Fix::RevokeScopes(vec![(bin.clone(), ws.clone())]))
+        );
+        assert!(
+            warn.detail.contains(&format!(
+                "ahma sandbox grant {} --workspace {}",
+                bin.display(),
+                ws.display()
+            )),
+            "{report}"
+        );
     }
 
     /// SPEC R-PERM.11 (field case 2026-11-13): a yes in the harness dialog, given to a task typed
