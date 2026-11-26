@@ -618,6 +618,7 @@ impl Sandbox {
             temp_writable: writable && !self.is_no_temp_files(),
             package_cache_write: writable && self.package_cache_write(),
             connect_tcp_port: self.egress_proxy_addr.read().map(|addr| addr.port()),
+            local_tcp_ports: self.local_tcp_ports.read().clone(),
         }
     }
 
@@ -653,6 +654,7 @@ impl Sandbox {
                     temp_writable: false,
                     package_cache_write: false,
                     connect_tcp_port: None,
+                    local_tcp_ports: Vec::new(),
                 };
                 matches!(super::landlock::landlock_ruleset_fd(&probe), Ok(Some(_)))
             })

@@ -132,6 +132,14 @@ fn build_landlock_ruleset(policy: &super::KernelPolicy) -> Result<landlock::Rule
         ruleset = ruleset
             .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
             .context("Failed to add Landlock TCP-connect rule for the egress proxy")?;
+        // R-WEB.16.13: `[network] local_ports`, for services on this machine.
+        // Port-only like the rule above, so each is open to every host; that
+        // is disclosed at startup, not hidden here.
+        for &local in &policy.local_tcp_ports {
+            ruleset = ruleset
+                .add_rule(NetPort::new(local, AccessNet::ConnectTcp))
+                .context("Failed to add Landlock TCP-connect rule for [network] local_ports")?;
+        }
     }
 
     Ok(ruleset)
@@ -158,6 +166,7 @@ pub fn enforce_landlock_sandbox(policy: &super::KernelPolicy) -> Result<()> {
     // applied only to spawned children (see `landlock_ruleset_fd`).
     let ruleset = build_landlock_ruleset(&super::KernelPolicy {
         connect_tcp_port: None,
+        local_tcp_ports: Vec::new(),
         ..policy.clone()
     })?;
 
@@ -436,6 +445,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: false,
             connect_tcp_port: Some(34567),
+            local_tcp_ports: Vec::new(),
         })
         .expect("ruleset with a connect-tcp restriction must build");
         // None: the unrestricted path must keep working too.
@@ -446,6 +456,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: false,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("unrestricted ruleset must build");
     }
@@ -464,6 +475,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: false,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("empty scopes must still build a valid ruleset");
 
@@ -478,6 +490,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: false,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("multiple scopes must build a valid ruleset");
     }
@@ -505,6 +518,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: false,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("ruleset with a valid + missing read scope must still build");
     }
@@ -526,6 +540,7 @@ mod tests {
             temp_writable: true,
             package_cache_write: false,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("ruleset with temp files enabled must build");
     }
@@ -585,6 +600,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: true,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("ruleset with package_cache_write=true must build");
 
@@ -624,6 +640,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: false,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("ruleset must build when HOME has toolchain dirs present");
     }
@@ -660,6 +677,7 @@ mod tests {
             temp_writable: false,
             package_cache_write: false,
             connect_tcp_port: None,
+            local_tcp_ports: Vec::new(),
         })
         .expect("ruleset builds") else {
             eprintln!("skipped: this kernel has no Landlock");

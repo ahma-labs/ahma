@@ -163,6 +163,10 @@ pub struct AppConfig {
     /// Profiles whose hostnames are withheld from the allowlist by name
     /// (`[network] deny_profile_hosts`). Path grants are unaffected.
     pub network_deny_profile_hosts: Vec<String>,
+    /// Local TCP ports a restricted command may connect to directly
+    /// (`[network] local_ports`, SPEC R-WEB.16.13). Linux only: Landlock
+    /// filters by port, so each is reachable on every host.
+    pub network_local_ports: Vec<u16>,
     /// Sandbox profiles enabled for this session (`[sandbox] profiles`). Carried
     /// on `AppConfig` because the egress allowlist is seeded from the *same*
     /// enabled set as the filesystem rules — reading the settings file twice is
@@ -319,6 +323,7 @@ impl Default for AppConfig {
             network_allow: vec![],
             network_profile_hosts: true,
             network_deny_profile_hosts: vec![],
+            network_local_ports: vec![],
             sandbox_profiles: ahma_common::config::SandboxSettings::default().profiles,
             sandbox_scopes: vec![],
             defer_sandbox: false,
@@ -3885,6 +3890,7 @@ pub fn build_app_config_with_settings(
         network_allow: s.network.allow.clone(),
         network_profile_hosts: s.network.profile_hosts,
         network_deny_profile_hosts: s.network.deny_profile_hosts.clone(),
+        network_local_ports: s.network.local_ports.clone(),
         sandbox_profiles: s.sandbox.profiles.clone(),
         sandbox_scopes,
         defer_sandbox: sandbox.defer_sandbox,

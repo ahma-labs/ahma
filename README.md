@@ -53,8 +53,8 @@ Other install routes (`cargo binstall`, source builds, Intel Macs, branches):
 
 | | Writes | Reads | Network, with `--restrict-network` |
 |---|---|---|---|
-| **macOS** (Seatbelt; Apple Silicon binaries, Intel from source) | Workspace and your grants | Open, apart from a credential denylist; opt-in: home by allowlist | Kernel: only ahma's proxy is reachable |
-| **Linux** (Landlock, kernel 5.13+; x86_64 and arm64, incl. Raspberry Pi) | Workspace and your grants | Workspace, system and toolchain directories, and your grants | Kernel pins TCP to the proxy on 6.7+; advisory before; UDP and raw sockets refused by seccomp |
+| **macOS** (Seatbelt; Apple Silicon binaries, Intel from source) | Workspace and your grants | Open, apart from a credential denylist; opt-in: home by allowlist | Kernel: ahma's proxy and this machine's own ports (`localhost`), apart from Docker's TCP API |
+| **Linux** (Landlock, kernel 5.13+; x86_64 and arm64, incl. Raspberry Pi) | Workspace and your grants | Workspace, system and toolchain directories, and your grants | Kernel pins TCP to the proxy, plus ports you list in `local_ports` (open to any host), on 6.7+; advisory before; UDP and raw sockets refused by seccomp |
 | **Windows** (Job Objects) | **Not confined** | **Not confined** | Advisory proxy only |
 
 Windows has no OS path boundary yet: AppContainer isolation is written but switched off.

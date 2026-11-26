@@ -1,50 +1,50 @@
 lmstudio.base_url tier=Some(Preference) redacted=false cli_only=false row=0 ledger=-
 lmstudio.model tier=Some(Preference) redacted=false cli_only=false row=1 ledger=-
 tools.timeout_secs tier=Some(Preference) redacted=false cli_only=false row=2 ledger=-
-tools.background_timeout_secs tier=Some(Preference) redacted=false cli_only=false row=53 ledger=-
-tools.await_timeout_secs tier=Some(Preference) redacted=false cli_only=false row=52 ledger=-
-tools.idle_timeout_secs tier=Some(Preference) redacted=false cli_only=false row=57 ledger=-
-tools.request_budget_override_secs tier=Some(Preference) redacted=false cli_only=false row=62 ledger=-
-tools.force_progress_notifications tier=Some(Preference) redacted=false cli_only=false row=56 ledger=-
+tools.background_timeout_secs tier=Some(Preference) redacted=false cli_only=false row=54 ledger=-
+tools.await_timeout_secs tier=Some(Preference) redacted=false cli_only=false row=53 ledger=-
+tools.idle_timeout_secs tier=Some(Preference) redacted=false cli_only=false row=58 ledger=-
+tools.request_budget_override_secs tier=Some(Preference) redacted=false cli_only=false row=63 ledger=-
+tools.force_progress_notifications tier=Some(Preference) redacted=false cli_only=false row=57 ledger=-
 tools.execution_mode tier=Some(Preference) redacted=false cli_only=false row=3 ledger=-
 tools.skip_probes tier=Some(Preference) redacted=false cli_only=false row=4 ledger=-
-tools.tools_dir tier=Some(Preference) redacted=false cli_only=false row=66 ledger=-
-tools.tool_bundles tier=Some(Preference) redacted=false cli_only=false row=65 ledger=-
-tools.minimize_tokens tier=Some(Preference) redacted=false cli_only=false row=60 ledger=-
-tools.small_model_harness tier=Some(Preference) redacted=false cli_only=false row=63 ledger=-
-tools.context_length tier=Some(Preference) redacted=false cli_only=false row=54 ledger=-
-tools.max_turns tier=Some(Preference) redacted=false cli_only=false row=59 ledger=-
-tools.mutex_groups tier=Some(Preference) redacted=false cli_only=false row=61 ledger=-
-tools.workspace_queue tier=Some(Preference) redacted=false cli_only=false row=67 ledger=-
-tools.edit_guard tier=Some(Preference) redacted=false cli_only=false row=55 ledger=-
-tools.source_readers tier=Some(Preference) redacted=false cli_only=false row=64 ledger=-
-tools.long_running tier=Some(Security) redacted=false cli_only=false row=58 ledger=-
+tools.tools_dir tier=Some(Preference) redacted=false cli_only=false row=67 ledger=-
+tools.tool_bundles tier=Some(Preference) redacted=false cli_only=false row=66 ledger=-
+tools.minimize_tokens tier=Some(Preference) redacted=false cli_only=false row=61 ledger=-
+tools.small_model_harness tier=Some(Preference) redacted=false cli_only=false row=64 ledger=-
+tools.context_length tier=Some(Preference) redacted=false cli_only=false row=55 ledger=-
+tools.max_turns tier=Some(Preference) redacted=false cli_only=false row=60 ledger=-
+tools.mutex_groups tier=Some(Preference) redacted=false cli_only=false row=62 ledger=-
+tools.workspace_queue tier=Some(Preference) redacted=false cli_only=false row=68 ledger=-
+tools.edit_guard tier=Some(Preference) redacted=false cli_only=false row=56 ledger=-
+tools.source_readers tier=Some(Preference) redacted=false cli_only=false row=65 ledger=-
+tools.long_running tier=Some(Security) redacted=false cli_only=false row=59 ledger=-
 sandbox.disable tier=Some(Security) redacted=false cli_only=true row=5 ledger=-
 sandbox.tmp_access tier=Some(Security) redacted=false cli_only=false row=6 ledger=-
 sandbox.disable_temp tier=Some(Security) redacted=false cli_only=false row=7 ledger=-
 sandbox.defer tier=Some(Security) redacted=false cli_only=false row=8 ledger=-
-sandbox.task_vault tier=Some(Security) redacted=false cli_only=false row=50 ledger=-
-sandbox.scopes tier=Some(Security) redacted=false cli_only=false row=46 ledger=-
-sandbox.working_dirs tier=Some(Security) redacted=false cli_only=false row=51 ledger=-
-sandbox.package_cache_write tier=Some(Security) redacted=false cli_only=false row=44 ledger=-
+sandbox.task_vault tier=Some(Security) redacted=false cli_only=false row=51 ledger=-
+sandbox.scopes tier=Some(Security) redacted=false cli_only=false row=47 ledger=-
+sandbox.working_dirs tier=Some(Security) redacted=false cli_only=false row=52 ledger=-
+sandbox.package_cache_write tier=Some(Security) redacted=false cli_only=false row=45 ledger=-
 sandbox.container_root tier=Some(Security) redacted=false cli_only=false row=9 ledger=-
 sandbox.scratch_directory tier=Some(Security) redacted=false cli_only=false row=10 ledger=-
 sandbox.use_scratch_directory tier=Some(Security) redacted=false cli_only=false row=11 ledger=-
 sandbox.persistent_scopes tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma sandbox grant <path>` (and `ahma sandbox revoke`); it checks the path against the hard denylist
 sandbox.ssh_sign tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved
-sandbox.ssh_agent tier=Some(Security) redacted=false cli_only=false row=48 ledger=-
-sandbox.env_allow tier=Some(Security) redacted=false cli_only=false row=41 ledger=-
-sandbox.allow_keychain tier=Some(Security) redacted=false cli_only=false row=38 ledger=-
-sandbox.signal_other_processes tier=Some(Security) redacted=false cli_only=false row=47 ledger=-
-sandbox.allow_gpu tier=Some(Security) redacted=false cli_only=false row=37 ledger=-
-sandbox.deny_credential_reads tier=Some(Security) redacted=false cli_only=false row=40 ledger=-
-sandbox.allow_credential_reads tier=Some(Security) redacted=false cli_only=false row=35 ledger=-
-sandbox.profiles tier=Some(Security) redacted=false cli_only=false row=45 ledger=-
-sandbox.allow_git_hooks tier=Some(Security) redacted=false cli_only=false row=36 ledger=-
-sandbox.allow_project_tool_config tier=Some(Security) redacted=false cli_only=false row=39 ledger=-
-sandbox.linux_deny_tier tier=Some(Security) redacted=false cli_only=false row=43 ledger=-
-sandbox.syscall_filter tier=Some(Security) redacted=false cli_only=false row=49 ledger=-
-sandbox.home_reads tier=Some(Security) redacted=false cli_only=false row=42 ledger=-
+sandbox.ssh_agent tier=Some(Security) redacted=false cli_only=false row=49 ledger=-
+sandbox.env_allow tier=Some(Security) redacted=false cli_only=false row=42 ledger=-
+sandbox.allow_keychain tier=Some(Security) redacted=false cli_only=false row=39 ledger=-
+sandbox.signal_other_processes tier=Some(Security) redacted=false cli_only=false row=48 ledger=-
+sandbox.allow_gpu tier=Some(Security) redacted=false cli_only=false row=38 ledger=-
+sandbox.deny_credential_reads tier=Some(Security) redacted=false cli_only=false row=41 ledger=-
+sandbox.allow_credential_reads tier=Some(Security) redacted=false cli_only=false row=36 ledger=-
+sandbox.profiles tier=Some(Security) redacted=false cli_only=false row=46 ledger=-
+sandbox.allow_git_hooks tier=Some(Security) redacted=false cli_only=false row=37 ledger=-
+sandbox.allow_project_tool_config tier=Some(Security) redacted=false cli_only=false row=40 ledger=-
+sandbox.linux_deny_tier tier=Some(Security) redacted=false cli_only=false row=44 ledger=-
+sandbox.syscall_filter tier=Some(Security) redacted=false cli_only=false row=50 ledger=-
+sandbox.home_reads tier=Some(Security) redacted=false cli_only=false row=43 ledger=-
 logging.target tier=Some(Preference) redacted=false cli_only=false row=12 ledger=-
 logging.log_monitor tier=Some(Preference) redacted=false cli_only=false row=13 ledger=-
 logging.monitor_rate_limit_secs tier=Some(Preference) redacted=false cli_only=false row=14 ledger=-
@@ -63,18 +63,19 @@ hub.drain_timeout_secs tier=Some(Preference) redacted=false cli_only=false row=2
 agent.provider tier=Some(Preference) redacted=false cli_only=false row=23 ledger=-
 agent.model tier=Some(Preference) redacted=false cli_only=false row=22 ledger=-
 agent.provider_url tier=Some(Preference) redacted=false cli_only=false row=24 ledger=-
-web.default_policy tier=Some(Security) redacted=false cli_only=false row=69 ledger=-
-web.block_private_ranges tier=Some(Security) redacted=false cli_only=false row=68 ledger=-
-web.on_redirect_to_new_domain tier=Some(Security) redacted=false cli_only=false row=70 ledger=-
+web.default_policy tier=Some(Security) redacted=false cli_only=false row=70 ledger=-
+web.block_private_ranges tier=Some(Security) redacted=false cli_only=false row=69 ledger=-
+web.on_redirect_to_new_domain tier=Some(Security) redacted=false cli_only=false row=71 ledger=-
 web.always_allow tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma egress allow <domain>` / `ahma egress revoke <domain>`
 web.never_allow tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma egress deny <domain>` / `ahma egress revoke <domain>`
-network.restrict tier=Some(Security) redacted=false cli_only=false row=32 ledger=-
+network.restrict tier=Some(Security) redacted=false cli_only=false row=33 ledger=-
 network.allow tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma network allow <host>` / `ahma network revoke <host>`
-network.profile_hosts tier=Some(Security) redacted=false cli_only=false row=31 ledger=-
+network.profile_hosts tier=Some(Security) redacted=false cli_only=false row=32 ledger=-
 network.deny_profile_hosts tier=Some(Security) redacted=false cli_only=false row=30 ledger=-
+network.local_ports tier=Some(Security) redacted=false cli_only=false row=31 ledger=-
 permissions.tool_approvals tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved
-permissions.advisor tier=Some(Security) redacted=false cli_only=false row=33 ledger=-
-permissions.advisor_timeout_secs tier=Some(Security) redacted=false cli_only=false row=34 ledger=-
+permissions.advisor tier=Some(Security) redacted=false cli_only=false row=34 ledger=-
+permissions.advisor_timeout_secs tier=Some(Security) redacted=false cli_only=false row=35 ledger=-
 log_targets.approvals tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma permissions list` and `ahma permissions revoke`; grants are made when a request is approved
 open_url.allow tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma permissions grant open-url <site>` / `ahma permissions revoke open-url <site>`
 open_url.repos tier=Some(Security) redacted=false cli_only=false row=- ledger=`ahma permissions grant open-url <site>` / `ahma permissions revoke open-url <site>`

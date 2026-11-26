@@ -2171,6 +2171,20 @@ pub struct NetworkSettings {
     /// list entirely.
     /// Default: empty list
     pub deny_profile_hosts: Vec<String>,
+    /// Local TCP ports a restricted command may connect to directly, for
+    /// services on this machine: a test database, a cache, a docker-compose
+    /// service (`[5432, 6379]`).
+    ///
+    /// Only Linux needs it. Its kernel rule (Landlock) filters connections by
+    /// port, never by address, so a port listed here is reachable **on every
+    /// host**, not only on this machine: a command could send data out to any
+    /// server listening on it. ahma says so at startup. On macOS every
+    /// `localhost` port is reachable under restriction anyway, and only
+    /// `localhost` (SPEC R-WEB.16.13).
+    ///
+    /// Inert when `restrict` is off.
+    /// Default: empty list
+    pub local_ports: Vec<u16>,
 }
 
 impl Default for NetworkSettings {
@@ -2182,6 +2196,7 @@ impl Default for NetworkSettings {
             allow: Vec::new(),
             profile_hosts: true,
             deny_profile_hosts: Vec::new(),
+            local_ports: Vec::new(),
         }
     }
 }
@@ -3268,6 +3283,12 @@ impl AhmaSettings {
             toml_str_list(&self.network.deny_profile_hosts),
             toml_str_list(&d.network.deny_profile_hosts),
         );
+        w.setting(
+            "Local TCP ports a restricted command may connect to (a test database: [5432]). Linux only: its kernel filters by port, so a listed port is reachable on EVERY host, not just this one. macOS reaches every localhost port, and only localhost.",
+            "local_ports",
+            toml_u16_list(&self.network.local_ports),
+            toml_u16_list(&d.network.local_ports),
+        );
 
         // ── Permissions ──────────────────────────────────────────────────────
         w.section("Permission ledger (SPEC R-PERM)", "permissions");
@@ -3515,6 +3536,12 @@ fn toml_opt_u32(o: Option<u32>) -> String {
 /// Render a list of strings as an inline TOML array.
 fn toml_str_list(v: &[String]) -> String {
     let items: Vec<String> = v.iter().map(|s| toml_str(s)).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render a list of port numbers as an inline TOML array.
+fn toml_u16_list(v: &[u16]) -> String {
+    let items: Vec<String> = v.iter().map(u16::to_string).collect();
     format!("[{}]", items.join(", "))
 }
 
@@ -4779,6 +4806,7 @@ mod tests {
                 allow: vec!["crates.io".into(), "*.crates.io".into()],
                 profile_hosts: false,
                 deny_profile_hosts: vec!["go".into()],
+                local_ports: vec![5432],
             },
             permissions: crate::permissions::PermissionSettings {
                 tool_approvals: vec![crate::permissions::ToolApproval {

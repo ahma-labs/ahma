@@ -254,6 +254,7 @@ attribution, plus how to switch the profile-contributed half off.
 | `[network] allow` | Your own hosts. Always in effect; composes with profile hosts. |
 | `[network] profile_hosts` (default `true`) | Let enabled profiles contribute hosts. `false` drops **all** profile hosts and keeps **every** profile's path grants. |
 | `[network] deny_profile_hosts` (default `[]`) | The same, one profile at a time, by name. |
+| `[network] local_ports` (default `[]`) | Linux only: local TCP ports a command may connect to directly (`[5432, 6379]`). Each is open to **every** host. See [Local services](#local-services). |
 | `[sandbox] profiles` | Removing a profile removes its paths *and* its hosts. |
 
 The reason `profile_hosts` and `deny_profile_hosts` exist separately from
@@ -272,11 +273,37 @@ allow = ["artifacts.internal.example"]   # composes with the profile hosts
 deny_profile_hosts = ["go"]              # keep ~/.go, drop proxy.golang.org
 ```
 
+## Local services
+
+A restricted command still needs services on this machine: a test database, a cache, a
+docker-compose service, a test server on a random port.
+
+* **macOS** allows every `localhost` port, and only `localhost`. The exception is Docker's
+  TCP API (`localhost:2375` and `2376`), which answers without authentication and can start
+  a container that writes anywhere, so it stays shut, like Docker's socket.
+* **Linux** cannot express "localhost only": Landlock matches the port, never the address.
+  So only the proxy's port is open, and you list any others:
+
+  ```toml
+  [network]
+  restrict = true
+  local_ports = [5432, 6379]   # Postgres, Redis
+  ```
+
+  A listed port is open to **every** host, not only this machine: a command could send
+  data to a server anywhere that listens on it. ahma says so at startup. A test server on
+  a random port (bind to port 0, then connect) cannot be listed, so such tests fail under
+  restriction on Linux. That is why restriction stays opt-in there.
+
+Either way, a local service that forwards to the internet (a local HTTP proxy, a browser's
+remote-debugging port) is a way out that ahma cannot see.
+
 ## The default stays opt-in, for now
 
-`[network] restrict` defaults to `false`: most toolchains have no shipped profile yet (PyPI,
-RubyGems, Docker Hub), so turning it on would break their first command. Restricting by
-default is planned once they do (SPEC R-HARDEN.4); until then, turn it on yourself.
+`[network] restrict` defaults to `false`. Restricting by default is planned for macOS
+(SPEC R-HARDEN.4) once `git` over SSH works under it and it has been used day to day. On
+Linux it stays opt-in: a test server on a random port cannot be reached under restriction
+there ([Local services](#local-services)). Until then, turn it on yourself.
 
 ## Managing network grants and permissions
 
@@ -318,6 +345,8 @@ SPEC R-LISTEN records the evidence.
 
 ## Limits you still have
 
+* SSH does not use the proxy, so `ssh` and `git` over SSH (`git@github.com:…` remotes)
+  cannot connect under restriction. Use an HTTPS remote, or leave restriction off.
 * Interactive approval still applies: a subprocess reaching an unlisted host
   raises an MCP `elicitation/create` prompt when a capable client is attached
   (SPEC R-WEB.16.8), so profiles reduce the prompt volume rather than replacing
