@@ -64,13 +64,17 @@ session; past that the agent is told to ask you in conversation instead.
 **Commands run through Claude Code's Bash tool** (the terminal hook) are refused
 mid-command, where no prompt is possible. When the command **failed**, ahma remembers
 the refusal, and before
-the refused command — or any later one running the same program, `xcodebuild` with
-different flags, say — runs again in that workspace, Claude Code shows its own
+the refused command — or any later one running the program that was refused, `xcodebuild`
+with different flags, say — runs again in that workspace, Claude Code shows its own
 permission dialog with ahma's question in a few plain sentences: which program was
 refused which folder, what yes allows and for which workspace, how to undo it, and what
 no means. Above it, the dialog shows your command as the agent wrote it, under one line
 of ahma's (`ahma hooks run-shell … --command-stdin <<'AHMA_CMD_…'`), not re-quoted into
-ahma's arguments. The evidence and the full list of refused paths are in the agent's
+ahma's arguments. When the refusal names the program (`cp: …: Operation not permitted`,
+or the kernel's own record) and your command ran it by name, only that program asks: a
+refused `cp` in `cargo build && cp … ~/bin` asks before the next `cp`, never before an
+unrelated `cargo test`. A program the agent never typed (`make` running `cp`) asks before
+the command that started it. The evidence and the full list of refused paths are in the agent's
 result, not the dialog (SPEC R-PERM.10.2). The directory is the tool's own folder
 (`/Volumes/T7/caches/swiftpm`, not the deepest folder that was refused; under
 `~/Library/Caches`, `~/.cache` and the like, the folder directly inside it, such as
@@ -79,9 +83,13 @@ folder many tools share (`~/.cache`, `~/Library`, a cache folder, a volume root,
 system temp directory), your home folder, a folder of projects, or anything holding
 credentials. **Yes** grants it and runs the command. The grant is **remembered** only if
 that run shows it helped: the run succeeded, or got past the refusal (that folder was not
-refused again, and it exists). Otherwise ahma withdraws it, saves nothing, and says why,
-so a yes to a question that turned out to be wrong leaves nothing behind. A run stopped
-by its time limit decides nothing: the grant lasts for this session only. The dialog
+refused again, and it exists), **and** it used the folder — for a write grant, something
+under the folder changed during the run; for a read grant, the run ran the program that
+was refused. When the same folder is refused again, the command cannot run in any
+sandbox, or nothing exists there, ahma withdraws the grant, saves nothing, and says why,
+so a yes to a question that turned out to be wrong leaves nothing behind. A run that never
+used the folder, or one stopped by its time limit, decides nothing: the grant lasts for
+this session only, and the result names the `ahma sandbox grant` that keeps it. The dialog
 names the `ahma sandbox revoke` that undoes a kept grant, and `ahma sandbox list` marks a
 saved grant on a path where nothing exists (SPEC R-PERM.10.3). **No** runs nothing, and ahma does not
 ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).

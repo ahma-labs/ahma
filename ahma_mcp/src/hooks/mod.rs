@@ -2006,11 +2006,13 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
 
     // A grant approved for this run is remembered only if the run shows it
     // helped (SPEC R-PERM.10.3).
+    // Judging it walks the granted folder, so it runs off the async thread.
     if let Some(trial) = trial {
-        eprintln!(
-            "{}",
-            harness_ask::finish_trial(trial, trial_outcome(&result))
-        );
+        let outcome = trial_outcome(&result);
+        match tokio::task::spawn_blocking(move || harness_ask::finish_trial(trial, outcome)).await {
+            Ok(line) => eprintln!("{line}"),
+            Err(e) => tracing::warn!("the trial grant was not judged: {e}"),
+        }
     }
 
     match result {
@@ -2350,10 +2352,19 @@ fn report_shell_execution_error(
     // Remembered so a re-run of this command can ask first (R-PERM.10).
     // A path no grant can open is never asked about (R-PERM.4.3).
     match sandbox_err {
-        crate::sandbox::SandboxError::RuntimeDenial { path, access, .. }
-            if ahma_common::scope_grant::refusal_reason(path).is_none() =>
-        {
-            harness_ask::record_refusal(cwd, path, *access, who.command.as_deref().unwrap_or(""));
+        crate::sandbox::SandboxError::RuntimeDenial {
+            path,
+            access,
+            program,
+            ..
+        } if ahma_common::scope_grant::refusal_reason(path).is_none() => {
+            harness_ask::record_refusal(
+                cwd,
+                path,
+                *access,
+                who.command.as_deref().unwrap_or(""),
+                program.as_deref(),
+            );
         }
         crate::sandbox::SandboxError::PathOutsideSandbox { path, .. }
             if ahma_common::scope_grant::refusal_reason(path).is_none() =>
@@ -2363,6 +2374,7 @@ fn report_shell_execution_error(
                 path,
                 ahma_common::config::ScopeAccess::Rw,
                 who.command.as_deref().unwrap_or(""),
+                None,
             );
         }
         _ => {}

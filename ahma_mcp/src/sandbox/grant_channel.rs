@@ -833,6 +833,7 @@ pub async fn kernel_denial_lines(
     }
     let mut lines: Vec<String> = Vec::new();
     let mut grant = None;
+    let mut grant_process = None;
     let mut unfixable = false;
     let mut asked = false;
     // A refused Mach registration ends the program at startup (SPEC
@@ -853,6 +854,7 @@ pub async fn kernel_denial_lines(
             && grant.is_none()
         {
             grant = Some((path.clone(), *access));
+            grant_process = Some(denial.process.clone());
         }
         if let (DenialClass::Grant { path, access }, false, Some(n)) = (&class, asked, notifier) {
             asked = true;
@@ -890,6 +892,7 @@ pub async fn kernel_denial_lines(
     Some(KernelReport {
         lines,
         grant,
+        grant_process,
         unfixable,
     })
 }
@@ -915,6 +918,8 @@ pub struct KernelReport {
     pub lines: Vec<String>,
     /// The first path a human may grant, and the access the kernel refused.
     pub grant: Option<(PathBuf, ScopeAccess)>,
+    /// The process the kernel refused that path (SPEC R-PERM.10.1).
+    pub grant_process: Option<String>,
     /// Whether a refusal was something no grant or setting allows.
     pub unfixable: bool,
 }

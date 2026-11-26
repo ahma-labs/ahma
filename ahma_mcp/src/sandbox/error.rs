@@ -28,6 +28,9 @@ pub enum SandboxError {
         access: ScopeAccess,
         scopes: Vec<PathBuf>,
         details: String,
+        /// The program the kernel's record or the tool's own error line says
+        /// was refused, when either says (SPEC R-PERM.10.1).
+        program: Option<String>,
     },
 
     /// The kernel's own record says a command was refused something no grant

@@ -110,6 +110,7 @@ fn execution_error_attaches_runtime_denial_payload() {
         scopes: vec![PathBuf::from("/work/space")],
         details: "Command failed with exit code 101: stderr: Operation not permitted (os error 1)"
             .to_string(),
+        program: None,
     }
     .into();
 

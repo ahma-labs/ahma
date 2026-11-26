@@ -389,6 +389,30 @@ pub fn may_use_ssh_agent(command: &str) -> bool {
     }
 }
 
+/// The programs to charge a refusal to (SPEC R-PERM.10.1): only `refused`,
+/// the program the kernel or the tool's own error line named, when `command`
+/// ran it by name; otherwise every program of the line
+/// ([`command_programs`]), since the refused one was a child the agent never
+/// typed (`make` running `cp`, `xcodebuild` running `swift-build`) and the
+/// program that started it is the one to ask before. Charging every program
+/// of `cargo build && cp … ~/.local/bin` raised the dialog before the next,
+/// unrelated `cargo nextest run`.
+pub fn refused_programs(command: &str, refused: Option<&str>) -> Vec<String> {
+    let programs = command_programs(command);
+    let refused = refused
+        .map(|p| {
+            Path::new(p)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(p)
+        })
+        .filter(|p| programs.iter().any(|q| q == p));
+    match refused {
+        Some(p) => vec![p.to_string()],
+        None => programs,
+    }
+}
+
 /// Whether `refusal` is one to ask about before `command` runs: the same
 /// command run again, or one that runs a program the refused command ran
 /// (SPEC R-PERM.10.1). An agent rarely re-runs a command byte for byte — it
@@ -1697,6 +1721,42 @@ fn common_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::config::PersistentScope;
+
+    /// SPEC R-PERM.10.1 (field case 2026-11-26): `cp` was refused a write to
+    /// `~/.local/bin` in a line that also ran `cargo`, so the refusal was
+    /// charged to `cargo` too, and the next, unrelated `cargo nextest run`
+    /// raised the dialog. A refusal is charged to the program that was
+    /// refused when the command ran it by name; a child the agent never typed
+    /// (`make` running `cp`) leaves every program of the line, as before.
+    #[test]
+    fn a_refusal_is_charged_to_the_program_that_was_refused() {
+        let line = "cargo build --release && cp target/release/ahma ~/.local/bin/ahma.new \
+                    && chmod +x ~/.local/bin/ahma.new && mv a b && codesign -s - b";
+        assert_eq!(refused_programs(line, Some("cp")), vec!["cp"]);
+        assert_eq!(refused_programs(line, Some("/bin/cp")), vec!["cp"]);
+        assert_eq!(refused_programs(line, None), command_programs(line));
+        assert_eq!(refused_programs("make install", Some("cp")), vec!["make"]);
+        assert_eq!(
+            refused_programs("xcodebuild -scheme A build", Some("swift-build")),
+            vec!["xcodebuild"]
+        );
+
+        let refusal = Refusal {
+            path: PathBuf::from("/Users/me/.local/bin/ahma.new"),
+            grant_dir: PathBuf::from("/Users/me/.local/bin"),
+            access: ScopeAccess::Rw,
+            at: 0,
+            harness_pid: None,
+            command_digest: Some(CommandDigest::of(line)),
+            programs: refused_programs(line, Some("cp")),
+        };
+        assert!(!refused_for(&refusal, "cargo nextest run"));
+        assert!(refused_for(
+            &refusal,
+            "cp target/release/ahma ~/.local/bin/"
+        ));
+        assert!(refused_for(&refusal, line), "the same command still asks");
+    }
 
     /// SPEC R-ESCAPE.4: `sudo` is setuid, so no sandbox runs it; the hook asks to run the command
     /// once outside the sandbox before trying.

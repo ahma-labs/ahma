@@ -1438,6 +1438,7 @@ async fn explain_failed_run(
             access: hit.access,
             scopes: sandbox.scopes().to_vec(),
             details,
+            program: hit.program,
         }
         .into());
     }
@@ -1464,6 +1465,7 @@ async fn explain_failed_run(
             access: ahma_common::config::ScopeAccess::Rw,
             scopes: sandbox.scopes().to_vec(),
             details: format!("{error}\n\n{note}"),
+            program: Some("sccache".to_string()),
         }
         .into());
     }
@@ -1858,6 +1860,7 @@ async fn kernel_report_result(
                 access,
                 scopes: sandbox.scopes().to_vec(),
                 details: format!("{details}\n\n{lines}"),
+                program: report.grant_process,
             }
             .into())
         }
@@ -3083,6 +3086,7 @@ mod tests {
         let report = || sandbox::grant_channel::KernelReport {
             lines: vec![one_line(&denial, &classify(&denial))],
             grant: None,
+            grant_process: None,
             unfixable: true,
         };
         let failed = || Err(anyhow::anyhow!("exit 1"));
