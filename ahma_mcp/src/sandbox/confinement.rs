@@ -113,6 +113,10 @@ pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
             .with_environ(UpdateKind::OnlyIfNotSet),
     );
     let me = std::process::id();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let services = super::profiles::host_services(super::profiles::enabled_profile_names());
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let services = Vec::new();
     let mut out: Vec<ahma_common::doctor::ConfinedDaemon> = sys
         .processes()
         .iter()
@@ -121,14 +125,7 @@ pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
             if pid == me || p.parent().map(|pp| pp.as_u32()) != Some(1) {
                 return None;
             }
-            let exe = p.exe()?;
-            if !exe.starts_with(&home) || exe.starts_with(home.join("Applications")) {
-                return None;
-            }
-            let name = exe.file_name()?.to_string_lossy().into_owned();
-            if name.starts_with("ahma") {
-                return None;
-            }
+            let (name, service) = daemon_candidate(p.exe()?, &home, &services)?;
             if !pid_is_seatbelt_confined(pid) {
                 return None;
             }
@@ -144,11 +141,35 @@ pub fn confined_daemons() -> Vec<ahma_common::doctor::ConfinedDaemon> {
                 name,
                 pid,
                 confined_to: None,
+                service,
             })
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.pid.cmp(&b.pid)));
     out
+}
+
+/// Whether a process running `exe` is one the doctor looks at, by its
+/// program's file name, and the restart a profile declares for it: the user's
+/// own executable (under `home`, not an application in `~/Applications`, not
+/// ahma), or a host service an enabled profile declares, wherever it is
+/// installed (SPEC R-DOCTOR.7, R-PROC.6).
+fn daemon_candidate(
+    exe: &std::path::Path,
+    home: &std::path::Path,
+    services: &[super::profiles::HostService],
+) -> Option<(String, Option<ahma_common::doctor::ServiceRestart>)> {
+    let name = exe.file_name()?.to_string_lossy().into_owned();
+    if let Some(s) = services.iter().find(|s| s.program == name) {
+        let restart = ahma_common::doctor::ServiceRestart {
+            stop: s.stop.clone(),
+            start: s.start.clone(),
+            resource: s.resource.clone(),
+        };
+        return Some((name, Some(restart)));
+    }
+    let own = exe.starts_with(home) && !exe.starts_with(home.join("Applications"));
+    (own && !name.starts_with("ahma")).then_some((name, None))
 }
 
 /// A confined daemon that serves only the workspace it can write is working as
@@ -207,6 +228,49 @@ pub fn restart_confined_sccache_if_any() {
 mod tests {
     use super::super::host_detect::HostSandbox;
     use super::*;
+
+    /// The user's own programs are looked at wherever their files live under
+    /// `$HOME`; a host service a profile declares (adb's server, often in
+    /// `/opt/homebrew/bin`) wherever it lives, with its restart (R-PROC.6).
+    #[test]
+    fn a_host_service_counts_wherever_its_program_lives() {
+        use super::super::profiles::HostService;
+        use std::path::Path;
+        let adb = HostService {
+            profile: "android".into(),
+            program: "adb".into(),
+            start: vec!["start-server".into()],
+            stop: vec!["kill-server".into()],
+            default_port: 5037,
+            port_env: None,
+            resource: "USB devices".into(),
+            cost: "x".into(),
+        };
+        let home = Path::new("/Users/me");
+        let services = [adb];
+        let (name, service) = daemon_candidate(Path::new("/opt/homebrew/bin/adb"), home, &services)
+            .expect("a declared host service, outside home");
+        assert_eq!(name, "adb");
+        let service = service.expect("with its restart");
+        assert_eq!(service.stop, ["kill-server"]);
+        assert_eq!(service.start, ["start-server"]);
+        assert_eq!(service.resource, "USB devices");
+
+        let (name, service) =
+            daemon_candidate(Path::new("/Users/me/.cargo/bin/sccache"), home, &services)
+                .expect("the user's own program");
+        assert_eq!((name.as_str(), service), ("sccache", None));
+        for not_one in [
+            "/opt/homebrew/bin/node",
+            "/Users/me/Applications/Thing.app/Contents/MacOS/thing",
+            "/Users/me/.local/bin/ahma",
+        ] {
+            assert!(
+                daemon_candidate(Path::new(not_one), home, &services).is_none(),
+                "{not_one}"
+            );
+        }
+    }
 
     /// A per-workspace sccache server is confined by design and is neither
     /// restarted nor reported; one on the shared default port still is.

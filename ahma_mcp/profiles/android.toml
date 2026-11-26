@@ -183,3 +183,25 @@ reason = "Gradle wrapper distributions (`gradlew` downloads the pinned Gradle ve
 [[hosts]]
 host = "plugins.gradle.org"
 reason = "the Gradle plugin portal — `plugins {}` blocks resolve plugin ids and artifacts here"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Host services: servers that must run outside the sandbox (SPEC R-PROC.6).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# adb's server holds the USB devices. Any `adb` command starts it when none is
+# running, and one started inside the sandbox is confined for life: the
+# profile grants no `iokit-open`, so it cannot open a phone's USB interface and
+# lists no devices, without an error (field case 2026-11-26). It has to be
+# started outside the sandbox; sandboxed `adb` commands then reach it on its
+# loopback port.
+[[services]]
+program = "adb"
+start = ["start-server"]
+stop = ["kill-server"]
+port = 5037
+port_env = "ANDROID_ADB_SERVER_PORT"
+resource = "USB devices"
+cost = """a sandboxed `adb` command reaches a server running outside the sandbox, so the agent \
+drives every attached device: it installs and removes apps, runs a shell on the device, and \
+reads what the device lets adb read. Through `adb connect`, `forward` and `reverse` the server \
+also reaches network ports the sandbox does not."""

@@ -157,6 +157,73 @@ pub struct ProfileEnv {
     pub cache_dir: bool,
 }
 
+/// A host service as written in a profile's TOML (SPEC R-PROC.6): a server
+/// one user's clients share, which holds something only the machine can give
+/// (adb's server holds the USB devices). Started inside the sandbox it is
+/// confined for life and cannot reach what it serves, so it has to run outside.
+/// `resource` and `cost` are mandatory for the reason a host's `reason` is.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawService {
+    program: String,
+    start: Vec<String>,
+    stop: Vec<String>,
+    /// The loopback port its clients find it on.
+    port: u16,
+    /// The variable that moves the port, when the tool has one.
+    #[serde(default)]
+    port_env: Option<String>,
+    resource: String,
+    cost: String,
+}
+
+/// A host service an enabled profile declares (SPEC R-PROC.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostService {
+    /// The profile that declares it, for provenance in every display.
+    pub profile: String,
+    /// The client program, which also runs the server (`adb`).
+    pub program: String,
+    /// The arguments that start the server (`start-server`).
+    pub start: Vec<String>,
+    /// The arguments that stop it (`kill-server`).
+    pub stop: Vec<String>,
+    /// The loopback port clients find it on when `port_env` is unset.
+    pub default_port: u16,
+    /// The variable that moves the port.
+    pub port_env: Option<String>,
+    /// What only the machine can give it (`USB devices`).
+    pub resource: String,
+    /// What a sandboxed agent gets from a server running outside the sandbox.
+    pub cost: String,
+}
+
+impl HostService {
+    /// The port this process's clients would use.
+    pub fn port(&self) -> u16 {
+        let value = self.port_env.as_deref().and_then(|v| std::env::var(v).ok());
+        self.port_from(value.as_deref())
+    }
+
+    /// The port, given the value of `port_env` (when set).
+    pub fn port_from(&self, value: Option<&str>) -> u16 {
+        value
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(self.default_port)
+    }
+
+    /// The line a human types, in a terminal outside the sandbox, to put the
+    /// server there.
+    pub fn restart_line(&self) -> String {
+        format!(
+            "{p} {} && {p} {}",
+            self.stop.join(" "),
+            self.start.join(" "),
+            p = self.program
+        )
+    }
+}
+
 /// A profile as written in its TOML file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -193,6 +260,9 @@ struct RawProfile {
     /// configured the tool themselves.
     #[serde(default)]
     unless: Vec<RawCondition>,
+    /// Servers that must run outside the sandbox (SPEC R-PROC.6).
+    #[serde(default)]
+    services: Vec<RawService>,
 }
 
 /// One condition on a profile's variables: an environment variable, or a file
@@ -292,6 +362,8 @@ pub struct SandboxProfile {
     /// When the variables apply, and when they never do.
     when: Vec<RawCondition>,
     unless: Vec<RawCondition>,
+    /// Servers it declares must run outside the sandbox.
+    services: Vec<RawService>,
 }
 
 /// The profiles ahma ships, parsed from the TOML data files in `profiles/`.
@@ -331,6 +403,7 @@ pub fn builtin_profiles() -> &'static [SandboxProfile] {
                     env: raw.env,
                     when: raw.when,
                     unless: raw.unless,
+                    services: raw.services,
                 }),
                 Err(e) => {
                     // A malformed builtin is a build-time bug, not a user problem; it
@@ -571,6 +644,34 @@ pub fn profile_hosts(enabled: &[String]) -> Vec<ProfileHost> {
         }
     }
     out
+}
+
+/// The host services every shipped profile declares, enabled or not: what a
+/// denial names when it says which server reaches a resource.
+pub fn declared_host_services() -> Vec<HostService> {
+    let all: Vec<String> = builtin_profiles().iter().map(|p| p.name.clone()).collect();
+    host_services(&all)
+}
+
+/// The host services every enabled profile declares (SPEC R-PROC.6), in
+/// [`builtin_profiles`] order.
+pub fn host_services(enabled: &[String]) -> Vec<HostService> {
+    builtin_profiles()
+        .iter()
+        .filter(|p| enabled.iter().any(|n| n == &p.name))
+        .flat_map(|p| {
+            p.services.iter().map(|s| HostService {
+                profile: p.name.clone(),
+                program: s.program.clone(),
+                start: s.start.clone(),
+                stop: s.stop.clone(),
+                default_port: s.port,
+                port_env: s.port_env.clone(),
+                resource: s.resource.clone(),
+                cost: s.cost.clone(),
+            })
+        })
+        .collect()
 }
 
 impl SandboxProfile {
@@ -849,6 +950,7 @@ mod tests {
             env: vec![],
             when,
             unless,
+            services: vec![],
         };
         let file = |f: &str, c: &str| RawCondition {
             env: None,
@@ -1035,7 +1137,75 @@ mod tests {
                     e.name
                 );
             }
+            for s in &p.services {
+                assert!(
+                    !s.cost.trim().is_empty() && !s.resource.trim().is_empty(),
+                    "{}: the {} service states what it holds and what it costs",
+                    p.name,
+                    s.program
+                );
+                assert!(
+                    !s.start.is_empty() && !s.stop.is_empty(),
+                    "{}: the {} service says how it starts and stops",
+                    p.name,
+                    s.program
+                );
+            }
         }
+    }
+
+    /// adb's server holds the USB devices, so it is a host service: it has to
+    /// run outside the sandbox, and the android profile says how it is found,
+    /// started and stopped (SPEC R-PROC.6).
+    #[test]
+    fn the_android_profile_declares_adb_server_as_a_host_service() {
+        let services = host_services(&["android".to_string()]);
+        let adb = services
+            .iter()
+            .find(|s| s.program == "adb")
+            .expect("android declares adb's server");
+        assert_eq!(adb.profile, "android");
+        assert_eq!(adb.start, ["start-server"]);
+        assert_eq!(adb.stop, ["kill-server"]);
+        assert_eq!(adb.default_port, 5037);
+        assert_eq!(adb.port_env.as_deref(), Some("ANDROID_ADB_SERVER_PORT"));
+        assert!(adb.resource.contains("USB"), "{}", adb.resource);
+        assert!(
+            host_services(&["rust".to_string()]).is_empty(),
+            "a profile that is not enabled declares nothing"
+        );
+    }
+
+    /// A service with no stated cost is not a service ahma will load: the
+    /// disclosure is the point (SPEC R-PERM.5.2).
+    #[test]
+    fn a_service_without_its_cost_does_not_parse() {
+        let src = "name = \"x\"\ndescription = \"x\"\n[[services]]\nprogram = \"adb\"\n\
+                   start = [\"start-server\"]\nstop = [\"kill-server\"]\nport = 5037\n\
+                   resource = \"USB devices\"\n";
+        assert!(toml::from_str::<RawProfile>(src).is_err());
+        let with_cost = format!("{src}cost = \"the agent drives your phone\"\n");
+        let raw = toml::from_str::<RawProfile>(&with_cost).expect("parses with a cost");
+        assert_eq!(raw.services.len(), 1);
+    }
+
+    /// The port a client finds the server on is the one the human's
+    /// environment names, when it names one.
+    #[test]
+    fn a_service_port_follows_its_variable() {
+        let s = HostService {
+            profile: "android".into(),
+            program: "adb".into(),
+            start: vec!["start-server".into()],
+            stop: vec!["kill-server".into()],
+            default_port: 5037,
+            port_env: Some("AHMA_TEST_NO_SUCH_PORT_VAR".into()),
+            resource: "USB devices".into(),
+            cost: "x".into(),
+        };
+        assert_eq!(s.port_from(None), 5037);
+        assert_eq!(s.port_from(Some("6000")), 6000);
+        assert_eq!(s.port_from(Some("not a port")), 5037);
     }
 
     /// The `sccache` profile gives each workspace its own cache server: the
