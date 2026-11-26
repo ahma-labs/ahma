@@ -53,6 +53,7 @@ Example report:
 | Granted folders with no workspace (they apply to every project) | warn | none — revoke and re-grant from the project (SPEC R5.4.11) |
 | Tool approvals for folders that no longer exist | info | forget them |
 | A grant letting a workspace write **another repository** that a dialog's yes saved and no human confirmed (SPEC R-PERM.11) | warn | revoke it (keep it instead with the `ahma sandbox grant … --workspace …` the finding names) |
+| A write grant a dialog's yes saved on a folder whose contents **run later** as you, outside the sandbox — a folder on your `PATH` such as `~/.local/bin`, a git hooks folder, a shell start-up file (SPEC R-HANDOFF.1, R-PERM.10.3) | warn | revoke it (keep it instead with the `ahma sandbox grant … --workspace …` the finding names) |
 | Grants into other repositories that you made yourself | info | none — a deliberate setup is listed, never questioned |
 | Hub running a different build than this binary | warn | none — quit ahma sessions and the next one starts the new build |
 | A harness allow-list auto-approves `sandbox_grant` or `network_grant` | warn | none |

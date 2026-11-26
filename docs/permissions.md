@@ -89,7 +89,12 @@ was refused. When the same folder is refused again, the command cannot run in an
 sandbox, or nothing exists there, ahma withdraws the grant, saves nothing, and says why,
 so a yes to a question that turned out to be wrong leaves nothing behind. A run that never
 used the folder, or one stopped by its time limit, decides nothing: the grant lasts for
-this session only, and the result names the `ahma sandbox grant` that keeps it. The dialog
+this session only, and the result names the `ahma sandbox grant` that keeps it. A write
+grant on a folder whose contents run later as you, outside the sandbox — a folder on your
+`PATH` such as `~/.local/bin` or `~/.cargo/bin`, a git hooks folder, a shell start-up file
+— is never remembered from a dialog at all: it lasts the session, the dialog marks it high
+risk, and keeping it takes the `ahma sandbox grant … --workspace …` you type yourself.
+`ahma doctor` reports such a grant an older ahma saved, with the revoke as its fix. The dialog
 names the `ahma sandbox revoke` that undoes a kept grant, and `ahma sandbox list` marks a
 saved grant on a path where nothing exists (SPEC R-PERM.10.3). **No** runs nothing, and ahma does not
 ask about that directory again this session (SPEC R-PERM.10, R-PERM.10.1).

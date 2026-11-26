@@ -841,6 +841,22 @@ pub(super) fn finish_trial(trial: Trial, outcome: TrialOutcome) -> String {
             q.dir.display(),
             trial.workspace.display()
         ),
+        // Code that runs later (SPEC R-HANDOFF.1): a folder on PATH, a git hook, a shell start-up
+        // file. Whatever the agent writes there runs as the human, outside the sandbox, so a yes
+        // in a dialog — often given by reflex — never makes such a grant permanent.
+        TrialVerdict::Keep
+            if q.access.is_write()
+                && ahma_common::scope_grant::runs_later(&q.dir, home.as_deref()) =>
+        {
+            format!(
+                "ahma: what is written in {} runs later as you, outside the sandbox, so a yes in a \
+                 dialog grants it for this session only and nothing was saved. To keep it, a \
+                 human runs `ahma sandbox grant {} --workspace {}`.",
+                q.dir.display(),
+                q.dir.display(),
+                trial.workspace.display()
+            )
+        }
         TrialVerdict::Keep => match persist_approval(q, &trial.workspace) {
             Ok(binding) if binding == trial.workspace => format!(
                 "ahma: remembered — the run got past the refusal, so commands in this workspace \
@@ -1735,6 +1751,52 @@ mod tests {
             .map(|s| s.sandbox.persistent_scopes.iter().any(|s| s.path == other))
             .unwrap_or(false);
         assert!(!saved, "nothing saved for another repository");
+    }
+
+    /// SPEC R-HANDOFF.1, R-PERM.10.3 (field case 2026-11-26): a yes saved a write
+    /// grant on `~/.local/bin`, a folder on `PATH`. What an agent writes there
+    /// runs later as the human, outside the sandbox, so a dialog's yes keeps it
+    /// for the session only, even when the run used it, and names the command
+    /// a human types to keep it.
+    #[test]
+    fn a_yes_on_a_folder_on_path_is_never_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = dunce::canonicalize(tmp.path()).unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", &home) };
+        let ws = home.join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let bin = home.join(".local").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let trial = Trial {
+            question: Question {
+                dir: bin.clone(),
+                access: ScopeAccess::Rw,
+                covers: vec![bin.join("ahma.new")],
+                programs: vec!["cp".into()],
+            },
+            workspace: ws.clone(),
+            session_file: None,
+            started: std::time::SystemTime::now(),
+            ran_refused_program: true,
+        };
+        std::fs::write(bin.join("ahma.new"), "").unwrap();
+        let line = finish_trial(trial, TrialOutcome::Succeeded);
+        assert!(line.contains("runs later"), "{line}");
+        assert!(line.contains("this session only"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "ahma sandbox grant {} --workspace {}",
+                bin.display(),
+                ws.display()
+            )),
+            "{line}"
+        );
+        let file = ahma_common::config::settings_path().unwrap();
+        let saved = ahma_common::config::AhmaSettings::load_from_checked(&file)
+            .map(|s| s.sandbox.persistent_scopes.iter().any(|s| s.path == bin))
+            .unwrap_or(false);
+        assert!(!saved, "nothing saved for a folder on PATH");
     }
 
     /// SPEC R-PERM.11, R5.4.11: a grant's path is stored as the human typed it
