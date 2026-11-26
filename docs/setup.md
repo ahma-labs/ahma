@@ -1,6 +1,6 @@
 # Setup — `ahma setup`, `/setup` and `ahma setup --plan`
 
-**Status:** tests-pass. SPEC: [R-SETUP.3, R-SETUP.4](../SPEC.md).
+**Status:** tests-pass. SPEC: [R-SETUP.3, R-SETUP.4, R-SETUP.5](../SPEC.md).
 
 ## Why
 
@@ -20,6 +20,11 @@ one item, through the same audited writer as the dedicated commands.
 ahma setup          # in a terminal: opens the view (also: /setup in ahma tui)
 ahma setup --cli    # the question-by-question installer wizard instead
 ```
+
+The MCP entries setup writes always run `ahma serve stdio`, a pipe to your per-user hub.
+It writes no `serve http` or `serve unix` entry: those servers need a token a client config
+cannot keep safely, so connect them by hand
+([connection-modes.md](connection-modes.md#authentication-on-by-default)).
 
 The view takes the whole screen and opens on the first thing ahma proposes for this folder,
 asked as a question you can answer without knowing ahma's settings:
@@ -195,4 +200,4 @@ command is a decision only you can make).
 - [doctor.md](doctor.md) — the fixes the plan includes
 - [permissions.md](permissions.md) — grants and the hard denylist
 - [tui.md](tui.md) — `/setup` and `/connect` among the other commands
-- SPEC [R-SETUP.3, R-SETUP.4](../SPEC.md)
+- SPEC [R-SETUP.3, R-SETUP.4, R-SETUP.5](../SPEC.md)
