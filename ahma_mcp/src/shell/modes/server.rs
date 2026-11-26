@@ -92,7 +92,7 @@ async fn connect_http_mcp_client(
 /// R-NET interactive approval): the caller passes the same peer handle the
 /// MCP service populates on connect, so a prompt can reach whichever client
 /// is attached by the time a subprocess actually tries to connect.
-async fn maybe_start_egress_proxy(
+pub(crate) async fn maybe_start_egress_proxy(
     config: &AppConfig,
     sandbox: &sandbox::Sandbox,
     net_approval: crate::egress::NetApprovalContext,

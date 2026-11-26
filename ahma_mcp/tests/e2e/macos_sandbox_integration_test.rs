@@ -1834,3 +1834,27 @@ fn home_reads_allowlist_is_kernel_enforced() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// SPEC R-WEB.16 on macOS: the profile `--restrict-network` produces must be
+/// one the kernel accepts. SBPL takes only `*` or `localhost` as the host of a
+/// `remote ip` address; a profile naming `127.0.0.1:<port>` was refused by
+/// sandbox-exec outright, so every restricted command failed to start, and a
+/// test comparing profile text could not see it. This loads the profile.
+#[test]
+fn a_restricted_network_profile_is_one_the_kernel_accepts() {
+    skip_if_nested_sandbox!();
+    let scope = TempDir::new().expect("scope dir");
+    let sandbox = strict_sandbox(scope.path(), true);
+    sandbox.set_egress_proxy_addr(Some("127.0.0.1:34567".parse().unwrap()));
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    let out = Command::new("sandbox-exec")
+        .args(["-p", &profile, "/usr/bin/true"])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec");
+    assert!(
+        out.status.success(),
+        "sandbox-exec refused the restricted-network profile: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

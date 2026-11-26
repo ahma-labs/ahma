@@ -224,3 +224,44 @@ fn a_signalled_hook_takes_its_command_tree_with_it() {
         std::thread::sleep(TestTimeouts::poll_interval());
     }
 }
+
+/// `[network] restrict = true` binds a command run through the terminal hook
+/// as it binds one run over MCP (SPEC R-WEB.16): the command's traffic goes
+/// through ahma's egress proxy. Before, only `ahma serve` started the proxy,
+/// so a harness's Bash commands had the whole network whatever the setting
+/// said, and nothing said so.
+#[test]
+fn a_hooked_command_goes_through_the_egress_proxy_when_restricted() {
+    let (home, _ws, ws) = workspace();
+    std::fs::create_dir_all(home.path().join(".ahma")).unwrap();
+    std::fs::write(
+        home.path().join(".ahma/settings.toml"),
+        "[network]\nrestrict = true\n",
+    )
+    .unwrap();
+    let answer = hooked(
+        home.path(),
+        &ws,
+        "printf '%s' \"${HTTPS_PROXY:-none}\"",
+        None,
+    );
+    assert_eq!(answer.code, Some(0), "{answer:?}");
+    assert!(
+        answer.stdout.starts_with("http://127.0.0.1:"),
+        "SECURITY: a hooked command must see ahma's egress proxy: {answer:?}"
+    );
+    // And the proxy itself refuses a host nothing allowed: its CONNECT
+    // refusal is 407 (`egress::proxy`). It answers before resolving or connecting anything, so this
+    // needs no internet, and a DNS failure (what an unproxied command gets
+    // for this name) answers 000.
+    let refused = hooked(
+        home.path(),
+        &ws,
+        "curl -s -o /dev/null -w 'connect=%{http_connect}' --max-time 20 https://unlisted.example/; true",
+        None,
+    );
+    assert!(
+        refused.stdout.contains("connect=407"),
+        "SECURITY: the egress proxy must refuse an unlisted host for a hooked command: {refused:?}"
+    );
+}

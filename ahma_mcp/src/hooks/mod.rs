@@ -1962,6 +1962,20 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     // The harness owns this call's lifetime (SPEC R-SETUP.2.1).
     let limit = payload.intent.limit(&cfg);
     let limit_secs = limit.map_or(NO_LIMIT_SECS, |l| l.secs);
+    // SPEC R-WEB.16: `[network] restrict` binds a hooked command as it binds
+    // one run over MCP. There is no MCP peer to ask about an unlisted host, so
+    // it is refused (R-WEB.16.8's no-peer answer). Held until the command ends.
+    let _egress_proxy = crate::shell::modes::server::maybe_start_egress_proxy(
+        &cfg,
+        &sandbox,
+        crate::egress::NetApprovalContext {
+            coordinator: std::sync::Arc::new(
+                ahma_common::net_approval::NetApprovalCoordinator::new(),
+            ),
+            peer: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        },
+    )
+    .await;
     let (adapter, reporter) = build_hook_adapter(
         &cfg,
         &payload,
