@@ -95,7 +95,8 @@ pub use command::{
 };
 pub use confinement::outer_confinement;
 pub use core::{
-    ContainerNarrowing, Enforcement, Sandbox, SandboxOptions, ScopeCommit, auxiliary_temp_scope,
+    ContainerNarrowing, Enforcement, Sandbox, SandboxOptions, ScopeCommit, auxiliary_temp_scopes,
+    temp_scope_roots,
 };
 pub use core::{add_log_exception, approve_log_link, is_target_allowed, load_exceptions};
 pub use credential_reads::{

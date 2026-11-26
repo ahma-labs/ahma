@@ -244,9 +244,10 @@ fn test_commit_carries_temp_as_an_auxiliary_scope() {
         "the new workspace is the primary scope: {:?}",
         updated_scopes.to_vec()
     );
-    assert_eq!(
-        updated_scopes.last(),
-        Some(&canonical_temp),
+    assert!(
+        updated_scopes[1..]
+            .iter()
+            .any(|s| canonical_temp.starts_with(s)),
         "the commit carries the temp dir after the workspace: {:?}",
         updated_scopes.to_vec()
     );

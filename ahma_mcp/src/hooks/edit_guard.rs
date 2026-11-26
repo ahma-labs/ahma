@@ -344,8 +344,9 @@ pub fn allowed_edit_scopes(
         }
     }
     if !disable_temp {
-        let tmp = std::env::temp_dir();
-        allowed.push(dunce::canonicalize(&tmp).unwrap_or(tmp));
+        // Every temp directory a hooked command may write, not only $TMPDIR
+        // (SPEC R5.2.5): one list with the kernel rules and the MCP server.
+        allowed.extend(crate::sandbox::temp_scope_roots().iter().cloned());
     }
     allowed
 }
@@ -1223,12 +1224,27 @@ mod scope_tests {
             open.contains(&temp),
             "temp is admitted by default: {open:?}"
         );
+        // Every temp root the kernel lets a command write, not only $TMPDIR.
+        let kernel_roots: Vec<PathBuf> = crate::sandbox::temp_write_roots()
+            .into_iter()
+            .filter_map(|r| dunce::canonicalize(r).ok())
+            .collect();
+        for root in &kernel_roots {
+            assert!(
+                open.iter().any(|s| root.starts_with(s)),
+                "{} is writable by commands: {open:?}",
+                root.display()
+            );
+        }
 
         let closed = allowed_edit_scopes(&repo, &[], true);
         assert!(
             !closed.contains(&temp),
             "disable_temp keeps temp out: {closed:?}"
         );
+        for root in &kernel_roots {
+            assert!(!closed.contains(root), "{closed:?}");
+        }
         for dir in harness_owned_dirs_for_this_user() {
             assert!(
                 closed.contains(&dir),

@@ -74,8 +74,10 @@ fn committed(scopes: Vec<PathBuf>, mode: SandboxMode, options: SandboxOptions) -
     sandbox
 }
 
+/// Whether a scope covers `path`: the temp directory may be in scope through a
+/// kernel temp root that contains it (`/private/var/folders` on macOS).
 fn in_scope(sandbox: &Sandbox, path: &Path) -> bool {
-    sandbox.scopes().iter().any(|s| s == path)
+    sandbox.scopes().iter().any(|s| path.starts_with(s))
 }
 
 /// A client that would grant anything it was asked, so a question shows up
