@@ -499,7 +499,9 @@ fn note_with(stopped: &[Leftover], services: &[super::profiles::HostService]) ->
              so it has to run outside the sandbox: started inside it, it is confined for life and \
              cannot reach {res}, so it finds none, and every later `{p}` would ask it. A human \
              runs `{line}` once, in a terminal outside the sandbox; this command and every later \
-             one then reach that server (SPEC R-PROC.6).",
+             one then reach that server. Or a human runs `ahma settings set \
+             sandbox.host_services '[\"{p}\"]'`, and ahma starts it outside the sandbox before \
+             each command that needs it (SPEC R-PROC.6).",
             p = s.program,
             res = s.resource,
             line = s.restart_line(),
@@ -564,6 +566,10 @@ mod note_tests {
         assert!(
             !line.contains("tools.long_running"),
             "keeping it inside the sandbox is not the fix: {line}"
+        );
+        assert!(
+            line.contains("ahma settings set sandbox.host_services '[\"adb\"]'"),
+            "{line}"
         );
     }
 

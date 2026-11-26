@@ -300,7 +300,11 @@ The fix is to start the server outside the sandbox, once, from your own terminal
 adb kill-server && adb start-server
 ```
 
-Sandboxed `adb` commands (an agent's, or ahma's `adb-*` tools) then reach it on 127.0.0.1:5037. ahma never starts it for you. When a sandboxed command does start one, ahma stops it as the command ends (as for any server, R-PROC.5), and the result names it as a host service and gives that line. A kernel denial of a USB device says the same, and `ahma doctor` finds a confined adb server wherever adb is installed and can restart it. The `android` profile declares the service, and `ahma permissions list` shows it with its cost. The agent then drives every attached device: it installs apps, runs a shell, and reads what the device lets adb read. Through `adb connect`, `forward` and `reverse` the server also reaches network ports the sandbox does not. Under `--restrict-network` a sandboxed client cannot reach the server's loopback port.
+Sandboxed `adb` commands (an agent's, or ahma's `adb-*` tools) then reach it on 127.0.0.1:5037.
+
+To have ahma do this for you, name the service: `ahma settings set sandbox.host_services '["adb"]'`. Before a sandboxed command that runs `adb`, ahma then starts adb's server outside the sandbox if none is running, or restarts it if the one running is confined, and the command's result says so. It runs the `adb` on its own `PATH`, never one in a folder a sandboxed command can write, with the profile's arguments and its own environment. It does not do this when ahma itself runs inside another sandbox, or under `--restrict-network`, and says why instead. Leave the setting empty to start the server yourself.
+
+When a sandboxed command does start one, ahma stops it as the command ends (as for any server, R-PROC.5), and the result names it as a host service and gives that line. A kernel denial of a USB device says the same, and `ahma doctor` finds a confined adb server wherever adb is installed and can restart it. The `android` profile declares the service, and `ahma permissions list` shows it with its cost. The agent then drives every attached device: it installs apps, runs a shell, and reads what the device lets adb read. Through `adb connect`, `forward` and `reverse` the server also reaches network ports the sandbox does not. Under `--restrict-network` a sandboxed client cannot reach the server's loopback port.
 
 ### sccache: `Operation not permitted`
 

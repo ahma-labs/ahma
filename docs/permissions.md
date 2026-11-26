@@ -428,7 +428,8 @@ the program, how it starts and stops, its loopback port, what it holds, and what
 costs). The `android` profile declares adb's server, which holds the USB devices;
 one started inside the sandbox cannot reach them. `ahma permissions list` shows each
 service under its profile with the line that starts it outside the sandbox
-(`adb kill-server && adb start-server`) and its cost. ahma never starts one itself
+(`adb kill-server && adb start-server`) and its cost. ahma starts one itself only when you
+name it: `ahma settings set sandbox.host_services '["adb"]'`
 ([security-sandbox.md](security-sandbox.md#host-services-adbs-server-finds-no-phone),
 SPEC R-PROC.6).
 

@@ -278,6 +278,13 @@ async fn run_to_end(prepared: Prepared, deps: Deps, cancel: CancellationToken) {
     // the run's for drift.
     let started = Instant::now();
 
+    // A host service the command uses starts outside the sandbox first, when
+    // a human turned it on (SPEC R-PROC.6).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let before = sandbox::host_services::prepare_for(&line, &deps.sandbox).await;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let before: Vec<String> = Vec::new();
+
     let mut ready = match prepare(run, lane, &op_id, &line, &working_dir, &deps, &mut guards) {
         Ok(ready) => ready,
         Err(why) => {
@@ -294,6 +301,9 @@ async fn run_to_end(prepared: Prepared, deps: Deps, cancel: CancellationToken) {
     let mut sink = ready
         .sink(monitor, &op_id, stages.near_limit)
         .keep_raw(reply.is_some());
+    for line in before {
+        sink.before_run(line).await;
+    }
     let end = ready
         .run(&deps, &working_dir, limit, started, &cancel, &mut sink)
         .await;

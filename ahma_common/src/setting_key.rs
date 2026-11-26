@@ -205,6 +205,7 @@ setting_keys! {
     SandboxSignalOtherProcesses = sandbox.signal_other_processes
         => SECURITY.switch("signalling other processes"),
     SandboxAllowGpu = sandbox.allow_gpu => SECURITY.switch("the GPU (Metal)"),
+    SandboxHostServices = sandbox.host_services => SECURITY,
     SandboxDenyCredentialReads = sandbox.deny_credential_reads => SECURITY,
     SandboxAllowCredentialReads = sandbox.allow_credential_reads => SECURITY,
     SandboxProfiles = sandbox.profiles => SECURITY,
