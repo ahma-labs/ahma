@@ -285,6 +285,12 @@ pub fn set_egress_proxy_env(vars: Vec<(String, String)>) {
     *guard = vars;
 }
 
+/// Whether `--restrict-network` is on in this process: the egress proxy's
+/// variables are installed.
+pub(crate) fn egress_restricted() -> bool {
+    !EGRESS_PROXY_ENV.read().is_empty()
+}
+
 /// Inject the egress-proxy variables into `cmd`. A no-op when restriction is off.
 /// Applied *after* [`scrub_secret_env`] at every subprocess spawn site so a tool
 /// that honours `HTTP_PROXY` reaches the network only through the allow-listed,

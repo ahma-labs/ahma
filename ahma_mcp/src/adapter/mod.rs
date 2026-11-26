@@ -1347,6 +1347,15 @@ async fn waited_result(
         },
         None => result,
     };
+    let result = if raw.before_run.is_empty() {
+        result
+    } else {
+        let lines = raw.before_run.join("\n");
+        match result {
+            Ok(out) => Ok(format!("{out}\n{lines}")),
+            Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
+        }
+    };
     let result = match raw.left_running {
         Some(line) => match result {
             Ok(out) => Ok(format!("{out}\n{line}")),

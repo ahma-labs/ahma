@@ -105,6 +105,9 @@ pub(super) struct RawOutput {
     pub(super) stderr: Vec<u8>,
     /// The line saying what it left running ended with it (SPEC R-PROC.5).
     pub(super) left_running: Option<String>,
+    /// What ahma did before it ran: a host service started outside the
+    /// sandbox, or why not (SPEC R-PROC.6).
+    pub(super) before_run: Vec<String>,
 }
 
 impl OpSink {
@@ -227,6 +230,15 @@ impl OpSink {
     pub(super) async fn left_running(&mut self, line: String) {
         if let Some(raw) = &mut self.raw {
             raw.left_running = Some(line.clone());
+        }
+        self.alert(line).await;
+    }
+
+    /// What ahma did before the command ran (SPEC R-PROC.6): an alert, and a
+    /// line in a waiting caller's result.
+    pub(super) async fn before_run(&mut self, line: String) {
+        if let Some(raw) = &mut self.raw {
+            raw.before_run.push(line.clone());
         }
         self.alert(line).await;
     }
@@ -447,10 +459,13 @@ mod tests {
         sink.chunk(Stream::Stdout, b"last").await;
         sink.chunk(Stream::Stderr, b"err\n").await;
         sink.left_running("left".into()).await;
+        sink.before_run("started adb's server".into()).await;
         let raw = sink.take_raw().expect("kept");
         assert_eq!(raw.stdout, b"one\r\nt\xffo\nlast");
         assert_eq!(raw.stderr, b"err\n");
         assert_eq!(raw.left_running.as_deref(), Some("left"));
+        // What ahma did before it ran reaches a waiting caller too (SPEC R-PROC.6).
+        assert_eq!(raw.before_run, ["started adb's server"]);
         let result = sink
             .close(RunEnd::Exited(Some(0)))
             .await

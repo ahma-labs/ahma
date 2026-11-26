@@ -1569,6 +1569,18 @@ pub struct SandboxSettings {
     /// allow. A capability, not a path: it cannot be granted at a prompt.
     /// Default: `false`
     pub allow_gpu: bool,
+    /// Host services ahma starts outside the sandbox, by program name
+    /// (`["adb"]`). A host service is a server one user's clients share that
+    /// holds something only the machine can give: adb's server holds the USB
+    /// devices. Started inside the sandbox it is confined for life and finds
+    /// none, so with its name here, before a sandboxed command that runs it,
+    /// ahma starts its server outside the sandbox, or restarts one found
+    /// confined, with the commands its profile declares (SPEC R-PROC.6). Only
+    /// programs an enabled profile declares count. What it costs is shown with
+    /// the profile in `ahma permissions list`: for adb, the agent drives every
+    /// attached device. A capability a human turns on, never offered at a
+    /// prompt. Default: empty (a human starts the server in their own terminal).
+    pub host_services: Vec<String>,
     /// macOS only. Additional credential directories whose **reads** are denied
     /// to sandboxed tools, on top of the built-in default set (`~/.ahma`,
     /// `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`,
@@ -1773,6 +1785,7 @@ impl Default for SandboxSettings {
             allow_keychain: true,
             signal_other_processes: false,
             allow_gpu: false,
+            host_services: Vec::new(),
             deny_credential_reads: Vec::new(),
             allow_credential_reads: Vec::new(),
             profiles: default_sandbox_profiles(),
@@ -3046,6 +3059,12 @@ impl AhmaSettings {
             "allow_gpu",
             self.sandbox.allow_gpu.to_string(),
             d.sandbox.allow_gpu.to_string(),
+        );
+        w.setting(
+            "Host services ahma starts outside the sandbox before a sandboxed command runs them, e.g. [\"adb\"]: a server holding USB devices finds none when started inside it. Empty = a human starts them in their own terminal (SPEC R-PROC.6).",
+            "host_services",
+            toml_str_list(&self.sandbox.host_services),
+            toml_str_list(&d.sandbox.host_services),
         );
         w.setting(
             "macOS: extra credential dirs to deny reads (on top of the built-in default set; e.g. ~/.ssh to harden further).",
@@ -4755,6 +4774,7 @@ mod tests {
                 allow_keychain: false,
                 signal_other_processes: true,
                 allow_gpu: true,
+                host_services: vec!["adb".into()],
                 deny_credential_reads: vec![PathBuf::from("~/.ssh")],
                 allow_credential_reads: vec![PathBuf::from("~/.aws")],
                 profiles: vec!["rust".into()],

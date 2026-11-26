@@ -45,7 +45,7 @@
 
 pub mod build_diagnostics;
 pub mod capability_denial;
-mod command;
+pub(crate) mod command;
 pub mod confinement;
 pub(crate) mod core;
 pub mod credential_reads;
@@ -58,6 +58,7 @@ pub mod gpu;
 pub mod grant_channel;
 pub mod handoff_watch;
 pub mod host_detect;
+pub(crate) mod host_services;
 pub mod kernel_denials;
 #[cfg(target_os = "linux")]
 mod landlock;
