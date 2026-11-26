@@ -234,42 +234,64 @@ fn cached_canonical_temp_dir() -> Option<&'static Path> {
         .as_deref()
 }
 
-/// The canonical system temp directory when it may join `scopes` as an
-/// auxiliary scope (SPEC R5.2.5), else `None`: never as the sole scope (an
-/// empty set is a sandbox still waiting for its workspace, R5.2.4), never when
-/// a scope already contains it, and never when the hard denylist refuses it
-/// for this workspace (R-PERM.4.3) — a workspace *inside* the temp directory,
-/// where adding it would widen the scope above the workspace.
+/// Every directory a command may write for temp files, canonical (SPEC
+/// R5.2.5): the kernel's [`super::temp_write_roots`] that exist, then the
+/// platform's temp directory (`$TMPDIR`), which may lie inside one of them or,
+/// on Linux, elsewhere. The one list ahma's own checks admit, so a path a
+/// command can write is never one ahma's tools ask about.
+pub fn temp_scope_roots() -> &'static [PathBuf] {
+    static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut roots: Vec<PathBuf> = super::temp_write_roots()
+            .into_iter()
+            .filter_map(|r| dunce::canonicalize(r).ok())
+            .collect();
+        if let Some(temp) = cached_canonical_temp_dir()
+            && !roots.iter().any(|r| r == temp)
+        {
+            roots.push(temp.to_path_buf());
+        }
+        roots
+    })
+}
+
+/// The temp directories ([`temp_scope_roots`]) that may join `scopes` as
+/// auxiliary scopes (SPEC R5.2.5), in order; empty when none may. Never as the
+/// sole scope (an empty set is a sandbox still waiting for its workspace,
+/// R5.2.4), never one a scope (or an earlier one) already contains, and never
+/// one the hard denylist refuses for this workspace (R-PERM.4.3): a parent of
+/// a workspace that lies inside it, which would widen the scope above it.
 ///
 /// The one rule for every surface that puts temp in scope: the commit
 /// ([`Sandbox::admit_temp_scope`]) and the one-shot `ahma tool run` / hook
 /// seed, which runs before a [`Sandbox`] exists.
-pub fn auxiliary_temp_scope(scopes: &[PathBuf]) -> Option<PathBuf> {
+pub fn auxiliary_temp_scopes(scopes: &[PathBuf]) -> Vec<PathBuf> {
     if scopes.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let temp = cached_canonical_temp_dir()?;
-    let live: Vec<PathBuf> = scopes
+    let mut live: Vec<PathBuf> = scopes
         .iter()
         .map(|s| dunce::canonicalize(s).unwrap_or_else(|_| s.clone()))
         .collect();
-    if path_within_scopes(temp, &live) {
-        return None;
+    let home = ahma_common::config::ahma_home_dir();
+    let mut admitted = Vec::new();
+    for temp in temp_scope_roots() {
+        if path_within_scopes(temp, &live) {
+            continue;
+        }
+        if let ahma_common::scope_grant::GrantRisk::Refused(why) =
+            ahma_common::scope_grant::classify_grant_risk(temp, home.as_deref(), &live)
+        {
+            tracing::info!(
+                "The temp directory {} stays out of this scope ({why}).",
+                temp.display()
+            );
+            continue;
+        }
+        live.push(temp.clone());
+        admitted.push(temp.clone());
     }
-    if let ahma_common::scope_grant::GrantRisk::Refused(why) =
-        ahma_common::scope_grant::classify_grant_risk(
-            temp,
-            ahma_common::config::ahma_home_dir().as_deref(),
-            &live,
-        )
-    {
-        tracing::info!(
-            "The temp directory {} stays out of this scope ({why}).",
-            temp.display()
-        );
-        return None;
-    }
-    Some(temp.to_path_buf())
+    admitted
 }
 
 /// The name of the immediate child of `container` that `requested` lives in, or
@@ -1185,26 +1207,31 @@ impl Sandbox {
         }
     }
 
-    /// Put the system temp directory in scope as an auxiliary scope, after the
-    /// workspace, when `tmp_access` is on and `disable_temp` is off (SPEC
+    /// Put the temp directories ([`temp_scope_roots`]) in scope as auxiliary
+    /// scopes, after the workspace, when `tmp_access` is on and `disable_temp` is off (SPEC
     /// R5.2.5). No prompt: commands may already write temp at the kernel layer,
     /// and this only lets ahma's own tools (`working_directory`, `format: path`
     /// arguments, the built-in file tools) follow them there. Skipped as
-    /// [`auxiliary_temp_scope`] says — no workspace yet, temp already in scope,
+    /// [`auxiliary_temp_scopes`] says — no workspace yet, temp already in scope,
     /// or the hard denylist refuses it for this workspace. Called by every
     /// commit; a one-shot `ahma tool run` seeds the same directory before its
-    /// sandbox exists, under the same rule. Returns whether the temp directory
-    /// is in scope afterwards.
+    /// sandbox exists, under the same rule. Returns whether the platform's
+    /// temp directory is in scope afterwards.
     pub fn admit_temp_scope(&self) -> bool {
         if self.tmp_access {
             let mut scopes = self.scopes.write();
-            if let Some(temp) = auxiliary_temp_scope(&scopes) {
+            let temps = auxiliary_temp_scopes(&scopes);
+            if !temps.is_empty() {
                 tracing::info!(
-                    "The temp directory {} joins the scope after the workspace \
+                    "The temp directories {} join the scope after the workspace \
                      ([sandbox] tmp_access; turn temp off with disable_temp, SPEC R5.2.5)",
-                    temp.display()
+                    temps
+                        .iter()
+                        .map(|t| t.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
-                append_missing_scopes(&mut scopes, &[temp]);
+                append_missing_scopes(&mut scopes, &temps);
             }
         }
         self.tmp_in_scope()
@@ -1945,7 +1972,13 @@ mod scope_view_tests {
         let temp = Sandbox::canonical_temp_dir().unwrap();
         assert!(sb.tmp_in_scope());
         assert_eq!(sb.scopes().first(), Some(&ws), "workspace stays primary");
-        assert_eq!(sb.scopes().last(), Some(&temp), "temp is auxiliary");
+        assert!(
+            sb.scopes()[1..]
+                .iter()
+                .all(|s| temp_scope_roots().contains(s)),
+            "temp is auxiliary: {:?}",
+            sb.scopes().to_vec()
+        );
         assert!(sb.validate_path(&temp.join("scratch.txt")).is_ok());
         assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp"], true);
         assert_eq!(sb.scope_json(ScopeSource::RootsList)["tmp_in_scope"], true);
@@ -1993,6 +2026,40 @@ mod scope_view_tests {
         );
     }
 
+    /// SPEC R5.2.5: ahma's own checks accept every temp directory the kernel
+    /// lets commands write, not just `$TMPDIR`. Claude Code's scratchpad under
+    /// `/private/tmp/claude-<uid>` was asked about on every use, though a
+    /// command could already write there.
+    #[test]
+    fn tmp_access_admits_every_temp_root_the_kernel_allows() {
+        let ws = workspace_outside_temp();
+        let sb = tmp_sandbox(true, false);
+        let _ = sb.commit_scopes(vec![ws.clone()]).unwrap();
+        assert_eq!(sb.scopes().first(), Some(&ws), "workspace stays primary");
+        for root in super::super::temp_write_roots() {
+            let Ok(root) = dunce::canonicalize(&root) else {
+                continue;
+            };
+            let inside = root.join("claude-501").join("scratchpad").join("x.txt");
+            assert!(
+                sb.validate_path(&inside).is_ok(),
+                "{} is writable by commands, so ahma's tools accept it: {:?}",
+                inside.display(),
+                sb.scopes().to_vec()
+            );
+        }
+
+        let off = tmp_sandbox(false, false);
+        let _ = off.commit_scopes(vec![ws]).unwrap();
+        for root in super::super::temp_write_roots() {
+            assert!(
+                off.validate_path(&root.join("x.txt")).is_err(),
+                "tmp_access = false keeps {} out",
+                root.display()
+            );
+        }
+    }
+
     /// `tmp_access = false` keeps it out of ahma's own scope.
     #[test]
     fn tmp_access_off_keeps_temp_out_of_scope_at_commit() {
@@ -2007,20 +2074,26 @@ mod scope_view_tests {
     #[test]
     fn the_auxiliary_temp_scope_needs_a_workspace_outside_it() {
         let temp = Sandbox::canonical_temp_dir().unwrap();
-        assert_eq!(auxiliary_temp_scope(&[]), None, "never the sole scope");
+        let covers_temp = |admitted: &[PathBuf]| admitted.iter().any(|t| temp.starts_with(t));
         assert_eq!(
-            auxiliary_temp_scope(&[temp.join("project")]),
-            None,
+            auxiliary_temp_scopes(&[]),
+            Vec::<PathBuf>::new(),
+            "never the sole scope"
+        );
+        assert!(
+            !covers_temp(&auxiliary_temp_scopes(&[temp.join("project")])),
             "never above a workspace inside it"
         );
-        assert_eq!(
-            auxiliary_temp_scope(&[workspace_outside_temp(), temp.clone()]),
-            None,
-            "already in scope"
+        let already = auxiliary_temp_scopes(&[workspace_outside_temp(), temp.clone()]);
+        assert!(
+            !already.iter().any(|t| t.starts_with(&temp)),
+            "already in scope: {already:?}"
         );
-        assert_eq!(
-            auxiliary_temp_scope(&[workspace_outside_temp()]),
-            Some(temp)
+        let admitted = auxiliary_temp_scopes(&[workspace_outside_temp()]);
+        assert!(covers_temp(&admitted), "{admitted:?}");
+        assert!(
+            admitted.iter().all(|t| temp_scope_roots().contains(t)),
+            "only temp roots: {admitted:?}"
         );
     }
 

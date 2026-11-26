@@ -340,7 +340,7 @@ fn test_update_scopes_preserves_sandbox_dir_and_temp() {
         scopes.to_vec()
     );
     assert!(
-        scopes.contains(&canonical_temp),
+        scopes.iter().any(|s| canonical_temp.starts_with(s)),
         "tmp_access puts the temp dir in scope: {:?}",
         scopes.to_vec()
     );

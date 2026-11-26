@@ -262,7 +262,7 @@ Validate configs: `ahma tool validate .ahma/`
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
 | `sandbox.container_root` | unset | Directory holding your projects; scope fallback when the client reports no roots |
 | `--scratch` / `sandbox.use_scratch_directory` | off | Add a persistent secondary scope |
-| `--tmp` / `sandbox.tmp_access` | on | Temp dir in ahma's own scope (file tools, `working_directory`); `--tmp` kept for old configs |
+| `--tmp` / `sandbox.tmp_access` | on | Every temp dir commands may write is in ahma's own scope too (file tools, `working_directory`); `--tmp` kept for old configs |
 | `--disable-temp-files` / `sandbox.disable_temp` | off | Expert opt-out: temp closed to commands, file tools and native edits |
 | `--no-package-cache-write` | off | Disable cargo cache writes (strictest isolation) |
 | `--log-to-stderr` / `logging.target` | file | Log to stderr |

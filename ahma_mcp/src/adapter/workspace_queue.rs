@@ -259,8 +259,11 @@ pub fn format_duration_secs(secs: u64) -> String {
 /// `.git` entry — a directory for a plain clone, a file for a worktree, so two
 /// worktrees of one repository are two workspaces. Without one, the longest
 /// sandbox scope containing the directory; without that, the directory itself.
-/// Both sides are canonicalized so `/tmp` vs `/private/tmp` (macOS) or case
-/// differences (Windows) cannot split one workspace into two keys.
+/// A temp root in scope (R5.2.5) is shared space rather than a workspace: a
+/// directory under one is keyed to the folder just below the deepest temp root
+/// holding it. Both sides are canonicalized so `/tmp` vs
+/// `/private/tmp` (macOS) or case differences (Windows) cannot split one
+/// workspace into two keys.
 pub fn workspace_key(working_dir: &Path, scopes: &[PathBuf]) -> PathBuf {
     let wd = dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
     for ancestor in wd.ancestors() {
@@ -268,12 +271,39 @@ pub fn workspace_key(working_dir: &Path, scopes: &[PathBuf]) -> PathBuf {
             return ancestor.to_path_buf();
         }
     }
-    scopes
+    let temp_roots = crate::sandbox::temp_scope_roots();
+    match scopes
         .iter()
         .map(|s| dunce::canonicalize(s).unwrap_or_else(|_| s.clone()))
         .filter(|s| wd.starts_with(s))
         .max_by_key(|s| s.components().count())
-        .unwrap_or(wd)
+    {
+        Some(scope) if temp_roots.contains(&scope) => temp_lane(&wd, temp_roots),
+        Some(scope) => scope,
+        None => wd,
+    }
+}
+
+/// The folder just below the deepest of `temp_roots` that holds `wd` (the
+/// root itself when `wd` is the root): one session's scratch folder, so two
+/// sessions working in temp do not share a lane, and the drift walk (R2.7.6)
+/// lists that folder rather than the whole of temp.
+fn temp_lane(wd: &Path, temp_roots: &[PathBuf]) -> PathBuf {
+    let Some(root) = temp_roots
+        .iter()
+        .filter(|r| wd.starts_with(r))
+        .max_by_key(|r| r.components().count())
+    else {
+        return wd.to_path_buf();
+    };
+    match wd
+        .strip_prefix(root)
+        .ok()
+        .and_then(|rest| rest.components().next())
+    {
+        Some(child) => root.join(child),
+        None => root.clone(),
+    }
 }
 
 /// Where the drift probe (SPEC R2.7.6) may walk for an operation keyed on
@@ -1197,6 +1227,26 @@ mod tests {
         std::fs::create_dir_all(&wd).unwrap();
         let key = workspace_key(&wd, &[outer.clone(), inner.clone()]);
         assert_eq!(key, dunce::canonicalize(&inner).unwrap());
+    }
+
+    /// SPEC R2.7.2, R5.2.5: a temp root in scope (`/private/tmp`) is shared
+    /// space, not a workspace. A command in a temp folder is keyed to the
+    /// folder just below the root, so two sessions' scratch folders do not
+    /// share a lane and the drift walk lists that folder, not all of temp.
+    #[test]
+    fn a_temp_root_scope_keys_the_folder_below_it() {
+        let Some(root) = crate::sandbox::temp_scope_roots().first().cloned() else {
+            return;
+        };
+        let own = tempfile::Builder::new().tempdir_in(&root).unwrap();
+        let own_dir = dunce::canonicalize(own.path()).unwrap();
+        let wd = own_dir.join("scratchpad").join("deep");
+        std::fs::create_dir_all(&wd).unwrap();
+        let scopes = vec![root.clone()];
+        let key = workspace_key(&wd, &scopes);
+        assert_eq!(key, own_dir, "not the whole of {}", root.display());
+        assert_eq!(drift_root(&key, &scopes, &wd), own_dir);
+        assert_eq!(workspace_key(&root, &scopes), root, "the root itself");
     }
 
     /// SPEC R2.7.6: a `.git` above the sandbox scope (a dotfiles repository in

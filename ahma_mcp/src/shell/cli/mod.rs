@@ -641,13 +641,14 @@ fn add_temp_scope_if_requested(
     // awaiting client `roots/list`) is not seeded — doing so would make the
     // sandbox appear "already configured" and lock it to the temp directory,
     // rejecting the actual workspace. The same rule as the commit's.
-    if let Some(temp) = sandbox::auxiliary_temp_scope(&scopes) {
+    let temps = sandbox::auxiliary_temp_scopes(&scopes);
+    if !temps.is_empty() {
         tracing::info!(
-            "Adding the temp directory to the sandbox scope after the workspace \
+            "Adding the temp directories to the sandbox scope after the workspace \
              ([sandbox] tmp_access): {:?}",
-            temp
+            temps
         );
-        scopes.push(temp);
+        scopes.extend(temps);
     }
 
     Some(scopes)
@@ -4605,7 +4606,7 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let canonical_temp = dunce::canonicalize(&temp_dir).unwrap();
         assert!(
-            result.contains(&canonical_temp),
+            result.iter().any(|s| canonical_temp.starts_with(s)),
             "Expected temp dir in scopes: {:?}",
             result
         );
@@ -4623,8 +4624,12 @@ mod tests {
         if !ws.starts_with(&canonical_temp) {
             return;
         }
-        let result = add_temp_scope_if_requested(Some(vec![ws.clone()]), true);
-        assert_eq!(result, Some(vec![ws]));
+        let result = add_temp_scope_if_requested(Some(vec![ws.clone()]), true).unwrap();
+        assert_eq!(result.first(), Some(&ws));
+        assert!(
+            result[1..].iter().all(|t| !ws.starts_with(t)),
+            "no temp root above the workspace: {result:?}"
+        );
     }
 
     #[test]
@@ -4692,7 +4697,10 @@ mod tests {
         assert!(sandbox.is_committed());
         assert_eq!(sandbox.scopes().first(), Some(&ws));
         assert!(
-            sandbox.scopes().contains(&canonical_temp),
+            sandbox
+                .scopes()
+                .iter()
+                .any(|s| canonical_temp.starts_with(s)),
             "{:?}",
             sandbox.scopes().to_vec()
         );
@@ -4730,7 +4738,10 @@ mod tests {
         };
         let sandbox = initialize_sandbox(&cfg).unwrap().unwrap();
         assert!(
-            sandbox.scopes().contains(&canonical_temp),
+            sandbox
+                .scopes()
+                .iter()
+                .any(|s| canonical_temp.starts_with(s)),
             "{:?}",
             sandbox.scopes().to_vec()
         );
