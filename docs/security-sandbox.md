@@ -58,7 +58,7 @@ Some rights need a newer kernel, and ahma asks for them best effort, logging whi
 |---|---|---|
 | Truncation (`truncate(2)`, `O_TRUNC`) | 6.2 | a command can truncate a file outside the scope |
 | Cross-directory rename (`Refer`) | 5.19 | renames between directories fail with `EXDEV` |
-| TCP connect only to the egress proxy | 6.7 | `--restrict-network` is advisory |
+| TCP connect only to the egress proxy and `[network] local_ports` | 6.7 | `--restrict-network` is advisory |
 
 ```bash
 uname -r   # 5.13 or newer
@@ -323,7 +323,7 @@ to keep the code off the clipboard ([docs/web.md](web.md)).
 
 ## Network egress
 
-The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the allowed hosts (`[network] allow` plus each enabled profile's hosts) and refuses private, loopback and cloud-metadata addresses. It is kernel-enforced on macOS (only the proxy is reachable) and on Linux 6.7+ (TCP only, pinned to the proxy port; UDP is not filtered), and advisory elsewhere. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).
+The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the allowed hosts (`[network] allow` plus each enabled profile's hosts) and refuses private, loopback and cloud-metadata addresses. It is kernel-enforced on macOS (the proxy and this machine's own ports are reachable, apart from Docker's TCP API) and on Linux 6.7+ (TCP pinned to the proxy port plus any `[network] local_ports`, each of which is open to every host; UDP and raw sockets refused by seccomp), and advisory elsewhere. How the allowlist is built, and the hosts each sandbox profile contributes: [network-egress.md](network-egress.md).
 
 ## Nested Sandbox Environments (Cursor, Claude Code, VS Code, Docker)
 

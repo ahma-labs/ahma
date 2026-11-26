@@ -1005,6 +1005,7 @@ mod tests {
                 temp_writable: true,
                 package_cache_write: false,
                 connect_tcp_port: None,
+                local_tcp_ports: Vec::new(),
             })
             .unwrap() else {
                 eprintln!("Skipping test: Landlock unavailable on this kernel");

@@ -1858,3 +1858,55 @@ fn a_restricted_network_profile_is_one_the_kernel_accepts() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Whether `nc -z` from inside `profile` reaches `port` on 127.0.0.1.
+fn restricted_command_connects(profile: &str, cwd: &Path, port: u16) -> bool {
+    Command::new("sandbox-exec")
+        .args(["-p", profile, "/usr/bin/nc", "-z", "-G", "5"])
+        .args(["127.0.0.1", &port.to_string()])
+        .current_dir(cwd)
+        .output()
+        .expect("run sandbox-exec")
+        .status
+        .success()
+}
+
+/// SPEC R-WEB.16.13 on macOS: under `--restrict-network` a command still
+/// reaches services on this machine (a test database, a test server on a
+/// random port), which only the loopback allow makes possible; Docker's TCP
+/// API stays shut, since it is a complete escape like its socket. The
+/// listeners are this test's own, so the control (connecting with restriction
+/// off) proves each port is really listening.
+#[test]
+fn a_restricted_command_reaches_local_services_but_not_dockers_tcp_api() {
+    skip_if_nested_sandbox!();
+    let scope = TempDir::new().expect("scope dir");
+    let sandbox = strict_sandbox(scope.path(), true);
+    let open_profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    sandbox.set_egress_proxy_addr(Some("127.0.0.1:34567".parse().unwrap()));
+    let restricted = sandbox.generate_seatbelt_profile_test(scope.path());
+
+    let service = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local service");
+    let port = service.local_addr().unwrap().port();
+    assert!(
+        restricted_command_connects(&open_profile, scope.path(), port),
+        "control: the local service must be reachable with restriction off"
+    );
+    assert!(
+        restricted_command_connects(&restricted, scope.path(), port),
+        "a restricted command must reach a local service on port {port}"
+    );
+
+    // Docker's port only when nothing else holds it on this machine.
+    if let Ok(docker) = std::net::TcpListener::bind("127.0.0.1:2375") {
+        assert!(
+            restricted_command_connects(&open_profile, scope.path(), 2375),
+            "control: the stand-in Docker port must be reachable with restriction off"
+        );
+        assert!(
+            !restricted_command_connects(&restricted, scope.path(), 2375),
+            "SECURITY: a restricted command must not reach Docker's TCP API"
+        );
+        drop(docker);
+    }
+}

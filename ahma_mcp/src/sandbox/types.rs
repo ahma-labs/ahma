@@ -39,6 +39,10 @@ pub struct KernelPolicy {
     /// The only TCP port a command may connect to (the egress proxy), or
     /// `None` for unrestricted network.
     pub connect_tcp_port: Option<u16>,
+    /// With `connect_tcp_port` set, the further TCP ports a command may
+    /// connect to (`[network] local_ports`, SPEC R-WEB.16.13). Landlock matches
+    /// the port alone, so each is reachable on every host.
+    pub local_tcp_ports: Vec<u16>,
 }
 
 /// A guard that holds a read lock on the sandbox scopes.

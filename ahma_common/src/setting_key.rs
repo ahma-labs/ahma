@@ -246,6 +246,7 @@ setting_keys! {
     NetworkAllow = network.allow => ledger(NETWORK_ALLOW),
     NetworkProfileHosts = network.profile_hosts => SECURITY,
     NetworkDenyProfileHosts = network.deny_profile_hosts => SECURITY,
+    NetworkLocalPorts = network.local_ports => SECURITY,
     // The grant ledger itself. A project file proposing grants would be the
     // whole R5.4.5 gate bypassed in one line.
     PermissionsToolApprovals = permissions.tool_approvals => ledger(PERMISSIONS_LIST),

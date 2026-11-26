@@ -169,8 +169,44 @@ pub(crate) async fn maybe_start_egress_proxy(
     // egress except this proxy address, so a subprocess that ignores HTTP_PROXY
     // still cannot reach the network directly. No-op on other platforms.
     sandbox.set_egress_proxy_addr(Some(proxy.local_addr));
+    sandbox.set_local_tcp_ports(&config.network_local_ports);
     disclose_egress_restriction(&grants, proxy.local_addr);
+    if let Some(note) = local_ports_disclosure(&config.network_local_ports) {
+        tracing::warn!("{note}");
+    }
     Some(proxy)
+}
+
+/// What `[network] local_ports` opens, said at startup (SPEC R-WEB.16.13).
+/// On Linux each port is open to every host, since Landlock matches the port
+/// alone; on macOS the setting is not needed. `None` when nothing is listed.
+pub(crate) fn local_ports_disclosure(ports: &[u16]) -> Option<String> {
+    if ports.is_empty() {
+        return None;
+    }
+    let list = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if cfg!(target_os = "linux") {
+        format!(
+            "[network] local_ports: commands may connect to TCP port(s) {list} directly, on ANY \
+             host, not only this machine: Linux's kernel rule (Landlock) matches the port, never \
+             the address. A command could send data out to a server listening on one of them. \
+             Other local ports stay closed."
+        )
+    } else if cfg!(target_os = "macos") {
+        format!(
+            "[network] local_ports ({list}) is not needed on macOS: under restriction every \
+             localhost port is reachable, and only localhost."
+        )
+    } else {
+        format!(
+            "[network] local_ports ({list}) has no effect on this platform: restriction here is \
+             advisory and blocks no port."
+        )
+    })
 }
 
 /// Announce the active egress restriction loudly (SPEC R7): what is reachable,
@@ -220,10 +256,13 @@ fn disclose_egress_restriction(
 /// ignores `HTTP_PROXY` or opens a raw socket is not contained — see the README).
 fn network_enforcement_note() -> &'static str {
     if cfg!(target_os = "macos") {
-        "Kernel-enforced (Seatbelt): direct egress that bypasses the proxy is blocked."
+        "Kernel-enforced (Seatbelt): direct egress that bypasses the proxy is blocked; \
+         localhost stays reachable."
     } else if cfg!(target_os = "linux") {
         "Kernel-enforced where supported (Landlock, kernel 6.7+): outbound TCP is restricted to \
-         the proxy port. Advisory on older kernels and for UDP (see the README network limits)."
+         the proxy port and any [network] local_ports, and UDP and raw sockets are refused \
+         (seccomp, unless [sandbox] syscall_filter = false). Advisory on older kernels \
+         (see the README network limits)."
     } else {
         "Advisory: a tool that ignores HTTP_PROXY or opens a raw socket is not contained \
          (see the README network limits)."
@@ -987,6 +1026,20 @@ async fn run_as_frontend(config: &AppConfig, socket_path: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// R-WEB.16.13: listed local ports are named at startup, and on Linux the
+    /// disclosure says they are open to every host, not only this machine.
+    #[test]
+    fn local_ports_are_disclosed_with_what_they_open() {
+        assert_eq!(local_ports_disclosure(&[]), None);
+        let note = local_ports_disclosure(&[5432, 6379]).expect("listed ports are disclosed");
+        assert!(note.contains("5432, 6379"), "{note}");
+        if cfg!(target_os = "linux") {
+            assert!(note.contains("ANY host"), "{note}");
+        } else if cfg!(target_os = "macos") {
+            assert!(note.contains("not needed on macOS"), "{note}");
+        }
+    }
+
     /// A client reads whether the hub is already handing over (SPEC R-HUB.5),
     /// and a hub from before the field existed is simply not draining.
     #[test]
@@ -1046,6 +1099,7 @@ mod tests {
             // input. `profile_hosts_seed_the_allowlist` opts back in explicitly.
             network_profile_hosts: false,
             network_deny_profile_hosts: vec![],
+            network_local_ports: vec![],
             sandbox_profiles: vec![],
             sandbox_scopes: vec![],
             use_scratch_dir: false,

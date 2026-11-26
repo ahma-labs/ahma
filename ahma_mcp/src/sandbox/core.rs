@@ -398,6 +398,10 @@ pub struct Sandbox {
     /// blanket `(allow network*)` rule (advisory tier / restriction off). Set after
     /// the proxy binds its port; behind a lock because it is installed post-construction.
     pub(super) egress_proxy_addr: parking_lot::RwLock<Option<std::net::SocketAddr>>,
+    /// `[network] local_ports`: TCP ports a restricted command may connect to
+    /// besides the proxy's (SPEC R-WEB.16.13). Read only while the proxy is on;
+    /// Linux only, since macOS lets every `localhost` port through.
+    pub(super) local_tcp_ports: parking_lot::RwLock<Vec<u16>>,
     /// The scope commit latch and roots-received flag, modeled as an explicit
     /// state machine (SPEC R23). Owns the one-shot lock semantics and the memory
     /// ordering that the commit decision must not be reordered past the scopes
@@ -621,6 +625,7 @@ impl Clone for Sandbox {
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
             egress_proxy_addr: parking_lot::RwLock::new(*self.egress_proxy_addr.read()),
+            local_tcp_ports: parking_lot::RwLock::new(self.local_tcp_ports.read().clone()),
             scope_lock: self.scope_lock.clone(),
             container_root: self.container_root.clone(),
             narrowed_to: parking_lot::RwLock::new(self.narrowed_to.read().clone()),
@@ -731,6 +736,7 @@ impl Sandbox {
             livelog,
             package_cache_write: true,
             egress_proxy_addr: parking_lot::RwLock::new(None),
+            local_tcp_ports: parking_lot::RwLock::new(Vec::new()),
             // A fresh sandbox has received nothing from any client, so
             // `scope_source()` never reports `roots/list` for a scope that
             // never saw roots.
@@ -781,6 +787,15 @@ impl Sandbox {
     pub fn set_egress_proxy_addr(&self, addr: Option<std::net::SocketAddr>) {
         let mut guard = self.egress_proxy_addr.write();
         *guard = addr;
+    }
+
+    /// Install `[network] local_ports` (SPEC R-WEB.16.13), alongside the proxy
+    /// address. Without the proxy they change nothing: the network is open.
+    pub fn set_local_tcp_ports(&self, ports: &[u16]) {
+        let mut ports = ports.to_vec();
+        ports.sort_unstable();
+        ports.dedup();
+        *self.local_tcp_ports.write() = ports;
     }
 
     /// Override the package-cache-write flag.

@@ -1207,3 +1207,69 @@ async fn red_team_seccomp_refuses_kernel_attack_surface() {
         );
     }
 }
+
+/// Landlock's network rules (ABI 4) arrived in Linux 6.7; before that a
+/// restricted command's TCP connects are not kernel-filtered at all.
+#[cfg(target_os = "linux")]
+fn kernel_filters_tcp_connect() -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut parts = release
+        .trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|p| p.parse::<u32>().ok());
+    matches!((parts.next(), parts.next()), (Some(major), Some(minor)) if (major, minor) >= (6, 7))
+}
+
+/// SPEC R-WEB.16.13 on Linux: under `--restrict-network` a command may
+/// connect to the proxy's port and nothing else, so a local service (a test
+/// database) is refused until `[network] local_ports` lists its port. The
+/// listener is this test's own; with restriction off the command reaches it,
+/// which proves the refusal is the kernel rule's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(target_os = "linux")]
+async fn red_team_restricted_network_opens_a_local_port_only_when_listed() {
+    init_test_logging();
+    skip_if_landlock_unavailable!();
+    if !kernel_filters_tcp_connect() {
+        eprintln!("Skipping test: Landlock filters TCP connects from Linux 6.7");
+        return;
+    }
+    let (scope_dir, _outside) = scope_and_outside_dirs("local-ports");
+    let sandbox = Sandbox::new(
+        vec![scope_dir.path().to_path_buf()],
+        SandboxMode::Strict,
+        ahma_mcp::sandbox::SandboxOptions::default(),
+    )
+    .unwrap();
+    let service = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local service");
+    let port = service.local_addr().unwrap().port();
+    let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo connected || echo refused");
+    let run = |sandbox: &Sandbox| {
+        let cmd = sandbox.create_shell_command("bash", &probe, scope_dir.path());
+        async move {
+            let out = cmd.unwrap().output().await.unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+    };
+
+    assert_eq!(run(&sandbox).await, "connected", "control: restriction off");
+
+    // Any port that is not the service's stands in for the proxy.
+    let proxy_port = if port == 1 { 2 } else { 1 };
+    sandbox.set_egress_proxy_addr(Some(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        proxy_port,
+    ))));
+    assert_eq!(
+        run(&sandbox).await,
+        "refused",
+        "SECURITY: under restriction an unlisted port must be refused"
+    );
+
+    sandbox.set_local_tcp_ports(&[port]);
+    assert_eq!(
+        run(&sandbox).await,
+        "connected",
+        "a port in [network] local_ports must be reachable"
+    );
+}

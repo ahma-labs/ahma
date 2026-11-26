@@ -29,6 +29,11 @@ fn macos_path_rules(path: &Path, access: WorkspaceAccess) -> String {
     rules
 }
 
+/// Docker's TCP API ports (plain and TLS). With "expose daemon on
+/// tcp://localhost:2375" on, the daemon answers there with no authentication,
+/// so it is shut under restriction even though the rest of loopback is open.
+const DOCKER_TCP_PORTS: [u16; 2] = [2375, 2376];
+
 impl Sandbox {
     pub(super) fn build_macos_sandbox_command(
         &self,
@@ -282,14 +287,27 @@ impl Sandbox {
             // with this rule every command failed to start on macOS (found by
             // `a_hooked_command_goes_through_the_egress_proxy_when_restricted`
             // on CI, 2026-11-26). The proxy always binds loopback.
+            //
+            // Every loopback port, not only the proxy's (SPEC R-WEB.16.13): a
+            // test database, a cache, a test server on a random port are all
+            // local, and refusing them broke the first test run under
+            // restriction. `localhost` is exactly loopback, so nothing off
+            // this machine is reachable except through the proxy. Loopback
+            // services that matter (ahma's own servers) require a token;
+            // Docker's TCP API, which needs none and is a complete escape like
+            // its socket (R-HANDOFF.6), stays shut.
             Some(addr) => {
                 debug_assert!(addr.ip().is_loopback(), "the egress proxy binds loopback");
-                format!(
-                    "(allow network*)\n\
-                     (deny network-outbound (remote ip \"*:*\"))\n\
-                     (allow network-outbound (remote ip \"localhost:{}\"))\n",
-                    addr.port()
-                )
+                let mut rules = "(allow network*)\n\
+                                 (deny network-outbound (remote ip \"*:*\"))\n\
+                                 (allow network-outbound (remote ip \"localhost:*\"))\n"
+                    .to_string();
+                for port in DOCKER_TCP_PORTS {
+                    rules.push_str(&format!(
+                        "(deny network-outbound (remote ip \"localhost:{port}\"))\n"
+                    ));
+                }
+                rules
             }
         }
     }
@@ -864,7 +882,8 @@ mod tests {
             "no IP deny rule without restrict-network"
         );
 
-        // Proxy set → deny all outbound IP, re-allow only the proxy address.
+        // Proxy set → deny all outbound IP, re-allow loopback only: the proxy
+        // is there, and so are local services (R-WEB.16.13).
         sb.set_egress_proxy_addr(Some("127.0.0.1:34567".parse().unwrap()));
         let p = sb.generate_seatbelt_profile_test(dir.path());
         assert!(
@@ -872,9 +891,28 @@ mod tests {
             "enforcement must deny all outbound IP egress, got:\n{p}"
         );
         assert!(
-            p.contains("(allow network-outbound (remote ip \"localhost:34567\"))"),
-            "enforcement must re-allow exactly the proxy address, got:\n{p}"
+            p.contains("(allow network-outbound (remote ip \"localhost:*\"))"),
+            "enforcement must re-allow every loopback port and nothing else, got:\n{p}"
         );
+        let deny = p
+            .find("(deny network-outbound (remote ip \"*:*\"))")
+            .unwrap();
+        let allow = p
+            .find("(allow network-outbound (remote ip \"localhost:*\"))")
+            .unwrap();
+        assert!(
+            deny < allow,
+            "the loopback allow must follow the deny (last match wins)"
+        );
+        // Docker's TCP API is a complete escape, like its socket (R-HANDOFF.6),
+        // so its ports stay shut on loopback too: after the allow.
+        for port in [2375, 2376] {
+            let rule = format!("(deny network-outbound (remote ip \"localhost:{port}\"))");
+            let at = p
+                .find(&rule)
+                .unwrap_or_else(|| panic!("{rule} missing:\n{p}"));
+            assert!(at > allow, "{rule} must follow the loopback allow");
+        }
 
         // Clearing the address returns to the open policy.
         sb.set_egress_proxy_addr(None);
