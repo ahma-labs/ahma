@@ -477,8 +477,14 @@ pub(super) fn next_link_ask(
     let workspace = workspace_for(cwd);
     let now = ahma_common::session_grants::now_secs();
     let asks = harness_asks::load(&dir, &workspace, now);
-    let gh_host = std::env::var("GH_HOST").ok();
-    let link = crate::links::policy::predicted_link(command, gh_host.as_deref());
+    // Only where the link broker stands between a command and the browser (Unix,
+    // R-LINK.1) is a link ever refused, so only there is it asked about first.
+    let link = if cfg!(unix) {
+        let gh_host = std::env::var("GH_HOST").ok();
+        crate::links::policy::predicted_link(command, gh_host.as_deref())
+    } else {
+        None
+    };
     // Most commands open no link and none was refused here: read no grants for them.
     if asks.link_refusals.is_empty() && link.is_none() {
         return None;
@@ -1324,6 +1330,7 @@ mod tests {
     /// once per harness session. Nothing is recorded as refused, since nothing
     /// was, so no other surface lists it. A command that opens nothing, or a
     /// site a grant allows, is not held.
+    #[cfg(unix)]
     #[test]
     fn a_command_that_opens_an_unallowed_site_asks_before_its_first_run() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1384,6 +1391,7 @@ mod tests {
     /// SPEC R-LINK.6, R-LINK.11: outside a git repository no repo names
     /// where a grant would apply, so the dialog's yes is this time: that run
     /// opens the site, and nothing is saved.
+    #[cfg(unix)]
     #[test]
     fn outside_a_repo_a_yes_to_a_link_is_for_that_run_only() {
         let tmp = tempfile::tempdir().unwrap();

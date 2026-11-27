@@ -2780,12 +2780,17 @@ fn next_prior_step(
     // A link this command will open, before its first run, or one the link
     // broker refused, before this command or one opening the same site runs
     // again (SPEC R-LINK.6).
+    // The link broker, and with it the egress rule for links, is Unix-only (R-LINK.1).
+    #[cfg(unix)]
+    let egress = crate::links::host::egress_rules(cfg);
+    #[cfg(not(unix))]
+    let egress = None;
     if let Some(link) = harness_ask::next_link_ask(
         cwd,
         session_id,
         command,
         cfg.settings_origin.user_settings_file().as_deref(),
-        crate::links::host::egress_rules(cfg).as_ref(),
+        egress.as_ref(),
     ) {
         let workspace = harness_ask::workspace_for(cwd);
         let reason = harness_ask::link_ask_reason(&link, &workspace);
