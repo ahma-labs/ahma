@@ -31,7 +31,9 @@ async fn ahma_command_doctor_returns_the_report() -> Result<()> {
         assert!(text.contains("! ahma doctor"), "{text}");
     } else {
         assert!(
-            text.contains("Nothing to fix") || text.contains("ahma doctor --fix"),
+            text.contains("Nothing to fix")
+                || text.contains("no fix of its own")
+                || text.contains("ahma doctor --fix"),
             "expected the doctor report, got: {text}"
         );
     }

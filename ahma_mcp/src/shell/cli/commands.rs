@@ -2838,7 +2838,7 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
     }
     let fixes = ahma_common::doctor::fixes(&findings);
     if fixes.is_empty() {
-        println!("\nNothing to fix.");
+        println!("\n{}", ahma_common::doctor::no_fix_close(&findings));
         return Ok(());
     }
     if !args.fix {

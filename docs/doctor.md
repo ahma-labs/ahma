@@ -11,7 +11,10 @@ repeats thousands of times in the log. You should not have to know where each
 of those lives. The doctor looks, says what it found and what it costs, and
 offers a fix — which it applies only after you have seen that exact fix and
 said `y`. A model can help you understand the report; it can never apply
-anything.
+anything. Some findings are yours to change (another tool's allow-list, say),
+so when there is no fix to offer, the report ends with "Nothing to fix." only if
+nothing is wrong. Otherwise it counts the warnings and problems that remain
+(SPEC R-DOCTOR.13).
 
 ## Quickstart
 
