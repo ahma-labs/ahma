@@ -361,6 +361,45 @@ fn gh_api_reads(args: &[String]) -> bool {
     true
 }
 
+/// A `sed` that can only print input lines (SPEC R-PERM.11): options `-n`,
+/// `--quiet`, `--silent`, `-E`, `-r`, `--regexp-extended`, and scripts made of
+/// decimal line addresses each ending in `p` (`20,50p`, `1p;9p`). Anything
+/// else keeps `sed` a possible writer: another option (`-i`, `-f`, a bundled
+/// `-ne`), another command (`w`, `W`, `e`, `r`, `R`, `s///w`), a regex address,
+/// or `$`, which the shell could expand.
+fn sed_only_prints(args: &[String]) -> bool {
+    let (mut scripts, mut operands) = (Vec::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-n" | "--quiet" | "--silent" | "-E" | "-r" | "--regexp-extended" => {}
+            "-e" => match it.next() {
+                Some(script) => scripts.push(script),
+                None => return false,
+            },
+            s if s.starts_with('-') => return false,
+            _ => operands.push(a),
+        }
+    }
+    if scripts.is_empty() {
+        match operands.first() {
+            Some(script) => scripts.push(script),
+            None => return false,
+        }
+    }
+    let line = |a: &str| !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit());
+    scripts.iter().all(|s| {
+        s.split(';').all(|cmd| {
+            cmd.trim()
+                .strip_suffix('p')
+                .is_some_and(|addr| match addr.split_once(',') {
+                    None => addr.is_empty() || line(addr),
+                    Some((a, b)) => line(a) && line(b),
+                })
+        })
+    })
+}
+
 /// Whether a reading program can still write a file through its own
 /// arguments — `sort -o`, `uniq in out`, a `sed` `w` command, `env` running
 /// another program. Harmless in the read-only lane, where the kernel refuses
@@ -376,7 +415,8 @@ fn writes_through_args(program: &str, args: &[String]) -> bool {
     match program {
         // Run another program, or a script that may write.
         "env" => !args.is_empty(),
-        "sed" | "gsed" | "awk" | "gawk" | "mawk" => true,
+        "sed" | "gsed" => !sed_only_prints(args),
+        "awk" | "gawk" | "mawk" => true,
         // Interactive: `s` saves, `!` runs a shell.
         "less" | "more" => true,
         "xxd" => operands() > 1,
@@ -2649,7 +2689,7 @@ mod watch_and_redirect_tests {
             "gh pr checks 113 --watch > /tmp/ci.log; rm -f x",
             "cargo build > /tmp/build.log 2>&1",
             "sort -o out.txt in.txt > /tmp/x",
-            "sed -n 1p f > /tmp/x",
+            "sed 'w f' x > /tmp/x",
             "env rm -rf x > /tmp/x",
             "XDG_CACHE_HOME=/tmp/c gh pr checks 113 > /tmp/x",
             "echo $(sed 'w f' x) > /tmp/x",
@@ -3139,6 +3179,11 @@ mod queue_reason_tests {
             "cat /other/repo/a.json | jq .name",
             "git log -1 --oneline",
             "cd sub && ls /other/repo",
+            // Field case 2026-11-27: a subagent's lookup asked the human, because any `sed`
+            // counted as a writer. A script of line addresses and `p` can only print.
+            "sed -n 20,50p ~/.zshenv; echo ----; ls -ld /other/repo 2>&1",
+            "sed -n -e 1p -e 5,9p /other/repo/f",
+            "sed -n '1p;9p' /other/repo/f",
         ] {
             assert!(only_looks(cmd), "{cmd}");
         }
@@ -3154,6 +3199,17 @@ mod queue_reason_tests {
             "cp /other/repo/a .",
             "/other/repo/scripts/release.sh",
             "ls $(touch /other/repo/f)",
+            "sed -n 1p /other/repo/f -i",
+            "sed -n --in-place 1p /other/repo/f",
+            "sed -n '1w /other/repo/x' f",
+            "sed -n 1e f",
+            "sed -n 1r/etc/passwd f",
+            "sed 1,5s/a/b/w /other/repo/x f",
+            "sed -n '$p' f",
+            "sed -n '/x/p' f",
+            "sed -f /other/repo/x.sed f",
+            "sed -ne 1p f",
+            "sed -n",
         ] {
             assert!(!only_looks(cmd), "{cmd}");
         }
