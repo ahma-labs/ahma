@@ -7,7 +7,7 @@ use ahma_mcp::config::{
     AvailabilityCheck, CommandOption, ItemsSpec, SequenceStep, SubcommandConfig, ToolConfig,
     ToolHints, load_mcp_config, load_tool_configs_sync,
 };
-use ahma_test_support::path_helpers::test_temp_path;
+use ahma_mcp::test_utils::path_helpers::test_temp_path;
 use serde_json::json;
 use tempfile::tempdir;
 

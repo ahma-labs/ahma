@@ -12,17 +12,17 @@
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use tempfile::TempDir;
 
+/// A sandbox scoped to `scope` with default options, in `mode`.
+fn new_sandbox(scope: &TempDir, mode: SandboxMode) -> Sandbox {
+    Sandbox::new(vec![scope.path().to_path_buf()], mode, Default::default()).unwrap()
+}
+
 // ─── Sandbox builder ──────────────────────────────────────────────────────────
 
 #[test]
 fn test_sandbox_package_cache_write_default_is_true() {
     let tmp = TempDir::new().unwrap();
-    let sandbox = Sandbox::new(
-        vec![tmp.path().to_path_buf()],
-        SandboxMode::Test,
-        Default::default(),
-    )
-    .unwrap();
+    let sandbox = new_sandbox(&tmp, SandboxMode::Test);
     assert!(
         sandbox.package_cache_write(),
         "Default should be package_cache_write = true"
@@ -32,13 +32,7 @@ fn test_sandbox_package_cache_write_default_is_true() {
 #[test]
 fn test_sandbox_with_package_cache_write_disabled() {
     let tmp = TempDir::new().unwrap();
-    let sandbox = Sandbox::new(
-        vec![tmp.path().to_path_buf()],
-        SandboxMode::Test,
-        Default::default(),
-    )
-    .unwrap()
-    .with_package_cache_write(false);
+    let sandbox = new_sandbox(&tmp, SandboxMode::Test).with_package_cache_write(false);
     assert!(
         !sandbox.package_cache_write(),
         "After with_package_cache_write(false) the flag must be false"
@@ -48,13 +42,7 @@ fn test_sandbox_with_package_cache_write_disabled() {
 #[test]
 fn test_sandbox_with_package_cache_write_enabled_is_noop() {
     let tmp = TempDir::new().unwrap();
-    let sandbox = Sandbox::new(
-        vec![tmp.path().to_path_buf()],
-        SandboxMode::Test,
-        Default::default(),
-    )
-    .unwrap()
-    .with_package_cache_write(true);
+    let sandbox = new_sandbox(&tmp, SandboxMode::Test).with_package_cache_write(true);
     assert!(
         sandbox.package_cache_write(),
         "with_package_cache_write(true) must keep the flag true"
@@ -64,13 +52,7 @@ fn test_sandbox_with_package_cache_write_enabled_is_noop() {
 #[test]
 fn test_sandbox_clone_preserves_package_cache_write_flag() {
     let tmp = TempDir::new().unwrap();
-    let sandbox = Sandbox::new(
-        vec![tmp.path().to_path_buf()],
-        SandboxMode::Test,
-        Default::default(),
-    )
-    .unwrap()
-    .with_package_cache_write(false);
+    let sandbox = new_sandbox(&tmp, SandboxMode::Test).with_package_cache_write(false);
     let cloned = sandbox.clone();
     assert!(
         !cloned.package_cache_write(),
@@ -131,12 +113,7 @@ mod seatbelt_profile_tests {
         let saved = std::env::var("CARGO_HOME").ok();
         let fake_cargo = setup_fake_cargo_home(&tmp);
 
-        let sandbox = Sandbox::new(
-            vec![scope.path().to_path_buf()],
-            SandboxMode::Strict,
-            Default::default(),
-        )
-        .unwrap();
+        let sandbox = new_sandbox(&scope, SandboxMode::Strict);
         // Default: package_cache_write = true
         let profile = profile_for(&sandbox, &scope);
 
@@ -162,12 +139,7 @@ mod seatbelt_profile_tests {
         let saved = std::env::var("CARGO_HOME").ok();
         let fake_cargo = setup_fake_cargo_home(&tmp);
 
-        let sandbox = Sandbox::new(
-            vec![scope.path().to_path_buf()],
-            SandboxMode::Strict,
-            Default::default(),
-        )
-        .unwrap();
+        let sandbox = new_sandbox(&scope, SandboxMode::Strict);
         let profile = profile_for(&sandbox, &scope);
 
         restore_cargo_home(saved);
@@ -203,13 +175,7 @@ mod seatbelt_profile_tests {
         let saved = std::env::var("CARGO_HOME").ok();
         let fake_cargo = setup_fake_cargo_home(&tmp);
 
-        let sandbox = Sandbox::new(
-            vec![scope.path().to_path_buf()],
-            SandboxMode::Strict,
-            Default::default(),
-        )
-        .unwrap()
-        .with_package_cache_write(false);
+        let sandbox = new_sandbox(&scope, SandboxMode::Strict).with_package_cache_write(false);
         let profile = profile_for(&sandbox, &scope);
 
         restore_cargo_home(saved);
@@ -246,12 +212,7 @@ mod seatbelt_profile_tests {
         // nextest runs each test in its own process, so this global is isolated.
         ahma_mcp::sandbox::set_credential_read_denies(vec![secret.path().to_path_buf()]);
 
-        let sandbox = Sandbox::new(
-            vec![scope.path().to_path_buf()],
-            SandboxMode::Strict,
-            Default::default(),
-        )
-        .unwrap();
+        let sandbox = new_sandbox(&scope, SandboxMode::Strict);
         let profile = profile_for(&sandbox, &scope);
         ahma_mcp::sandbox::set_credential_read_denies(Vec::new());
 
@@ -283,12 +244,7 @@ mod seatbelt_profile_tests {
     fn test_seatbelt_profile_has_no_credential_denies_by_default() {
         ahma_mcp::sandbox::set_credential_read_denies(Vec::new());
         let scope = TempDir::new().unwrap();
-        let sandbox = Sandbox::new(
-            vec![scope.path().to_path_buf()],
-            SandboxMode::Strict,
-            Default::default(),
-        )
-        .unwrap();
+        let sandbox = new_sandbox(&scope, SandboxMode::Strict);
         let profile = profile_for(&sandbox, &scope);
         // Narrowed from "no `(deny file-read*` at all" to "no operator-list
         // deny": the profile also carries unconditional container-socket and

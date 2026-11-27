@@ -1065,21 +1065,12 @@ fn warn_elevated_risk_grant(path: &std::path::Path, live_scopes: &[PathBuf]) {
 }
 
 pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
-    use ahma_common::config::{AhmaSettings, settings_path};
+    use ahma_common::config::settings_path;
 
     let file = settings_path()
         .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
-    // Fold any retired ~/.config/ahma/{approvals,log_exceptions}.json into the
-    // ledger first, so `list` shows the truth rather than a partial picture.
-    if let Err(e) = ahma_common::permissions::migrate_legacy_approvals(&file) {
-        eprintln!("warning: could not migrate legacy approvals: {e:#}");
-    }
-    if let Err(e) = ahma_common::permissions::migrate_legacy_log_exceptions(&file) {
-        eprintln!("warning: could not migrate legacy log exceptions: {e:#}");
-    }
-    let load = || -> Result<AhmaSettings> {
-        AhmaSettings::load_from_result(&file).map_err(|e| anyhow::anyhow!(e))
-    };
+    migrate_legacy_permissions(&file);
+    let load = || load_sandbox_settings(&file);
 
     match args.command {
         PermissionsCommand::List { kind, expiring } => {
@@ -1121,27 +1112,39 @@ pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
             lease,
             yes,
         } => {
-            if parse_kind(&kind)? == GrantKind::OpenUrl {
-                if lease.is_some() {
-                    anyhow::bail!(
-                        "an open-url grant lasts until revoked; `--for` is not offered for it \
-                         (revoke with `ahma permissions revoke open-url <site> --yes`)"
-                    );
-                }
-                let binding = open_url_grant_binding(workspace, all_repos)?;
-                let settings = load()?;
-                return grant_open_url(
-                    &file,
-                    &settings,
-                    subject.as_deref(),
-                    and_subdomains,
-                    binding,
-                    yes,
+            if parse_kind(&kind)? != GrantKind::OpenUrl {
+                let subject = subject_or_bail(&kind, subject)?;
+                return grant_permission(&file, &kind, &subject, workspace, lease.as_deref(), yes);
+            }
+            if lease.is_some() {
+                anyhow::bail!(
+                    "an open-url grant lasts until revoked; `--for` is not offered for it \
+                     (revoke with `ahma permissions revoke open-url <site> --yes`)"
                 );
             }
-            let subject = subject_or_bail(&kind, subject)?;
-            grant_permission(&file, &kind, &subject, workspace, lease.as_deref(), yes)
+            let binding = open_url_grant_binding(workspace, all_repos)?;
+            let settings = load()?;
+            grant_open_url(
+                &file,
+                &settings,
+                subject.as_deref(),
+                and_subdomains,
+                binding,
+                yes,
+            )
         }
+    }
+}
+
+/// Fold any retired ~/.config/ahma/{approvals,log_exceptions}.json into the
+/// ledger first, so `list` shows the truth rather than a partial picture. A
+/// failure only warns.
+fn migrate_legacy_permissions(file: &std::path::Path) {
+    if let Err(e) = ahma_common::permissions::migrate_legacy_approvals(file) {
+        eprintln!("warning: could not migrate legacy approvals: {e:#}");
+    }
+    if let Err(e) = ahma_common::permissions::migrate_legacy_log_exceptions(file) {
+        eprintln!("warning: could not migrate legacy log exceptions: {e:#}");
     }
 }
 
@@ -1236,48 +1239,23 @@ fn grant_open_url(
     binding: ahma_common::open_url::OpenUrlBinding,
     yes: bool,
 ) -> Result<()> {
-    use ahma_common::open_url::{ANY_SITE_WARNING, GUIDANCE, OpenUrlBinding};
     let patterns = open_url_patterns(site, and_subdomains)?;
     let any = patterns == ["*"];
     let lines: Vec<String> = patterns
         .iter()
-        .map(|pattern| match &binding {
-            OpenUrlBinding::AllRepos => format!("[open_url] allow = \"{pattern}\" (all repos)"),
-            OpenUrlBinding::Repo(ws) => format!(
-                "[open_url] repos = {{ workspace = \"{}\", allow = \"{pattern}\" }} (this repo \
-                 only)",
-                ws.display()
-            ),
-        })
+        .map(|pattern| open_url_grant_line(pattern, &binding))
         .collect();
     let shared = patterns
         .iter()
         .find_map(|p| crate::links::policy::shared_wildcard_warning(p));
     if !yes {
-        for line in &lines {
-            println!("Would add: {line}");
-        }
-        println!();
-        if any {
-            println!("{ANY_SITE_WARNING}");
-            println!();
-        }
-        if let Some(warning) = &shared {
-            println!("{warning}");
-            println!();
-        }
-        if settings.network.restrict {
-            println!(
-                "Network restriction is on: any site here means any site on your network \
-                 allow list; other sites still need their own grant."
-            );
-            println!();
-        }
-        println!("{GUIDANCE}");
-        println!();
-        println!("File: {}", file.display());
-        println!();
-        println!("Nothing was changed. Re-run with --yes to apply.");
+        print_open_url_grant_preview(
+            file,
+            &lines,
+            any,
+            shared.as_deref(),
+            settings.network.restrict,
+        );
         return Ok(());
     }
     let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
@@ -1299,7 +1277,80 @@ fn grant_open_url(
         println!("✓ Granted: {line}");
     }
     println!();
-    let revoke_flag = match &binding {
+    println!(
+        "Revoke with: {}",
+        open_url_revoke_command(&patterns, any, and_subdomains, &binding)
+    );
+    Ok(())
+}
+
+/// The `[open_url]` settings line one granted `pattern` becomes under
+/// `binding`, as the grant previews and confirms it.
+fn open_url_grant_line(pattern: &str, binding: &ahma_common::open_url::OpenUrlBinding) -> String {
+    use ahma_common::open_url::OpenUrlBinding;
+    match binding {
+        OpenUrlBinding::AllRepos => format!("[open_url] allow = \"{pattern}\" (all repos)"),
+        OpenUrlBinding::Repo(ws) => format!(
+            "[open_url] repos = {{ workspace = \"{}\", allow = \"{pattern}\" }} (this repo \
+             only)",
+            ws.display()
+        ),
+    }
+}
+
+/// What `ahma permissions grant open-url` without `--yes` prints: the lines
+/// it would add, the warnings that apply, the guidance, and that nothing
+/// changed.
+fn print_open_url_grant_preview(
+    file: &std::path::Path,
+    lines: &[String],
+    any: bool,
+    shared: Option<&str>,
+    network_restricted: bool,
+) {
+    use ahma_common::open_url::{ANY_SITE_WARNING, GUIDANCE};
+    for line in lines {
+        println!("Would add: {line}");
+    }
+    println!();
+    if any {
+        println!("{ANY_SITE_WARNING}");
+        println!();
+    }
+    if let Some(warning) = shared {
+        println!("{warning}");
+        println!();
+    }
+    if network_restricted {
+        println!(
+            "Network restriction is on: any site here means any site on your network \
+             allow list; other sites still need their own grant."
+        );
+        println!();
+    }
+    println!("{GUIDANCE}");
+    println!();
+    print_unchanged_footer(file);
+}
+
+/// The closing lines of every `--yes`-gated preview: the file it would
+/// change, and that nothing was changed.
+fn print_unchanged_footer(file: &std::path::Path) {
+    println!("File: {}", file.display());
+    println!();
+    println!("Nothing was changed. Re-run with --yes to apply.");
+}
+
+/// The command that undoes an `open-url` grant of `patterns` under `binding`
+/// (no site when the grant was for any site).
+fn open_url_revoke_command(
+    patterns: &[String],
+    any: bool,
+    and_subdomains: bool,
+    binding: &ahma_common::open_url::OpenUrlBinding,
+) -> String {
+    use ahma_common::open_url::OpenUrlBinding;
+    let revoke_flag = match binding {
         OpenUrlBinding::AllRepos => " --global".to_string(),
         OpenUrlBinding::Repo(ws) => format!(
             " --workspace {}",
@@ -1315,8 +1366,7 @@ fn grant_open_url(
     } else {
         ""
     };
-    println!("Revoke with: ahma permissions revoke open-url{site_arg}{pair}{revoke_flag} --yes");
-    Ok(())
+    format!("ahma permissions revoke open-url{site_arg}{pair}{revoke_flag} --yes")
 }
 
 /// `ahma permissions revoke open-url [SITE]`: previews what it removes and
@@ -1333,106 +1383,47 @@ fn revoke_open_url(
     yes: bool,
 ) -> Result<()> {
     use ahma_common::open_url::OpenUrlBinding;
-    let patterns: Vec<Option<String>> = match site {
-        None if and_subdomains => {
-            anyhow::bail!("--and-subdomains needs a SITE: the domain whose `*.SITE` to remove")
-        }
-        None => vec![None],
-        Some(s) => {
-            let p = open_url_pattern(Some(s))?;
-            if and_subdomains {
-                vec![Some(format!("*.{p}")), Some(p)]
-            } else {
-                vec![Some(p)]
-            }
-        }
-    };
-    let settings = ahma_common::config::AhmaSettings::load_from_result(file)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let patterns = open_url_revoke_patterns(site, and_subdomains)?;
+    let settings = load_sandbox_settings(file)?;
     let found: Vec<(String, OpenUrlBinding)> = patterns
         .iter()
         .flat_map(|p| settings.open_url.matching(p.as_deref(), binding))
         .collect();
-    let session_repo: Option<Option<&std::path::Path>> = match binding {
-        None => Some(None),
-        Some(OpenUrlBinding::Repo(ws)) => Some(Some(ws.as_path())),
-        Some(OpenUrlBinding::AllRepos) => None,
-    };
+    let session_repo = open_url_session_repo(binding);
     let session_dir = ahma_common::open_url::session_dir();
-    let sessions: Vec<_> = match (&session_dir, session_repo) {
-        (Some(dir), Some(repo)) => ahma_common::open_url::active_sessions(
-            dir,
-            ahma_common::session_grants::now_secs(),
-            &crate::sandbox::pid_alive,
-        )
-        .into_iter()
-        .filter(|g| {
-            patterns
-                .iter()
-                .any(|p| p.as_deref().is_none_or(|p| g.site.eq_ignore_ascii_case(p)))
-                && repo.is_none_or(|ws| g.workspace == ws)
-        })
-        .collect(),
+    let sessions = match (&session_dir, session_repo) {
+        (Some(dir), Some(repo)) => matching_open_url_sessions(dir, &patterns, repo),
         _ => Vec::new(),
     };
-    // A bare site whose wildcard sibling stays: say so, and how to remove it.
-    let sibling = match (&patterns[..], and_subdomains) {
-        ([Some(p)], false) if !p.starts_with('*') => {
-            let wild = format!("*.{p}");
-            (!settings.open_url.matching(Some(&wild), binding).is_empty()).then_some(wild)
-        }
-        _ => None,
-    };
-    let sibling_note = |site: &str| {
-        if let Some(wild) = &sibling {
-            println!(
-                "{wild} is still granted. To remove it too: ahma permissions revoke open-url \
-                 {site} --and-subdomains"
-            );
-        }
-    };
+    let sibling = open_url_wildcard_sibling(&settings.open_url, &patterns, and_subdomains, binding);
     let named = site.unwrap_or("any site");
     if found.is_empty() && sessions.is_empty() {
         println!("Nothing to revoke: no open-url grant for {named}.");
-        sibling_note(named);
+        print_open_url_sibling_note(sibling.as_deref(), named);
         return Ok(());
     }
-    let describe = |list: &[(String, OpenUrlBinding)]| {
-        list.iter()
-            .map(|(p, b)| format!("{p} ({})", b.describe()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let describe_sessions = sessions
-        .iter()
-        .map(|g| format!("{} (repo {})", g.site, g.workspace.display()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let describe_sessions = describe_open_url_sessions(&sessions);
     if !yes {
         if !found.is_empty() {
-            println!("Would remove the open-url grant for {}.", describe(&found));
+            println!(
+                "Would remove the open-url grant for {}.",
+                describe_open_url_grants(&found)
+            );
         }
         if !sessions.is_empty() {
             println!("Would end the session grant for {describe_sessions}.");
         }
-        sibling_note(named);
+        print_open_url_sibling_note(sibling.as_deref(), named);
         println!();
-        println!("File: {}", file.display());
-        println!();
-        println!("Nothing was changed. Re-run with --yes to apply.");
+        print_unchanged_footer(file);
         return Ok(());
     }
     if !found.is_empty() {
-        let mut removed = Vec::new();
-        for p in &patterns {
-            removed.extend(ahma_common::open_url::revoke_open_url(
-                file,
-                p.as_deref(),
-                binding,
-                &ApproverSurface::Cli,
-            )?);
-        }
-        println!("✓ Revoked: the open-url grant for {}.", describe(&removed));
+        let removed = revoke_saved_open_url_grants(file, &patterns, binding)?;
+        println!(
+            "✓ Revoked: the open-url grant for {}.",
+            describe_open_url_grants(&removed)
+        );
     }
     if let (Some(dir), Some(repo), false) = (&session_dir, session_repo, sessions.is_empty()) {
         for p in &patterns {
@@ -1440,8 +1431,128 @@ fn revoke_open_url(
         }
         println!("✓ Ended: the session grant for {describe_sessions}.");
     }
-    sibling_note(named);
+    print_open_url_sibling_note(sibling.as_deref(), named);
     Ok(())
+}
+
+/// The patterns an `open-url` revoke removes: every site (`None`) when none
+/// is named; with `--and-subdomains`, `*.SITE` and then `SITE` (R-LINK.11).
+fn open_url_revoke_patterns(
+    site: Option<&str>,
+    and_subdomains: bool,
+) -> Result<Vec<Option<String>>> {
+    let Some(s) = site else {
+        if and_subdomains {
+            anyhow::bail!("--and-subdomains needs a SITE: the domain whose `*.SITE` to remove");
+        }
+        return Ok(vec![None]);
+    };
+    let p = open_url_pattern(Some(s))?;
+    if and_subdomains {
+        return Ok(vec![Some(format!("*.{p}")), Some(p)]);
+    }
+    Ok(vec![Some(p)])
+}
+
+/// Which session grants an `open-url` revoke reaches: none with `--global`
+/// (a session grant is never for every repo), else those of every repo
+/// (`Some(None)`) or of the one repo named (SPEC R-LINK.7).
+fn open_url_session_repo(
+    binding: Option<&ahma_common::open_url::OpenUrlBinding>,
+) -> Option<Option<&std::path::Path>> {
+    use ahma_common::open_url::OpenUrlBinding;
+    match binding {
+        None => Some(None),
+        Some(OpenUrlBinding::Repo(ws)) => Some(Some(ws.as_path())),
+        Some(OpenUrlBinding::AllRepos) => None,
+    }
+}
+
+/// The session grants in force under `dir` for one of `patterns` (`None`
+/// matches every site) in `repo` (every repo when `None`).
+fn matching_open_url_sessions(
+    dir: &std::path::Path,
+    patterns: &[Option<String>],
+    repo: Option<&std::path::Path>,
+) -> Vec<ahma_common::open_url::OpenUrlSessionGrant> {
+    ahma_common::open_url::active_sessions(
+        dir,
+        ahma_common::session_grants::now_secs(),
+        &crate::sandbox::pid_alive,
+    )
+    .into_iter()
+    .filter(|g| {
+        patterns
+            .iter()
+            .any(|p| p.as_deref().is_none_or(|p| g.site.eq_ignore_ascii_case(p)))
+            && repo.is_none_or(|ws| g.workspace == ws)
+    })
+    .collect()
+}
+
+/// A bare site whose wildcard sibling `*.SITE` stays granted after the
+/// revoke: that wildcard, so the revoke can say so (R-LINK.11).
+fn open_url_wildcard_sibling(
+    open_url: &ahma_common::open_url::OpenUrlSettings,
+    patterns: &[Option<String>],
+    and_subdomains: bool,
+    binding: Option<&ahma_common::open_url::OpenUrlBinding>,
+) -> Option<String> {
+    let ([Some(p)], false) = (patterns, and_subdomains) else {
+        return None;
+    };
+    if p.starts_with('*') {
+        return None;
+    }
+    let wild = format!("*.{p}");
+    (!open_url.matching(Some(&wild), binding).is_empty()).then_some(wild)
+}
+
+/// Name the wildcard sibling a revoke left behind, if any, and how to remove
+/// it too.
+fn print_open_url_sibling_note(sibling: Option<&str>, site: &str) {
+    if let Some(wild) = sibling {
+        println!(
+            "{wild} is still granted. To remove it too: ahma permissions revoke open-url \
+             {site} --and-subdomains"
+        );
+    }
+}
+
+/// Saved `open-url` grants as a revoke reports them: `pattern (binding)`, …
+fn describe_open_url_grants(list: &[(String, ahma_common::open_url::OpenUrlBinding)]) -> String {
+    list.iter()
+        .map(|(p, b)| format!("{p} ({})", b.describe()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Session `open-url` grants as a revoke reports them: `site (repo WS)`, …
+fn describe_open_url_sessions(sessions: &[ahma_common::open_url::OpenUrlSessionGrant]) -> String {
+    sessions
+        .iter()
+        .map(|g| format!("{} (repo {})", g.site, g.workspace.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Remove the saved `open-url` grants each of `patterns` names, audited;
+/// every grant removed.
+fn revoke_saved_open_url_grants(
+    file: &std::path::Path,
+    patterns: &[Option<String>],
+    binding: Option<&ahma_common::open_url::OpenUrlBinding>,
+) -> Result<Vec<(String, ahma_common::open_url::OpenUrlBinding)>> {
+    let mut removed = Vec::new();
+    for p in patterns {
+        removed.extend(ahma_common::open_url::revoke_open_url(
+            file,
+            p.as_deref(),
+            binding,
+            &ApproverSurface::Cli,
+        )?);
+    }
+    Ok(removed)
 }
 
 /// `ahma permissions grant`: today the `ssh-sign` kind (SPEC R-CRED.3).
@@ -2335,75 +2446,80 @@ pub(crate) fn run_network_command(args: NetworkArgs) -> Result<()> {
 }
 
 fn network_command_at(file: &std::path::Path, command: NetworkCommand) -> Result<()> {
-    use crate::egress::host_pattern::HostPattern;
-    use ahma_common::config::AhmaSettings;
-
-    let load = || -> Result<AhmaSettings> {
-        AhmaSettings::load_from_result(file).map_err(|e| anyhow::anyhow!(e))
-    };
-
     match command {
-        NetworkCommand::Allow { host } => {
-            let _ = HostPattern::parse(&host)
-                .map_err(|e| anyhow::anyhow!("invalid host pattern '{host}': {e}"))?;
-
-            let newly_added =
-                ahma_common::net_approval::persist_net_allow(file, &host, &ApproverSurface::Cli)?;
-            if newly_added {
-                println!("✓ Added `{host}` to [network].allow");
-            } else {
-                println!("`{host}` is already in [network].allow; nothing to do.");
-            }
-            println!();
-            println!("Recorded in: {}", file.display());
-            println!("  This file lives outside every sandbox scope, so a sandboxed tool cannot");
-            println!(
-                "  edit it. Takes effect immediately for the active session and persists across restarts."
-            );
-            Ok(())
-        }
+        NetworkCommand::Allow { host } => network_allow(file, &host),
         NetworkCommand::List => {
-            let settings = load()?;
-            println!("# Subprocess network-egress policy");
-            println!("# File: {}", file.display());
-            println!();
-            println!("restrict_network = {}", settings.network.restrict);
-            println!();
-            println!("allow (permitted outbound hosts):");
-            if settings.network.allow.is_empty() {
-                println!("  (none)");
-            } else {
-                for h in &settings.network.allow {
-                    println!("  • {h}");
-                }
-            }
-            println!();
-            println!("Manage with: ahma network allow|revoke <HOST>, or `ahma permissions list`.");
+            print_network_list(file, &load_sandbox_settings(file)?);
             Ok(())
         }
-        NetworkCommand::Revoke { host } => {
-            let mut settings = load()?;
-            let pattern = host.trim().to_ascii_lowercase();
-            let before = settings.network.allow.len();
-            settings
-                .network
-                .allow
-                .retain(|h| h.trim().to_ascii_lowercase() != pattern);
-            if settings.network.allow.len() == before {
-                println!("No `{host}` entry found in [network].allow.");
-                println!("Run `ahma network list` to see current entries.");
-                return Ok(());
-            }
-            settings
-                .save_to(file)
-                .with_context(|| format!("Failed to write {}", file.display()))?;
-            audit(AuditAction::Revoke, GrantKind::NetHost, pattern, None);
-            println!("✓ Removed `{host}` from [network].allow");
-            println!();
-            println!("Updated: {}", file.display());
-            Ok(())
-        }
+        NetworkCommand::Revoke { host } => network_revoke(file, &host),
     }
+}
+
+/// `ahma network allow <HOST>`: validate the pattern, then add it to
+/// `[network].allow` through the audited writer.
+fn network_allow(file: &std::path::Path, host: &str) -> Result<()> {
+    use crate::egress::host_pattern::HostPattern;
+    let _ = HostPattern::parse(host)
+        .map_err(|e| anyhow::anyhow!("invalid host pattern '{host}': {e}"))?;
+
+    let newly_added =
+        ahma_common::net_approval::persist_net_allow(file, host, &ApproverSurface::Cli)?;
+    if newly_added {
+        println!("✓ Added `{host}` to [network].allow");
+    } else {
+        println!("`{host}` is already in [network].allow; nothing to do.");
+    }
+    println!();
+    println!("Recorded in: {}", file.display());
+    println!("  This file lives outside every sandbox scope, so a sandboxed tool cannot");
+    println!(
+        "  edit it. Takes effect immediately for the active session and persists across restarts."
+    );
+    Ok(())
+}
+
+/// `ahma network list`: the subprocess network-egress policy in `settings`.
+fn print_network_list(file: &std::path::Path, settings: &ahma_common::config::AhmaSettings) {
+    println!("# Subprocess network-egress policy");
+    println!("# File: {}", file.display());
+    println!();
+    println!("restrict_network = {}", settings.network.restrict);
+    println!();
+    println!("allow (permitted outbound hosts):");
+    if settings.network.allow.is_empty() {
+        println!("  (none)");
+    }
+    for h in &settings.network.allow {
+        println!("  • {h}");
+    }
+    println!();
+    println!("Manage with: ahma network allow|revoke <HOST>, or `ahma permissions list`.");
+}
+
+/// `ahma network revoke <HOST>`: remove every `[network].allow` entry equal
+/// to `host` (trimmed, case-insensitive), save, and audit the revoke.
+fn network_revoke(file: &std::path::Path, host: &str) -> Result<()> {
+    let mut settings = load_sandbox_settings(file)?;
+    let pattern = host.trim().to_ascii_lowercase();
+    let before = settings.network.allow.len();
+    settings
+        .network
+        .allow
+        .retain(|h| h.trim().to_ascii_lowercase() != pattern);
+    if settings.network.allow.len() == before {
+        println!("No `{host}` entry found in [network].allow.");
+        println!("Run `ahma network list` to see current entries.");
+        return Ok(());
+    }
+    settings
+        .save_to(file)
+        .with_context(|| format!("Failed to write {}", file.display()))?;
+    audit(AuditAction::Revoke, GrantKind::NetHost, pattern, None);
+    println!("✓ Removed `{host}` from [network].allow");
+    println!();
+    println!("Updated: {}", file.display());
+    Ok(())
 }
 
 pub(crate) fn run_logs_command(args: LogsArgs) -> Result<()> {
@@ -2816,7 +2932,7 @@ pub(crate) fn check_stdio_not_interactive() -> Result<()> {
 /// `ahma doctor [--fix]` (SPEC R-DOCTOR): print the shared health report and,
 /// with `--fix` on a terminal, offer each fix individually.
 pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::IsTerminal;
 
     let workspace = match args.path.clone() {
         Some(p) => p,
@@ -2853,20 +2969,28 @@ pub(crate) fn run_doctor_command(args: super::DoctorArgs) -> Result<()> {
         println!("\n--fix needs a terminal to ask you; nothing was changed.");
         return Ok(());
     }
+    offer_doctor_fixes(&fixes)
+}
+
+/// `ahma doctor --fix` on a terminal: ask about each fix in turn and apply
+/// only the ones answered `y` (SPEC R-DOCTOR).
+fn offer_doctor_fixes(fixes: &[ahma_common::doctor::Fix]) -> Result<()> {
+    use std::io::{BufRead, Write};
+
     let stdin = std::io::stdin();
     for (i, fix) in fixes.iter().enumerate() {
         print!("\nfix {}: {}\nApply? [y/N] ", i + 1, fix.describe());
         std::io::stdout().flush()?;
         let mut answer = String::new();
         stdin.lock().read_line(&mut answer)?;
-        if answer.trim().eq_ignore_ascii_case("y") {
-            let now = ahma_common::timestamp::rfc3339_local_now();
-            match fix.apply(&now) {
-                Ok(done) => println!("{done}."),
-                Err(e) => println!("Could not apply: {e:#}"),
-            }
-        } else {
+        if !answer.trim().eq_ignore_ascii_case("y") {
             println!("Skipped.");
+            continue;
+        }
+        let now = ahma_common::timestamp::rfc3339_local_now();
+        match fix.apply(&now) {
+            Ok(done) => println!("{done}."),
+            Err(e) => println!("Could not apply: {e:#}"),
         }
     }
     Ok(())

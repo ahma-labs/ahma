@@ -113,23 +113,29 @@ const NOT_THE_PROGRAM: &[&str] = &[
 pub fn command_programs(command: &str) -> Vec<String> {
     let mut programs = Vec::new();
     for word in command_words(command) {
-        // `"$CH"` runs whatever the variable holds: no name to match on.
-        if word.contains(['$', '`']) {
-            continue;
-        }
-        let word = word.as_str();
-        let name = Path::new(word)
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or(word)
-            .to_string();
-        // `2>&1` splits at its `&`; what follows is a descriptor, not a program.
-        let is_name = name.chars().any(char::is_alphabetic);
-        if is_name && !NOT_THE_PROGRAM.contains(&name.as_str()) && !programs.contains(&name) {
+        if let Some(name) = program_name(&word)
+            && !programs.contains(&name)
+        {
             programs.push(name);
         }
     }
     programs
+}
+
+/// The file name of one program word for [`command_programs`], or `None` when
+/// the word names no program a refusal can be matched to.
+fn program_name(word: &str) -> Option<String> {
+    // `"$CH"` runs whatever the variable holds: no name to match on.
+    if word.contains(['$', '`']) {
+        return None;
+    }
+    let name = Path::new(word)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(word);
+    // `2>&1` splits at its `&`; what follows is a descriptor, not a program.
+    let is_name = name.chars().any(char::is_alphabetic);
+    (is_name && !NOT_THE_PROGRAM.contains(&name)).then(|| name.to_string())
 }
 
 /// The program word of each command a shell line runs, as written (quotes
@@ -174,19 +180,6 @@ pub struct NamedFolder {
 
 /// [`command_paths`], with how each folder is named: moved into, or passed as an argument.
 pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<NamedFolder> {
-    let expand = |word: &str, base: &Path| -> Option<PathBuf> {
-        if word.is_empty() || word.contains(['$', '`', '*', '?', '[']) {
-            return None;
-        }
-        let path = if word == "~" {
-            home?.to_path_buf()
-        } else if let Some(rest) = word.strip_prefix("~/") {
-            home?.join(rest)
-        } else {
-            base.join(word)
-        };
-        Some(path)
-    };
     let mut paths = Vec::new();
     let mut here = cwd.to_path_buf();
     // A `cd` whose target cannot be read (`cd $r`, `cd -`) may go to any folder the line names.
@@ -199,47 +192,22 @@ pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Na
         // A `cd` is the program wherever it stands: behind an assignment, a loop or
         // conditional keyword, a group or a wrapper (`X=1 cd /repo`,
         // `if cd /repo; then …`, `{ cd /repo; …; }`, `time cd /repo`) it moves in all the same.
-        if let Some(at) = shell_words::program_index(&segment).filter(|&at| segment[at] == "cd") {
-            match segment.get(at + 1).map(String::as_str) {
-                Some(t) if t != "-" => match expand(t, &here) {
-                    Some(target) => {
-                        here = target.clone();
-                        paths.push(NamedFolder {
-                            path: target,
-                            entered: true,
-                        });
-                    }
-                    None => moves_somewhere_unread = true,
-                },
-                Some(_) => moves_somewhere_unread = true,
-                // `cd` alone goes home, which is no repository (R-PERM.11).
-                None => {}
-            }
+        let Some(at) = shell_words::program_index(&segment).filter(|&at| segment[at] == "cd")
+        else {
+            argument_folders(&segment, &here, home, &mut paths);
             continue;
-        }
-        let mut words = segment
-            .iter()
-            .map(String::as_str)
-            .skip_while(|w| shell_words::is_frame_or_group(w));
-        while let Some(word) = words.next() {
-            if word == "-C" {
-                if let Some(path) = words.next().and_then(|t| expand(t, &here)) {
-                    paths.push(NamedFolder {
-                        path,
-                        entered: true,
-                    });
-                }
-            } else if (word.starts_with('/')
-                || Path::new(word).is_absolute()
-                || word == "~"
-                || word.starts_with("~/"))
-                && let Some(path) = expand(word, &here)
-            {
+        };
+        match cd_move(segment.get(at + 1).map(String::as_str), &here, home) {
+            CdMove::Into(target) => {
+                here = target.clone();
                 paths.push(NamedFolder {
-                    path,
-                    entered: false,
+                    path: target,
+                    entered: true,
                 });
             }
+            CdMove::Unread => moves_somewhere_unread = true,
+            // `cd` alone goes home, which is no repository (R-PERM.11).
+            CdMove::Home => {}
         }
     }
     if moves_somewhere_unread {
@@ -248,6 +216,79 @@ pub fn command_folders(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<Na
         }
     }
     paths
+}
+
+/// What one `cd` does to the folder the rest of a line runs from ([`command_folders`]).
+enum CdMove {
+    /// Moves into a folder the text names.
+    Into(PathBuf),
+    /// Moves to a folder the text does not say (`cd $r`, `cd -`).
+    Unread,
+    /// `cd` alone: goes home.
+    Home,
+}
+
+/// The [`CdMove`] of a `cd` whose argument is `target`, resolved against `here`.
+fn cd_move(target: Option<&str>, here: &Path, home: Option<&Path>) -> CdMove {
+    match target {
+        None => CdMove::Home,
+        Some("-") => CdMove::Unread,
+        Some(t) => expand_folder_word(t, here, home).map_or(CdMove::Unread, CdMove::Into),
+    }
+}
+
+/// The folders one segment that is not a `cd` names ([`command_folders`]), appended to
+/// `paths`: every `-C` argument, moved into, and every word written as an absolute or home
+/// path, only looked at.
+fn argument_folders(
+    segment: &[String],
+    here: &Path,
+    home: Option<&Path>,
+    paths: &mut Vec<NamedFolder>,
+) {
+    let mut words = segment
+        .iter()
+        .map(String::as_str)
+        .skip_while(|w| shell_words::is_frame_or_group(w));
+    while let Some(word) = words.next() {
+        if word == "-C" {
+            if let Some(path) = words.next().and_then(|t| expand_folder_word(t, here, home)) {
+                paths.push(NamedFolder {
+                    path,
+                    entered: true,
+                });
+            }
+        } else if is_absolute_or_home(word)
+            && let Some(path) = expand_folder_word(word, here, home)
+        {
+            paths.push(NamedFolder {
+                path,
+                entered: false,
+            });
+        }
+    }
+}
+
+/// Whether a word is written as an absolute path or a path under home (`~`, `~/…`).
+fn is_absolute_or_home(word: &str) -> bool {
+    word.starts_with('/') || Path::new(word).is_absolute() || word == "~" || word.starts_with("~/")
+}
+
+/// The folder one word of a shell line names, resolved against `base`, with `~` and `~/…`
+/// under `home`. `None` for an empty word, one holding `$`, a backtick or a glob (nothing
+/// reliable names a folder there), or a home path when there is no home.
+fn expand_folder_word(word: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if word.is_empty() || word.contains(['$', '`', '*', '?', '[']) {
+        return None;
+    }
+    let path = if word == "~" {
+        home?.to_path_buf()
+    } else if let Some(rest) = word.strip_prefix("~/") {
+        home?.join(rest)
+    } else {
+        base.join(word)
+    };
+    Some(path)
 }
 
 /// Where `sudo` runs in one segment: the program, or a wrapper on the way to it
@@ -344,49 +385,51 @@ pub fn may_use_ssh_agent(command: &str) -> bool {
         .unwrap_or(program);
     match program {
         "ssh" | "scp" | "sftp" | "rsync" => true,
-        "git" => {
-            // Global options that take their value as the next word.
-            const WITH_VALUE: &[&str] = &[
-                "-C",
-                "-c",
-                "--git-dir",
-                "--work-tree",
-                "--namespace",
-                "--config-env",
-            ];
-            let mut subcommand = None;
-            while let Some(w) = words.next() {
-                if WITH_VALUE.contains(&w) {
-                    words.next();
-                } else if !w.starts_with('-') {
-                    subcommand = Some(w);
-                    break;
-                }
-            }
-            matches!(
-                subcommand,
-                Some(
-                    "fetch"
-                        | "pull"
-                        | "push"
-                        | "clone"
-                        | "ls-remote"
-                        | "submodule"
-                        | "remote"
-                        | "archive"
-                        | "lfs"
-                        | "commit"
-                        | "tag"
-                        | "merge"
-                        | "rebase"
-                        | "cherry-pick"
-                        | "revert"
-                        | "am"
-                )
-            )
-        }
+        "git" => git_subcommand(words).is_some_and(|s| GIT_AGENT_SUBCOMMANDS.contains(&s)),
         _ => false,
     }
+}
+
+/// The `git` subcommands [`may_use_ssh_agent`] counts: those that reach a remote,
+/// and those that can sign with an SSH key.
+const GIT_AGENT_SUBCOMMANDS: &[&str] = &[
+    "fetch",
+    "pull",
+    "push",
+    "clone",
+    "ls-remote",
+    "submodule",
+    "remote",
+    "archive",
+    "lfs",
+    "commit",
+    "tag",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "am",
+];
+
+/// The first word after `git` that is neither a global option nor that option's value.
+fn git_subcommand<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    // Global options that take their value as the next word.
+    const WITH_VALUE: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+    ];
+    while let Some(w) = words.next() {
+        if WITH_VALUE.contains(&w) {
+            words.next();
+        } else if !w.starts_with('-') {
+            return Some(w);
+        }
+    }
+    None
 }
 
 /// The programs to charge a refusal to (SPEC R-PERM.10.1): only `refused`,
@@ -889,20 +932,31 @@ pub fn widening_is_safe(dir: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> 
     ) {
         return false;
     }
-    if let Some(home) = home {
-        if home.starts_with(dir) {
-            return false;
-        }
-        let shared = SHARED_ROOTS
-            .iter()
-            .map(|parts| parts.iter().fold(home.to_path_buf(), |p, c| p.join(c)));
-        if shared
-            .chain(sensitive_dirs(home))
-            .any(|guarded| guarded.starts_with(dir))
-        {
-            return false;
-        }
+    if let Some(home) = home
+        && encloses_home_or_guarded(dir, home)
+    {
+        return false;
     }
+    !is_folder_of_projects(dir)
+}
+
+/// Whether `dir` is `home` or an ancestor of it, or contains a folder under `home`
+/// that many tools share or that holds credentials ([`widening_is_safe`]).
+fn encloses_home_or_guarded(dir: &Path, home: &Path) -> bool {
+    if home.starts_with(dir) {
+        return true;
+    }
+    let shared = SHARED_ROOTS
+        .iter()
+        .map(|parts| parts.iter().fold(home.to_path_buf(), |p, c| p.join(c)));
+    shared
+        .chain(sensitive_dirs(home))
+        .any(|guarded| guarded.starts_with(dir))
+}
+
+/// Whether `dir` holds two or more child directories that are git repositories.
+/// A folder that cannot be read holds none.
+fn is_folder_of_projects(dir: &Path) -> bool {
     let repos = std::fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -911,7 +965,7 @@ pub fn widening_is_safe(dir: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> 
                 .count()
         })
         .unwrap_or(0);
-    repos < 2
+    repos >= 2
 }
 
 /// Group `refusals` into as few questions as is safe.
@@ -949,23 +1003,23 @@ fn find_mergeable_pair(
     home: Option<&Path>,
     scopes: &[PathBuf],
 ) -> Option<(usize, usize, PathBuf)> {
-    for i in 0..questions.len() {
-        for j in (i + 1)..questions.len() {
-            let (a, b) = (&questions[i].dir, &questions[j].dir);
-            // Identical directories are one question. Anything wider, even
-            // a directory one of them already names, is a widening for the
-            // other and must pass the same test.
-            let target = if a == b {
-                Some(a.clone())
-            } else {
-                common_ancestor(a, b).filter(|c| widening_is_safe(c, home, scopes))
-            };
-            if let Some(dir) = target {
-                return Some((i, j, dir));
-            }
-        }
+    let n = questions.len();
+    (0..n)
+        .flat_map(|i| ((i + 1)..n).map(move |j| (i, j)))
+        .find_map(|(i, j)| {
+            merge_target(&questions[i].dir, &questions[j].dir, home, scopes).map(|dir| (i, j, dir))
+        })
+}
+
+/// The one directory a question for `a` and one for `b` may merge into, if any.
+fn merge_target(a: &Path, b: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> Option<PathBuf> {
+    // Identical directories are one question. Anything wider, even
+    // a directory one of them already names, is a widening for the
+    // other and must pass the same test.
+    if a == b {
+        return Some(a.to_path_buf());
     }
-    None
+    common_ancestor(a, b).filter(|c| widening_is_safe(c, home, scopes))
 }
 
 fn extend_unique<T: PartialEq>(dest: &mut Vec<T>, src: Vec<T>) {

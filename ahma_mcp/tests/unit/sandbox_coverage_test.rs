@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 use ahma_mcp::sandbox::test_sandbox_exec_available;
 use ahma_mcp::sandbox::{Sandbox, SandboxMode, check_sandbox_prerequisites};
-use ahma_test_support::path_helpers::test_out_of_scope_path;
+use ahma_mcp::test_utils::path_helpers::test_out_of_scope_path;
 use tempfile::TempDir;
 
 #[test]

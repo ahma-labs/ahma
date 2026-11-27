@@ -378,61 +378,10 @@ impl Adapter {
         working_dir: &std::path::Path,
     ) -> (workspace_queue::Lane, Option<String>) {
         use workspace_queue::Lane;
-        let mut reason = None;
-        let lane = subcommand_config
-            .and_then(|s| s.concurrency)
-            .unwrap_or_else(|| match shell_command_line(args) {
-                // Declared by the human to run without the lease (SPEC R2.7.10).
-                Some(line)
-                    if lane::long_running_entry(line, self.workspace_queue.long_running())
-                        .is_some() =>
-                {
-                    Lane::Service
-                }
-                // Asked for by the caller (SPEC R2.7.12): the kernel holds the
-                // line to it, so the request needs no trust, only enforcement.
-                Some(_) if asks_read_only(args) => {
-                    if self.sandbox.can_enforce_read_only() {
-                        Lane::ReadOnly
-                    } else {
-                        reason = Some(
-                            "`read_only` was asked for, but the kernel cannot hold a command to \
-                             the read-only lane here (Windows, or ahma inside another sandbox), \
-                             so it takes its turn"
-                                .to_string(),
-                        );
-                        Lane::Exclusive
-                    }
-                }
-                Some(line) => {
-                    // A redirection writes the workspace when its file lies in
-                    // this workspace or in another repository the session can
-                    // write. A scope that is no repository — the harness's own
-                    // scratch directory, a cache, temp — is not a workspace
-                    // (SPEC R2.7.2).
-                    let workspace = self.workspace_key_for(working_dir);
-                    let scopes: Vec<std::path::PathBuf> = self
-                        .sandbox
-                        .scopes()
-                        .iter()
-                        .filter(|s| s.ancestors().any(|a| a.join(".git").exists()))
-                        .cloned()
-                        .collect();
-                    let writes_workspace =
-                        |path: &std::path::Path| lane::writes_inside(path, &workspace, &scopes);
-                    let site = lane::RunSite {
-                        cwd: working_dir,
-                        read_only_enforced: self.sandbox.can_enforce_read_only(),
-                        writes_workspace: &writes_workspace,
-                    };
-                    let lane = lane::classify_shell_command_at(line, &site);
-                    if lane == Lane::Exclusive {
-                        reason = Some(lane::why_exclusive(line, &site));
-                    }
-                    lane
-                }
-                None => Lane::Exclusive,
-            });
+        let (lane, reason) = match subcommand_config.and_then(|s| s.concurrency) {
+            Some(lane) => (lane, None),
+            None => self.shell_lane_with_reason(args, working_dir),
+        };
         if lane == Lane::ReadOnly && !self.sandbox.can_enforce_read_only() {
             let nested = "ahma runs inside another sandbox here, so read-only commands cannot \
                           be held to the read-only lane and every command takes its turn";
@@ -440,6 +389,67 @@ impl Adapter {
         } else {
             (lane, reason)
         }
+    }
+
+    /// [`Self::resolve_lane_with_reason`] for a tool that declares no lane:
+    /// what its shell command line, if it has one, asks for or is judged.
+    fn shell_lane_with_reason(
+        &self,
+        args: Option<&Map<String, serde_json::Value>>,
+        working_dir: &std::path::Path,
+    ) -> (workspace_queue::Lane, Option<String>) {
+        use workspace_queue::Lane;
+        let Some(line) = shell_command_line(args) else {
+            return (Lane::Exclusive, None);
+        };
+        // Declared by the human to run without the lease (SPEC R2.7.10).
+        if lane::long_running_entry(line, self.workspace_queue.long_running()).is_some() {
+            return (Lane::Service, None);
+        }
+        // Asked for by the caller (SPEC R2.7.12): the kernel holds the line to
+        // it, so the request needs no trust, only enforcement.
+        if asks_read_only(args) {
+            if self.sandbox.can_enforce_read_only() {
+                return (Lane::ReadOnly, None);
+            }
+            let reason = "`read_only` was asked for, but the kernel cannot hold a command to \
+                          the read-only lane here (Windows, or ahma inside another sandbox), \
+                          so it takes its turn";
+            return (Lane::Exclusive, Some(reason.to_string()));
+        }
+        self.classify_shell_line(line, working_dir)
+    }
+
+    /// The lane a shell line is judged to need, with the reason when it is
+    /// exclusive (SPEC R2.7.4).
+    fn classify_shell_line(
+        &self,
+        line: &str,
+        working_dir: &std::path::Path,
+    ) -> (workspace_queue::Lane, Option<String>) {
+        // A redirection writes the workspace when its file lies in this
+        // workspace or in another repository the session can write. A scope
+        // that is no repository — the harness's own scratch directory, a
+        // cache, temp — is not a workspace (SPEC R2.7.2).
+        let workspace = self.workspace_key_for(working_dir);
+        let scopes: Vec<std::path::PathBuf> = self
+            .sandbox
+            .scopes()
+            .iter()
+            .filter(|s| s.ancestors().any(|a| a.join(".git").exists()))
+            .cloned()
+            .collect();
+        let writes_workspace =
+            |path: &std::path::Path| lane::writes_inside(path, &workspace, &scopes);
+        let site = lane::RunSite {
+            cwd: working_dir,
+            read_only_enforced: self.sandbox.can_enforce_read_only(),
+            writes_workspace: &writes_workspace,
+        };
+        let lane = lane::classify_shell_command_at(line, &site);
+        let reason =
+            (lane == workspace_queue::Lane::Exclusive).then(|| lane::why_exclusive(line, &site));
+        (lane, reason)
     }
 
     /// How long an exclusive shell line holds the workspace when it holds it
@@ -1325,48 +1335,39 @@ async fn waited_result(
     // What the SSH key broker refused this command, one line each
     // (SPEC R-CRED.10), on whichever side the result is.
     #[cfg(unix)]
-    let result = match run.guards.broker().and_then(broker_refusals) {
-        Some(lines) => match result {
-            Ok(out) => Ok(format!("{out}\n{lines}")),
-            Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
-        },
-        None => result,
-    };
+    let result = with_note(result, run.guards.broker().and_then(broker_refusals));
     // What the link broker refused, once each, unless the helper's own
     // line already reached the output (SPEC R-LINK.6): a tool that ran
     // `$BROWSER` may have swallowed it.
     #[cfg(unix)]
-    let result = match run
-        .guards
-        .links()
-        .and_then(|l| link_refusals(l, &stdout, &stderr))
-    {
-        Some(lines) => match result {
-            Ok(out) => Ok(format!("{out}\n{lines}")),
-            Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
-        },
-        None => result,
-    };
-    let result = if raw.before_run.is_empty() {
-        result
-    } else {
-        let lines = raw.before_run.join("\n");
-        match result {
-            Ok(out) => Ok(format!("{out}\n{lines}")),
-            Err(e) => Err(anyhow::anyhow!("{e}\n\n{lines}")),
-        }
-    };
-    let result = match raw.left_running {
-        Some(line) => match result {
-            Ok(out) => Ok(format!("{out}\n{line}")),
-            Err(e) => Err(anyhow::anyhow!("{e}\n\n{line}")),
-        },
-        None => result,
-    };
+    let result = with_note(
+        result,
+        run.guards
+            .links()
+            .and_then(|l| link_refusals(l, &stdout, &stderr)),
+    );
+    let before_run = (!raw.before_run.is_empty()).then(|| raw.before_run.join("\n"));
+    let result = with_note(result, before_run);
+    let result = with_note(result, raw.left_running);
     if result.is_err() {
         return explain_failed_run(run, &stdout, &stderr, result, denial_tag, ran_for).await;
     }
     result
+}
+
+/// `result` with `note` appended, when there is one: on its own line after an
+/// output, after a blank line after an error.
+fn with_note(
+    result: Result<String, anyhow::Error>,
+    note: Option<String>,
+) -> Result<String, anyhow::Error> {
+    let Some(note) = note else {
+        return result;
+    };
+    match result {
+        Ok(out) => Ok(format!("{out}\n{note}")),
+        Err(e) => Err(anyhow::anyhow!("{e}\n\n{note}")),
+    }
 }
 
 /// A failed command's result, scanning stderr/stdout for a sandbox denial the
@@ -1696,20 +1697,17 @@ async fn wait_for_lease(
         monitor.note_progress(op_id, message);
     };
     let acquired = match queue {
-        Some(queue) => {
-            match tokio::time::timeout(queue.limit, ticket.acquire(cancel, &observe)).await {
-                Ok(acquired) => acquired,
-                Err(_) => {
-                    let ahead = last_ahead.lock().clone();
-                    return Err(Terminal::Failed(format!(
-                        "Not run: the workspace stayed busy for its whole {}s timeout. {}. \
-                         Retry once that finishes, or cancel it.",
-                        queue.limit.as_secs(),
-                        queued_message(Some(&waiting), reason.as_deref(), &ahead)
-                    )));
-                }
-            }
-        }
+        Some(queue) => tokio::time::timeout(queue.limit, ticket.acquire(cancel, &observe))
+            .await
+            .map_err(|_| {
+                let ahead = last_ahead.lock().clone();
+                Terminal::Failed(format!(
+                    "Not run: the workspace stayed busy for its whole {}s timeout. {}. \
+                     Retry once that finishes, or cancel it.",
+                    queue.limit.as_secs(),
+                    queued_message(Some(&waiting), reason.as_deref(), &ahead)
+                ))
+            })?,
         None => ticket.acquire(cancel, &observe).await,
     };
     let lease = acquired.map_err(|_| cancelled())?;
@@ -2720,36 +2718,24 @@ async fn record_failure_diagnostics(
     // the async path (the result is delivered later as text), so attach the
     // grant -> restart -> retry remediation as an operation alert. Mirrors the
     // typed `RuntimeDenial` a waiting caller gets (`explain_failed_run`).
-    let mut explained = false;
-    match out_of_scope_runtime_denial(sandbox, stderr_str, stdout_str, working_dir) {
-        Some((target, access)) => {
-            alert_out_of_scope_denial(op_monitor, op_id, tool, &target, access).await;
-            explained = true;
-        }
-        None => {
-            if let Some(note) = non_path_denial_note(stderr_str, stdout_str) {
-                op_monitor.append_alert(op_id, note).await;
-                explained = true;
+    let mut explained =
+        match out_of_scope_runtime_denial(sandbox, stderr_str, stdout_str, working_dir) {
+            Some((target, access)) => {
+                alert_out_of_scope_denial(op_monitor, op_id, tool, &target, access).await;
+                true
             }
-            // The grant flow above only fires for *out-of-scope* denials. The
-            // sibling failure — an in-scope EPERM from macOS provenance/sccache
-            // contamination — produces no kernel event and would otherwise surface
-            // as a bare `os error 1`. Diagnose it and attach the remediation as an
-            // alert so the user gets an actionable line, not an errno.
-            if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str)
-            {
-                let remediation = remediation_in_workspace(&hint, sandbox, working_dir);
-                tracing::warn!(
-                    "Operation {} failed with sandbox diagnostic ({:?}): {}",
+            None => {
+                alert_pathless_failure(
+                    sandbox,
+                    op_monitor,
                     op_id,
-                    hint.kind,
-                    remediation
-                );
-                op_monitor.append_alert(op_id, remediation).await;
-                explained = true;
+                    stdout_str,
+                    stderr_str,
+                    working_dir,
+                )
+                .await
             }
-        }
-    }
+        };
 
     // A non-path capability denial (the sandbox refused the OS credential
     // store, not a filesystem path) has no path to grant, so the scans above
@@ -2771,6 +2757,41 @@ async fn record_failure_diagnostics(
             .append_alert(op_id, QUIET_REFUSAL_NOTE.to_string())
             .await;
     }
+}
+
+/// [`record_failure_diagnostics`] for a failure that names no out-of-scope
+/// path: a non-path denial note, then a build diagnostic, each an operation
+/// alert when it matches. Whether either did.
+async fn alert_pathless_failure(
+    sandbox: &sandbox::Sandbox,
+    op_monitor: &OperationMonitor,
+    op_id: &str,
+    stdout_str: &str,
+    stderr_str: &str,
+    working_dir: Option<&Path>,
+) -> bool {
+    let mut explained = false;
+    if let Some(note) = non_path_denial_note(stderr_str, stdout_str) {
+        op_monitor.append_alert(op_id, note).await;
+        explained = true;
+    }
+    // The grant flow only fires for *out-of-scope* denials. The sibling
+    // failure — an in-scope EPERM from macOS provenance/sccache contamination
+    // — produces no kernel event and would otherwise surface as a bare
+    // `os error 1`. Diagnose it and attach the remediation as an alert so the
+    // user gets an actionable line, not an errno.
+    if let Some(hint) = sandbox::build_diagnostics::diagnose_streams(stderr_str, stdout_str) {
+        let remediation = remediation_in_workspace(&hint, sandbox, working_dir);
+        tracing::warn!(
+            "Operation {} failed with sandbox diagnostic ({:?}): {}",
+            op_id,
+            hint.kind,
+            remediation
+        );
+        op_monitor.append_alert(op_id, remediation).await;
+        explained = true;
+    }
+    explained
 }
 
 /// The denied path and access when the streams name a path outside the sandbox

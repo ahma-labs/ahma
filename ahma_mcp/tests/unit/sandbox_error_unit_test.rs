@@ -6,7 +6,7 @@
 //! `Sandbox::validate_path` which internally calls `format_scopes`.
 
 use ahma_mcp::sandbox::{Sandbox, SandboxError, SandboxMode};
-use ahma_test_support::path_helpers::test_temp_path;
+use ahma_mcp::test_utils::path_helpers::test_temp_path;
 use std::path::PathBuf;
 use tempfile::tempdir;
 

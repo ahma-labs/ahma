@@ -11,8 +11,8 @@ use ahma_mcp::{
     operation_monitor::{MonitorConfig, OperationMonitor},
     sandbox::Sandbox,
     shell_pool::{ShellPoolConfig, ShellPoolManager},
+    test_utils::path_helpers::test_root,
 };
-use ahma_test_support::path_helpers::test_root;
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tempfile::tempdir;
