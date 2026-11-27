@@ -125,3 +125,40 @@ pub fn test_blocked_device_path() -> PathBuf {
         PathBuf::from("/dev/null")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_abs_builds_absolute_paths() {
+        let path = test_abs(&["ahma", "path-helper-test"]);
+
+        assert!(
+            path.is_absolute(),
+            "test_abs should return an absolute path"
+        );
+        assert!(
+            path.ends_with("path-helper-test"),
+            "test_abs should preserve the final component: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn test_temp_path_is_under_system_temp_dir() {
+        let path = test_temp_path("ahma-test-support-marker");
+
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "test_temp_path should stay inside the platform temp dir: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn special_paths_are_non_empty() {
+        assert!(!test_out_of_scope_path().as_os_str().is_empty());
+        assert!(!test_blocked_device_path().as_os_str().is_empty());
+    }
+}

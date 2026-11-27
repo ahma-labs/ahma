@@ -207,17 +207,7 @@ fn extract_segment_redirections(seg: Vec<StrictWord>, writes: &mut Vec<String>) 
             Redirection::Read(target) => (false, target),
         };
         // `> file`: the file is the next word, which must be a plain one.
-        let target = match target {
-            Some(target) => target,
-            None => match words.next() {
-                Some(StrictWord { text: next, .. })
-                    if !next.is_empty() && !next.contains(['<', '>']) =>
-                {
-                    next
-                }
-                _ => return None,
-            },
-        };
+        let target = target.or_else(|| plain_word(words.next()))?;
         if target == "/dev/null" {
             continue;
         }
@@ -227,6 +217,13 @@ fn extract_segment_redirections(seg: Vec<StrictWord>, writes: &mut Vec<String>) 
         writes.push(target);
     }
     (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The text of a word that can name a redirection's file: present, not empty,
+/// and with no `<` or `>` of its own.
+fn plain_word(word: Option<StrictWord>) -> Option<String> {
+    let StrictWord { text, .. } = word?;
+    (!text.is_empty() && !text.contains(['<', '>'])).then_some(text)
 }
 
 /// Split a command line into pipeline/list segments of words, honouring plain
@@ -382,21 +379,27 @@ fn sed_only_prints(args: &[String]) -> bool {
         }
     }
     if scripts.is_empty() {
-        match operands.first() {
-            Some(script) => scripts.push(script),
-            None => return false,
-        }
+        let Some(script) = operands.first() else {
+            return false;
+        };
+        scripts.push(script);
     }
+    scripts.iter().all(|s| sed_script_only_prints(s))
+}
+
+/// Whether every `;`-separated command of a `sed` script is a print of decimal
+/// line addresses (`p`, `20p`, `20,50p`), the only scripts [`sed_only_prints`]
+/// accepts.
+fn sed_script_only_prints(script: &str) -> bool {
     let line = |a: &str| !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit());
-    scripts.iter().all(|s| {
-        s.split(';').all(|cmd| {
-            cmd.trim()
-                .strip_suffix('p')
-                .is_some_and(|addr| match addr.split_once(',') {
-                    None => addr.is_empty() || line(addr),
-                    Some((a, b)) => line(a) && line(b),
-                })
-        })
+    script.split(';').all(|cmd| {
+        let Some(addr) = cmd.trim().strip_suffix('p') else {
+            return false;
+        };
+        match addr.split_once(',') {
+            None => addr.is_empty() || line(addr),
+            Some((a, b)) => line(a) && line(b),
+        }
     })
 }
 
@@ -692,7 +695,6 @@ fn same_program(written: &str, declared: &str) -> bool {
 /// `site`: it names the first thing that made it so, in the order the
 /// classifier meets them.
 pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
-    const UNREADABLE: &str = "ahma cannot read it as a plain command line";
     // The classifier judges a line with a quoted heredoc by the line alone
     // (R2.7.4), so the reason it waits is in that line, not in the heredoc.
     if let Some(line) = without_quoted_heredoc(command) {
@@ -707,17 +709,8 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     if let Some(c) = inner.iter().find(|c| read_line(c).is_none()) {
         return why_exclusive(c, site);
     }
-    match shell_words::split_strict(&lifted) {
-        Err(Refusal::Construct('\n' | '\r')) => {
-            return "it spans several lines, which ahma does not parse".to_string();
-        }
-        Err(Refusal::Construct(c)) => {
-            return format!("it uses `{c}`, a shell construct ahma does not parse");
-        }
-        // A heredoc was answered above; an operator or an open quote has no
-        // construct to name.
-        Err(_) => return UNREADABLE.to_string(),
-        Ok(_) => {}
+    if let Some(refusal) = split_refusal(&lifted) {
+        return refusal;
     }
     let Some(line) = parse_line(&lifted) else {
         return UNREADABLE.to_string();
@@ -725,30 +718,7 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
     let mut reading = Reading::default();
     for seg in &line.segs {
         if read_one_segment(seg, &mut reading).is_none() {
-            // The project's own program is the one case with a way out, and
-            // only a human may take it (SPEC R2.7.10): say what to ask for.
-            let way_out = project_program(seg, site.cwd)
-                .filter(|program| !program.contains(char::is_whitespace))
-                .map(|program| {
-                    // The entry matches the command only as a line of its own
-                    // (R2.7.10): advice this line could never use would be
-                    // given again on every retry.
-                    let entry = [ahma_common::config::LongRunningCommand {
-                        command: program.clone(),
-                        timeout_secs: None,
-                    }];
-                    let alone = if long_running_entry(command, &entry).is_some() {
-                        ""
-                    } else {
-                        ", when it is run by itself, with nothing piped or chained to it"
-                    };
-                    format!(
-                        ". If it never writes this workspace, a human can let it skip the \
-                         queue{alone}: add `{{command='{program}'}}` to `tools.long_running` \
-                         (`ahma settings explain tools.long_running` says how)"
-                    )
-                })
-                .unwrap_or_default();
+            let way_out = skip_queue_advice(command, seg, site.cwd);
             return format!(
                 "`{}` may write (it is not a command ahma knows only reads){way_out}",
                 segment_head(seg)
@@ -781,6 +751,51 @@ pub fn why_exclusive(command: &str, site: &RunSite<'_>) -> String {
             .to_string();
     }
     "it may write the workspace".to_string()
+}
+
+/// [`why_exclusive`]'s answer for a line it cannot read at all.
+const UNREADABLE: &str = "ahma cannot read it as a plain command line";
+
+/// Why [`shell_words::split_strict`] refuses `line`, in [`why_exclusive`]'s
+/// words; `None` when it splits.
+fn split_refusal(line: &str) -> Option<String> {
+    Some(match shell_words::split_strict(line).err()? {
+        Refusal::Construct('\n' | '\r') => {
+            "it spans several lines, which ahma does not parse".to_string()
+        }
+        Refusal::Construct(c) => format!("it uses `{c}`, a shell construct ahma does not parse"),
+        // A heredoc was answered before [`why_exclusive`] got here; an
+        // operator or an open quote has no construct to name.
+        _ => UNREADABLE.to_string(),
+    })
+}
+
+/// The way out of the queue for a segment [`why_exclusive`] blames, appended
+/// to its reason; empty unless the segment runs the project's own program.
+/// That is the one case with a way out, and only a human may take it (SPEC
+/// R2.7.10): say what to ask for.
+fn skip_queue_advice(command: &str, seg: &Segment, cwd: &Path) -> String {
+    let Some(program) =
+        project_program(seg, cwd).filter(|program| !program.contains(char::is_whitespace))
+    else {
+        return String::new();
+    };
+    // The entry matches the command only as a line of its own (R2.7.10):
+    // advice this line could never use would be given again on every retry.
+    let entry = [ahma_common::config::LongRunningCommand {
+        command: program.clone(),
+        timeout_secs: None,
+    }];
+    let alone = if long_running_entry(command, &entry).is_some() {
+        ""
+    } else {
+        ", when it is run by itself, with nothing piped or chained to it"
+    };
+    format!(
+        ". If it never writes this workspace, a human can let it skip the \
+         queue{alone}: add `{{command='{program}'}}` to `tools.long_running` \
+         (`ahma settings explain tools.long_running` says how)"
+    )
 }
 
 /// The program a segment runs, when it is the project's own: named by a

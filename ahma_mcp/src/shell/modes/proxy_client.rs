@@ -92,15 +92,18 @@ impl CachedHandshake {
     /// Observe a message forwarded from the client (stdio) to the bridge, and
     /// cache it if the reconnect replay will need it.
     fn observe_client_to_bridge(&mut self, val: &serde_json::Value) {
-        let method = val.get("method").and_then(|m| m.as_str());
-        if method == Some("initialize") && self.init_request.is_none() {
-            self.init_request = Some(val.clone());
-        }
-        if method == Some(INITIALIZED_METHOD) && self.notif_initialized.is_none() {
-            self.notif_initialized = Some(val.clone());
+        // Only the first copy of each handshake message is kept.
+        match val.get("method").and_then(|m| m.as_str()) {
+            Some("initialize") => {
+                self.init_request.get_or_insert_with(|| val.clone());
+            }
+            Some(INITIALIZED_METHOD) => {
+                self.notif_initialized.get_or_insert_with(|| val.clone());
+            }
+            _ => {}
         }
         if self.pending_roots_list_id.is_some()
-            && self.pending_roots_list_id == val.get("id").cloned()
+            && self.pending_roots_list_id.as_ref() == val.get("id")
         {
             self.roots_response = Some(val.clone());
             self.pending_roots_list_id = None;
@@ -280,18 +283,28 @@ async fn announce_reconnect<S>(
     )
     .await;
     if version_changed_on_reconnect(handshake) {
-        let notice = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": TOOLS_LIST_CHANGED_METHOD,
-        });
-        match serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(notice) {
-            Ok(msg) => {
-                if let Err(e) = stdio.send(msg).await {
-                    tracing::debug!(error = ?e, "tools/list_changed to stdio failed (non-fatal)");
-                }
+        send_tools_list_changed(stdio).await;
+    }
+}
+
+/// Tell the client to fetch `tools/list` again. Best-effort, like every
+/// disclosure the proxy synthesizes: a failure is logged, never propagated.
+async fn send_tools_list_changed<S>(stdio: &mut S)
+where
+    S: Transport<RoleServer>,
+    S::Error: std::fmt::Debug,
+{
+    let notice = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": TOOLS_LIST_CHANGED_METHOD,
+    });
+    match serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(notice) {
+        Ok(msg) => {
+            if let Err(e) = stdio.send(msg).await {
+                tracing::debug!(error = ?e, "tools/list_changed to stdio failed (non-fatal)");
             }
-            Err(e) => tracing::debug!(error = %e, "tools/list_changed did not serialize"),
         }
+        Err(e) => tracing::debug!(error = %e, "tools/list_changed did not serialize"),
     }
 }
 
@@ -933,61 +946,76 @@ fn append_session_query(base: &str, session_query: &str) -> String {
 
 /// Detects a specific client name for modern MCP clients that probe via `server/discover`.
 fn detect_modern_client_name() -> &'static str {
-    // 1. Check known environment variables passed by Antigravity IDE
-    if std::env::var("ANTIGRAVITY_EDITOR_APP_ROOT").is_ok()
+    client_name_from_env()
+        .or_else(client_name_from_parent_process)
+        .unwrap_or("Antigravity")
+}
+
+/// The client named by environment variables its launcher sets, if any.
+fn client_name_from_env() -> Option<&'static str> {
+    let is_set = |key: &str| std::env::var(key).is_ok();
+
+    // 1. Known environment variables passed by Antigravity IDE
+    if is_set("ANTIGRAVITY_EDITOR_APP_ROOT")
         || std::env::var("__CFBundleIdentifier").as_deref() == Ok("com.google.antigravity-ide")
-        || std::env::var("ANTIGRAVITY_AGENT").is_ok()
-        || std::env::var("VSCODE_IPC_HOOK")
-            .map(|s| s.contains("Antigravity"))
-            .unwrap_or(false)
+        || is_set("ANTIGRAVITY_AGENT")
+        || std::env::var("VSCODE_IPC_HOOK").is_ok_and(|s| s.contains("Antigravity"))
     {
-        return "Antigravity IDE";
+        return Some("Antigravity IDE");
     }
 
-    // 2. Check known environment variables for Antigravity CLI (agy)
-    if std::env::var("GEMINI_CLI").is_ok() || std::env::var("ANTIGRAVITY_CLI").is_ok() {
-        return "agy";
+    // 2. Known environment variables for Antigravity CLI (agy)
+    if is_set("GEMINI_CLI") || is_set("ANTIGRAVITY_CLI") {
+        return Some("agy");
     }
+    None
+}
 
-    // 3. Inspect parent process on Unix
-    #[cfg(unix)]
-    {
-        let ppid = unsafe { libc::getppid() };
-        if ppid > 1 {
-            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-            let mut sys = System::new();
-            sys.refresh_processes_specifics(
-                ProcessesToUpdate::All,
-                true,
-                ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
-            );
-            let mut cur_pid = Some(Pid::from_u32(ppid as u32));
-            for _ in 0..3 {
-                let Some(pid) = cur_pid else { break };
-                let Some(proc) = sys.process(pid) else { break };
-                let name = proc.name().to_string_lossy().to_lowercase();
-                let cmd: String = proc
-                    .cmd()
-                    .iter()
-                    .map(|s| s.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .to_lowercase();
-                if name == "agy" || cmd.contains("agy") || cmd.contains("antigravity-cli") {
-                    return "agy";
-                }
-                if name.contains("antigravity")
-                    || cmd.contains("antigravity-ide")
-                    || cmd.contains("com.google.antigravity-ide")
-                {
-                    return "Antigravity IDE";
-                }
-                cur_pid = proc.parent();
-            }
+/// The client named by the parent process or one of its two nearest
+/// ancestors, if any of them is recognisably Antigravity.
+#[cfg(unix)]
+fn client_name_from_parent_process() -> Option<&'static str> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let ppid = unsafe { libc::getppid() };
+    if ppid <= 1 {
+        return None;
+    }
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
+    );
+    let mut cur_pid = Some(Pid::from_u32(ppid as u32));
+    for _ in 0..3 {
+        let proc = sys.process(cur_pid?)?;
+        let name = proc.name().to_string_lossy().to_lowercase();
+        let cmd: String = proc
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if name == "agy" || cmd.contains("agy") || cmd.contains("antigravity-cli") {
+            return Some("agy");
         }
+        if name.contains("antigravity")
+            || cmd.contains("antigravity-ide")
+            || cmd.contains("com.google.antigravity-ide")
+        {
+            return Some("Antigravity IDE");
+        }
+        cur_pid = proc.parent();
     }
+    None
+}
 
-    "Antigravity"
+/// No parent-process inspection off Unix.
+#[cfg(not(unix))]
+fn client_name_from_parent_process() -> Option<&'static str> {
+    None
 }
 
 /// One client field of a `server/discover` probe. The 2026-07-28 protocol puts
@@ -1094,8 +1122,9 @@ async fn deliver_modern_flush<S, C>(
     C::Error: std::fmt::Debug + std::fmt::Display,
 {
     for message in flush.to_bridge.into_iter().chain(flush.calls) {
-        let id = message.get("id").cloned();
+        // Only a failed tool call is answered on stdio; anything else just logs.
         let is_call = message.get("method").and_then(|m| m.as_str()) == Some(TOOLS_CALL_METHOD);
+        let call_id = message.get("id").cloned().filter(|_| is_call);
         let typed: TxJsonRpcMessage<RoleClient> = match serde_json::from_value(message) {
             Ok(typed) => typed,
             Err(e) => {
@@ -1103,15 +1132,16 @@ async fn deliver_modern_flush<S, C>(
                 continue;
             }
         };
-        if let Err(e) = conn.client.send(typed).await {
-            tracing::warn!(transport, error = %e, "Failed to forward a modern-session message to the bridge");
-            if is_call && let Some(id) = id {
-                let recovered = recover_bridge_jsonrpc_error(&format!("{e}"));
-                relay_forward_failure_to_client(stdio, id, recovered).await;
+        match conn.client.send(typed).await {
+            Ok(()) => conn.forwarded_any = true,
+            Err(e) => {
+                tracing::warn!(transport, error = %e, "Failed to forward a modern-session message to the bridge");
+                if let Some(id) = call_id {
+                    let recovered = recover_bridge_jsonrpc_error(&format!("{e}"));
+                    relay_forward_failure_to_client(stdio, id, recovered).await;
+                }
             }
-            continue;
         }
-        conn.forwarded_any = true;
     }
 }
 
@@ -2184,6 +2214,18 @@ mod tests {
         );
     }
 
+    /// A client that sends `initialize` (id 0), then tool calls `1..=requests`,
+    /// then EOF, recording into `sent` everything the proxy writes back.
+    fn stdio_initialize_then_requests(
+        sent: &Arc<Mutex<Vec<serde_json::Value>>>,
+        requests: i64,
+    ) -> MockStdio {
+        let inbound = std::iter::once(client_initialize(0))
+            .chain((1..=requests).map(client_request))
+            .collect();
+        MockStdio::new(inbound, sent.clone())
+    }
+
     #[tokio::test]
     async fn reconnect_after_dead_transport_resumes_session_transparently() {
         // REGRESSION: once a handshake has been observed, a genuinely dead
@@ -2192,16 +2234,7 @@ mod tests {
         // stdio session, invisibly to the downstream client.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![
-                    client_initialize(0),
-                    client_request(1),
-                    client_request(2),
-                    client_request(3),
-                    client_request(4),
-                ]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 4);
 
             let dead_attempts = Arc::new(AtomicUsize::new(0));
             let dead_client = MockClient {
@@ -2340,16 +2373,7 @@ mod tests {
         // while the bridge is down) and each new request tries to reconnect.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![
-                    client_initialize(0),
-                    client_request(1),
-                    client_request(2),
-                    client_request(3),
-                    client_request(4),
-                ]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 4);
             let reconnect_calls = Arc::new(AtomicUsize::new(0));
             let reconnect_calls_inner = reconnect_calls.clone();
             let mut reconnect = move || -> Result<MockClient> {
@@ -2385,15 +2409,7 @@ mod tests {
         // per outage, not once per request, and says the proxy is still here.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![
-                    client_initialize(0),
-                    client_request(1),
-                    client_request(2),
-                    client_request(3),
-                ]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 3);
             let mut reconnect =
                 move || -> Result<MockClient> { Err(anyhow!("simulated: bridge gone")) };
 
@@ -2434,15 +2450,7 @@ mod tests {
         // recovery is disclosed.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![
-                    client_initialize(0),
-                    client_request(1),
-                    client_request(2),
-                    client_request(3),
-                ]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 3);
             let reconnect_calls = Arc::new(AtomicUsize::new(0));
             let reconnect_calls_inner = reconnect_calls.clone();
             let fresh_attempts = Arc::new(AtomicUsize::new(0));
@@ -2482,10 +2490,7 @@ mod tests {
         // editor attached and reconnects when the next request arrives.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let mut stdio = MockStdio::new(
-                VecDeque::from(vec![client_initialize(0), client_request(1)]),
-                sent.clone(),
-            );
+            let mut stdio = stdio_initialize_then_requests(&sent, 1);
             stdio.inbound_delay = Some(Duration::from_millis(50));
             let first = MockClient {
                 inbound: VecDeque::from(vec![bridge_response(0)]),
@@ -2719,14 +2724,7 @@ mod tests {
         // resend the request that never reached the bridge.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![
-                    client_initialize(0),
-                    client_request(1),
-                    client_request(2),
-                ]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 2);
 
             let dead_attempts = Arc::new(AtomicUsize::new(0));
             let dead_client = MockClient {
@@ -3121,15 +3119,7 @@ mod tests {
     async fn respawn_hook_revives_a_gone_bridge_endpoint() {
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![
-                    client_initialize(0),
-                    client_request(1),
-                    client_request(2),
-                    client_request(3),
-                ]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 3);
 
             let dead_client = MockClient {
                 fail_first_n: usize::MAX,
@@ -3748,14 +3738,7 @@ mod tests {
         // handshake deadline — which watches the same flag — must not end it.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![
-                    client_initialize(0),
-                    client_request(1),
-                    client_request(2),
-                ]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 2);
             let fresh_closed = Arc::new(AtomicUsize::new(0));
             let fresh_closed_inner = fresh_closed.clone();
             let mut reconnect = move || -> Result<MockClient> {
@@ -3839,10 +3822,7 @@ mod tests {
         // before the reconnect: only adopting the fresh transport can mark it.
         with_zero_backoff(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let stdio = MockStdio::new(
-                VecDeque::from(vec![client_initialize(0), client_request(1)]),
-                sent.clone(),
-            );
+            let stdio = stdio_initialize_then_requests(&sent, 1);
             // `initialize` is a replayed handshake message, so its gone-endpoint
             // failure takes the failure-count path; request 1's takes the fast
             // path.

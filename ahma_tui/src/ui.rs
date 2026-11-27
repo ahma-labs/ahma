@@ -103,26 +103,40 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
-        let mut word: Vec<char> = word.chars().collect();
-        while word.len() > width {
-            if !line.is_empty() {
-                out.push(std::mem::take(&mut line));
-            }
-            out.push(word.drain(..width).collect());
-        }
-        let word: String = word.into_iter().collect();
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(&word);
+        push_wrapped_word(&mut out, &mut line, word, width);
     }
     if !line.is_empty() || out.is_empty() {
         out.push(line);
     }
     out.into_iter().map(|l| format!("{pad}{l}")).collect()
+}
+
+/// Append `word` to the line being filled, moving that line to `out` first
+/// when the word does not fit. A word wider than `width` is cut into
+/// full-width lines, and its remainder starts the next line.
+fn push_wrapped_word(out: &mut Vec<String>, line: &mut String, word: &str, width: usize) {
+    let mut chars: Vec<char> = word.chars().collect();
+    if chars.len() > width {
+        flush_line(out, line);
+        while chars.len() > width {
+            out.push(chars.drain(..width).collect());
+        }
+    }
+    let word: String = chars.into_iter().collect();
+    if line.chars().count() + 1 + word.chars().count() > width {
+        flush_line(out, line);
+    }
+    if !line.is_empty() {
+        line.push(' ');
+    }
+    line.push_str(&word);
+}
+
+/// Move `line` to `out`, unless it is empty.
+fn flush_line(out: &mut Vec<String>, line: &mut String) {
+    if !line.is_empty() {
+        out.push(std::mem::take(line));
+    }
 }
 
 fn setup_tone_style(theme: &Theme, tone: crate::setup_view::Tone) -> Style {
@@ -179,8 +193,6 @@ fn draw_setup_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
 
 /// One proposed change: what, why, what it allows, the exact change, its undo.
 fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    use crate::setup_view::{Answer, Tone};
-
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
     let width = rows[0].width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = vec![
@@ -190,43 +202,67 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
         )),
         Line::from(""),
     ];
-    let Some(card) = state.setup_view.card() else {
-        lines.push(Line::from(Span::styled("Nothing to answer.", theme.dim())));
-        frame.render_widget(Paragraph::new(lines), rows[0]);
-        draw_setup_footer(frame, state, theme, rows[1]);
-        return;
-    };
+    match state.setup_view.card() {
+        Some(card) => push_setup_card(&mut lines, theme, &card, width),
+        None => lines.push(Line::from(Span::styled("Nothing to answer.", theme.dim()))),
+    }
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+    draw_setup_footer(frame, state, theme, rows[1]);
+}
 
+/// The card's lines: intro, progress, title, labelled rows, then the question.
+fn push_setup_card(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    card: &crate::setup_view::Card,
+    width: usize,
+) {
     if let Some(intro) = &card.intro {
         for part in wrap_words(intro, width) {
             lines.push(Line::from(Span::styled(part, theme.normal())));
         }
         lines.push(Line::from(""));
     }
+    lines.push(setup_progress_line(theme, card));
+    lines.push(Line::from(""));
+    push_setup_title(lines, theme, card, width);
+    lines.push(Line::from(""));
+    push_setup_card_body(lines, theme, card, width);
+    lines.push(Line::from(""));
+    push_setup_answer(lines, theme, card);
+}
 
-    // Progress: which question this is, and one mark per question answered.
+/// Which question this is, and one mark per question answered.
+fn setup_progress_line(theme: &Theme, card: &crate::setup_view::Card) -> Line<'static> {
+    use crate::setup_view::Answer;
+
     let mut marks = vec![Span::styled(
         format!("Question {} of {}  ", card.position, card.total),
         theme.dim(),
     )];
-    for (i, answer) in card.progress.iter().enumerate() {
+    marks.extend(card.progress.iter().enumerate().map(|(i, answer)| {
         let (glyph, style) = match answer {
             Some(Answer::Yes) => (" ● ", theme.success()),
             Some(Answer::No) => (" ● ", theme.dim()),
             None => (" ○ ", theme.normal()),
         };
-        marks.push(Span::styled(
-            glyph,
-            if i + 1 == card.position {
-                theme.selected_item()
-            } else {
-                style
-            },
-        ));
-    }
-    lines.push(Line::from(marks));
-    lines.push(Line::from(""));
+        let style = if i + 1 == card.position {
+            theme.selected_item()
+        } else {
+            style
+        };
+        Span::styled(glyph, style)
+    }));
+    Line::from(marks)
+}
 
+/// The card's title, wrapped, with its badge after the first line.
+fn push_setup_title(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    card: &crate::setup_view::Card,
+    width: usize,
+) {
     let title_style = setup_tone_style(theme, card.tone).bold();
     for (i, part) in wrap_words(&card.title, width).into_iter().enumerate() {
         let mut spans = vec![Span::styled(part, title_style)];
@@ -237,46 +273,69 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
         }
         lines.push(Line::from(spans));
     }
-    lines.push(Line::from(""));
+}
 
-    const LABEL: usize = 12;
-    let body = width.saturating_sub(LABEL);
-    let labelled = |lines: &mut Vec<Line>, label: &str, text: &str, style: Style| {
-        for (i, part) in wrap_words(text, body).into_iter().enumerate() {
-            let head = if i == 0 {
-                format!("{label:<LABEL$}")
-            } else {
-                " ".repeat(LABEL)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(head, theme.dim().bold()),
-                Span::styled(part, style),
-            ]));
-        }
-    };
+/// The labelled rows: fields, warnings, the AI's advice, then the details.
+fn push_setup_card_body(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    card: &crate::setup_view::Card,
+    width: usize,
+) {
+    use crate::setup_view::Tone;
+
     for (label, text) in &card.fields {
-        labelled(&mut lines, label, text, theme.normal());
+        push_setup_labelled(lines, theme, label, text, theme.normal(), width);
     }
+    let warning_style = setup_tone_style(theme, Tone::Bad).bold();
     for warning in &card.warnings {
-        labelled(
-            &mut lines,
-            "WARNING",
-            warning,
-            setup_tone_style(theme, Tone::Bad).bold(),
-        );
+        push_setup_labelled(lines, theme, "WARNING", warning, warning_style, width);
     }
     if let Some(advice) = &card.advice {
         // Labelled as the AI's, apart from ahma's own words (SPEC R-SETUP.4.9).
         lines.push(Line::from(""));
-        labelled(&mut lines, "AI advice", advice, theme.title());
+        push_setup_labelled(lines, theme, "AI advice", advice, theme.title(), width);
     }
     if !card.details.is_empty() {
         lines.push(Line::from(""));
         for (label, text) in &card.details {
-            labelled(&mut lines, label, text, theme.dim());
+            push_setup_labelled(lines, theme, label, text, theme.dim(), width);
         }
     }
-    lines.push(Line::from(""));
+}
+
+/// `text` wrapped beside a fixed-width `label`, shown on its first line only.
+fn push_setup_labelled(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    label: &str,
+    text: &str,
+    style: Style,
+    width: usize,
+) {
+    const LABEL: usize = 12;
+    let body = width.saturating_sub(LABEL);
+    for (i, part) in wrap_words(text, body).into_iter().enumerate() {
+        let head = if i == 0 {
+            format!("{label:<LABEL$}")
+        } else {
+            " ".repeat(LABEL)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(head, theme.dim().bold()),
+            Span::styled(part, style),
+        ]));
+    }
+}
+
+/// The y/n question, and what the answer given so far means.
+fn push_setup_answer(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    card: &crate::setup_view::Card,
+) {
+    use crate::setup_view::Answer;
+
     lines.push(Line::from(vec![
         Span::styled(card.prompt.clone(), theme.normal().bold()),
         Span::raw("   "),
@@ -292,8 +351,6 @@ fn draw_setup_review(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
         },
         theme.dim(),
     )));
-    frame.render_widget(Paragraph::new(lines), rows[0]);
-    draw_setup_footer(frame, state, theme, rows[1]);
 }
 
 /// What the answers did, or "nothing to change".
@@ -320,8 +377,6 @@ fn draw_setup_done(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rec
 /// The reference: tabs, the rows of the current section, the explanation of the
 /// selected row, and the keys.
 fn draw_setup_browse(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    use crate::setup_view::Section;
-
     let view = &state.setup_view;
     let rows = Layout::vertical([
         Constraint::Length(3), // header
@@ -332,82 +387,13 @@ fn draw_setup_browse(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     ])
     .split(area);
 
-    // Header: where things are, and whether a model can be talked to.
-    let model = if state.llm_selection.is_some() {
-        format!(
-            "talk with {} — press t, or type /setup <what you want>",
-            state.llm_label()
-        )
-    } else {
-        "no model connected: /connect sets one up; this view works without one".to_string()
-    };
-    let header = vec![
-        Line::from(Span::styled(
-            format!("folder   {}", state.workspace),
-            theme.normal(),
-        )),
-        Line::from(Span::styled(
-            "files    ~/.ahma/settings.toml (yours)  ·  <folder>/.ahma/settings.toml (this repository)",
-            theme.dim(),
-        )),
-        Line::from(Span::styled(format!("model    {model}"), theme.dim())),
-    ];
-    frame.render_widget(Paragraph::new(header), rows[0]);
-
-    // Tabs, then the way back to the proposals.
-    let mut tabs = Vec::new();
-    for (i, section) in Section::ALL.iter().enumerate() {
-        let label = format!(" {} {} ", i + 1, section.label());
-        tabs.push(Span::styled(
-            label,
-            if *section == view.section() {
-                theme.selected_item()
-            } else {
-                theme.dim()
-            },
-        ));
-        tabs.push(Span::raw(" "));
-    }
-    let pending = view.plan().items.len();
-    if pending > 0 {
-        tabs.push(Span::styled(
-            format!(" p  {pending} proposed change(s) waiting "),
-            theme.pending(),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(tabs)), rows[1]);
-
-    // List, scrolled to keep the selection on screen.
-    let list = view.rows();
+    frame.render_widget(Paragraph::new(setup_browse_header(state, theme)), rows[0]);
+    frame.render_widget(Paragraph::new(setup_browse_tabs(view, theme)), rows[1]);
     let visible = rows[2].height as usize;
-    let selected = view.selected();
-    let offset = selected.saturating_sub(visible.saturating_sub(1));
-    let mut lines: Vec<Line> = list
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible)
-        .map(|(i, row)| {
-            let marker = if i == selected { "▶ " } else { "  " };
-            let style = if i == selected {
-                theme.selected_item()
-            } else {
-                setup_tone_style(theme, row.tone)
-            };
-            Line::from(Span::styled(format!("{marker}{}", row.text), style))
-        })
-        .collect();
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            match view.section() {
-                Section::Settings => "  Everything is at its default. [a] shows every setting.",
-                Section::Allow => "  Nothing has been granted or switched on.",
-                Section::Install => "  Nothing to show.",
-            },
-            theme.dim(),
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines), rows[2]);
+    frame.render_widget(
+        Paragraph::new(setup_browse_list(view, theme, visible)),
+        rows[2],
+    );
 
     // Detail of the selected row.
     let detail: Vec<Line> = view
@@ -425,6 +411,94 @@ fn draw_setup_browse(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     );
 
     draw_setup_footer(frame, state, theme, rows[4]);
+}
+
+/// Where things are, and whether a model can be talked to.
+fn setup_browse_header(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let model = if state.llm_selection.is_some() {
+        format!(
+            "talk with {} — press t, or type /setup <what you want>",
+            state.llm_label()
+        )
+    } else {
+        "no model connected: /connect sets one up; this view works without one".to_string()
+    };
+    vec![
+        Line::from(Span::styled(
+            format!("folder   {}", state.workspace),
+            theme.normal(),
+        )),
+        Line::from(Span::styled(
+            "files    ~/.ahma/settings.toml (yours)  ·  <folder>/.ahma/settings.toml (this repository)",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(format!("model    {model}"), theme.dim())),
+    ]
+}
+
+/// The section tabs, then the way back to the proposals.
+fn setup_browse_tabs(view: &crate::setup_view::SetupView, theme: &Theme) -> Line<'static> {
+    use crate::setup_view::Section;
+
+    let mut tabs = Vec::new();
+    for (i, section) in Section::ALL.iter().enumerate() {
+        let label = format!(" {} {} ", i + 1, section.label());
+        let style = if *section == view.section() {
+            theme.selected_item()
+        } else {
+            theme.dim()
+        };
+        tabs.push(Span::styled(label, style));
+        tabs.push(Span::raw(" "));
+    }
+    let pending = view.plan().items.len();
+    if pending > 0 {
+        tabs.push(Span::styled(
+            format!(" p  {pending} proposed change(s) waiting "),
+            theme.pending(),
+        ));
+    }
+    Line::from(tabs)
+}
+
+/// The current section's rows, scrolled to keep the selection on screen, or
+/// what an empty section means.
+fn setup_browse_list(
+    view: &crate::setup_view::SetupView,
+    theme: &Theme,
+    visible: usize,
+) -> Vec<Line<'static>> {
+    use crate::setup_view::Section;
+
+    let list = view.rows();
+    let selected = view.selected();
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    let lines: Vec<Line<'static>> = list
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(i, row)| {
+            let marker = if i == selected { "▶ " } else { "  " };
+            let style = if i == selected {
+                theme.selected_item()
+            } else {
+                setup_tone_style(theme, row.tone)
+            };
+            Line::from(Span::styled(format!("{marker}{}", row.text), style))
+        })
+        .collect();
+    if !lines.is_empty() {
+        return lines;
+    }
+    vec![Line::from(Span::styled(
+        match view.section() {
+            Section::Settings => "  Everything is at its default. [a] shows every setting.",
+            Section::Allow => "  Nothing has been granted or switched on.",
+            Section::Install => "  Nothing to show.",
+        },
+        theme.dim(),
+    ))]
 }
 
 /// "Apply this fix?" for `/doctor fix <n>`: the exact change, then `y`.
@@ -1563,31 +1637,44 @@ pub(crate) fn window_meter(
     ctx_window: Option<u32>,
     unicode: bool,
 ) -> String {
-    let mut parts = Vec::new();
-    if let Some(u) = usage {
-        if let Some(window) = ctx_window.filter(|_| u.last_prompt_tokens > 0) {
-            let pct = ((u.last_prompt_tokens as f64 / window as f64) * 100.0).round() as u32;
-            parts.push(format!(
-                "ctx {}% ({}/{})",
-                pct.min(999),
-                fmt_token_count(u.last_prompt_tokens),
-                fmt_token_count(window)
-            ));
-        }
-        if u.prompt_tokens > 0 || u.completion_tokens > 0 {
-            let (up, down) = if unicode {
-                ("↑", "↓")
-            } else {
-                ("in ", "out ")
-            };
-            parts.push(format!(
-                "{up}{} {down}{}",
-                fmt_token_count(u.prompt_tokens),
-                fmt_token_count(u.completion_tokens)
-            ));
-        }
+    let Some(u) = usage else {
+        return String::new();
+    };
+    [context_fill_part(u, ctx_window), spend_part(u, unicode)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// `ctx 38% (49k/128k)`, or `None` without both a last prompt and a window.
+fn context_fill_part(u: &crate::state::WindowUsage, ctx_window: Option<u32>) -> Option<String> {
+    let window = ctx_window.filter(|_| u.last_prompt_tokens > 0)?;
+    let pct = ((u.last_prompt_tokens as f64 / window as f64) * 100.0).round() as u32;
+    Some(format!(
+        "ctx {}% ({}/{})",
+        pct.min(999),
+        fmt_token_count(u.last_prompt_tokens),
+        fmt_token_count(window)
+    ))
+}
+
+/// `↑12.3k ↓2.1k` (`in 12.3k out 2.1k` without unicode), or `None` when the
+/// provider has reported no usage.
+fn spend_part(u: &crate::state::WindowUsage, unicode: bool) -> Option<String> {
+    if u.prompt_tokens == 0 && u.completion_tokens == 0 {
+        return None;
     }
-    parts.join(" · ")
+    let (up, down) = if unicode {
+        ("↑", "↓")
+    } else {
+        ("in ", "out ")
+    };
+    Some(format!(
+        "{up}{} {down}{}",
+        fmt_token_count(u.prompt_tokens),
+        fmt_token_count(u.completion_tokens)
+    ))
 }
 
 /// Honest scope display (SPEC R5.4): once the server reports its locked
@@ -4689,7 +4776,6 @@ fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, a
 /// asks it (SPEC R-LINK.6): the question every surface shows, ending with the
 /// guidance (R-LINK.7), then the answers this surface offers, deny first.
 fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    use ahma_mcp::links::policy::LinkChoice;
     let Some(gate) = &state.link_ask else {
         return;
     };
@@ -4700,6 +4786,43 @@ fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area:
         format!(" Link · open in your browser? ({waiting} more waiting) ")
     };
     let question = gate.ask.question();
+    let lines = link_ask_body(gate, &question, theme);
+    let answers = link_ask_answers(gate, &question, theme);
+    let mut notes = vec![Line::from(Span::styled(
+        "  Enter / Esc = Deny",
+        theme.dim(),
+    ))];
+    // Pinned with the answers, so the line a second press saves is on screen
+    // whenever that key is (R-PERM.3.5); any site says first that one site is
+    // safer (R-LINK.7).
+    notes.extend(link_ask_confirm_notes(gate, theme));
+    notes.extend(gate_typing_note(state, theme));
+
+    let view = draw_gate_popup(
+        frame,
+        theme,
+        area,
+        GatePopup {
+            title,
+            width: 84,
+            body: lines,
+            answers,
+            notes,
+            watched: None,
+            reveal_watched: false,
+            scroll: gate.scroll,
+            unicode: state.unicode,
+        },
+    );
+    gate.view.set(view);
+}
+
+/// Where the link was refused, the question itself, and that nothing waits.
+fn link_ask_body(
+    gate: &crate::state::LinkAskGate,
+    question: &ahma_mcp::links::policy::LinkQuestion,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
             format!(
@@ -4725,8 +4848,18 @@ fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area:
             theme.dim(),
         )),
     ]);
-    let answers = gate
-        .choices
+    lines
+}
+
+/// One `[key] label` per offered answer that has a key, deny first.
+fn link_ask_answers(
+    gate: &crate::state::LinkAskGate,
+    question: &ahma_mcp::links::policy::LinkQuestion,
+    theme: &Theme,
+) -> Vec<Vec<Span<'static>>> {
+    use ahma_mcp::links::policy::LinkChoice;
+
+    gate.choices
         .iter()
         .filter_map(|choice| {
             let key = crate::state::LinkAskGate::key_for(*choice)?;
@@ -4740,50 +4873,35 @@ fn draw_link_ask_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area:
                 Span::styled(label, theme.normal()),
             ])
         })
-        .collect();
-    let mut notes = vec![Line::from(Span::styled(
-        "  Enter / Esc = Deny",
-        theme.dim(),
-    ))];
-    // Pinned with the answers, so the line a second press saves is on screen
-    // whenever that key is (R-PERM.3.5); any site says first that one site is
-    // safer (R-LINK.7).
-    if let Some(choice) = gate.confirm
-        && let (Some(key), Some(line)) = (
-            crate::state::LinkAskGate::key_for(choice),
-            gate.ask.save_line(choice),
-        )
-    {
-        if choice == LinkChoice::AlwaysAnyThisRepo {
-            notes.push(Line::from(Span::styled(
-                format!("  {}", ahma_common::open_url::ANY_SITE_WARNING),
-                theme.pending(),
-            )));
-        }
+        .collect()
+}
+
+/// The line a second press of the pressed saving key writes, after the
+/// any-site warning when it saves any site; empty when nothing awaits it.
+fn link_ask_confirm_notes(gate: &crate::state::LinkAskGate, theme: &Theme) -> Vec<Line<'static>> {
+    use ahma_mcp::links::policy::LinkChoice;
+
+    let Some(choice) = gate.confirm else {
+        return Vec::new();
+    };
+    let (Some(key), Some(line)) = (
+        crate::state::LinkAskGate::key_for(choice),
+        gate.ask.save_line(choice),
+    ) else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    if choice == LinkChoice::AlwaysAnyThisRepo {
         notes.push(Line::from(Span::styled(
-            format!("  [{key}] again {line}"),
-            theme.pending().bold(),
+            format!("  {}", ahma_common::open_url::ANY_SITE_WARNING),
+            theme.pending(),
         )));
     }
-    notes.extend(gate_typing_note(state, theme));
-
-    let view = draw_gate_popup(
-        frame,
-        theme,
-        area,
-        GatePopup {
-            title,
-            width: 84,
-            body: lines,
-            answers,
-            notes,
-            watched: None,
-            reveal_watched: false,
-            scroll: gate.scroll,
-            unicode: state.unicode,
-        },
-    );
-    gate.view.set(view);
+    notes.push(Line::from(Span::styled(
+        format!("  [{key}] again {line}"),
+        theme.pending().bold(),
+    )));
+    notes
 }
 
 fn style_raw_log_line<'a>(line: &str, theme: &Theme) -> Line<'a> {

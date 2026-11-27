@@ -516,73 +516,15 @@ pub fn validate(env: &Env, proposal: &Proposal) -> Result<Validated, Refusal> {
     match &proposal.change {
         Change::Set { file, key, value } => validate_set(env, *file, key, Some(value), proposal),
         Change::Unset { file, key } => validate_set(env, *file, key, None, proposal),
-        Change::AddToList { file, key, item } | Change::RemoveFromList { file, key, item } => {
-            let adding = matches!(proposal.change, Change::AddToList { .. });
-            let path = env.file(*file)?;
-            if let Some(command) = ledger_key_command(split_key(key)?.0, split_key(key)?.1) {
-                return Err(refuse(format!(
-                    "`{key}` holds grants, which setup does not write as a setting. Use {command}."
-                )));
-            }
-            if item.trim().is_empty() {
-                return Err(refuse("an empty entry".to_string()));
-            }
-            let mut list = current_list(path, key)?;
-            let present = list.contains(item);
-            if adding && !present {
-                list.push(item.clone());
-            } else if !adding && present {
-                list.retain(|x| x != item);
-            }
-            let mut v = validate_set(env, *file, key, Some(&list_literal(&list)), proposal)?;
-            v.already = if adding { present } else { !present };
-            Ok(v)
+        Change::AddToList { file, key, item } => {
+            validate_list_edit(env, *file, key, item, true, proposal)
+        }
+        Change::RemoveFromList { file, key, item } => {
+            validate_list_edit(env, *file, key, item, false, proposal)
         }
         Change::GrantPath { path, read_only } => validate_grant(env, path, *read_only, proposal),
-        Change::NetworkAllow { host } => {
-            use crate::egress::host_pattern::HostPattern;
-            use crate::mcp_service::handlers::network_grant_tool::{
-                NetGrantRisk, classify_network_risk,
-            };
-            let pattern = HostPattern::parse(host)
-                .map_err(|e| refuse(format!("invalid host pattern '{host}': {e}")))?;
-            // The same hard denylist the agent-facing `network_grant` applies:
-            // setup may be driven by a model, and a blanket or local
-            // destination is a decision for `ahma network allow` by hand.
-            let risk = match classify_network_risk(&pattern, host) {
-                NetGrantRisk::Refused(reason) => return Err(refuse(reason)),
-                NetGrantRisk::High(reason) => Risk::High(vec![reason]),
-                NetGrantRisk::Normal => Risk::Security,
-            };
-            let current = AhmaSettings::load_from_checked(&env.user_file)
-                .map_err(|e| refuse(format!("{}: {}", env.user_file.display(), e.summary())))?;
-            Ok(Validated {
-                proposal: proposal.clone(),
-                risk,
-                preview: format!("[network].allow += `{host}`"),
-                undo: format!("ahma network revoke {host}"),
-                already: current
-                    .network
-                    .allow
-                    .iter()
-                    .any(|p| p.eq_ignore_ascii_case(host)),
-            })
-        }
-        Change::Install(InstallItem::McpConfig) => {
-            let drifts = crate::setup::detect_mcp_config_drifts();
-            let names: Vec<&str> = drifts.iter().map(|d| d.platform_name).collect();
-            Ok(Validated {
-                proposal: proposal.clone(),
-                risk: Risk::Normal,
-                preview: if names.is_empty() {
-                    "every installed client's MCP entry is current".into()
-                } else {
-                    format!("update the MCP entry for {}", names.join(", "))
-                },
-                undo: "ahma uninstall --mcp".into(),
-                already: drifts.is_empty(),
-            })
-        }
+        Change::NetworkAllow { host } => validate_network_allow(env, host, proposal),
+        Change::Install(InstallItem::McpConfig) => Ok(validate_mcp_config(proposal)),
         Change::DoctorFix(fix) => Ok(Validated {
             proposal: proposal.clone(),
             risk: Risk::Normal,
@@ -590,6 +532,86 @@ pub fn validate(env: &Env, proposal: &Proposal) -> Result<Validated, Refusal> {
             undo: "none: a doctor fix is recorded in the audit log".into(),
             already: false,
         }),
+    }
+}
+
+/// Validate adding `item` to (or, with `adding` false, removing it from) the
+/// list setting `key`, by previewing the whole list it would write.
+fn validate_list_edit(
+    env: &Env,
+    file: SettingsFile,
+    key: &str,
+    item: &str,
+    adding: bool,
+    proposal: &Proposal,
+) -> Result<Validated, Refusal> {
+    let path = env.file(file)?;
+    let (table, field) = split_key(key)?;
+    if let Some(command) = ledger_key_command(table, field) {
+        return Err(refuse(format!(
+            "`{key}` holds grants, which setup does not write as a setting. Use {command}."
+        )));
+    }
+    if item.trim().is_empty() {
+        return Err(refuse("an empty entry".to_string()));
+    }
+    let mut list = current_list(path, key)?;
+    let present = list.iter().any(|x| x == item);
+    if adding && !present {
+        list.push(item.to_string());
+    } else if !adding && present {
+        list.retain(|x| x != item);
+    }
+    let mut v = validate_set(env, file, key, Some(&list_literal(&list)), proposal)?;
+    v.already = if adding { present } else { !present };
+    Ok(v)
+}
+
+fn validate_network_allow(
+    env: &Env,
+    host: &str,
+    proposal: &Proposal,
+) -> Result<Validated, Refusal> {
+    use crate::egress::host_pattern::HostPattern;
+    use crate::mcp_service::handlers::network_grant_tool::{NetGrantRisk, classify_network_risk};
+    let pattern = HostPattern::parse(host)
+        .map_err(|e| refuse(format!("invalid host pattern '{host}': {e}")))?;
+    // The same hard denylist the agent-facing `network_grant` applies:
+    // setup may be driven by a model, and a blanket or local
+    // destination is a decision for `ahma network allow` by hand.
+    let risk = match classify_network_risk(&pattern, host) {
+        NetGrantRisk::Refused(reason) => return Err(refuse(reason)),
+        NetGrantRisk::High(reason) => Risk::High(vec![reason]),
+        NetGrantRisk::Normal => Risk::Security,
+    };
+    let current = AhmaSettings::load_from_checked(&env.user_file)
+        .map_err(|e| refuse(format!("{}: {}", env.user_file.display(), e.summary())))?;
+    Ok(Validated {
+        proposal: proposal.clone(),
+        risk,
+        preview: format!("[network].allow += `{host}`"),
+        undo: format!("ahma network revoke {host}"),
+        already: current
+            .network
+            .allow
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(host)),
+    })
+}
+
+fn validate_mcp_config(proposal: &Proposal) -> Validated {
+    let drifts = crate::setup::detect_mcp_config_drifts();
+    let names: Vec<&str> = drifts.iter().map(|d| d.platform_name).collect();
+    Validated {
+        proposal: proposal.clone(),
+        risk: Risk::Normal,
+        preview: if names.is_empty() {
+            "every installed client's MCP entry is current".into()
+        } else {
+            format!("update the MCP entry for {}", names.join(", "))
+        },
+        undo: "ahma uninstall --mcp".into(),
+        already: drifts.is_empty(),
     }
 }
 
@@ -963,28 +985,7 @@ pub fn render_plan(plan: &Plan) -> String {
     }
     let _ = writeln!(out, "{} change(s) proposed:", plan.items.len());
     for (i, v) in plan.items.iter().enumerate() {
-        let marker = match &v.risk {
-            Risk::Normal => "",
-            Risk::Security => "  [security]",
-            Risk::High(_) => "  [HIGH RISK]",
-        };
-        let optional = if v.proposal.optional {
-            "  (optional)"
-        } else {
-            ""
-        };
-        let _ = writeln!(out, "\n{}. {}{optional}{marker}", i + 1, v.proposal.title);
-        let _ = writeln!(out, "   why:     {}", v.proposal.why);
-        let _ = writeln!(out, "   benefit: {}", v.proposal.benefit);
-        let _ = writeln!(out, "   risk:    {}", v.proposal.risk);
-        let _ = writeln!(out, "   source:  {}", v.proposal.source.label());
-        let _ = writeln!(out, "   change:  {}", v.preview);
-        if let Risk::High(reasons) = &v.risk {
-            for r in reasons {
-                let _ = writeln!(out, "   warning: {r}");
-            }
-        }
-        let _ = writeln!(out, "   undo:    {}", v.undo);
+        render_plan_item(&mut out, i + 1, v);
     }
     for (p, reason) in &plan.refused {
         let _ = writeln!(
@@ -999,6 +1000,33 @@ pub fn render_plan(plan: &Plan) -> String {
     }
     declined_note(&mut out, plan);
     out
+}
+
+/// One numbered item of [`render_plan`], with every warning a high-risk change
+/// carries.
+fn render_plan_item(out: &mut String, number: usize, v: &Validated) {
+    let marker = match &v.risk {
+        Risk::Normal => "",
+        Risk::Security => "  [security]",
+        Risk::High(_) => "  [HIGH RISK]",
+    };
+    let optional = if v.proposal.optional {
+        "  (optional)"
+    } else {
+        ""
+    };
+    let _ = writeln!(out, "\n{number}. {}{optional}{marker}", v.proposal.title);
+    let _ = writeln!(out, "   why:     {}", v.proposal.why);
+    let _ = writeln!(out, "   benefit: {}", v.proposal.benefit);
+    let _ = writeln!(out, "   risk:    {}", v.proposal.risk);
+    let _ = writeln!(out, "   source:  {}", v.proposal.source.label());
+    let _ = writeln!(out, "   change:  {}", v.preview);
+    if let Risk::High(reasons) = &v.risk {
+        for r in reasons {
+            let _ = writeln!(out, "   warning: {r}");
+        }
+    }
+    let _ = writeln!(out, "   undo:    {}", v.undo);
 }
 
 /// Say what was left out because you declined it, so a quiet plan is not a
@@ -1184,27 +1212,7 @@ const SWITCH_ORDER: [SettingKey; 7] = [
 ];
 
 fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
-    let mut out = Vec::new();
-    for g in &s.sandbox.persistent_scopes {
-        let access = if g.access == ScopeAccess::Ro {
-            "read-only"
-        } else {
-            "read-write"
-        };
-        let place = g
-            .workspace
-            .as_ref()
-            .map_or("every workspace".to_string(), |w| {
-                format!("for {}", w.display())
-            });
-        let lease = g.expires_at.map_or(String::new(), |_| ", leased".into());
-        out.push(AllowRow {
-            area: "folder",
-            subject: g.path.display().to_string(),
-            detail: format!("{access}, {place}{lease}"),
-            undo: Undo::Command(format!("ahma sandbox revoke {}", g.path.display())),
-        });
-    }
+    let mut out: Vec<AllowRow> = s.sandbox.persistent_scopes.iter().map(folder_row).collect();
     for h in &s.network.allow {
         out.push(AllowRow {
             area: "network",
@@ -1239,29 +1247,32 @@ fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
             });
         }
     }
-    for b in &s.tools.tool_bundles {
-        out.push(AllowRow {
-            area: "bundle",
-            subject: b.clone(),
-            detail: "tool bundle enabled".into(),
-            undo: list_entry_undo("tools.tool_bundles", b),
-        });
-    }
-    for p in &s.sandbox.profiles {
-        out.push(AllowRow {
-            area: "profile",
-            subject: p.clone(),
-            detail: "toolchain folders and hosts".into(),
-            undo: list_entry_undo("sandbox.profiles", p),
-        });
-    }
-    for r in &s.tools.source_readers {
-        out.push(AllowRow {
-            area: "reader",
-            subject: r.clone(),
-            detail: "edits continue while it runs".into(),
-            undo: list_entry_undo("tools.source_readers", r),
-        });
+    for (area, list, detail, key) in [
+        (
+            "bundle",
+            &s.tools.tool_bundles,
+            "tool bundle enabled",
+            "tools.tool_bundles",
+        ),
+        (
+            "profile",
+            &s.sandbox.profiles,
+            "toolchain folders and hosts",
+            "sandbox.profiles",
+        ),
+        (
+            "reader",
+            &s.tools.source_readers,
+            "edits continue while it runs",
+            "tools.source_readers",
+        ),
+    ] {
+        out.extend(list.iter().map(|item| AllowRow {
+            area,
+            subject: item.clone(),
+            detail: detail.into(),
+            undo: list_entry_undo(key, item),
+        }));
     }
     for l in &s.tools.long_running {
         out.push(AllowRow {
@@ -1277,40 +1288,68 @@ fn allow_rows(env: &Env, s: &AhmaSettings) -> Vec<AllowRow> {
     // "temporary files" switch is on while it is `false`) reads the right way
     // round.
     let defaults = AhmaSettings::default();
-    for setting in SWITCH_ORDER {
-        let Some(what) = setting.switch_label() else {
-            continue;
-        };
-        let is_on = |s: &AhmaSettings| setting.switch_is_on(s) == Some(true);
-        let key = setting.as_str();
-        if is_on(s) {
-            // Back to the default is `unset`, unless the default is itself on
-            // (the login keychain, temporary files): then only the value that
-            // turns it off does — `false` for an `allow_*` key, `true` for
-            // `disable_temp`.
-            let on_by_default = is_on(&defaults);
-            let undo = if on_by_default {
-                Change::Set {
-                    file: SettingsFile::User,
-                    key: key.into(),
-                    value: (!setting.switch_on_value()).to_string(),
-                }
-            } else {
-                Change::Unset {
-                    file: SettingsFile::User,
-                    key: key.into(),
-                }
-            };
-            out.push(AllowRow {
-                area: "switch",
-                subject: what.into(),
-                detail: key.into(),
-                undo: Undo::Proposal(undo),
-            });
-        }
-    }
+    out.extend(
+        SWITCH_ORDER
+            .into_iter()
+            .filter_map(|setting| switch_row(setting, s, &defaults)),
+    );
     let _ = env;
     out
+}
+
+/// The setup view's row for one persistent folder grant.
+fn folder_row(g: &ahma_common::config::PersistentScope) -> AllowRow {
+    let access = if g.access == ScopeAccess::Ro {
+        "read-only"
+    } else {
+        "read-write"
+    };
+    let place = g
+        .workspace
+        .as_ref()
+        .map_or("every workspace".to_string(), |w| {
+            format!("for {}", w.display())
+        });
+    let lease = g.expires_at.map_or(String::new(), |_| ", leased".into());
+    AllowRow {
+        area: "folder",
+        subject: g.path.display().to_string(),
+        detail: format!("{access}, {place}{lease}"),
+        undo: Undo::Command(format!("ahma sandbox revoke {}", g.path.display())),
+    }
+}
+
+/// The setup view's row for `setting`, or `None` when it is not a switch or
+/// the switch is off in `s`.
+fn switch_row(setting: SettingKey, s: &AhmaSettings, defaults: &AhmaSettings) -> Option<AllowRow> {
+    let what = setting.switch_label()?;
+    let is_on = |s: &AhmaSettings| setting.switch_is_on(s) == Some(true);
+    if !is_on(s) {
+        return None;
+    }
+    let key = setting.as_str();
+    // Back to the default is `unset`, unless the default is itself on
+    // (the login keychain, temporary files): then only the value that
+    // turns it off does — `false` for an `allow_*` key, `true` for
+    // `disable_temp`.
+    let undo = if is_on(defaults) {
+        Change::Set {
+            file: SettingsFile::User,
+            key: key.into(),
+            value: (!setting.switch_on_value()).to_string(),
+        }
+    } else {
+        Change::Unset {
+            file: SettingsFile::User,
+            key: key.into(),
+        }
+    };
+    Some(AllowRow {
+        area: "switch",
+        subject: what.into(),
+        detail: key.into(),
+        undo: Undo::Proposal(undo),
+    })
 }
 
 fn install_rows() -> Vec<InstallRow> {
@@ -1451,29 +1490,31 @@ pub fn parse_model_proposals(answer: &str, model: &str) -> ModelProposals {
             ));
             break;
         }
-        let change = match parse_model_change(c, i + 1) {
-            Ok(change) => change,
-            Err(reason) => {
-                out.dropped.push(reason);
-                continue;
-            }
-        };
-        let reason = c
-            .get("why")
-            .and_then(|v| v.as_str())
-            .map(clean_reason)
-            .unwrap_or_default();
-        out.proposals.push(Proposal::new(
-            change,
-            if reason.is_empty() {
-                "(the model gave no reason)".to_string()
-            } else {
-                format!("The model's reason: {reason}")
-            },
-            Source::Model(model.to_string()),
-        ));
+        match parse_model_change(c, i + 1) {
+            Ok(change) => out.proposals.push(Proposal::new(
+                change,
+                model_reason(c),
+                Source::Model(model.to_string()),
+            )),
+            Err(reason) => out.dropped.push(reason),
+        }
     }
     out
+}
+
+/// The model's own reason for change `c`, cleaned, cut and labelled as the
+/// model's; never a caption for the change (see [`parse_model_proposals`]).
+fn model_reason(c: &serde_json::Value) -> String {
+    let reason = c
+        .get("why")
+        .and_then(|v| v.as_str())
+        .map(clean_reason)
+        .unwrap_or_default();
+    if reason.is_empty() {
+        "(the model gave no reason)".to_string()
+    } else {
+        format!("The model's reason: {reason}")
+    }
 }
 
 fn parse_model_change(c: &serde_json::Value, index: usize) -> Result<Change, String> {
@@ -1613,7 +1654,7 @@ example, do not grant the credentials or network that command needs).\n\
 /// current directory). With `apply` and a terminal, offer each item in turn and
 /// apply only on `y`; without a terminal, change nothing and say so.
 pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::IsTerminal;
 
     let workspace = match path {
         Some(p) => p,
@@ -1628,48 +1669,58 @@ pub fn run_plan_command(path: Option<PathBuf>, apply_each: bool) -> Result<()> {
     let fixes = ahma_common::doctor::fixes(&ahma_common::doctor::run(&input));
     let plan = build_plan(&env, fixes, true);
     print!("{}", render_plan(&plan));
-    if plan.is_empty() || !apply_each {
-        if !plan.is_empty() {
-            println!(
-                "\nNothing was changed. `ahma setup --plan --apply` offers each one (nothing \
-                 applies without a y), or run `ahma setup` for the guided view."
-            );
-        }
+    if plan.is_empty() {
+        return Ok(());
+    }
+    if !apply_each {
+        println!(
+            "\nNothing was changed. `ahma setup --plan --apply` offers each one (nothing \
+             applies without a y), or run `ahma setup` for the guided view."
+        );
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
         println!("\n--apply needs a terminal to ask you; nothing was changed.");
         return Ok(());
     }
-    let stdin = std::io::stdin();
     for (i, item) in plan.items.iter().enumerate() {
-        let extra = match &item.risk {
-            Risk::High(_) => " This is HIGH RISK; read the warnings above.",
-            Risk::Security => " This changes what the sandbox permits.",
-            Risk::Normal => "",
-        };
-        print!(
-            "\n{}. {}{extra}\nApply? [y = yes, n = no and don't ask again here, Enter = skip] ",
-            i + 1,
-            item.proposal.title
-        );
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        stdin.lock().read_line(&mut answer)?;
-        if answer.trim().eq_ignore_ascii_case("y") {
-            let now = ahma_common::timestamp::rfc3339_local_now();
-            match apply(&env, &item.proposal, &ApproverSurface::Cli, &now) {
-                Ok(done) => println!("Done: {done}"),
-                Err(e) => println!("Could not apply: {e:#}"),
-            }
-        } else if answer.trim().eq_ignore_ascii_case("n") {
-            match record_declined(&env, &[&item.proposal]) {
-                Ok(()) => println!("Declined; not asked again in this folder."),
-                Err(e) => println!("Skipped (could not remember the answer: {e:#})."),
-            }
-        } else {
-            println!("Skipped.");
+        offer_plan_item(&env, i + 1, item)?;
+    }
+    Ok(())
+}
+
+/// Ask about one item of `ahma setup --plan --apply` on the terminal and act
+/// on the answer: `y` applies it, `n` declines it for this folder, anything
+/// else skips it.
+fn offer_plan_item(env: &Env, number: usize, item: &Validated) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let extra = match &item.risk {
+        Risk::High(_) => " This is HIGH RISK; read the warnings above.",
+        Risk::Security => " This changes what the sandbox permits.",
+        Risk::Normal => "",
+    };
+    print!(
+        "\n{number}. {}{extra}\nApply? [y = yes, n = no and don't ask again here, Enter = skip] ",
+        item.proposal.title
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") {
+        let now = ahma_common::timestamp::rfc3339_local_now();
+        match apply(env, &item.proposal, &ApproverSurface::Cli, &now) {
+            Ok(done) => println!("Done: {done}"),
+            Err(e) => println!("Could not apply: {e:#}"),
         }
+    } else if answer.eq_ignore_ascii_case("n") {
+        match record_declined(env, &[&item.proposal]) {
+            Ok(()) => println!("Declined; not asked again in this folder."),
+            Err(e) => println!("Skipped (could not remember the answer: {e:#})."),
+        }
+    } else {
+        println!("Skipped.");
     }
     Ok(())
 }

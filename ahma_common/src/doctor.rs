@@ -746,24 +746,9 @@ const MAX_FOLDERS_BELOW: usize = 400;
 /// folders are skipped and at most [`MAX_FOLDERS_BELOW`] folders are looked
 /// at, so a doctor run in a home directory stays quick.
 fn checkouts_below(folder: &Path) -> Vec<PathBuf> {
-    let children = |dir: &Path| -> Vec<PathBuf> {
-        let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|p| {
-                p.is_dir()
-                    && p.file_name()
-                        .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
-            })
-            .collect();
-        dirs.sort();
-        dirs
-    };
     let mut looked_at = 0;
     let mut found = Vec::new();
-    for child in children(folder) {
+    for child in visible_subdirs(folder) {
         if looked_at >= MAX_FOLDERS_BELOW {
             break;
         }
@@ -772,17 +757,35 @@ fn checkouts_below(folder: &Path) -> Vec<PathBuf> {
             found.push(child);
             continue;
         }
-        for grandchild in children(&child) {
-            if looked_at >= MAX_FOLDERS_BELOW {
-                break;
-            }
-            looked_at += 1;
-            if grandchild.join(".git").exists() {
-                found.push(grandchild);
-            }
-        }
+        let grandchildren: Vec<PathBuf> = visible_subdirs(&child)
+            .into_iter()
+            .take(MAX_FOLDERS_BELOW - looked_at)
+            .collect();
+        looked_at += grandchildren.len();
+        found.extend(
+            grandchildren
+                .into_iter()
+                .filter(|grandchild| grandchild.join(".git").exists()),
+        );
     }
     found
+}
+
+/// The folders directly in `dir` whose names do not start with `.`, in name order.
+fn visible_subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
+        })
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 /// SPEC R-DOCTOR.10, from the other side: a session started in a folder that
@@ -802,33 +805,11 @@ fn check_hooks_below(home: Option<&Path>, workspace: &Path, out: &mut Vec<Findin
     let user_has_ahma_hook = home
         .map(|h| h.join(".claude").join("settings.json"))
         .is_some_and(|p| matches!(hook_file_coverage(&p), Some((true, _))));
-    let mut declared = Vec::new();
-    let mut unsandboxed = Vec::new();
-    for checkout in checkouts_below(workspace) {
-        let events = project_hook_events(&checkout);
-        if events.is_empty() {
-            continue;
-        }
-        let ahma_hook = ahma_hook_file(&checkout, SHARED_SETTINGS).is_some()
-            || ahma_hook_file(&checkout, LOCAL_SETTINGS).is_some();
-        if ahma_hook && !user_has_ahma_hook {
-            unsandboxed.push(checkout.display().to_string());
-        }
-        declared.push(format!("  {} ({})", checkout.display(), events.join(", ")));
-    }
+    let (declared, unsandboxed) = hooked_checkouts_below(workspace, user_has_ahma_hook);
     if declared.is_empty() {
         return;
     }
-    let sandbox = if unsandboxed.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " Among them is ahma's shell hook, and your own ~/.claude/settings.json has none, \
-             so a session started here runs shell commands in {} without ahma's sandbox. Run \
-             `ahma hooks install` for a user-level hook that applies everywhere.",
-            unsandboxed.join(", ")
-        )
-    };
+    let sandbox = unsandboxed_hooks_sentence(&unsandboxed);
     out.push(Finding {
         level: if unsandboxed.is_empty() {
             Level::Info
@@ -848,6 +829,44 @@ fn check_hooks_below(home: Option<&Path>, workspace: &Path, out: &mut Vec<Findin
         ),
         fix: None,
     });
+}
+
+/// For [`check_hooks_below`]: one line for each checkout below `workspace` that declares
+/// hooks of its own, and the checkouts among them whose missed hook is ahma's shell hook
+/// while the user's settings carry none.
+fn hooked_checkouts_below(
+    workspace: &Path,
+    user_has_ahma_hook: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut declared = Vec::new();
+    let mut unsandboxed = Vec::new();
+    for checkout in checkouts_below(workspace) {
+        let events = project_hook_events(&checkout);
+        if events.is_empty() {
+            continue;
+        }
+        let ahma_hook = ahma_hook_file(&checkout, SHARED_SETTINGS).is_some()
+            || ahma_hook_file(&checkout, LOCAL_SETTINGS).is_some();
+        if ahma_hook && !user_has_ahma_hook {
+            unsandboxed.push(checkout.display().to_string());
+        }
+        declared.push(format!("  {} ({})", checkout.display(), events.join(", ")));
+    }
+    (declared, unsandboxed)
+}
+
+/// The sentence [`check_hooks_below`] adds when commands in `unsandboxed` run without
+/// ahma's sandbox; empty when there are none.
+fn unsandboxed_hooks_sentence(unsandboxed: &[String]) -> String {
+    if unsandboxed.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Among them is ahma's shell hook, and your own ~/.claude/settings.json has none, \
+         so a session started here runs shell commands in {} without ahma's sandbox. Run \
+         `ahma hooks install` for a user-level hook that applies everywhere.",
+        unsandboxed.join(", ")
+    )
 }
 
 fn check_settings(input: &DoctorInput, out: &mut Vec<Finding>) -> Option<AhmaSettings> {
@@ -1617,6 +1636,36 @@ fn check_antigravity_permissions(
         return;
     }
 
+    out.push(Finding {
+        level: if has_warnings {
+            Level::Warn
+        } else {
+            Level::Info
+        },
+        id: FindingId::AntigravityPermissions,
+        title: "Antigravity permission grants need cleanup".into(),
+        detail: antigravity_cleanup_detail(
+            total_bloated,
+            total_malformed,
+            total_grant_tools,
+            ide_has_retired_tmp,
+        ),
+        fix: Some(Fix::RepairAntigravityPermissions {
+            cli_settings: cli_path.exists().then_some(cli_path),
+            config_file: config_path.exists().then_some(config_path),
+            ide_mcp: ide_has_retired_tmp.then_some(ide_path),
+            clean_grants,
+        }),
+    });
+}
+
+/// The detail of [`check_antigravity_permissions`]'s cleanup finding.
+fn antigravity_cleanup_detail(
+    total_bloated: usize,
+    total_malformed: usize,
+    total_grant_tools: usize,
+    ide_has_retired_tmp: bool,
+) -> String {
     let mut detail = format!(
         "Found {total_bloated} bloated one-off wrapped command(s) and {total_malformed} malformed grant(s) across ~/.gemini settings. \
          These cause Antigravity to repeatedly prompt for permission on every tool call."
@@ -1630,22 +1679,7 @@ fn check_antigravity_permissions(
     if ide_has_retired_tmp {
         detail.push_str(" Also found retired --tmp flag in ~/.antigravity/mcp.json.");
     }
-    out.push(Finding {
-        level: if has_warnings {
-            Level::Warn
-        } else {
-            Level::Info
-        },
-        id: FindingId::AntigravityPermissions,
-        title: "Antigravity permission grants need cleanup".into(),
-        detail,
-        fix: Some(Fix::RepairAntigravityPermissions {
-            cli_settings: cli_path.exists().then_some(cli_path),
-            config_file: config_path.exists().then_some(config_path),
-            ide_mcp: ide_has_retired_tmp.then_some(ide_path),
-            clean_grants,
-        }),
-    });
+    detail
 }
 
 fn inspect_log_dir(dir: &Path) -> Option<(u64, Option<PathBuf>)> {
@@ -3328,8 +3362,11 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
 
     let mut problems = check_git_ssh_auth(probe, keys_present, out);
     problems += check_git_https_auth(helpers, settings, out);
+    if problems > 0 {
+        return;
+    }
 
-    if problems == 0 && helpers.is_empty() && !keys_present {
+    if helpers.is_empty() && !keys_present {
         // An SSH key works with every git host, and the broker signs with a
         // new ed25519 key with no further setup; a host's own CLI is second.
         let new_key = if cfg!(unix) {
@@ -3355,25 +3392,24 @@ fn check_git_auth(probe: &GitAuthProbe, settings: &AhmaSettings, out: &mut Vec<F
         return;
     }
 
-    if problems == 0 && (keys_present || !helpers.is_empty()) {
-        let https = if helpers.is_empty() {
-            "HTTPS: no credential helper (public fetches only)".to_string()
-        } else {
-            format!("HTTPS via {}", helpers.join(", "))
-        };
-        let ssh = git_ssh_summary(probe, keys_present);
-        out.push(Finding {
-            level: Level::Info,
-            id: FindingId::GitAuth,
-            title: "Git can authenticate from inside the sandbox".into(),
-            detail: format!(
-                "Nothing more to do. {https}; {ssh}. Sandboxed commands sign through the agent \
-                 socket ahma gives them and may use the keychain; only the private key files \
-                 themselves stay unreadable (SPEC R6.2.3)."
-            ),
-            fix: None,
-        });
-    }
+    // Here a key is present or a helper is configured.
+    let https = if helpers.is_empty() {
+        "HTTPS: no credential helper (public fetches only)".to_string()
+    } else {
+        format!("HTTPS via {}", helpers.join(", "))
+    };
+    let ssh = git_ssh_summary(probe, keys_present);
+    out.push(Finding {
+        level: Level::Info,
+        id: FindingId::GitAuth,
+        title: "Git can authenticate from inside the sandbox".into(),
+        detail: format!(
+            "Nothing more to do. {https}; {ssh}. Sandboxed commands sign through the agent \
+             socket ahma gives them and may use the keychain; only the private key files \
+             themselves stay unreadable (SPEC R6.2.3)."
+        ),
+        fix: None,
+    });
 }
 
 #[cfg(test)]

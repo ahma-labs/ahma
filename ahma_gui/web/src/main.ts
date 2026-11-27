@@ -56,7 +56,35 @@ function endSession(notice: string): void {
   showPair(notice);
 }
 
-function startSession(): void {
+// ── the session ──
+
+interface Views {
+  toast: ReturnType<typeof toastView.mount>;
+  header: ReturnType<typeof headerView.mount>;
+  gate: gateView.GateView;
+  work: ReturnType<typeof workView.mount>;
+  chat: ReturnType<typeof chatView.mount>;
+  log: ReturnType<typeof logView.mount>;
+}
+
+interface Session {
+  readonly views: Views;
+  /** The newest state the stream has given. */
+  state: State;
+  /** The state the views last drew. */
+  shown: State;
+  link: StreamState;
+  /** The link state the header last drew, null before the first draw. */
+  shownLink: StreamState | null;
+  /** A draw is scheduled and has not run yet. */
+  pending: boolean;
+  stopped: boolean;
+  /** Stops the stream; set once the stream starts. */
+  stop: () => void;
+}
+
+/** Lay out the session's regions in `root` and mount a view in each. */
+function mountSession(): { app: HTMLElement; views: Views } {
   const app = el("div", { class: "app" });
   const top = el("div", { class: "top" });
   const headerRoot = el("div", {});
@@ -68,97 +96,113 @@ function startSession(): void {
   app.append(top, el("main", { class: "main" }, workRoot, chatRoot), logRoot);
   root.replaceChildren(app);
 
-  const toast = toastView.mount(app);
-  const header = headerView.mount(headerRoot);
-  const gate = gateView.mount(gateRoot);
-  const work = workView.mount(workRoot);
-  const chat = chatView.mount(chatRoot);
-  const log = logView.mount(logRoot);
-
-  let state: State = initialState;
-  let shown: State = { ...initialState, rev: -1 };
-  let link: StreamState = "connecting";
-  let shownLink: StreamState | null = null;
-  let pending = false;
-  let stopped = false;
-
-  function draw(): void {
-    pending = false;
-    if (stopped) return;
-    const next = state;
-    const changed = new Set(changedRegions(shown, next));
-    shown = next;
-    // A view that throws must not take the others (above all the gate) with it.
-    const run = <T>(view: Mounted<T>, data: T): void => {
-      try {
-        view.update(data);
-      } catch (err) {
-        console.error(err);
-        toastView.notify("Part of the page could not be drawn.");
-      }
-    };
-    if (changed.has("header") || link !== shownLink) run(header, { header: next.header, link });
-    shownLink = link;
-    if (changed.has("gates")) run(gate, next.gates);
-    if (changed.has("work")) run(work, next.work);
-    if (changed.has("chat")) run(chat, next.chat);
-    if (changed.has("log")) run(log, next.log);
-  }
-
-  function schedule(): void {
-    if (pending || stopped) return;
-    pending = true;
-    // Frames do not run in a hidden tab, and that is exactly when a new question
-    // must still reach the title bar.
-    if (document.visibilityState === "visible") requestAnimationFrame(draw);
-    else setTimeout(draw, 0);
-  }
-
-  const stop = startStream({
-    onView(message) {
-      state = reduce(state, message);
-      if (state.protocolError !== null) {
-        if (stopped) return;
-        end();
-        showFatal(`This page speaks protocol ${PROTOCOL}; the server speaks protocol ${state.protocolError}. Reload after updating ahma.`);
-        return;
-      }
-      schedule();
+  return {
+    app,
+    views: {
+      toast: toastView.mount(app),
+      header: headerView.mount(headerRoot),
+      gate: gateView.mount(gateRoot),
+      work: workView.mount(workRoot),
+      chat: chatView.mount(chatRoot),
+      log: logView.mount(logRoot),
     },
-    onState(next) {
-      if (next === "live" && link !== "live") gate.resync();
-      link = next;
-      if (next === "unauthorized") {
-        lost();
-        return;
-      }
-      schedule();
-    },
+  };
+}
+
+/** A view that throws must not take the others (above all the gate) with it. */
+function drawView<T>(view: Mounted<T>, data: T): void {
+  try {
+    view.update(data);
+  } catch (err) {
+    console.error(err);
+    toastView.notify("Part of the page could not be drawn.");
+  }
+}
+
+function draw(s: Session): void {
+  s.pending = false;
+  if (s.stopped) return;
+  const next = s.state;
+  const changed = new Set(changedRegions(s.shown, next));
+  s.shown = next;
+  const { header, gate, work, chat, log } = s.views;
+  if (changed.has("header") || s.link !== s.shownLink) drawView(header, { header: next.header, link: s.link });
+  s.shownLink = s.link;
+  if (changed.has("gates")) drawView(gate, next.gates);
+  if (changed.has("work")) drawView(work, next.work);
+  if (changed.has("chat")) drawView(chat, next.chat);
+  if (changed.has("log")) drawView(log, next.log);
+}
+
+function schedule(s: Session): void {
+  if (s.pending || s.stopped) return;
+  s.pending = true;
+  const frame = (): void => draw(s);
+  // Frames do not run in a hidden tab, and that is exactly when a new question
+  // must still reach the title bar.
+  if (document.visibilityState === "visible") requestAnimationFrame(frame);
+  else setTimeout(frame, 0);
+}
+
+function end(s: Session): void {
+  if (s.stopped) return;
+  s.stopped = true;
+  s.stop();
+}
+
+/** The server no longer knows this token: back to pairing, once. */
+function lost(s: Session): void {
+  if (s.stopped) return;
+  end(s);
+  endSession("Your session ended. Enter a new pairing code.");
+}
+
+function onView(s: Session, message: unknown): void {
+  s.state = reduce(s.state, message);
+  if (s.state.protocolError === null) return schedule(s);
+  if (s.stopped) return;
+  end(s);
+  showFatal(`This page speaks protocol ${PROTOCOL}; the server speaks protocol ${s.state.protocolError}. Reload after updating ahma.`);
+}
+
+function onState(s: Session, next: StreamState): void {
+  if (next === "live" && s.link !== "live") s.views.gate.resync();
+  s.link = next;
+  if (next === "unauthorized") return lost(s);
+  schedule(s);
+}
+
+function startSession(): void {
+  const { app, views } = mountSession();
+  const s: Session = {
+    views,
+    state: initialState,
+    shown: { ...initialState, rev: -1 },
+    link: "connecting",
+    shownLink: null,
+    pending: false,
+    stopped: false,
+    stop: () => {},
+  };
+
+  // The stream reports "connecting" before startStream returns; nothing calls
+  // stop() that early, so the placeholder above is never what is stopped.
+  s.stop = startStream({
+    onView: (message) => onView(s, message),
+    onState: (next) => onState(s, next),
   });
 
-  setOnUnauthorized(lost);
-
-  /** The server no longer knows this token: back to pairing, once. */
-  function lost(): void {
-    if (stopped) return;
-    end();
-    endSession("Your session ended. Enter a new pairing code.");
-  }
-
-  function end(): void {
-    if (stopped) return;
-    stopped = true;
-    stop();
-  }
+  setOnUnauthorized(() => lost(s));
 
   show({
     destroy() {
-      end();
+      end(s);
+      const { toast, header, gate, work, chat, log } = views;
       for (const view of [toast, header, gate, work, chat, log]) view.destroy?.();
       app.remove();
     },
   });
-  schedule();
+  schedule(s);
 }
 
 // `ahma desktop`'s own window arrives already holding its token.

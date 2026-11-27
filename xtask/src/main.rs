@@ -136,35 +136,47 @@ fn bump_version(new_ver: &str) {
 
 fn update_other_stale_files(root: &Path, new_ver: &str) {
     println!("Cargo.toml is already at {new_ver}; checking other files for stale versions…");
-    let other_files: &[(&str, &str)] = &[
-        ("skills/ahma/SKILL.md", "skills/ahma/SKILL.md"),
-        ("scripts/install.sh", "scripts/install.sh"),
-        ("scripts/install.ps1", "scripts/install.ps1"),
-    ];
     let mut any_updated = false;
-    for (rel_path, label) in other_files {
-        let path = root.join(rel_path);
-        if let Some(stale) = find_stale_version(&path, new_ver) {
-            println!("  Updating {label}: {stale} → {new_ver}");
-            replace_all_version_occurrences(&path, &stale, new_ver, label);
-            any_updated = true;
-        } else {
-            println!("  {label}: already at {new_ver} ✓");
-        }
+    // `|=`, not `||`: every file is checked and reported, even after one is updated.
+    for rel_path in [
+        "skills/ahma/SKILL.md",
+        "scripts/install.sh",
+        "scripts/install.ps1",
+    ] {
+        any_updated |= update_stale_file(root, rel_path, new_ver);
     }
-    let lock_stale = fs::read_to_string(root.join("Cargo.lock"))
-        .map(|lock| lockfile_needs_refresh(&lock, new_ver))
-        .unwrap_or(true);
-    if lock_stale {
-        println!("  Cargo.lock: workspace members lag {new_ver}; refreshing");
-        refresh_cargo_lock(root, new_ver);
-        any_updated = true;
-    } else {
-        println!("  Cargo.lock: already at {new_ver} ✓");
-    }
+    any_updated |= refresh_lock_if_stale(root, new_ver);
     if !any_updated {
         println!("All files already at {new_ver} — nothing to do.");
     }
+}
+
+/// Rewrite every occurrence of a stale version in `rel_path` to `new_ver`.
+/// Returns whether the file was updated.
+fn update_stale_file(root: &Path, rel_path: &str, new_ver: &str) -> bool {
+    let path = root.join(rel_path);
+    let Some(stale) = find_stale_version(&path, new_ver) else {
+        println!("  {rel_path}: already at {new_ver} ✓");
+        return false;
+    };
+    println!("  Updating {rel_path}: {stale} → {new_ver}");
+    replace_all_version_occurrences(&path, &stale, new_ver, rel_path);
+    true
+}
+
+/// Refresh `Cargo.lock` when its workspace members lag `new_ver` (or it cannot be
+/// read). Returns whether a refresh ran.
+fn refresh_lock_if_stale(root: &Path, new_ver: &str) -> bool {
+    let lock_stale = fs::read_to_string(root.join("Cargo.lock"))
+        .map(|lock| lockfile_needs_refresh(&lock, new_ver))
+        .unwrap_or(true);
+    if !lock_stale {
+        println!("  Cargo.lock: already at {new_ver} ✓");
+        return false;
+    }
+    println!("  Cargo.lock: workspace members lag {new_ver}; refreshing");
+    refresh_cargo_lock(root, new_ver);
+    true
 }
 
 /// Whether `Cargo.lock` must be refreshed for `new_ver`: true unless the
@@ -791,18 +803,7 @@ fn safe_update(args: &[String]) {
     // the candidates' own new versions are checked after they are applied
     // (Step 5b), the only place they appear in a lockfile.
     let vulnerable_pairs = parse_deny_advisories(&root);
-    if !vulnerable_pairs.is_empty() {
-        let mut current: Vec<_> = vulnerable_pairs
-            .iter()
-            .map(|(n, v)| format!("{n} {v}"))
-            .collect();
-        current.sort();
-        println!(
-            "cargo-deny flags the current Cargo.lock: {} (an upgrade below may fix it; one \
-             held by the age gate is not applied).",
-            current.join(", ")
-        );
-    }
+    report_current_advisories(&vulnerable_pairs);
 
     // --- Step 3: evaluate each candidate (includes a resolvability pre-check) ---
     let (rows, to_apply) = evaluate_candidates(&root, &candidates, &vulnerable_pairs, &opts);
@@ -835,23 +836,7 @@ fn safe_update(args: &[String]) {
         .collect();
 
     // --- Step 5b: the advisory check, on the versions this run wrote ---
-    let flagged = newly_flagged(&results, &parse_deny_advisories(&root));
-    if !flagged.is_empty() {
-        eprintln!("ERROR: cargo-deny flags upgrade(s) this run applied:");
-        for r in &flagged {
-            eprintln!("  {} {} -> {}", r.name, r.old_ver, r.new_ver);
-        }
-        eprintln!(
-            "Revert with `git checkout -- Cargo.toml Cargo.lock`, then re-run with \
-             `--exclude {}`.",
-            flagged
-                .iter()
-                .map(|r| r.name.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        process::exit(1);
-    }
+    exit_if_applied_upgrades_flagged(&root, &results);
 
     // --- Step 6: verify workspace still compiles ---
     verify_workspace_compiles(&root);
@@ -863,6 +848,47 @@ fn safe_update(args: &[String]) {
     if results.iter().any(|r| r.error.is_some()) {
         process::exit(1);
     }
+}
+
+/// Name the `(crate, version)` pairs cargo-deny flags in the *current* lockfile,
+/// sorted; prints nothing when it flags none.
+fn report_current_advisories(vulnerable_pairs: &std::collections::HashSet<(String, String)>) {
+    if vulnerable_pairs.is_empty() {
+        return;
+    }
+    let mut current: Vec<_> = vulnerable_pairs
+        .iter()
+        .map(|(n, v)| format!("{n} {v}"))
+        .collect();
+    current.sort();
+    println!(
+        "cargo-deny flags the current Cargo.lock: {} (an upgrade below may fix it; one \
+         held by the age gate is not applied).",
+        current.join(", ")
+    );
+}
+
+/// Re-run cargo-deny on the lockfile this run rewrote and exit 1 if it flags
+/// any upgrade that was applied, naming them and the `--exclude` that skips them.
+fn exit_if_applied_upgrades_flagged(root: &Path, results: &[ApplyResult]) {
+    let flagged = newly_flagged(results, &parse_deny_advisories(root));
+    if flagged.is_empty() {
+        return;
+    }
+    eprintln!("ERROR: cargo-deny flags upgrade(s) this run applied:");
+    for r in &flagged {
+        eprintln!("  {} {} -> {}", r.name, r.old_ver, r.new_ver);
+    }
+    eprintln!(
+        "Revert with `git checkout -- Cargo.toml Cargo.lock`, then re-run with \
+         `--exclude {}`.",
+        flagged
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    process::exit(1);
 }
 
 fn print_summary_table(rows: &[Row]) {
@@ -1712,33 +1738,36 @@ fn parse_deny_report(stderr: &str) -> Result<std::collections::HashSet<(String, 
         };
         match record.get("type").and_then(|t| t.as_str()) {
             Some("summary") => completed = true,
-            Some("diagnostic")
-                if record.pointer("/fields/severity").and_then(|s| s.as_str()) == Some("error") =>
-            {
-                let graphs = record
-                    .pointer("/fields/graphs")
-                    .and_then(|g| g.as_array())
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                for krate in graphs.iter().filter_map(|g| g.get("Krate")) {
-                    if let (Some(name), Some(version)) = (
-                        krate.get("name").and_then(|n| n.as_str()),
-                        krate.get("version").and_then(|v| v.as_str()),
-                    ) {
-                        flagged.insert((name.to_string(), version.to_string()));
-                    }
-                }
-            }
+            Some("diagnostic") => flagged.extend(error_diagnostic_krates(&record)),
             _ => {}
         }
     }
-    if completed {
-        Ok(flagged)
-    } else {
-        Err(first_error
+    if !completed {
+        return Err(first_error
             .unwrap_or("cargo-deny printed no summary record (did it run?)")
-            .to_string())
+            .to_string());
     }
+    Ok(flagged)
+}
+
+/// The `(crate, version)` pairs a cargo-deny `diagnostic` record names under
+/// `fields.graphs[].Krate`, or none unless its severity is `error`.
+fn error_diagnostic_krates(record: &serde_json::Value) -> Vec<(String, String)> {
+    if record.pointer("/fields/severity").and_then(|s| s.as_str()) != Some("error") {
+        return Vec::new();
+    }
+    let Some(graphs) = record.pointer("/fields/graphs").and_then(|g| g.as_array()) else {
+        return Vec::new();
+    };
+    graphs
+        .iter()
+        .filter_map(|g| g.get("Krate"))
+        .filter_map(|krate| {
+            let name = krate.get("name")?.as_str()?;
+            let version = krate.get("version")?.as_str()?;
+            Some((name.to_string(), version.to_string()))
+        })
+        .collect()
 }
 
 /// Return `true` if `(name, ver)` appears in the known-vulnerable set.
@@ -1810,51 +1839,7 @@ fn publish_age_days(created_at: &str, now: jiff::Timestamp) -> Result<i64, Strin
 /// genuine failure.
 fn apply_upgrade(root: &Path, up: &Upgrade, is_direct: bool) -> ApplyResult {
     let kind = if is_direct { "direct" } else { "transitive" };
-    let result = (|| {
-        if is_direct {
-            // `cargo upgrade -p name@new` already carries a version, so it is
-            // unambiguous; it rewrites the Cargo.toml requirement and updates Cargo.lock.
-            run_cargo_capture(
-                root,
-                &["upgrade", "-p", &format!("{}@{}", up.name, up.new_ver)],
-            )?;
-            // If cargo upgrade already updated Cargo.lock to up.new_ver, pinning is complete.
-            let lock_path = root.join("Cargo.lock");
-            if let Ok(content) = fs::read_to_string(&lock_path)
-                && package_version_in_lock(&content, &up.name).as_deref() == Some(&up.new_ver)
-            {
-                return Ok(());
-            }
-        }
-        // Pin Cargo.lock. `name@old --precise new` disambiguates when several
-        // versions of `name` coexist — the bare `-p name` form errors as
-        // "specification is ambiguous" and used to fail silently.
-        let pin_res = run_cargo_capture(
-            root,
-            &[
-                "update",
-                "-p",
-                &format!("{}@{}", up.name, up.old_ver),
-                "--precise",
-                &up.new_ver,
-            ],
-        );
-        if pin_res.is_err() {
-            // A preceding upgrade in the batch may have already bumped this dependency
-            // to up.new_ver (removing up.old_ver from Cargo.lock), in which case `cargo update`
-            // errors with "package ID specification did not match any packages".
-            // If the lockfile already contains up.new_ver and no longer contains up.old_ver,
-            // the upgrade is already successfully in place.
-            let lock_path = root.join("Cargo.lock");
-            if let Ok(content) = fs::read_to_string(&lock_path)
-                && has_package_version_in_lock(&content, &up.name, &up.new_ver)
-                && !has_package_version_in_lock(&content, &up.name, &up.old_ver)
-            {
-                return Ok(());
-            }
-        }
-        pin_res
-    })();
+    let result = try_apply_upgrade(root, up, is_direct);
 
     match &result {
         Ok(()) => println!(
@@ -1877,6 +1862,57 @@ fn apply_upgrade(root: &Path, up: &Upgrade, is_direct: bool) -> ApplyResult {
         new_ver: up.new_ver.clone(),
         error: result.err(),
     }
+}
+
+/// The cargo work behind [`apply_upgrade`]: `Err` carries cargo's most
+/// informative stderr line.
+fn try_apply_upgrade(root: &Path, up: &Upgrade, is_direct: bool) -> Result<(), String> {
+    if is_direct {
+        // `cargo upgrade -p name@new` already carries a version, so it is
+        // unambiguous; it rewrites the Cargo.toml requirement and updates Cargo.lock.
+        run_cargo_capture(
+            root,
+            &["upgrade", "-p", &format!("{}@{}", up.name, up.new_ver)],
+        )?;
+        // If cargo upgrade already updated Cargo.lock to up.new_ver, pinning is complete.
+        if read_lockfile(root).is_some_and(|content| {
+            package_version_in_lock(&content, &up.name).as_deref() == Some(up.new_ver.as_str())
+        }) {
+            return Ok(());
+        }
+    }
+    // Pin Cargo.lock. `name@old --precise new` disambiguates when several
+    // versions of `name` coexist — the bare `-p name` form errors as
+    // "specification is ambiguous" and used to fail silently.
+    let pin_res = run_cargo_capture(
+        root,
+        &[
+            "update",
+            "-p",
+            &format!("{}@{}", up.name, up.old_ver),
+            "--precise",
+            &up.new_ver,
+        ],
+    );
+    // A preceding upgrade in the batch may have already bumped this dependency
+    // to up.new_ver (removing up.old_ver from Cargo.lock), in which case `cargo update`
+    // errors with "package ID specification did not match any packages".
+    // If the lockfile already contains up.new_ver and no longer contains up.old_ver,
+    // the upgrade is already successfully in place.
+    if pin_res.is_err()
+        && read_lockfile(root).is_some_and(|content| {
+            has_package_version_in_lock(&content, &up.name, &up.new_ver)
+                && !has_package_version_in_lock(&content, &up.name, &up.old_ver)
+        })
+    {
+        return Ok(());
+    }
+    pin_res
+}
+
+/// The workspace `Cargo.lock`, or `None` if it cannot be read.
+fn read_lockfile(root: &Path) -> Option<String> {
+    fs::read_to_string(root.join("Cargo.lock")).ok()
 }
 
 /// Build the honest post-apply summary lines from per-crate results: a count of

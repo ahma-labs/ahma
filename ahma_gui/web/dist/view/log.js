@@ -17,11 +17,7 @@ function createLine() {
         },
     };
 }
-export function mount(root) {
-    let open = false;
-    let log = null;
-    let stick = true;
-    let needsDraw = true;
+function createPanel(root) {
     const summary = el("span", { class: "log-summary quiet" });
     const toggle = el("button", { type: "button", class: "log-toggle", "aria-expanded": "false" }, el("span", { class: "caret", "aria-hidden": "true" }, "▸"), el("span", { class: "panel-title" }, "Log"), summary);
     const filter = el("input", { type: "text", class: "input log-filter", placeholder: "Filter", "aria-label": "Filter log lines" });
@@ -30,62 +26,89 @@ export function mount(root) {
     const body = el("div", { class: "log-body" }, el("div", { class: "log-tools" }, filter, active), lines);
     body.hidden = true;
     root.appendChild(el("section", { class: "panel log", "aria-label": "Log" }, toggle, body));
-    const pool = [];
-    lines.addEventListener("scroll", () => {
-        stick = lines.scrollHeight - lines.scrollTop - lines.clientHeight < BOTTOM_SLACK_PX;
-    });
-    function draw() {
-        needsDraw = false;
-        if (log === null)
-            return;
-        const needle = filter.value.trim().toLowerCase();
-        const shown = needle === "" ? log.lines : log.lines.filter((l) => `${l.ts} ${l.level} ${l.text}`.toLowerCase().includes(needle));
-        while (pool.length < shown.length) {
-            const line = createLine();
-            pool.push(line);
-            lines.appendChild(line.node);
-        }
-        while (pool.length > shown.length)
-            pool.pop()?.node.remove();
-        shown.forEach((l, i) => pool[i]?.set(l));
-        setText(active, log.active ?? "");
-        if (stick)
-            lines.scrollTop = lines.scrollHeight;
+    return { toggle, summary, filter, active, lines, body, pool: [], open: false, log: null, stick: true, needsDraw: true };
+}
+/** The lines whose timestamp, level or text contain `needle` (already lower-cased); all of them for "". */
+function matching(lines, needle) {
+    if (needle === "")
+        return lines;
+    return lines.filter((l) => `${l.ts} ${l.level} ${l.text}`.toLowerCase().includes(needle));
+}
+/** Grow or shrink the row pool to exactly `n` rows. */
+function resizePool(p, n) {
+    while (p.pool.length < n) {
+        const line = createLine();
+        p.pool.push(line);
+        p.lines.appendChild(line.node);
     }
-    toggle.addEventListener("click", () => {
-        open = !open;
-        toggle.setAttribute("aria-expanded", String(open));
-        body.hidden = !open;
-        if (open && needsDraw)
-            draw();
-        if (open)
-            lines.scrollTop = lines.scrollHeight;
-    });
-    filter.addEventListener("input", () => {
-        if (open)
-            draw();
-        else
-            needsDraw = true;
-    });
-    return {
-        update(next) {
-            if (next === null)
-                return;
-            log = next;
-            const errors = next.lines.filter((l) => l.level === "error").length;
-            const warns = next.lines.filter((l) => l.level === "warn").length;
-            const parts = [`${next.lines.length} lines`];
-            if (errors > 0)
-                parts.push(`${errors} error${errors === 1 ? "" : "s"}`);
-            if (warns > 0)
-                parts.push(`${warns} warning${warns === 1 ? "" : "s"}`);
-            setText(summary, parts.join(" · "));
-            summary.dataset["tone"] = errors > 0 ? "error" : warns > 0 ? "warn" : "none";
-            if (open)
-                draw();
-            else
-                needsDraw = true;
-            setHidden(active, next.active === null);
-        },
-    };
+    while (p.pool.length > n)
+        p.pool.pop()?.node.remove();
+}
+function draw(p) {
+    p.needsDraw = false;
+    if (p.log === null)
+        return;
+    const shown = matching(p.log.lines, p.filter.value.trim().toLowerCase());
+    resizePool(p, shown.length);
+    shown.forEach((l, i) => p.pool[i]?.set(l));
+    setText(p.active, p.log.active ?? "");
+    if (p.stick)
+        p.lines.scrollTop = p.lines.scrollHeight;
+}
+/** Draw now if the panel is open; otherwise draw when it next opens. */
+function drawOrDefer(p) {
+    if (p.open)
+        draw(p);
+    else
+        p.needsDraw = true;
+}
+function onToggle(p) {
+    p.open = !p.open;
+    p.toggle.setAttribute("aria-expanded", String(p.open));
+    p.body.hidden = !p.open;
+    if (!p.open)
+        return;
+    if (p.needsDraw)
+        draw(p);
+    p.lines.scrollTop = p.lines.scrollHeight;
+}
+function onScroll(p) {
+    p.stick = p.lines.scrollHeight - p.lines.scrollTop - p.lines.clientHeight < BOTTOM_SLACK_PX;
+}
+/** `1 error`, `2 errors`. */
+function counted(n, noun) {
+    return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+function toneOf(errors, warns) {
+    if (errors > 0)
+        return "error";
+    if (warns > 0)
+        return "warn";
+    return "none";
+}
+function summarize(p, lines) {
+    const errors = lines.filter((l) => l.level === "error").length;
+    const warns = lines.filter((l) => l.level === "warn").length;
+    const parts = [`${lines.length} lines`];
+    if (errors > 0)
+        parts.push(counted(errors, "error"));
+    if (warns > 0)
+        parts.push(counted(warns, "warning"));
+    setText(p.summary, parts.join(" · "));
+    p.summary.dataset["tone"] = toneOf(errors, warns);
+}
+function updatePanel(p, next) {
+    if (next === null)
+        return;
+    p.log = next;
+    summarize(p, next.lines);
+    drawOrDefer(p);
+    setHidden(p.active, next.active === null);
+}
+export function mount(root) {
+    const p = createPanel(root);
+    p.lines.addEventListener("scroll", () => onScroll(p));
+    p.toggle.addEventListener("click", () => onToggle(p));
+    p.filter.addEventListener("input", () => drawOrDefer(p));
+    return { update: (next) => updatePanel(p, next) };
 }
