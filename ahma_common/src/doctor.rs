@@ -160,7 +160,7 @@ impl Fix {
                     .join(", ")
             ),
             Fix::RepairAntigravityPermissions { .. } => {
-                "Clean up bloated one-off and malformed grants in ~/.gemini configs, and repair Antigravity MCP settings".to_string()
+                "Clean up bloated one-off and malformed grants in ~/.gemini configs, remove auto-approval of ahma's grant tools, and repair Antigravity MCP settings".to_string()
             }
         }
     }
@@ -280,13 +280,26 @@ fn apply_repair_antigravity_permissions(
     now: &str,
 ) -> anyhow::Result<String> {
     let mut files_cleaned = 0;
+    let mut removed = Vec::new();
     if let Some(path) = cli_settings {
-        clean_antigravity_file(path, clean_grants, false)?;
+        removed.extend(clean_antigravity_file(path, clean_grants, false)?);
         files_cleaned += 1;
     }
     if let Some(path) = config_file {
-        clean_antigravity_file(path, clean_grants, true)?;
+        removed.extend(clean_antigravity_file(path, clean_grants, true)?);
         files_cleaned += 1;
+    }
+    for entry in &removed {
+        append_audit(
+            &AuditEntry::new(
+                now.to_string(),
+                AuditAction::Revoke,
+                GrantKind::Tool,
+                entry.clone(),
+                GrantTier::Always,
+            )
+            .with_surface(&ApproverSurface::DOCTOR),
+        );
     }
     if let Some(path) = ide_mcp {
         clean_antigravity_ide_mcp(path)?;
@@ -501,6 +514,8 @@ fn check_grant_tools_auto_allowed(home: Option<&Path>, workspace: &Path, out: &m
         home.join(".cursor").join("mcp.json"),
         home.join(".codex").join("config.toml"),
     ];
+    let gemini = home.join(".gemini");
+    let mut gemini_hits = false;
     let mut detail = Vec::new();
     for path in candidates.iter().filter(|p| p.exists()) {
         let entries = if path.extension().is_some_and(|e| e == "toml") {
@@ -516,6 +531,7 @@ fn check_grant_tools_auto_allowed(home: Option<&Path>, workspace: &Path, out: &m
         } else {
             grant_tool_allow_entries(path)
         };
+        gemini_hits |= !entries.is_empty() && path.starts_with(&gemini);
         for e in entries {
             detail.push(format!("{}: {e}", path.display()));
         }
@@ -523,6 +539,13 @@ fn check_grant_tools_auto_allowed(home: Option<&Path>, workspace: &Path, out: &m
     if detail.is_empty() {
         return;
     }
+    // The ~/.gemini entries have a fix of the doctor's own (R-DOCTOR.5); the
+    // other harnesses' files stay the person's to edit.
+    let gemini_note = if gemini_hits {
+        " The Antigravity permission fix removes the ~/.gemini ones."
+    } else {
+        ""
+    };
     out.push(Finding {
         level: Level::Warn,
         id: FindingId::GrantToolsAutoApproved,
@@ -531,7 +554,7 @@ fn check_grant_tools_auto_allowed(home: Option<&Path>, workspace: &Path, out: &m
             "`sandbox_grant` / `network_grant` only *request* a wider scope; the human decides. \
              These allow-list entries let the model call them without a prompt, and a harness \
              that cannot show ahma's own approval prompt then has no human in the loop at all \
-             (an agent granted itself a read-write directory this way). Remove them: {}",
+             (an agent granted itself a read-write directory this way). Remove them: {}.{gemini_note}",
             detail.join("; ")
         ),
         fix: None,
@@ -1323,29 +1346,29 @@ fn is_malformed_ahma_grant(s: &str) -> bool {
     s.contains("ahma") && (s.contains(".*") || s.contains(r"\.") || s.contains('\n'))
 }
 
-fn is_grant_unwanted(s: &str, bloated: &mut usize, malformed: &mut usize) -> bool {
-    if is_bloated_ahma_grant(s) {
-        *bloated += 1;
-        true
-    } else if is_malformed_ahma_grant(s) {
-        *malformed += 1;
-        true
-    } else {
-        false
-    }
+/// An allow-list entry that approves one of ahma's [`GRANT_TOOLS`] without a
+/// prompt (`mcp(Ahma/sandbox_grant)`): the Antigravity repair removes it
+/// (SPEC R-DOCTOR.5, R5.4.5).
+fn is_grant_tool_entry(s: &str) -> bool {
+    GRANT_TOOLS.iter().any(|t| s.contains(t))
 }
 
+/// Keep what an allow list should keep, add the clean hook grants, and return
+/// the grant-tool entries it dropped so the caller can audit them.
 fn clean_grants_vec(
     grants: &[serde_json::Value],
     clean_grants: &[String],
-) -> (Vec<serde_json::Value>, usize, usize) {
+) -> (Vec<serde_json::Value>, Vec<String>) {
     let mut cleaned = Vec::new();
-    let mut bloated_count = 0;
-    let mut malformed_count = 0;
+    let mut grant_tools = Vec::new();
 
     for g in grants {
         let Some(s) = g.as_str() else { continue };
-        if is_grant_unwanted(s, &mut bloated_count, &mut malformed_count) {
+        if is_grant_tool_entry(s) {
+            grant_tools.push(s.to_string());
+            continue;
+        }
+        if is_bloated_ahma_grant(s) || is_malformed_ahma_grant(s) {
             continue;
         }
         if !cleaned.contains(g) {
@@ -1360,28 +1383,36 @@ fn clean_grants_vec(
         }
     }
 
-    (cleaned, bloated_count, malformed_count)
+    (cleaned, grant_tools)
 }
 
+/// Clean one `~/.gemini` file in place and return the grant-tool entries it
+/// removed. A file that does not parse is refused, never rewritten.
 fn clean_antigravity_file(
     path: &Path,
     clean_grants: &[String],
     is_config_file: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(path)?;
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+    let mut doc: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "{} does not parse ({e}); left unchanged. Fix it by hand, then run the doctor again.",
+            path.display()
+        )
+    })?;
     let Some(root) = doc.as_object_mut() else {
         anyhow::bail!("Root of {} is not an object", path.display());
     };
+    let mut removed = Vec::new();
 
     if let Some(perms) = root.get_mut("permissions").and_then(|p| p.as_object_mut())
         && let Some(allow) = perms.get("allow").and_then(|a| a.as_array())
     {
-        let (cleaned, _, _) = clean_grants_vec(allow, clean_grants);
+        let (cleaned, dropped) = clean_grants_vec(allow, clean_grants);
+        removed.extend(dropped);
         perms.insert("allow".to_string(), serde_json::Value::Array(cleaned));
     }
 
@@ -1392,13 +1423,14 @@ fn clean_antigravity_file(
             .and_then(|g| g.as_object_mut())
         && let Some(allow) = gpg.get("allow").and_then(|a| a.as_array())
     {
-        let (cleaned, _, _) = clean_grants_vec(allow, clean_grants);
+        let (cleaned, dropped) = clean_grants_vec(allow, clean_grants);
+        removed.extend(dropped);
         gpg.insert("allow".to_string(), serde_json::Value::Array(cleaned));
     }
 
     let formatted = serde_json::to_string_pretty(&doc)?;
     std::fs::write(path, formatted)?;
-    Ok(())
+    Ok(removed)
 }
 
 fn remove_tmp_from_args(args: &mut Vec<serde_json::Value>) -> bool {
@@ -1459,54 +1491,54 @@ fn antigravity_clean_grants(current_exe: Option<&Path>) -> Vec<String> {
     ]
 }
 
-fn check_grant_array(arr: &serde_json::Value, clean_grants: &[String]) -> (usize, usize, bool) {
+/// What one or more Antigravity allow lists hold that the repair would change.
+#[derive(Debug, Default)]
+struct GrantScan {
+    bloated: usize,
+    malformed: usize,
+    /// Entries that auto-approve one of ahma's [`GRANT_TOOLS`].
+    grant_tools: usize,
+    /// A clean hook grant is not installed yet.
+    missing_clean: bool,
+}
+
+fn check_grant_array(arr: &serde_json::Value, clean_grants: &[String], totals: &mut GrantScan) {
     let Some(items) = arr.as_array() else {
-        return (0, 0, false);
+        return;
     };
-    let mut bloated = 0;
-    let mut malformed = 0;
-    for item in items {
-        if let Some(s) = item.as_str() {
-            if is_bloated_ahma_grant(s) {
-                bloated += 1;
-            } else if is_malformed_ahma_grant(s) {
-                malformed += 1;
-            }
+    for s in items.iter().filter_map(|i| i.as_str()) {
+        if is_grant_tool_entry(s) {
+            totals.grant_tools += 1;
+        } else if is_bloated_ahma_grant(s) {
+            totals.bloated += 1;
+        } else if is_malformed_ahma_grant(s) {
+            totals.malformed += 1;
         }
     }
-    let missing = clean_grants
+    totals.missing_clean |= clean_grants
         .iter()
         .any(|cg| !items.iter().any(|i| i.as_str() == Some(cg.as_str())));
-    (bloated, malformed, missing)
 }
 
 fn accumulate_grant_section(
     section: Option<&serde_json::Value>,
     clean_grants: &[String],
-    totals: &mut (usize, usize, bool),
+    totals: &mut GrantScan,
 ) {
-    let Some(allow) = section else {
-        totals.2 = true;
-        return;
-    };
-    let (sb, sm, smiss) = check_grant_array(allow, clean_grants);
-    totals.0 += sb;
-    totals.1 += sm;
-    totals.2 |= smiss;
+    match section {
+        Some(allow) => check_grant_array(allow, clean_grants, totals),
+        None => totals.missing_clean = true,
+    }
 }
 
-fn scan_antigravity_file(
-    path: &Path,
-    is_config: bool,
-    clean_grants: &[String],
-) -> (usize, usize, bool) {
+fn scan_antigravity_file(path: &Path, is_config: bool, clean_grants: &[String]) -> GrantScan {
+    let mut totals = GrantScan::default();
     let Ok(content) = std::fs::read_to_string(path) else {
-        return (0, 0, false);
+        return totals;
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return (0, 0, false);
+        return totals;
     };
-    let mut totals = (0, 0, false);
     accumulate_grant_section(
         doc.get("permissions").and_then(|p| p.get("allow")),
         clean_grants,
@@ -1562,14 +1594,17 @@ fn check_antigravity_permissions(
     }
 
     let clean_grants = antigravity_clean_grants(current_exe);
-    let (cb, cm, cmiss) = scan_antigravity_file(&cli_path, false, &clean_grants);
-    let (gb, gm, gmiss) = scan_antigravity_file(&config_path, true, &clean_grants);
+    let cli = scan_antigravity_file(&cli_path, false, &clean_grants);
+    let config = scan_antigravity_file(&config_path, true, &clean_grants);
 
-    let total_bloated = cb + gb;
-    let total_malformed = cm + gm;
-    let missing_clean = (cli_path.exists() && cmiss) || (config_path.exists() && gmiss);
+    let total_bloated = cli.bloated + config.bloated;
+    let total_malformed = cli.malformed + config.malformed;
+    let total_grant_tools = cli.grant_tools + config.grant_tools;
+    let missing_clean =
+        (cli_path.exists() && cli.missing_clean) || (config_path.exists() && config.missing_clean);
     let ide_has_retired_tmp = check_ide_has_retired_tmp(&ide_path);
-    let has_warnings = total_bloated > 0 || total_malformed > 0 || ide_has_retired_tmp;
+    let has_warnings =
+        total_bloated > 0 || total_malformed > 0 || total_grant_tools > 0 || ide_has_retired_tmp;
 
     if !has_warnings && !missing_clean {
         out.push(Finding {
@@ -1586,6 +1621,12 @@ fn check_antigravity_permissions(
         "Found {total_bloated} bloated one-off wrapped command(s) and {total_malformed} malformed grant(s) across ~/.gemini settings. \
          These cause Antigravity to repeatedly prompt for permission on every tool call."
     );
+    if total_grant_tools > 0 {
+        detail.push_str(&format!(
+            " Also found {total_grant_tools} entry(ies) auto-approving `sandbox_grant`/`network_grant`, \
+             which let the model widen its own sandbox without asking you."
+        ));
+    }
     if ide_has_retired_tmp {
         detail.push_str(" Also found retired --tmp flag in ~/.antigravity/mcp.json.");
     }
@@ -2460,6 +2501,99 @@ mod hook_and_grant_tool_tests {
             confined_daemons: Vec::new(),
             audit_entries: Vec::new(),
         }
+    }
+
+    /// Field case, 0.23.3: `mcp(Ahma/sandbox_grant)` in Antigravity's global
+    /// grants drew a grant-tool warning with no fix, while the Antigravity check
+    /// in the same report called those grants clean (SPEC R-DOCTOR.5).
+    #[test]
+    fn antigravity_fix_removes_auto_approved_grant_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let cli_dir = home.path().join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        let cli_file = cli_dir.join("settings.json");
+        std::fs::write(
+            &cli_file,
+            r#"{"permissions":{"allow":["mcp(Ahma/run_terminal_command)","mcp(Ahma/network_grant)"]}}"#,
+        )
+        .unwrap();
+        let config_dir = home.path().join(".gemini").join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("config.json");
+        std::fs::write(
+            &config_file,
+            r#"{"userSettings":{"globalPermissionGrants":{"allow":["command(xcodebuild)","mcp(Ahma/sandbox_grant)","mcp(Ahma/network_grant)"]}}}"#,
+        )
+        .unwrap();
+
+        let findings = run(&input(home.path(), ws.path()));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.id == FindingId::AntigravityPermissions && f.level == Level::Ok),
+            "grants that auto-approve a grant tool are not clean: {}",
+            render(&findings)
+        );
+        let f = findings
+            .iter()
+            .find(|f| f.id == FindingId::AntigravityPermissions)
+            .unwrap();
+        assert_eq!(f.level, Level::Warn);
+        assert!(f.detail.contains("sandbox_grant"), "{}", f.detail);
+        let Some(fix @ Fix::RepairAntigravityPermissions { .. }) = &f.fix else {
+            panic!("expected the Antigravity repair: {f:?}");
+        };
+        assert!(fix.describe().contains("grant tools"), "{}", fix.describe());
+        let warn = findings
+            .iter()
+            .find(|f| f.id == FindingId::GrantToolsAutoApproved)
+            .unwrap();
+        assert!(
+            warn.detail.contains("Antigravity permission fix"),
+            "{}",
+            warn.detail
+        );
+
+        fix.apply("2026-11-27T12:00:00Z").unwrap();
+        for file in [&cli_file, &config_file] {
+            let text = std::fs::read_to_string(file).unwrap();
+            assert!(!text.contains("sandbox_grant"), "{text}");
+            assert!(!text.contains("network_grant"), "{text}");
+        }
+        let cli = std::fs::read_to_string(&cli_file).unwrap();
+        assert!(cli.contains("mcp(Ahma/run_terminal_command)"), "{cli}");
+        let config = std::fs::read_to_string(&config_file).unwrap();
+        assert!(config.contains("command(xcodebuild)"), "{config}");
+        assert!(config.contains("hooks run-shell"), "{config}");
+
+        let findings = run(&input(home.path(), ws.path()));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.id == FindingId::GrantToolsAutoApproved),
+            "{}",
+            render(&findings)
+        );
+    }
+
+    #[test]
+    fn antigravity_fix_refuses_a_file_it_cannot_parse() {
+        let home = tempfile::tempdir().unwrap();
+        let config_dir = home.path().join(".gemini").join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("config.json");
+        let broken = "{\"userSettings\": {\"globalPermissionGrants\": ";
+        std::fs::write(&config_file, broken).unwrap();
+        let fix = Fix::RepairAntigravityPermissions {
+            cli_settings: None,
+            config_file: Some(config_file.clone()),
+            ide_mcp: None,
+            clean_grants: antigravity_clean_grants(None),
+        };
+        let err = fix.apply("2026-11-27T12:00:00Z").unwrap_err();
+        assert!(err.to_string().contains("config.json"), "{err}");
+        assert_eq!(std::fs::read_to_string(&config_file).unwrap(), broken);
     }
 
     #[test]
