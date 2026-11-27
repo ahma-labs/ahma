@@ -22,6 +22,15 @@ running `.exe` cannot be replaced, the old one is moved aside to `ahma.old` and
 removed the next time the hub starts. The install scripts behave the same way.
 See [docs/hub.md](hub.md#upgrades).
 
+**From an agent.** Inside ahma's sandbox `ahma update` cannot work: it writes a
+folder on your PATH and talks to the hub in `~/.ahma`, and a sandboxed command
+may do neither. So when you ask an agent (`/ahma update`), it calls ahma's
+`ahma_command` tool, and ahma runs `ahma update --only-newer` itself, outside
+the sandbox. That installs the latest published, signature-verified release, and
+only if it is newer than the one installed. The session carries on: no editor
+reload. A branch build, an older release, `--install-dir` or `--force` stays
+yours to run in a terminal (in Claude Code, `! ahma update main`). SPEC R-PROC.7.
+
 Custom install location: `--install-dir ~/.local/bin`. `AHMA_INSTALL_DIR` is retired
 (R-CFG1.2) and ignored by `ahma update` / `ahma uninstall`; only the bootstrap installer
 scripts still read it, because they run before any `ahma` binary exists.

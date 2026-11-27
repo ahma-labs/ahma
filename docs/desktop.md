@@ -33,6 +33,11 @@ On Linux, where the operating system has no web engine of its own (WebKitGTK is 
 servers and many desktops lack), and on a Windows machine without the WebView2 runtime,
 `ahma desktop` says so and runs `ahma web` instead.
 
+**From an agent** (`/ahma desktop`), on macOS: the agent calls ahma's `ahma_command` tool and ahma
+opens the window for the workspace itself, outside the sandbox. Elsewhere, where the fallback to
+`ahma web` would put the pairing code on a clipboard a sandboxed command can read, the agent asks
+you to run it (SPEC R-PROC.7).
+
 ## How it is kept safe
 
 | Layer | What it does |

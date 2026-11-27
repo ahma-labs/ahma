@@ -70,6 +70,7 @@ builtin_tools! {
     TodoWrite => "todo_write",
     LogMonitor => "log_monitor",
     AhmaHelp => "ahma_help",
+    AhmaCommand => "ahma_command",
 }
 
 impl BuiltinTool {
@@ -118,7 +119,8 @@ impl BuiltinTool {
             | BuiltinTool::MultiEdit
             | BuiltinTool::ApplyPatch
             | BuiltinTool::Agent
-            | BuiltinTool::LogMonitor => false,
+            | BuiltinTool::LogMonitor
+            | BuiltinTool::AhmaCommand => false,
         }
     }
 
@@ -161,7 +163,8 @@ impl BuiltinTool {
             | BuiltinTool::FetchWebpage
             | BuiltinTool::Agent
             | BuiltinTool::LogMonitor
-            | BuiltinTool::AhmaHelp => false,
+            | BuiltinTool::AhmaHelp
+            | BuiltinTool::AhmaCommand => false,
         }
     }
 
@@ -193,7 +196,8 @@ impl BuiltinTool {
             | BuiltinTool::ApplyPatch
             | BuiltinTool::Agent
             | BuiltinTool::TodoWrite
-            | BuiltinTool::LogMonitor => false,
+            | BuiltinTool::LogMonitor
+            | BuiltinTool::AhmaCommand => false,
         }
     }
 
@@ -226,7 +230,9 @@ impl BuiltinTool {
             | BuiltinTool::ReplaceInFile
             | BuiltinTool::MultiEdit
             | BuiltinTool::ApplyPatch
-            | BuiltinTool::RunTerminalCommand => true,
+            | BuiltinTool::RunTerminalCommand
+            // Installs a binary, or opens a window or a server (R-PROC.7).
+            | BuiltinTool::AhmaCommand => true,
             BuiltinTool::Await
             | BuiltinTool::Status
             | BuiltinTool::LogsList
@@ -318,6 +324,9 @@ impl BuiltinTool {
             BuiltinTool::FetchWebpage => ToolHints::new(false, false, true, true),
             // Starts an operation that sends log lines to a model.
             BuiltinTool::LogMonitor => ToolHints::new(false, false, false, true),
+            // Runs one of ahma's own commands outside the sandbox: `update`
+            // downloads a release; running one again changes nothing more.
+            BuiltinTool::AhmaCommand => ToolHints::new(false, false, true, true),
             // Runs a whole agent loop: edits, commands, a model.
             BuiltinTool::Agent => ToolHints::new(false, true, false, true),
             BuiltinTool::RunTerminalCommand => ToolHints::new(false, true, false, true),
@@ -350,6 +359,7 @@ impl BuiltinTool {
                 | BuiltinTool::SandboxGrant
                 | BuiltinTool::NetworkGrant
                 | BuiltinTool::FetchWebpage
+                | BuiltinTool::AhmaCommand
         )
     }
 
@@ -384,7 +394,8 @@ impl BuiltinTool {
             BuiltinTool::SandboxGrant
             | BuiltinTool::NetworkGrant
             | BuiltinTool::Restart
-            | BuiltinTool::AhmaHelp => Some("sandbox"),
+            | BuiltinTool::AhmaHelp
+            | BuiltinTool::AhmaCommand => Some("sandbox"),
             BuiltinTool::Agent => Some("agent"),
         }
     }
@@ -406,6 +417,7 @@ mod tests {
             TodoWrite | SandboxGrant | NetworkGrant | LogsApprove => (false, false, true, false),
             FetchWebpage => (false, false, true, true),
             LogMonitor => (false, false, false, true),
+            AhmaCommand => (false, false, true, true),
             Agent => (false, true, false, true),
             RunTerminalCommand => (false, true, false, true),
             Restart => (false, true, false, false),
@@ -479,6 +491,7 @@ mod tests {
             BuiltinTool::SandboxGrant,
             BuiltinTool::NetworkGrant,
             BuiltinTool::FetchWebpage,
+            BuiltinTool::AhmaCommand,
         ] {
             assert!(tool.crosses_sandbox_boundary(), "{}", tool.name());
         }

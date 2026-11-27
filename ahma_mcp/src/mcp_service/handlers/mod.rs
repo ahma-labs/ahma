@@ -1,4 +1,5 @@
 pub mod agent_tool;
+pub mod ahma_command_tool;
 pub mod await_tool;
 pub mod cancel_tool;
 pub mod common;

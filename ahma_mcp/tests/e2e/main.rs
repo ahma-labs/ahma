@@ -19,6 +19,7 @@
 //! alphabetical order; never as a new top-level `tests/*.rs` file
 //! (scripts/check-guardrails.sh rejects those).
 
+mod ahma_command_tool_test;
 mod automatic_async_integration_test;
 mod cli_binary_integration_test;
 mod cli_extended_integration_test;

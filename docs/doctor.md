@@ -43,6 +43,10 @@ Example report:
 [ok] Settings file reads cleanly
 ```
 
+**From an agent** (`/ahma doctor`): a sandboxed command cannot read `~/.ahma`, so the agent calls
+ahma's `ahma_command` tool and ahma runs `ahma doctor` itself, outside the sandbox, and hands the
+agent the report. Only the report: `--fix` stays yours (SPEC R-PROC.7).
+
 ## What it checks
 
 | Check | Level | Fix offered |

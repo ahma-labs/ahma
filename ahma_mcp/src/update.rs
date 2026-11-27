@@ -205,6 +205,7 @@ mod tests {
             dry_run: true,
             insecure_skip_verify: false,
             prefer_musl: false,
+            only_newer: false,
         }
     }
 
@@ -217,6 +218,7 @@ mod tests {
             dry_run: false,
             insecure_skip_verify: false,
             prefer_musl: false,
+            only_newer: false,
         }
     }
 
@@ -294,6 +296,7 @@ mod tests {
             dry_run: true,
             insecure_skip_verify: false,
             prefer_musl: false,
+            only_newer: false,
         };
         let cfg = crate::shell::cli::AppConfig::default();
         let result = run(args, &cfg).await;
@@ -315,6 +318,7 @@ mod tests {
             dry_run: true,
             insecure_skip_verify: false,
             prefer_musl: true,
+            only_newer: false,
         };
         let cfg = crate::shell::cli::AppConfig::default();
         let result = run(args, &cfg).await;
@@ -339,6 +343,7 @@ mod tests {
             dry_run: true,
             insecure_skip_verify: false,
             prefer_musl: false,
+            only_newer: false,
         };
         let cfg = crate::shell::cli::AppConfig::default();
         let result = run(args, &cfg).await;

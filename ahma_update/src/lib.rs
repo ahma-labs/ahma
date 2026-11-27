@@ -102,6 +102,52 @@ pub struct UpdateArgs {
     /// Replaces the retired `AHMA_PREFER_MUSL` environment variable (R-CFG1.2).
     #[arg(long)]
     pub prefer_musl: bool,
+
+    /// Install the latest published release only if it is strictly newer than the installed one; never a branch, an older release, another directory or an unverified binary. This is the update an agent asks for through ahma's `ahma_command` tool (SPEC R-PROC.7).
+    #[arg(
+        long,
+        conflicts_with_all = ["reference", "install_dir", "force", "insecure_skip_verify"]
+    )]
+    pub only_newer: bool,
+}
+
+/// What `ahma update --only-newer` does, given the installed and the latest
+/// release's versions (SPEC R-PROC.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnlyNewer {
+    /// The latest release is strictly newer: install it.
+    Install,
+    /// The installed version is the latest release.
+    AlreadyCurrent,
+    /// Anything else, with the sentence that says why and who can.
+    Refuse(String),
+}
+
+/// Decide `--only-newer` from the installed version (`None` when nothing is
+/// installed there) and the latest release's. Anything that cannot be
+/// compared is refused rather than guessed: the agent's update may only move
+/// forward.
+pub fn only_newer(installed: Option<&str>, latest: &str) -> OnlyNewer {
+    use ahma_common::exe_identity::parse_semver;
+    let Some(installed) = installed else {
+        return OnlyNewer::Refuse(
+            "no ahma is installed in the install directory, so there is nothing to update; \
+             a human runs `ahma update` to install one"
+                .to_string(),
+        );
+    };
+    match (parse_semver(installed), parse_semver(latest)) {
+        (Some(have), Some(want)) if want > have => OnlyNewer::Install,
+        (Some(have), Some(want)) if want == have => OnlyNewer::AlreadyCurrent,
+        (Some(_), Some(_)) => OnlyNewer::Refuse(format!(
+            "the installed ahma {installed} is newer than the latest release {latest}; \
+             only a human installs an older one (`ahma update {latest}`)"
+        )),
+        _ => OnlyNewer::Refuse(format!(
+            "cannot compare the installed version {installed:?} with the latest release \
+             {latest:?}; a human runs `ahma update`"
+        )),
+    }
 }
 
 impl UpdateArgs {
@@ -232,6 +278,25 @@ pub async fn run_release_update(
     };
 
     let target = install_dir.join(platform.binary_name());
+    if args.only_newer {
+        let installed = read_installed_version(&target).await;
+        match only_newer(installed.as_deref(), &asset.version) {
+            OnlyNewer::Install => {}
+            OnlyNewer::AlreadyCurrent => {
+                println!(
+                    "Ahma {} is already the latest release, at {}.",
+                    asset.version,
+                    target.display()
+                );
+                return Ok(UpdateOutcome {
+                    binary_path: target,
+                    binary_changed: false,
+                    attestation: verification.into(),
+                });
+            }
+            OnlyNewer::Refuse(why) => anyhow::bail!("ahma update --only-newer: {why}"),
+        }
+    }
     if !args.force
         && let Some(installed) = read_installed_version(&target).await
     {
@@ -436,7 +501,13 @@ fn print_path_hint(install_dir: &std::path::Path) {
 
 fn print_restart_hint() {
     println!();
-    println!("Restart MCP clients or reload your IDE window to pick up the new binary.");
+    // The hub hands over to the new build and each session's frontend
+    // rebuilds its session on it (SPEC R-HUB.5): nothing needs a restart,
+    // unless the MCP configuration itself changed.
+    println!(
+        "Open MCP sessions move to the new build on their own. Restart an editor only if \
+         its MCP configuration was changed."
+    );
 }
 
 #[cfg(test)]
@@ -993,6 +1064,7 @@ mod tests {
                 dry_run: true,
                 insecure_skip_verify: true,
                 prefer_musl: false,
+                only_newer: false,
             };
             let outcome =
                 run_release_update(&args, &platform, temp_dir.path(), &Release::Latest).await;
@@ -1034,6 +1106,7 @@ mod tests {
                 dry_run: true,
                 insecure_skip_verify: true,
                 prefer_musl: false,
+                only_newer: false,
             };
             let mode = Release::Tagged {
                 tag: "v0.1.0".to_string(),
@@ -1053,6 +1126,62 @@ mod tests {
                     "unexpected non-network error in tagged-release path: {msg}"
                 );
             }
+        }
+    }
+
+    /// SPEC R-PROC.7: an agent's `ahma_command update` runs `ahma update
+    /// --only-newer`, which installs the latest release only when it is
+    /// strictly newer than the installed one. A plain `ahma update` compares
+    /// for equality only, so on a newer dev build it would install an older
+    /// release.
+    #[test]
+    fn only_newer_installs_a_strictly_newer_release_and_nothing_else() {
+        assert_eq!(only_newer(Some("0.23.2"), "0.23.3"), OnlyNewer::Install);
+        assert_eq!(only_newer(Some("0.23.2"), "0.24.0"), OnlyNewer::Install);
+        assert_eq!(
+            only_newer(Some("0.23.2"), "0.23.2"),
+            OnlyNewer::AlreadyCurrent
+        );
+        for (installed, latest) in [
+            (Some("0.23.3"), "0.23.2"),
+            (None, "0.23.3"),
+            (Some("garbage"), "0.23.3"),
+            (Some("0.23.2"), "not-a-version"),
+        ] {
+            assert!(
+                matches!(only_newer(installed, latest), OnlyNewer::Refuse(_)),
+                "{installed:?} -> {latest}"
+            );
+        }
+    }
+
+    /// `--only-newer` is the agent's update. Each option that installs
+    /// unsigned code, installs somewhere else, or reinstalls is the human's,
+    /// so clap refuses it alongside.
+    #[test]
+    fn only_newer_refuses_every_option_that_widens_it() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: UpdateArgs,
+        }
+        assert!(
+            Cli::try_parse_from(["ahma", "--only-newer"])
+                .unwrap()
+                .args
+                .only_newer
+        );
+        for extra in [
+            &["main"][..],
+            &["0.20.0"][..],
+            &["--install-dir", "/tmp/x"][..],
+            &["--force"][..],
+            &["--insecure-skip-verify"][..],
+        ] {
+            let mut argv = vec!["ahma", "--only-newer"];
+            argv.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
         }
     }
 }
