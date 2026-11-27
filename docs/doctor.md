@@ -63,13 +63,13 @@ agent the report. Only the report: `--fix` stays yours (SPEC R-PROC.7).
 | A write grant a dialog's yes saved on a folder whose contents **run later** as you, outside the sandbox — a folder on your `PATH` such as `~/.local/bin`, a git hooks folder, a shell start-up file (SPEC R-HANDOFF.1, R-PERM.10.3) | warn | revoke it (keep it instead with the `ahma sandbox grant … --workspace …` the finding names) |
 | Grants into other repositories that you made yourself | info | none — a deliberate setup is listed, never questioned |
 | Hub running a different build than this binary | warn | none — quit ahma sessions and the next one starts the new build |
-| A harness allow-list auto-approves `sandbox_grant` or `network_grant` | warn | none |
+| A harness allow-list auto-approves `sandbox_grant` or `network_grant` | warn | Antigravity's (`~/.gemini`): the Antigravity fix removes them. Claude Code, Cursor and Codex: none — remove the entries it names |
 | A client's shell is hooked but its native edits are not guarded | warn | none — `ahma hooks install` (SPEC R5.5.6) |
 | Which clients' hooks apply ahma's sandbox | info | none |
 | An old `target/sccache` cache | info | none — the `rm -rf` it names |
 | Whether this folder is trusted, and what is always allowed here | info | none — `/settings trust` |
 | Log size, and the most repeated warnings in the newest log | info / warn | none |
-| Antigravity permission grants (`~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/config.json`) | warn / info | prune bloated one-off/malformed entries and install clean prefix token grants |
+| Antigravity permission grants (`~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/config.json`) | warn / info | prune bloated one-off/malformed entries, remove auto-approved `sandbox_grant`/`network_grant`, and install clean prefix token grants; a file that does not parse is left as it is |
 | Git authentication from inside the sandbox: a key the [SSH key broker](ssh-agent-broker.md) signs with, or an agent holding any other key; HTTPS credential helper not blocked by a sandbox setting | warn / info | none — the finding names the exact `ssh-add` or `ssh-keygen` command, or settings key |
 | A build helper (sccache, a Gradle or Kotlin daemon) left running inside a sandbox, by shape: confined, orphaned, your own executable; or a host service a profile declares (adb's server), wherever it is installed ([security-sandbox.md](security-sandbox.md#host-services-adbs-server-finds-no-phone), SPEC R-PROC.6). New ones no longer arise: a sandboxed command's processes end with it ([security-sandbox.md](security-sandbox.md#helpers-left-running-inside-a-sandbox-sccache-gradle-and-kotlin-daemons), SPEC R-PROC.5) | warn | sccache: restart it (`--stop-server` / `--start-server`); a host service: restart it with its profile's commands (`adb kill-server` / `adb start-server`); Gradle/Kotlin: stop it. Refused if the doctor is itself sandboxed |
 | How grant prompts are being answered: median time-to-decision, share under three seconds, advisor followed | info / warn | none — a habit, not a file |
