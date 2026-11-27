@@ -14,7 +14,7 @@ set -euo pipefail
 
 # Skill version — keep in sync with [workspace.package] version in Cargo.toml.
 # CI guardrails verify this matches. Bump via: cargo xtask bump-version X.Y.Z
-AHMA_VERSION="0.23.3"
+AHMA_VERSION="0.23.4"
 
 # Parse CLI arguments
 VERIFY_ONLY=0
