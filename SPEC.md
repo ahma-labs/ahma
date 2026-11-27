@@ -2072,6 +2072,17 @@ lifetime.
     worker and no request unanswered — on two consecutive looks, since a tool call answered a
     moment ago may not have reported its operation yet. Open sessions and subscribers are not
     work: their clients reconnect to the successor when the socket goes.
+  - **The frontend re-initializes a session the hub no longer knows, roots included.** The
+    successor never issued the old session id and answers it 404; a session that has lost the
+    client's roots answers `tools/call` 409 / `-32001` although the client gave them. Either
+    way the hub ran nothing. On the **first** such answer the frontend rebuilds the session
+    from its cached handshake (`initialize`, `notifications/initialized`, and the cached roots,
+    announced with `roots/list_changed` to a deferred-roots session, R-HUB.4.3), resends the
+    refused request once, and discloses `reconnected` with cause `session_gone`. The client
+    sees no error. A refusal of the resend is relayed, never rebuilt again. The MCP
+    transport's own re-initialization is **off**: it repeats `initialize` without the roots,
+    and the session it made answered every tool call "sandbox initializing" until three had
+    failed (field case 2026-11-27, the first update to 0.23.2).
   - At `[hub] drain_timeout_secs` (3600; `0` waits for as long as the work takes) it ends what
     is left: every session is terminated, which answers each request still in flight with an
     error, and the operations it interrupts are replayed `interrupted` (R-HUB.7). The timeout
