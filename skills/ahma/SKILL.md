@@ -339,8 +339,9 @@ ahma tls init && ahma tls status        # ahma tls rotate replaces certificate
 | `/ahma simplify top N` | — | Auto-fix top N complexity issues concurrently |
 | `/ahma simplify N` | — | Get fix instructions for issue #N only (manual mode) |
 | `/ahma tui` | — | Start the terminal user interface (TUI) control plane |
-| `/ahma web`, `/ahma desktop` | — | Open ahma in the browser or in a window of its own *(experimental)*. `web`: loopback only, returns to the prompt, the pairing code is copied to the clipboard (or typed with `--no-copy`), stops a minute after the last tab; [docs/web.md](https://github.com/ahma-labs/ahma/blob/main/docs/web.md). `desktop`: macOS and Windows, no pairing, closing the window stops it; [docs/desktop.md](https://github.com/ahma-labs/ahma/blob/main/docs/desktop.md) |
-| `/ahma update` | — | Update ahma to the latest version |
+| `/ahma web`, `/ahma desktop` | — | Open ahma in the browser or in a window of its own *(experimental)*: call `ahma_command` with `{"command": "web"}` or `"desktop"` (macOS; elsewhere ask the user to run it). `web`: loopback only, returns to the prompt, the pairing code is copied to the clipboard (or typed with `--no-copy`), stops a minute after the last tab; [docs/web.md](https://github.com/ahma-labs/ahma/blob/main/docs/web.md). `desktop`: macOS and Windows, no pairing, closing the window stops it; [docs/desktop.md](https://github.com/ahma-labs/ahma/blob/main/docs/desktop.md) |
+| `/ahma update` | — | Update ahma to the latest signed release (`ahma_command`, below) |
+| `/ahma doctor` | — | ahma's health report: `ahma_command` with `{"command": "doctor"}`; `--fix` is the user's |
 | `/ahma uninstall` | — | Remove integrations installed by `ahma setup` (MCP entries, hooks, skills, binary) |
 
 `/ahma help` / `/ahma ?` just reprints this table plus the key config flags (`--tools`, `--sandbox`, `--log-monitor`).
@@ -375,13 +376,14 @@ Inside that chat, `/skills` lists Agent Skills from the standard locations and `
 /ahma update <branch-name>    # build and install from a named feature branch
 ```
 
-**Workflow — always prefer the built-in subcommand**, which handles platform detection,
-version comparison, `RUSTFLAGS`, and PATH hints automatically:
+A sandboxed command cannot install ahma (the install directory is on PATH, and the hub
+lives in `~/.ahma`), so never `run_terminal_command("ahma update")`. Instead:
 
-1. `run_terminal_command("ahma update")` (or `ahma update <branch-name>` — branch installs
-   compile from source and take several minutes; watch for `Installed /path/to/ahma`)
-2. `run_terminal_command("ahma --version")` — confirm it reports the expected version
-3. Ask the user to reload the IDE (MCP clients cache the binary path)
+1. Plain `/ahma update`: call `ahma_command` with `{"command": "update"}`. ahma runs
+   `ahma update --only-newer` outside the sandbox: the latest signed release, only if newer.
+   No reload: the session reconnects by itself; `status` shows the new version.
+2. A tag, `main` or a branch: ask the user to type `! ahma update <ref>` (branch builds
+   compile from source, older releases are a downgrade; both are the user's call).
 
 Manual `cargo install` fallback (only if `ahma update` is absent or broken), the
 `RUSTFLAGS='--cfg reqwest_unstable'` requirement, and anti-patterns (never target the retired

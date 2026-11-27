@@ -523,6 +523,10 @@ impl AhmaMcpService {
                 "Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.",
                 handlers::log_tools::logs_search_schema(),
             ),
+            BuiltinTool::AhmaCommand => (
+                "Run one of ahma's own commands outside the sandbox, where it can work: `update` installs the latest signed ahma release if it is newer than the installed one (the session carries on), `web` or `desktop` opens ahma's browser page or window for this workspace (macOS), `doctor` reports on ahma's health. Use it when the user asks for one (`/ahma update`, `/ahma web`, `/ahma desktop`, `/ahma doctor`). Nothing else can be run through it: branch builds, older releases, `uninstall`, settings and grants are the human's, in their own terminal.",
+                handlers::ahma_command_tool::ahma_command_schema(),
+            ),
             BuiltinTool::Restart => (
                 "Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.",
                 handlers::restart_tool::restart_schema(),
@@ -1900,6 +1904,10 @@ impl AhmaMcpService {
             }
             BuiltinTool::Restart => {
                 self.handle_restart(run_params.arguments.unwrap_or_default())
+                    .await
+            }
+            BuiltinTool::AhmaCommand => {
+                self.handle_ahma_command(run_params.arguments.unwrap_or_default(), context)
                     .await
             }
             BuiltinTool::ReadFile => {

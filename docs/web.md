@@ -49,6 +49,13 @@ To use it from another machine, forward the port over SSH
 (`ssh -L 8765:127.0.0.1:8765 host`), run `ahma web --port 8765 --no-open --foreground` there,
 and open `http://127.0.0.1:8765/` locally. There is no option to listen on another address.
 
+**From an agent** (`/ahma web`), on macOS: the agent calls ahma's `ahma_command` tool and ahma
+runs `ahma web` for the workspace itself, outside the sandbox, which cannot reach the hub. The
+agent is told only that the page opened and the code is on your clipboard, never the address or
+the code, and macOS's sandbox keeps every command from the clipboard. On Linux and Windows a
+sandboxed command could read the clipboard, so an agent asks you to run `ahma web` instead
+(SPEC R-PROC.7).
+
 ## What you see
 
 - **Header**: connection, sync or async mode, sandbox state.

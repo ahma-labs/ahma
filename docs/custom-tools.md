@@ -16,7 +16,7 @@ If your main goal is to use ahma with existing tools such as cargo, git, Python,
 - **The names ahma answers itself are reserved.** (`run_terminal_command`, `await`,
   `status`, `cancel`, `restart`, `sandbox_grant`, `network_grant`, the four
   `logs_*`, the file tools, `fetch_webpage`, `agent`, `todo_write`,
-  `log_monitor`, `ahma_help`). A config that takes one is refused at
+  `log_monitor`, `ahma_help`, `ahma_command`). A config that takes one is refused at
   load with a message naming the conflict ([the full list](#where-tools-come-from)).
 - **Say whether a tool writes.** A tool (or subcommand) that only reads can declare `"concurrency": "read_only"` and then runs at once even while a build holds the workspace — under a sandbox that cannot write the workspace, so a wrong declaration fails rather than writes. `"service"` marks a long-lived process that must not hold the workspace write queue for its whole life; the default is `"exclusive"`. A declaration on the tool applies to every subcommand that does not declare its own. See [workspace-queue.md](workspace-queue.md).
 - **Say whether a tool changes anything.** `"mutates": false` on a tool or a subcommand says it changes nothing (the default is `true`, so an undeclared tool is assumed to). ahma's own agent loop then runs it without asking for approval, and `tools/list` marks it read-only (`readOnlyHint`) so a client such as Claude Code may skip its prompt too. A declared `"concurrency": "read_only"` earns the same hint only where the kernel enforces that lane (Linux and macOS); on Windows it does not. Declare `mutates: false` only for a tool that writes nothing and sends nothing anywhere you would not want unasked (SPEC R1.5.6).
@@ -28,7 +28,7 @@ If your main goal is to use ahma with existing tools such as cargo, git, Python,
 
 ahma offers tools from three places, loaded once at startup:
 
-1. **Built-in tools**, always present. Their 24 names are reserved:
+1. **Built-in tools**, always present. Their 25 names are reserved:
 
    | Tools | What |
    |---|---|
@@ -37,6 +37,7 @@ ahma offers tools from three places, loaded once at startup:
    | `logs_list`, `logs_read`, `logs_search`, `logs_approve`, `log_monitor` | Project logs and live monitoring |
    | `read_file`, `write_file`, `replace_in_file`, `multi_edit`, `apply_patch`, `list_dir`, `file_search`, `grep_search`, `todo_write` | File tools; withheld from clients with their own ([file-tools.md](file-tools.md)) |
    | `fetch_webpage`, `agent`, `ahma_help` | A web page under `[web]` policy, a sub-agent, sandbox guidance |
+   | `ahma_command` | Run ahma's own `update`, `web`, `desktop` or `doctor` outside the sandbox ([installation.md](installation.md#update-recommended)) |
 
    The list is generated from one place, `BuiltinTool::ALL` in `ahma_mcp/src/builtin_tool.rs`.
 2. **Bundles**, compiled in and offered only with `--tools` (repeat or comma-separate, e.g.
