@@ -1884,8 +1884,12 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let mut trial = None;
     let mut link_this_run = None;
     if let Some(token) = approval
-        && let Some(approval) =
-            harness_ask::apply_approval(&token, Path::new(&payload.cwd), &payload.command)
+        && let Some(approval) = harness_ask::apply_approval(
+            &token,
+            Path::new(&payload.cwd),
+            &payload.command,
+            cfg.settings_origin.user_settings_file().as_deref(),
+        )
     {
         eprintln!("{}", approval.line);
         trial = approval.trial;
@@ -2773,19 +2777,19 @@ fn next_prior_step(
     ) {
         return Some(ask((harness_ask::ssh_ask_reason(&refusal), token)));
     }
-    // A link the link broker refused, before this command or one opening the
-    // same site runs again (SPEC R-LINK.6).
-    if let Some((refusal, token)) = harness_ask::next_link_ask(
+    // A link this command will open, before its first run, or one the link
+    // broker refused, before this command or one opening the same site runs
+    // again (SPEC R-LINK.6).
+    if let Some(link) = harness_ask::next_link_ask(
         cwd,
         session_id,
         command,
         cfg.settings_origin.user_settings_file().as_deref(),
+        crate::links::host::egress_rules(cfg).as_ref(),
     ) {
         let workspace = harness_ask::workspace_for(cwd);
-        return Some(ask((
-            harness_ask::link_ask_reason(&refusal, &workspace),
-            token,
-        )));
+        let reason = harness_ask::link_ask_reason(&link, &workspace);
+        return Some(ask((reason, link.token)));
     }
     // This exact command was refused what nothing allows: offer one
     // run outside the sandbox (SPEC R-ESCAPE).

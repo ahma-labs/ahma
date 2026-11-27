@@ -120,7 +120,6 @@ fn a_whole_line_open_runs_as_the_helper() {
 /// the one-use token a yes spends.
 #[test]
 fn a_rerun_after_a_refusal_is_asked() {
-    use std::io::Write as _;
     let bin = ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma");
     let home = tempfile::tempdir().unwrap();
     let (_ws, ws) = workspace();
@@ -131,11 +130,37 @@ fn a_rerun_after_a_refusal_is_asked() {
     assert!(!refused.status.success(), "no grant yet: {said}");
     assert!(said.contains("re-run this command and ahma asks"), "{said}");
 
-    let mut child = Command::new(&bin)
+    let decision = pre_tool_use(&bin, home.path(), &ws, open);
+    let hook = &decision["hookSpecificOutput"];
+    assert_eq!(hook["permissionDecision"], "ask", "{decision}");
+    let reason = hook["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.contains("when this command last ran"), "{reason}");
+    assert!(reason.contains("Site: example.com"), "{reason}");
+    // In a repo, yes saves this site for it (R-LINK.6); the wider lasting
+    // answers follow, each naming its binding.
+    let this_repo = reason
+        .find("Yes — always for example.com — this repo only")
+        .unwrap_or_else(|| panic!("{reason}"));
+    let all_repos = reason
+        .find("`ahma permissions grant open-url example.com --all-repos`")
+        .unwrap_or_else(|| panic!("{reason}"));
+    assert!(this_repo < all_repos, "{reason}");
+    let rewritten = hook["updatedInput"]["command"].as_str().unwrap_or_default();
+    assert!(rewritten.contains("--approve-grant"), "{rewritten}");
+}
+
+/// What `ahma hooks exec --platform claude` answers for a Bash call running
+/// `command` in `ws`: the hook's JSON decision.
+fn pre_tool_use(bin: &Path, home: &Path, ws: &Path, command: &str) -> serde_json::Value {
+    use std::io::Write as _;
+    let mut child = Command::new(bin)
         .args(["hooks", "exec", "--platform", "claude", "--scope", "user"])
         .env("AHMA_HOOKS", "on")
-        .env("AHMA_TEST_HOME", home.path())
-        .current_dir(&ws)
+        .env("AHMA_TEST_HOME", home)
+        .env_remove("GH_HOST")
+        .current_dir(ws)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -145,7 +170,7 @@ fn a_rerun_after_a_refusal_is_asked() {
         "session_id": "e2e-session",
         "cwd": ws,
         "tool_name": "Bash",
-        "tool_input": {"command": open},
+        "tool_input": {"command": command},
     });
     child
         .stdin
@@ -157,25 +182,42 @@ fn a_rerun_after_a_refusal_is_asked() {
         .wait_with_output()
         .expect("wait for `ahma hooks exec`");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let decision: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("a JSON decision, got {stdout:?}: {e}"));
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("a JSON decision, got {stdout:?}: {e}"))
+}
+
+/// SPEC R-LINK.6: a command whose text says it will open a link to a site
+/// no grant allows (`gh … --web`) is asked about in Claude Code's dialog
+/// before its first run, with no refused run first; a yes there saves the
+/// site for this repo.
+#[test]
+fn a_first_web_link_command_is_asked_before_it_runs() {
+    let bin = ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma");
+    let home = tempfile::tempdir().unwrap();
+    let (_ws, ws) = workspace();
+    let decision = pre_tool_use(&bin, home.path(), &ws, "gh pr view 12 --web");
     let hook = &decision["hookSpecificOutput"];
-    assert_eq!(hook["permissionDecision"], "ask", "{stdout}");
+    assert_eq!(hook["permissionDecision"], "ask", "{decision}");
     let reason = hook["permissionDecisionReason"]
         .as_str()
         .unwrap_or_default();
-    assert!(reason.contains("Site: example.com"), "{reason}");
-    assert!(reason.contains("Yes — this time"), "{reason}");
-    // Each lasting answer names its binding, this repo first.
-    let this_repo = reason
-        .find("Always for example.com — this repo only (the usual lasting answer)")
-        .unwrap_or_else(|| panic!("{reason}"));
-    let all_repos = reason
-        .find("`ahma permissions grant open-url example.com --all-repos`")
-        .unwrap_or_else(|| panic!("{reason}"));
-    assert!(this_repo < all_repos, "{reason}");
+    assert!(
+        reason.contains("this command opens a github.com link"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("Yes — always for github.com — this repo only"),
+        "{reason}"
+    );
     let rewritten = hook["updatedInput"]["command"].as_str().unwrap_or_default();
     assert!(rewritten.contains("--approve-grant"), "{rewritten}");
+
+    // A command that opens nothing is not held.
+    let plain = pre_tool_use(&bin, home.path(), &ws, "gh pr view 12");
+    assert_ne!(
+        plain["hookSpecificOutput"]["permissionDecision"], "ask",
+        "{plain}"
+    );
 }
 
 /// `cargo doc --open` runs `$BROWSER <file>`: a file is never opened and
