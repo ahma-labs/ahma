@@ -535,11 +535,11 @@ pub enum Surface {
     /// leaves deny and this session: what both this and [`Self::TuiForHarness`]
     /// offer (`ahma_tui::harness_asks::HarnessLinkAsk::unsaved_choices`).
     Browser,
-    /// Claude Code's own dialog, before a hooked command whose link was
-    /// refused runs again. Its contract is yes or no: no is deny, yes is
-    /// "this time" (the approved run may open the site's links), and the
-    /// lasting answers are named as the grants a human runs
-    /// ([`harness_dialog_answers`]).
+    /// Claude Code's own dialog, before a hooked command that will open a
+    /// link to the site, or whose link was refused, runs. Its contract is yes
+    /// or no: no is deny; yes is this site in this repo, saved — "this time"
+    /// outside a git repository — and the wider lasting answers are named as
+    /// the grants a human runs ([`harness_dialog_answers`]).
     HarnessDialog,
 }
 
@@ -779,12 +779,27 @@ pub fn grant_command(choice: LinkChoice, host: &str, workspace: &Path) -> Option
     Some(line)
 }
 
+/// The `ahma permissions revoke open-url` line that undoes a grant of `host`
+/// for the repo `workspace` (SPEC R-LINK.11).
+pub fn revoke_command(host: &str, workspace: &Path) -> String {
+    format!(
+        "ahma permissions revoke open-url {host} --workspace {}",
+        sh_single_quote(&workspace.to_string_lossy())
+    )
+}
+
 /// Every answer to `question` in Claude Code's dialog ([`Surface::HarnessDialog`]),
 /// one line each, in the order [`LinkQuestion::choices`] gives (SPEC R-LINK.6):
-/// how the human gives it there. Its yes/no answers deny and this time; a
-/// lasting one is the grant a human runs, then re-runs the command.
-/// `workspace` is the repo the question was asked from.
-pub fn harness_dialog_answers(question: &LinkQuestion, workspace: &Path) -> Vec<String> {
+/// how the human gives it there. No is deny. Yes is the usual lasting answer,
+/// this site in this repo, saved — when `yes_saves`, that is, when the
+/// question was asked from a git repository (R-LINK.11) — and otherwise this
+/// time. Each wider lasting answer is the grant a human runs, then re-runs
+/// the command. `workspace` is the repo the question was asked from.
+pub fn harness_dialog_answers(
+    question: &LinkQuestion,
+    workspace: &Path,
+    yes_saves: bool,
+) -> Vec<String> {
     let host = &question.host;
     question
         .choices(Surface::HarnessDialog)
@@ -797,9 +812,15 @@ pub fn harness_dialog_answers(question: &LinkQuestion, workspace: &Path) -> Vec<
                     "No — {label}: ahma does not ask about {host} again in this Claude Code \
                      session."
                 ),
+                LinkChoice::Once if yes_saves => return None,
                 LinkChoice::Once => format!(
                     "Yes — {label}: this run of the command may open {host} links; nothing is \
                      remembered."
+                ),
+                LinkChoice::AlwaysSiteThisRepo if yes_saves => format!(
+                    "Yes — always for {host} — this repo only: saved to your ahma settings, so \
+                     commands in this repo open {host} links without asking. Undo: `{}`.",
+                    revoke_command(host, workspace)
                 ),
                 // The dialog keeps nothing for the session (its yes is "this time").
                 LinkChoice::Session => return None,
@@ -924,8 +945,13 @@ fn one_literal_word(arg: &str) -> Option<&str> {
 /// command that opens it again, and never before an unrelated one (SPEC
 /// R-LINK.6).
 pub fn link_open_host(command: &str) -> Option<String> {
+    link_open_target(command).map(|t| t.host().to_string())
+}
+
+/// The link [`link_open_host`] reads, whole.
+fn link_open_target(command: &str) -> Option<LinkTarget> {
     if let Some(target) = exact_open_command(command) {
-        return Some(target.host().to_string());
+        return Some(target);
     }
     let (program, rest) = command.trim().split_once([' ', '\t'])?;
     let arg = match program {
@@ -936,9 +962,111 @@ pub fn link_open_host(command: &str) -> Option<String> {
         }
         _ => return None,
     };
-    LinkTarget::parse(one_literal_word(arg)?)
-        .ok()
-        .map(|t| t.host().to_string())
+    LinkTarget::parse(one_literal_word(arg)?).ok()
+}
+
+/// A link a command line will open, known from its text before it runs, so
+/// the harness dialog can ask first instead of after a refusal (SPEC
+/// R-LINK.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredictedLink {
+    /// The link, or for a command that builds its own address (`gh … --web`)
+    /// the root of the site it opens.
+    pub target: LinkTarget,
+    /// The address is the one the command opens, not only its site.
+    pub exact: bool,
+}
+
+/// The link `command` will open (SPEC R-LINK.6): [`link_open_host`]'s
+/// whole-line open of one literal link, or a `gh` command that opens the
+/// browser (`--web`, a `-w` that means it, `gh browse`), whose site is the host `-R HOST/OWNER/REPO`
+/// or a `GH_HOST=` assignment names, else `gh_host` (the hook's own
+/// `GH_HOST`), else `github.com`. A heuristic over the text: a link it
+/// misses is refused and asked about when the command runs again, as
+/// before; a wrong guess is one question more.
+pub fn predicted_link(command: &str, gh_host: Option<&str>) -> Option<PredictedLink> {
+    if let Some(target) = link_open_target(command) {
+        return Some(PredictedLink {
+            target,
+            exact: true,
+        });
+    }
+    let host = ahma_common::shell_words::segment_texts(command)
+        .iter()
+        .find_map(|segment| gh_web_host(segment, gh_host))?;
+    let target = LinkTarget::parse(&format!("https://{host}/")).ok()?;
+    Some(PredictedLink {
+        target,
+        exact: false,
+    })
+}
+
+/// `gh` subcommands whose `-w` is `--web`. Elsewhere `-w` means something
+/// else (`gh run list -w` is `--workflow`), so only `--web` counts there.
+const GH_SHORT_WEB: &[(&str, &str)] = &[
+    ("pr", "view"),
+    ("pr", "list"),
+    ("pr", "create"),
+    ("issue", "view"),
+    ("issue", "list"),
+    ("issue", "create"),
+    ("repo", "view"),
+    ("release", "view"),
+    ("run", "view"),
+    ("workflow", "view"),
+    ("gist", "view"),
+    ("gist", "create"),
+    ("project", "view"),
+    ("search", "repos"),
+    ("search", "issues"),
+    ("search", "prs"),
+    ("search", "code"),
+    ("search", "commits"),
+];
+
+/// The site a `gh` segment opens in the browser, or `None` when it is not
+/// `gh` or opens nothing: `--web`, a [`GH_SHORT_WEB`] `-w`, or `gh browse`
+/// without `-n`/`--no-browser`.
+fn gh_web_host(segment: &[String], gh_host: Option<&str>) -> Option<String> {
+    let at = ahma_common::shell_words::program_index(segment)?;
+    if Path::new(&segment[at]).file_name() != Some(std::ffi::OsStr::new("gh")) {
+        return None;
+    }
+    let args = &segment[at + 1..];
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let mut positional = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(String::as_str);
+    let opens = match (positional.next(), positional.next()) {
+        (Some("browse"), _) => !has("-n") && !has("--no-browser"),
+        (Some(group), Some(sub)) => {
+            has("--web") || (has("-w") && GH_SHORT_WEB.contains(&(group, sub)))
+        }
+        _ => false,
+    };
+    if !opens {
+        return None;
+    }
+    let repo = args
+        .windows(2)
+        .find_map(|w| matches!(w[0].as_str(), "-R" | "--repo").then_some(w[1].as_str()))
+        .or_else(|| args.iter().find_map(|a| a.strip_prefix("--repo=")));
+    let repo_host = repo.and_then(|r| match r.split('/').collect::<Vec<_>>()[..] {
+        [host, _, _] => Some(host),
+        _ => None,
+    });
+    let assigned = segment[..at]
+        .iter()
+        .find_map(|w| w.strip_prefix("GH_HOST="));
+    Some(
+        repo_host
+            .or(assigned)
+            .or(gh_host)
+            .filter(|h| !h.is_empty())
+            .unwrap_or("github.com")
+            .to_string(),
+    )
 }
 
 /// `s` as one POSIX shell word, for the helper command an exact `open`
@@ -1211,7 +1339,28 @@ mod tests {
         ) else {
             panic!()
         };
-        let answers = harness_dialog_answers(&q, ws);
+        // In a repo, yes is the usual lasting answer, saved: this site, this
+        // repo (R-LINK.6); the wider lasting answers stay grants a human runs.
+        let saved = harness_dialog_answers(&q, ws, true);
+        assert_eq!(saved.len(), 5, "{saved:#?}");
+        assert!(saved[0].starts_with("No — deny"), "{}", saved[0]);
+        assert!(
+            saved[1].starts_with("Yes — always for github.com — this repo only:")
+                && saved[1].contains("saved")
+                && saved[1].contains(
+                    "`ahma permissions revoke open-url github.com --workspace '/w/my repo'`"
+                ),
+            "{}",
+            saved[1]
+        );
+        assert!(
+            saved[2].starts_with("Always for github.com — all repos:"),
+            "{}",
+            saved[2]
+        );
+        assert!(!saved.iter().any(|a| a.contains("this time")), "{saved:#?}");
+        // Outside a repo nothing names one to save for: yes is this time.
+        let answers = harness_dialog_answers(&q, ws, false);
         assert_eq!(answers.len(), 6, "{answers:#?}");
         assert!(answers[0].starts_with("No — deny"), "{}", answers[0]);
         assert!(answers[1].starts_with("Yes — this time"), "{}", answers[1]);
@@ -1253,7 +1402,7 @@ mod tests {
         ) else {
             panic!()
         };
-        let answers = harness_dialog_answers(&local, ws);
+        let answers = harness_dialog_answers(&local, ws, false);
         assert_eq!(
             answers.len(),
             4,
@@ -1376,7 +1525,7 @@ mod tests {
             want.push("Always for any site — this repo only".into());
             assert_eq!(titles, want, "{link}");
 
-            let dialog = harness_dialog_answers(&q, ws);
+            let dialog = harness_dialog_answers(&q, ws, false);
             let mut want = vec![
                 format!(
                     "Always for {host} — this repo only (the usual lasting answer): {}",
@@ -1757,6 +1906,70 @@ mod tests {
             assert!(exact_open_command(line).is_none(), "{line}");
         }
         assert_eq!(sh_single_quote("https://x/it's"), r"'https://x/it'\''s'");
+    }
+
+    /// SPEC R-LINK.6: the link a command will open, known from its text
+    /// before it runs, so Claude Code's dialog asks before the first run: a
+    /// whole-line open of one link (its exact address), or a `gh` command that
+    /// opens the browser (its site: `-R HOST/…`, then `GH_HOST=`, then the
+    /// hook's own `GH_HOST`, then github.com). Never a command that opens
+    /// nothing, or one that only mentions `gh`.
+    #[test]
+    fn a_command_that_will_open_a_link_names_it_before_it_runs() {
+        let site = |cmd: &str, gh_host: Option<&str>| {
+            predicted_link(cmd, gh_host).map(|p| (p.target.host().to_string(), p.exact))
+        };
+        let gh = |host: &str| Some((host.to_string(), false));
+        for (cmd, want) in [
+            ("gh pr view 12 --web", gh("github.com")),
+            ("gh pr view -w", gh("github.com")),
+            ("cd sub && gh issue view 3 --web", gh("github.com")),
+            ("gh browse", gh("github.com")),
+            ("gh browse src/main.rs", gh("github.com")),
+            ("gh run view 7 --web", gh("github.com")),
+            (
+                "GH_HOST=GHE.example.com gh issue view 3 --web",
+                gh("ghe.example.com"),
+            ),
+            (
+                "gh pr view 12 -R ghe.example.com/o/r --web",
+                gh("ghe.example.com"),
+            ),
+            (
+                "gh pr view 12 --repo=ghe.example.com/o/r --web",
+                gh("ghe.example.com"),
+            ),
+            ("gh pr view 12 -R o/r --web", gh("github.com")),
+            (
+                "open https://docs.rs/serde",
+                Some(("docs.rs".to_string(), true)),
+            ),
+            (
+                "\"$BROWSER\" 'https://example.com/x'",
+                Some(("example.com".to_string(), true)),
+            ),
+        ] {
+            assert_eq!(site(cmd, None), want, "{cmd}");
+        }
+        assert_eq!(
+            site("gh pr view 12 --web", Some("ghe.corp")),
+            gh("ghe.corp"),
+            "the hook's GH_HOST, when the line names none"
+        );
+        for cmd in [
+            "gh pr view 12",
+            "gh browse -n",
+            "gh browse --no-browser",
+            "gh pr checks 12 --watch",
+            "gh run list -w build.yml",
+            "gh api repos/o/r -w",
+            "echo gh pr view --web",
+            "git log --web",
+            "cargo doc --open",
+            "open \"$URL\"",
+        ] {
+            assert_eq!(site(cmd, None), None, "{cmd}");
+        }
     }
 
     /// SPEC R-PERM.3.4, R5.3.1: a form's answer is read back only as an

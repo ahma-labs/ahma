@@ -52,10 +52,12 @@ ahma permissions revoke open-url github.com --yes
 ahma permissions revoke open-url --yes        # every site
 ```
 
-A hooked command is never paused to ask: a link to a site you have not allowed is not opened,
-and the command fails at once with one line that names the exact
-`ahma permissions grant open-url <site>` and the address, so the agent can show it to you. A
-command run over MCP waits while you are asked ([below](#asked-in-your-mcp-client)).
+A hooked command is never paused to ask. When the command line itself says which link it will
+open — `gh pr view 12 --web`, `gh browse`, `open https://…`, `"$BROWSER" https://…` — Claude
+Code's dialog asks you before it runs ([below](#asked-in-claude-code)). Any other link to a site
+you have not allowed is not opened, and the command fails at once with one line that names the
+exact `ahma permissions grant open-url <site>` and the address, so the agent can show it to you.
+A command run over MCP waits while you are asked ([below](#asked-in-your-mcp-client)).
 
 ## Asked in your MCP client
 
@@ -89,17 +91,24 @@ decides nothing: the next link to that site is asked again.
 
 ## Asked in Claude Code
 
-When the agent runs the refused command again — or any `ahma open-url`, `"$BROWSER"` or
-whole-line `open` of a link to the same site — Claude Code's own dialog asks you first. It
-shows the site on its own line, the address (up to 300 characters), a note for a local site or
-one outside your network allow list, and the guidance above. That dialog has only yes and no,
-so it names every answer, in this order:
+Claude Code's own dialog asks you first:
+
+- **before a command whose text names the link it opens** runs for the first time: `gh … --web`
+  (or a `-w` that means `--web`), `gh browse` (not with `--no-browser`), or a whole-line `open`,
+  `ahma open-url` or `"$BROWSER"` of one link. For `gh` the site is the host `-R HOST/OWNER/REPO`
+  or `GH_HOST` names, else `github.com`; the address shown is the command, since gh builds it.
+- **when the agent runs a refused command again**, or any `ahma open-url`, `"$BROWSER"` or
+  whole-line `open` of a link to the same site.
+
+It shows the site on its own line, the address (up to 300 characters), a note for a local site
+or one outside your network allow list, and the guidance above. That dialog has only yes and
+no, so it names every answer, in this order:
 
 | Answer | How you give it | What it does |
 |---|---|---|
 | Deny | No | Not opened. ahma does not ask about that site again in this Claude Code session. |
-| This time | Yes | The approved run may open that site's links. Nothing is remembered; the next refusal asks again. |
-| Always for *site* — this repo only (the usual lasting answer) | `ahma permissions grant open-url <site> --workspace '<repo>'` | Saved for this repo. |
+| Always for *site* — this repo only | Yes | Saved to `[open_url] repos` for this git repository, and the approved run opens it. Later commands in this repo open that site's links without asking. Undo with the `ahma permissions revoke open-url <site> --workspace '<repo>'` line the dialog names. |
+| This time (outside a git repository) | Yes | With no repository to save for, the approved run may open that site's links and nothing is remembered. |
 | Always for *site* — all repos | `ahma permissions grant open-url <site> --all-repos` | Saved for every repo. |
 | Always for *domain* and \*.*domain* — this repo only | `ahma permissions grant open-url <domain> --and-subdomains --workspace '<repo>'` | The domain and its one-label subdomains, for this repo. Offered only where one owner holds the domain. |
 | Always for any site — this repo only | `ahma permissions grant open-url --workspace '<repo>'` | Any public site in this repo; never a local one, and with network restriction on only sites on your allow list. Offered only where it would cover the link. |
@@ -107,8 +116,8 @@ so it names every answer, in this order:
 Each line names its repo (`--workspace`) or `--all-repos`, so it means the same whatever
 directory you paste it into.
 
-Each yes is recorded in `permissions-audit.jsonl` as a one-time `open-url` grant from the
-harness dialog.
+Each yes is recorded in `permissions-audit.jsonl` with the surface `harness`: a saved
+`open-url` grant in a repository, a one-time grant outside one.
 
 ## Answered first in `ahma tui`
 
