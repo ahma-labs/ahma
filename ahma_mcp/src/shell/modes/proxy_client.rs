@@ -447,6 +447,9 @@ enum ForwardFailure {
     /// bridges unlink their socket and exit after `--idle-timeout`). The
     /// request never reached the bridge, so it can be resent after a reconnect.
     EndpointGone,
+    /// The hub answered 404 for this proxy's session: it does not know it
+    /// (it handed over to a successor, or restarted). The request never ran.
+    SessionGone,
     /// Anything else: a transient error on an endpoint that is still there.
     Transient,
 }
@@ -463,10 +466,37 @@ fn classify_forward_failure(display: &str, debug: &str) -> ForwardFailure {
     if let Some(error) = recover_bridge_jsonrpc_error(display) {
         return ForwardFailure::BridgeError(error);
     }
+    if display.contains(SESSION_EXPIRED_DISPLAY) || debug.contains("SessionExpired") {
+        return ForwardFailure::SessionGone;
+    }
     if error_text_indicates_gone_endpoint(display) || error_text_indicates_gone_endpoint(debug) {
         return ForwardFailure::EndpointGone;
     }
     ForwardFailure::Transient
+}
+
+/// `Display` of rmcp's `StreamableHttpError::SessionExpired`: the hub answered
+/// 404 for the session id this proxy holds.
+const SESSION_EXPIRED_DISPLAY: &str = "Session expired (HTTP 404)";
+
+/// Whether a failed forward means the hub's session is not the one this client
+/// set up, so the proxy must rebuild it from its cached handshake and resend
+/// the request (SPEC R-HUB.5). Either the hub does not know the session (404),
+/// or it answers "sandbox initializing" (409, `-32001`) although the client
+/// already gave its roots, so the session it holds lost them. In both cases
+/// the hub never ran the request.
+fn failure_rebuilds_session(failure: &ForwardFailure, handshake: &CachedHandshake) -> bool {
+    match failure {
+        ForwardFailure::SessionGone => true,
+        ForwardFailure::BridgeError(error) => {
+            handshake.roots_response.is_some()
+                && error.get("code").and_then(serde_json::Value::as_i64)
+                    == Some(i64::from(
+                        ahma_common::mcp_methods::RpcErrorCode::SandboxNotReady.code(),
+                    ))
+        }
+        ForwardFailure::EndpointGone | ForwardFailure::Transient => false,
+    }
 }
 
 /// The message the proxy invents when a forward failed and *nothing* better
@@ -515,22 +545,28 @@ fn message_is_replayed_by_handshake(val: &serde_json::Value) -> bool {
 }
 
 /// Transparently resend, on a freshly reconnected transport, the one request
-/// whose forward failed because the bridge endpoint was gone.
+/// whose forward failed because the bridge endpoint or its session was gone.
 ///
 /// Resending is safe and is *not* a duplicate execution: this path only runs
-/// when the failure proved the endpoint was gone, so the request never reached
-/// the bridge at all.
+/// when the failure proved the bridge never ran the request (the endpoint was
+/// gone, or the hub refused it for a session it does not know or that has no
+/// roots).
 ///
-/// Returns whether the request went out. When it did not, the caller must
-/// answer it with an error.
-async fn resend_pending<C>(fresh: &mut C, pending: &serde_json::Value, transport: &str) -> bool
+/// `Err` when the request did not go out, carrying the bridge's own JSON-RPC
+/// error when it answered one; the caller must answer the request with it, or
+/// with the generic error.
+async fn resend_pending<C>(
+    fresh: &mut C,
+    pending: &serde_json::Value,
+    transport: &str,
+) -> Result<(), Option<serde_json::Value>>
 where
     C: Transport<RoleClient>,
-    C::Error: std::fmt::Debug,
+    C::Error: std::fmt::Debug + std::fmt::Display,
 {
     match serde_json::from_value::<TxJsonRpcMessage<RoleClient>>(pending.clone()) {
         Ok(msg) => match fresh.send(msg).await {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(
                     transport,
@@ -538,7 +574,7 @@ where
                     "Resend on the freshly reconnected bridge failed; \
                      answering the request with an error instead"
                 );
-                false
+                Err(recover_bridge_jsonrpc_error(&e.to_string()))
             }
         },
         Err(e) => {
@@ -547,7 +583,7 @@ where
                 error = %e,
                 "Pending request no longer deserializes; cannot resend it"
             );
-            false
+            Err(None)
         }
     }
 }
@@ -564,6 +600,11 @@ enum ReconnectCause {
     /// never reached the bridge, so it was resent on the fresh transport;
     /// `resent` says whether that worked.
     EndpointGone { resent: bool },
+    /// The hub's session was not the one this client set up: it did not know
+    /// it (after a handover or restart), or it had lost the client's roots
+    /// (SPEC R-HUB.5). The request never ran, so it was resent on the rebuilt
+    /// session; `resent` says whether that worked.
+    SessionGone { resent: bool },
     /// Forwards kept failing until the threshold tripped. The request that
     /// tripped it was already answered with an error.
     TransportFailure,
@@ -574,6 +615,7 @@ impl ReconnectCause {
         match self {
             Self::BridgeUnreachable => "bridge_unreachable",
             Self::EndpointGone { .. } => "endpoint_gone",
+            Self::SessionGone { .. } => "session_gone",
             Self::TransportFailure => "transport_failure",
         }
     }
@@ -583,7 +625,7 @@ impl ReconnectCause {
     fn in_flight_resent(self) -> bool {
         match self {
             Self::BridgeUnreachable => true,
-            Self::EndpointGone { resent } => resent,
+            Self::EndpointGone { resent } | Self::SessionGone { resent } => resent,
             Self::TransportFailure => false,
         }
     }
@@ -1440,17 +1482,25 @@ where
                     // request never reached the bridge, resending it on the
                     // fresh transport is a retry, not a duplicate execution.
                     //
+                    // The same holds when the hub's session is not this
+                    // client's (SPEC R-HUB.5): a successor that does not know
+                    // it answers 404, and one that lost its roots answers 409.
+                    // The hub ran nothing, and only the proxy's replay carries
+                    // the roots, so rebuild on the first failure and resend.
+                    //
                     // Handshake messages are excluded: `replay_handshake` already
                     // resends those, so a resend would duplicate them.
-                    if failure == ForwardFailure::EndpointGone
+                    let session_gone = failure_rebuilds_session(&failure, &handshake);
+                    if (failure == ForwardFailure::EndpointGone || session_gone)
                         && handshake.init_request.is_some()
                         && !message_is_replayed_by_handshake(&val)
                     {
                         tracing::warn!(
                             transport,
                             error = %rendered,
-                            "Bridge endpoint is gone; reconnecting immediately and resending \
-                             the request rather than waiting for repeated failures"
+                            session_gone,
+                            "Bridge endpoint or its session is gone; reconnecting immediately \
+                             and resending the request rather than waiting for repeated failures"
                         );
                         match reconnect_with_retries(
                             reconnect,
@@ -1464,17 +1514,20 @@ where
                                 // Resend before adopting, so the disclosure can
                                 // say whether the request reached the fresh
                                 // bridge; the error relay still precedes it.
-                                let resent = resend_pending(&mut fresh, &val, transport).await;
-                                if !resent && let Some(id) = request_id.clone() {
-                                    relay_forward_failure_to_client(&mut stdio, id, None).await;
+                                let resend = resend_pending(&mut fresh, &val, transport).await;
+                                let resent = resend.is_ok();
+                                // Once per request: a refusal on the rebuilt
+                                // session is relayed, never rebuilt again.
+                                if let (Err(recovered), Some(id)) = (resend, request_id.clone()) {
+                                    relay_forward_failure_to_client(&mut stdio, id, recovered)
+                                        .await;
                                 }
-                                conn.adopt(
-                                    fresh,
-                                    ReconnectCause::EndpointGone { resent },
-                                    &mut stdio,
-                                    &mut handshake,
-                                )
-                                .await;
+                                let cause = if session_gone {
+                                    ReconnectCause::SessionGone { resent }
+                                } else {
+                                    ReconnectCause::EndpointGone { resent }
+                                };
+                                conn.adopt(fresh, cause, &mut stdio, &mut handshake).await;
                                 if !resent {
                                     // The failed resend is the fresh transport's
                                     // first forward failure.
@@ -2769,6 +2822,261 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// rmcp's rendering of a POST the hub answered 404: the session id the
+    /// proxy holds is one the hub does not know (it handed over to a successor,
+    /// or restarted), with rmcp's own re-initialization turned off.
+    const SESSION_EXPIRED_SEND_ERROR: &str = "Session expired (HTTP 404)";
+
+    /// A bridge transport whose sends fail from the `fail_sends_from`th one
+    /// (1-indexed) with `error`, which answers its receives from `inbound`,
+    /// and which records every send that went through in `sent`.
+    fn scripted_client(
+        fail_sends_from: usize,
+        error: &'static str,
+        inbound: Vec<RxJsonRpcMessage<RoleClient>>,
+        sent: &Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> MockClient {
+        MockClient {
+            fail_first_n: 0,
+            fail_sends_from,
+            send_error_text: error,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            inbound: VecDeque::from(inbound),
+            closed: Arc::new(AtomicUsize::new(0)),
+            receive_none_after: None,
+            receive_call_count: Arc::new(AtomicUsize::new(0)),
+            close_behavior: CloseBehavior::Ok,
+            sent: Some(sent.clone()),
+        }
+    }
+
+    /// The session events the proxy sent downstream.
+    fn session_events(sent: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        sent.iter()
+            .filter(|m| {
+                m.get("method").and_then(|m| m.as_str())
+                    == Some(ahma_common::session_event::SESSION_EVENT_METHOD)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A client that gave its roots: `initialize`, then (after the bridge has
+    /// asked) its `roots/list` answer, then one tool call. The delay lets the
+    /// bridge's `initialize` answer and `roots/list` request reach the proxy
+    /// between the client's messages.
+    fn stdio_with_roots_then_a_call(sent: &Arc<Mutex<Vec<serde_json::Value>>>) -> MockStdio {
+        let mut stdio = MockStdio::new(
+            VecDeque::from(vec![
+                client_initialize(0),
+                client_roots_list_response(50),
+                client_request(1),
+            ]),
+            sent.clone(),
+        );
+        stdio.inbound_delay = Some(Duration::from_millis(50));
+        stdio
+    }
+
+    /// SPEC R-HUB.5: after a hub hands over to its successor, the successor
+    /// does not know the proxy's session and answers 404. The proxy rebuilds
+    /// the session itself (only its replay carries roots) on that FIRST
+    /// failure, and resends the request the hub never ran. Field case
+    /// 2026-11-27: rmcp re-initialized behind the proxy's back instead, the new
+    /// session never got roots, and three tool calls in a row were answered
+    /// "Sandbox initializing from client roots" before the proxy noticed.
+    #[tokio::test]
+    async fn an_expired_session_is_rebuilt_with_its_roots_and_the_request_resent() {
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = stdio_with_roots_then_a_call(&sent);
+            let old_sent = Arc::new(Mutex::new(Vec::new()));
+            // `initialize` and the roots answer get through; then the hub hands over.
+            let old = scripted_client(
+                3,
+                SESSION_EXPIRED_SEND_ERROR,
+                vec![bridge_initialize_response(0), bridge_roots_list_request(50)],
+                &old_sent,
+            );
+            let fresh_sent = Arc::new(Mutex::new(Vec::new()));
+            let fresh_sent_inner = fresh_sent.clone();
+            let reconnects = Arc::new(AtomicUsize::new(0));
+            let reconnects_inner = reconnects.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                reconnects_inner.fetch_add(1, Ordering::SeqCst);
+                Ok(scripted_client(
+                    usize::MAX,
+                    TRANSIENT_SEND_ERROR,
+                    vec![bridge_initialize_response(0), bridge_roots_list_request(51)],
+                    &fresh_sent_inner,
+                ))
+            };
+
+            let result = run_transport_proxy(stdio, old, "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok_and(|responded| responded));
+            assert_eq!(
+                reconnects.load(Ordering::SeqCst),
+                1,
+                "rebuilt on the first 404"
+            );
+
+            let fresh_sent = fresh_sent.lock();
+            assert_eq!(
+                fresh_sent.len(),
+                3,
+                "replay, roots, resend: {fresh_sent:#?}"
+            );
+            assert_eq!(fresh_sent[0]["method"], INITIALIZE_METHOD);
+            assert_eq!(
+                fresh_sent[1]["id"], 51,
+                "the new session's roots/list is answered"
+            );
+            assert_eq!(
+                fresh_sent[1]["result"]["roots"][0]["uri"],
+                "file:///workspace"
+            );
+            assert_eq!(
+                fresh_sent[2]["id"], 1,
+                "the request is resent: {fresh_sent:#?}"
+            );
+
+            let sent = sent.lock();
+            assert!(
+                sent.iter().all(|m| m.get("error").is_none()),
+                "the client sees no error: {sent:#?}"
+            );
+            let events = session_events(&sent);
+            assert_eq!(events.len(), 1, "one disclosure: {sent:#?}");
+            assert_eq!(events[0]["params"]["kind"], "reconnected");
+            assert_eq!(events[0]["params"]["detail"]["cause"], "session_gone");
+            assert_eq!(events[0]["params"]["detail"]["in_flight_request"], "resent");
+        })
+        .await;
+    }
+
+    /// The backstop: a hub session that answers "sandbox initializing" after
+    /// this client already gave its roots has lost them, whatever lost them.
+    /// The proxy rebuilds it and resends the call, which the hub refused
+    /// without running it.
+    #[tokio::test]
+    async fn sandbox_initializing_after_roots_were_given_rebuilds_the_session() {
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = stdio_with_roots_then_a_call(&sent);
+            let old_sent = Arc::new(Mutex::new(Vec::new()));
+            let old = scripted_client(
+                3,
+                RENDERED_409_SANDBOX_INITIALIZING,
+                vec![bridge_initialize_response(0), bridge_roots_list_request(50)],
+                &old_sent,
+            );
+            let fresh_sent = Arc::new(Mutex::new(Vec::new()));
+            let fresh_sent_inner = fresh_sent.clone();
+            let reconnects = Arc::new(AtomicUsize::new(0));
+            let reconnects_inner = reconnects.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                reconnects_inner.fetch_add(1, Ordering::SeqCst);
+                Ok(scripted_client(
+                    usize::MAX,
+                    TRANSIENT_SEND_ERROR,
+                    vec![bridge_initialize_response(0), bridge_roots_list_request(51)],
+                    &fresh_sent_inner,
+                ))
+            };
+
+            let result = run_transport_proxy(stdio, old, "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok());
+            assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+            let fresh_sent = fresh_sent.lock();
+            assert_eq!(
+                fresh_sent.last().map(|m| m["id"].clone()),
+                Some(serde_json::json!(1))
+            );
+            let sent = sent.lock();
+            assert!(sent.iter().all(|m| m.get("error").is_none()), "{sent:#?}");
+            assert_eq!(
+                session_events(&sent)[0]["params"]["detail"]["cause"],
+                "session_gone"
+            );
+        })
+        .await;
+    }
+
+    /// Before the client gave roots, "sandbox initializing" is the truth, not
+    /// a lost session: it is relayed, and nothing is rebuilt.
+    #[tokio::test]
+    async fn sandbox_initializing_before_any_roots_is_relayed() {
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![
+            client_initialize(0),
+            client_request(1),
+        ]));
+        let mut client = state.client(0);
+        client.fail_sends_from = 2;
+        client.send_error_text = RENDERED_409_SANDBOX_INITIALIZING;
+        let mut reconnect =
+            || -> Result<MockClient> { panic!("a session that never had roots is not rebuilt") };
+
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
+        assert!(result.is_ok());
+        let sent = state.sent.lock();
+        assert_eq!(sent.len(), 1, "{sent:#?}");
+        assert_eq!(sent[0]["id"], 1);
+        assert_eq!(sent[0]["error"]["code"], -32001);
+    }
+
+    /// Once per request: when the rebuilt session refuses the resent call too,
+    /// the hub's own answer is relayed and the proxy does not rebuild again.
+    #[tokio::test]
+    async fn a_rebuilt_session_that_still_refuses_is_relayed_without_a_second_rebuild() {
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = stdio_with_roots_then_a_call(&sent);
+            let old_sent = Arc::new(Mutex::new(Vec::new()));
+            let old = scripted_client(
+                3,
+                RENDERED_409_SANDBOX_INITIALIZING,
+                vec![bridge_initialize_response(0), bridge_roots_list_request(50)],
+                &old_sent,
+            );
+            let fresh_sent = Arc::new(Mutex::new(Vec::new()));
+            let fresh_sent_inner = fresh_sent.clone();
+            let reconnects = Arc::new(AtomicUsize::new(0));
+            let reconnects_inner = reconnects.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                reconnects_inner.fetch_add(1, Ordering::SeqCst);
+                // The replay's two sends go through; the resend is refused.
+                Ok(scripted_client(
+                    3,
+                    RENDERED_409_SANDBOX_INITIALIZING,
+                    vec![bridge_initialize_response(0), bridge_roots_list_request(51)],
+                    &fresh_sent_inner,
+                ))
+            };
+
+            let result = run_transport_proxy(stdio, old, "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok());
+            assert_eq!(reconnects.load(Ordering::SeqCst), 1, "no second rebuild");
+            let sent = sent.lock();
+            let errors: Vec<_> = sent.iter().filter(|m| m.get("error").is_some()).collect();
+            assert_eq!(errors.len(), 1, "{sent:#?}");
+            assert_eq!(errors[0]["id"], 1);
+            assert_eq!(
+                errors[0]["error"]["code"], -32001,
+                "the hub's own answer, not the generic one"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn an_expired_session_is_classified_as_gone_not_transient() {
+        assert_eq!(
+            classify_forward_failure(SESSION_EXPIRED_SEND_ERROR, "SessionExpired"),
+            ForwardFailure::SessionGone
+        );
     }
 
     #[tokio::test]

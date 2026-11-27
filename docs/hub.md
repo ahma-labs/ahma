@@ -159,7 +159,10 @@ other. `/health` says which binary, and which file, the hub is running.
   rendezvous.
 - It hands over the moment nothing is running: no command in any session and
   no request waiting for an answer. Your editors reconnect to the new hub on
-  their next request, without you doing anything.
+  their next request, without you doing anything. That request goes through:
+  the new hub does not know the old session, so ahma's frontend opens a new
+  one with the workspace folders your editor gave at the start, and sends the
+  request again. You see no error, and no reconnect in your editor is needed.
 - Work that never goes quiet is ended after `[hub] drain_timeout_secs` (an
   hour by default), so an old build cannot run forever; the requests it
   interrupts get an error saying why.

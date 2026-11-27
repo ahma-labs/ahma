@@ -110,7 +110,12 @@ pub fn local_socket_transport(
     uri: &str,
 ) -> StreamableHttpClientTransport<LocalSocketHttpClient> {
     let client = LocalSocketHttpClient::new(socket_path, uri);
-    let config = StreamableHttpClientTransportConfig::with_uri(uri);
+    let mut config = StreamableHttpClientTransportConfig::with_uri(uri);
+    // The proxy owns re-initialization (SPEC R-HUB.5). rmcp's recovery repeats
+    // only `initialize`, so the session it makes after a hub handover never
+    // gets the client's roots and refuses every tool call; the proxy's replay
+    // carries them. A 404 must therefore reach the proxy as an error.
+    config.reinit_on_expired_session = false;
     StreamableHttpClientTransport::with_client(client, config)
 }
 
@@ -621,6 +626,92 @@ mod tests {
             rendered.contains("HTTP 409") && rendered.contains("-32001"),
             "{rendered}"
         );
+    }
+
+    /// SPEC R-HUB.5: when the hub no longer knows the session (it handed over
+    /// to a successor), the 404 must reach the proxy. The proxy rebuilds the
+    /// session from its cached handshake, which is the only one that carries
+    /// the client's roots. rmcp's own recovery repeats `initialize` without
+    /// them, and the session it makes answers every tool call "sandbox
+    /// initializing" (field case 2026-11-27).
+    #[tokio::test]
+    async fn an_expired_session_reaches_the_caller_instead_of_being_reinitialized() {
+        use rmcp::transport::Transport;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let initializes = Arc::new(AtomicUsize::new(0));
+        let seen = initializes.clone();
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                let seen = seen.clone();
+                async move {
+                    let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let json = [
+                        ("content-type", "application/json"),
+                        ("mcp-session-id", "s-1"),
+                    ];
+                    if request["method"] == "initialize" {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let answer = serde_json::json!({
+                            "jsonrpc": "2.0", "id": request["id"], "result": {
+                                "protocolVersion": "2025-11-25",
+                                "capabilities": {},
+                                "serverInfo": {"name": "hub", "version": "0"}
+                            }
+                        });
+                        return (axum::http::StatusCode::OK, json, answer.to_string());
+                    }
+                    if request.get("id").is_none() {
+                        return (axum::http::StatusCode::ACCEPTED, json, String::new());
+                    }
+                    assert!(headers.contains_key("mcp-session-id"));
+                    // The successor hub: it never issued this session.
+                    (axum::http::StatusCode::NOT_FOUND, json, String::new())
+                }
+            })
+            .get(|| async { axum::http::StatusCode::METHOD_NOT_ALLOWED })
+            .delete(|| async { axum::http::StatusCode::OK }),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp.sock");
+        serve(LocalListener::bind(&sock).unwrap(), app);
+        let mut transport = local_socket_transport(&sock.to_string_lossy(), "http://localhost/mcp");
+
+        let initialize: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                       "clientInfo": {"name": "proxy", "version": "0"}}
+        }))
+        .unwrap();
+        transport
+            .send(initialize)
+            .await
+            .expect("initialize goes out");
+        transport.receive().await.expect("initialize is answered");
+        let initialized: ClientJsonRpcMessage = serde_json::from_value(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .unwrap();
+        transport
+            .send(initialized)
+            .await
+            .expect("initialized goes out");
+
+        let err = transport
+            .send(ping())
+            .await
+            .expect_err("the hub does not know the session");
+        assert!(
+            matches!(err, StreamableHttpError::SessionExpired),
+            "{err:?}"
+        );
+        assert_eq!(
+            initializes.load(Ordering::SeqCst),
+            1,
+            "the transport must not re-initialize behind the proxy"
+        );
+        let _ = transport.close().await;
     }
 
     #[test]
