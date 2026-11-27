@@ -1719,6 +1719,38 @@ pub fn render(findings: &[Finding]) -> String {
     out
 }
 
+/// How a report closes when it offers no fix of doctor's own (SPEC
+/// R-DOCTOR.13): "Nothing to fix." only when nothing is wrong. A warning or
+/// problem doctor cannot fix itself is counted instead, so the close never
+/// contradicts the report above it.
+pub fn no_fix_close(findings: &[Finding]) -> String {
+    let count = |level| findings.iter().filter(|f| f.level == level).count();
+    let counted = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    let parts: Vec<String> = [
+        counted(count(Level::Problem), "problem", "problems"),
+        counted(count(Level::Warn), "warning", "warnings"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        return "Nothing to fix.".into();
+    }
+    format!(
+        "Doctor has no fix of its own for the {} above: {} what to change.",
+        parts.join(" and "),
+        if count(Level::Problem) + count(Level::Warn) == 1 {
+            "it says"
+        } else {
+            "each says"
+        }
+    )
+}
+
 /// The fixes in `findings`, in report order (fix 1 is the first).
 pub fn fixes(findings: &[Finding]) -> Vec<Fix> {
     findings.iter().filter_map(|f| f.fix.clone()).collect()
@@ -1742,6 +1774,37 @@ mod tests {
             confined_daemons: Vec::new(),
             audit_entries: Vec::new(),
         }
+    }
+
+    fn finding(level: Level) -> Finding {
+        Finding {
+            level,
+            id: FindingId::GrantToolsAutoApproved,
+            title: "t".into(),
+            detail: "d".into(),
+            fix: None,
+        }
+    }
+
+    #[test]
+    fn nothing_to_fix_is_said_only_when_nothing_is_wrong() {
+        let calm = [finding(Level::Ok), finding(Level::Info)];
+        assert_eq!(no_fix_close(&calm), "Nothing to fix.");
+
+        // Field case, 0.23.3: a warning with no fix of doctor's own was
+        // followed by "Nothing to fix.", which contradicted the report.
+        let one = [finding(Level::Ok), finding(Level::Warn)];
+        let close = no_fix_close(&one);
+        assert!(!close.contains("Nothing to fix"), "{close}");
+        assert!(close.contains("1 warning above"), "{close}");
+
+        let many = [
+            finding(Level::Problem),
+            finding(Level::Problem),
+            finding(Level::Warn),
+        ];
+        let close = no_fix_close(&many);
+        assert!(close.contains("2 problems and 1 warning above"), "{close}");
     }
 
     fn temp_finding(findings: &[Finding]) -> &Finding {

@@ -4094,7 +4094,8 @@ fn run_doctor_report(state: &mut crate::state::AppState) {
         ahma_common::doctor::render(&findings)
     );
     if state.doctor_fixes.is_empty() {
-        text.push_str("\nNothing to fix.");
+        text.push('\n');
+        text.push_str(&ahma_common::doctor::no_fix_close(&findings));
     } else {
         text.push_str("\n`/doctor fix <n>` applies a fix — it is shown again and needs your `y`.");
     }
